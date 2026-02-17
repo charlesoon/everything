@@ -8,16 +8,19 @@
   const rowHeight = 28;
   const PAGE_SIZE = 500;
   let homePrefix = '';
-  const columnKeys = ['name', 'modified', 'path'];
+  const COL_WIDTHS_KEY = 'everything-col-widths-v2';
+  const columnKeys = ['name', 'path', 'size', 'modified'];
   const minColumnWidth = {
     name: 180,
-    modified: 140,
-    path: 240
+    path: 240,
+    size: 80,
+    modified: 120
   };
   const defaultColumnRatios = {
-    name: 0.35,
-    modified: 0.2,
-    path: 0.45
+    name: 0.3,
+    path: 0.45,
+    size: 0.1,
+    modified: 0.15
   };
 
   let query = '';
@@ -70,9 +73,10 @@
   let resizingColumn = '';
   let resizeCleanup = null;
   let colWidths = {
-    name: 280,
-    modified: 180,
-    path: 420
+    name: 250,
+    path: 350,
+    size: 80,
+    modified: 120
   };
 
   let contextMenu = {
@@ -113,8 +117,8 @@
   $: endIndex = Math.min(results.length, startIndex + visibleCount);
   $: visibleRows = results.slice(startIndex, endIndex);
   $: translateY = startIndex * rowHeight;
-  $: tableMinWidth = totalColumnWidth(colWidths);
-  $: tableGridStyle = `--col-name:${colWidths.name}px;--col-modified:${colWidths.modified}px;--col-path:${colWidths.path}px;--table-min-width:${tableMinWidth}px;--header-offset:${-headerScrollLeft}px;`;
+  $: tableMinWidth = colWidths.name + colWidths.path + colWidths.size + colWidths.modified;
+  $: tableGridStyle = `--col-name:${colWidths.name}px;--col-path:${colWidths.path}px;--col-size:${colWidths.size}px;--col-modified:${colWidths.modified}px;--table-min-width:${tableMinWidth}px;--header-offset:${-headerScrollLeft}px;`;
 
   $: {
     for (const entry of visibleRows) {
@@ -217,73 +221,47 @@
     }
   }
 
-  function totalColumnWidth(widths) {
-    return columnKeys.reduce((sum, key) => sum + widths[key], 0);
-  }
-
-  function normalizeColumnWidths(widths, targetTotal) {
-    const next = {};
-    for (const key of columnKeys) {
-      next[key] = Math.max(minColumnWidth[key], Math.round(widths[key]));
-    }
-
-    let delta = Math.round(targetTotal - totalColumnWidth(next));
-    if (delta > 0) {
-      next.path += delta;
-      return next;
-    }
-
-    if (delta < 0) {
-      let remaining = -delta;
-      const shrinkOrder = ['path', 'name', 'modified'];
-
-      for (const key of shrinkOrder) {
-        const available = next[key] - minColumnWidth[key];
-        if (available <= 0) {
-          continue;
-        }
-
-        const cut = Math.min(available, remaining);
-        next[key] -= cut;
-        remaining -= cut;
-        if (remaining === 0) {
-          break;
-        }
-      }
-    }
-
-    return next;
-  }
-
-  function syncColumnWidthsToContainer(preserveExisting = true) {
+  function syncColumnWidthsToContainer() {
     const width = tableContainer?.clientWidth || tableAreaEl?.clientWidth;
-    if (!width) {
+    if (!width || lastTableWidth !== 0) {
       return;
     }
 
-    let base;
-    if (!preserveExisting || lastTableWidth === 0) {
-      base = {
-        name: width * defaultColumnRatios.name,
-        modified: width * defaultColumnRatios.modified,
-        path: width * defaultColumnRatios.path
-      };
+    const saved = loadColWidths();
+    if (saved) {
+      colWidths = saved;
     } else {
-      const scale = width / lastTableWidth;
-      base = {
-        name: colWidths.name * scale,
-        modified: colWidths.modified * scale,
-        path: colWidths.path * scale
+      colWidths = {
+        name: Math.max(minColumnWidth.name, Math.round(width * defaultColumnRatios.name)),
+        path: Math.max(minColumnWidth.path, Math.round(width * defaultColumnRatios.path)),
+        size: Math.max(minColumnWidth.size, Math.round(width * defaultColumnRatios.size)),
+        modified: Math.max(minColumnWidth.modified, Math.round(width * defaultColumnRatios.modified))
       };
     }
-
-    colWidths = normalizeColumnWidths(base, width);
     lastTableWidth = width;
+  }
+
+  function loadColWidths() {
+    try {
+      const raw = localStorage.getItem(COL_WIDTHS_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      for (const key of columnKeys) {
+        if (typeof parsed[key] !== 'number' || parsed[key] < (minColumnWidth[key] || 0)) return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveColWidths() {
+    localStorage.setItem(COL_WIDTHS_KEY, JSON.stringify(colWidths));
   }
 
   function updateViewportHeight() {
     viewportHeight = tableContainer?.clientHeight || 520;
-    syncColumnWidthsToContainer(true);
+    syncColumnWidthsToContainer();
   }
 
   function startColumnResize(event, leftKey) {
@@ -295,27 +273,19 @@
       return;
     }
 
-    const rightKey = columnKeys[index + 1];
     const startX = event.clientX;
     const startLeft = colWidths[leftKey];
-    const startRight = colWidths[rightKey];
-    const pairWidth = startLeft + startRight;
 
     resizeCleanup?.();
     resizingColumn = leftKey;
 
     const onMove = (moveEvent) => {
       const delta = moveEvent.clientX - startX;
-      const minLeft = minColumnWidth[leftKey];
-      const minRight = minColumnWidth[rightKey];
-      const maxLeft = pairWidth - minRight;
-      const nextLeft = Math.min(maxLeft, Math.max(minLeft, startLeft + delta));
-      const nextRight = pairWidth - nextLeft;
+      const nextLeft = Math.max(minColumnWidth[leftKey], Math.round(startLeft + delta));
 
       colWidths = {
         ...colWidths,
-        [leftKey]: Math.round(nextLeft),
-        [rightKey]: Math.round(nextRight)
+        [leftKey]: nextLeft
       };
     };
 
@@ -329,6 +299,7 @@
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       resizingColumn = '';
+      saveColWidths();
       if (resizeCleanup === cleanup) {
         resizeCleanup = null;
       }
@@ -1022,6 +993,23 @@
       return;
     }
 
+    if (event.key === ' ' && !isTextInput) {
+      event.preventDefault();
+      const entry = primaryEntry();
+      if (entry) {
+        await invoke('quick_look', { path: entry.path });
+      }
+      return;
+    }
+
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+      event.preventDefault();
+      clearSelection();
+      searchInputEl?.focus();
+      searchInputEl?.select();
+      return;
+    }
+
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'o') {
       event.preventDefault();
       await openSelected();
@@ -1051,6 +1039,15 @@
       await trashSelected();
       return;
     }
+  }
+
+  function formatSize(entry) {
+    if (entry.isDir || entry.size == null) return '';
+    const bytes = entry.size;
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   }
 
   function formatModified(entry) {
@@ -1223,6 +1220,7 @@
       type="text"
       bind:value={query}
       on:input={scheduleSearch}
+      on:focus={clearSelection}
       placeholder="Search file/folder names"
       autocomplete="off"
       spellcheck="false"
@@ -1245,22 +1243,35 @@
           />
         </div>
 
-        <div class="col modified">
-          <button type="button" class="col-button" on:click={() => handleHeaderSort('mtime')}>
-            Modified{sortMark('mtime')}
+        <div class="col path">
+          <button type="button" class="col-button" on:click={() => handleHeaderSort('dir')}>
+            Path{sortMark('dir')}
           </button>
           <button
             type="button"
             class="col-resizer"
-            class:active={resizingColumn === 'modified'}
-            on:mousedown={(event) => startColumnResize(event, 'modified')}
-            aria-label="Resize Modified column"
+            class:active={resizingColumn === 'path'}
+            on:mousedown={(event) => startColumnResize(event, 'path')}
+            aria-label="Resize Path column"
           />
         </div>
 
-        <div class="col path">
-          <button type="button" class="col-button" on:click={() => handleHeaderSort('dir')}>
-            Path{sortMark('dir')}
+        <div class="col size">
+          <button type="button" class="col-button" on:click={() => handleHeaderSort('size')}>
+            Size{sortMark('size')}
+          </button>
+          <button
+            type="button"
+            class="col-resizer"
+            class:active={resizingColumn === 'size'}
+            on:mousedown={(event) => startColumnResize(event, 'size')}
+            aria-label="Resize Size column"
+          />
+        </div>
+
+        <div class="col modified">
+          <button type="button" class="col-button" on:click={() => handleHeaderSort('mtime')}>
+            Modified{sortMark('mtime')}
           </button>
         </div>
       </div>
@@ -1306,8 +1317,9 @@
                   <span class="ellipsis">{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
                 {/if}
               </div>
-              <div class="cell modified">{formatModified(entry)}</div>
               <div class="cell path ellipsis">{displayPath(entry.dir)}</div>
+              <div class="cell size">{formatSize(entry)}</div>
+              <div class="cell modified">{formatModified(entry)}</div>
             </div>
           {/each}
         </div>
@@ -1319,7 +1331,7 @@
     {#if indexStatus.state === 'Indexing'}
         {#if indexStatus.entriesCount > 0}
           <span class="status-searchable">&#9679; Searchable</span>
-          <span>Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} {indexingElapsed}{/if} · {indexStatus.entriesCount.toLocaleString()} entries</span>
+          <span>Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if} · {indexStatus.entriesCount.toLocaleString()} entries</span>
         {:else}
           <span>Starting indexing...{#if indexingElapsed} ({indexingElapsed}){/if}</span>
         {/if}
@@ -1359,6 +1371,7 @@
   {#if contextMenu.visible}
     <div class="context-menu" style={`left:${contextMenu.x}px;top:${contextMenu.y}px;`}>
       <button on:click={() => (closeContextMenu(), openSelected())}>Open</button>
+      <button on:click={async () => { closeContextMenu(); const e = primaryEntry(); if (e) await invoke('quick_look', { path: e.path }); }}>Quick Look</button>
       <button on:click={() => (closeContextMenu(), openWithFallback())}>Open With... (Reveal in Finder)</button>
       <button on:click={() => (closeContextMenu(), revealSelected())}>Reveal in Finder</button>
       <button on:click={() => (closeContextMenu(), copySelectedPaths())}>Copy Path</button>
@@ -1500,7 +1513,7 @@
   .table-header-track,
   .row {
     display: grid;
-    grid-template-columns: var(--col-name, 35%) var(--col-modified, 20%) var(--col-path, 45%);
+    grid-template-columns: var(--col-name, 30%) minmax(var(--col-path, 240px), 1fr) var(--col-size, 10%) var(--col-modified, 15%);
     align-items: center;
     min-width: var(--table-min-width, 0px);
     width: max(var(--table-min-width, 0px), 100%);
@@ -1627,8 +1640,15 @@
   }
 
   .cell.path,
+  .cell.size,
   .cell.modified {
     min-width: 0;
+  }
+
+  .cell.size {
+    text-align: right;
+    padding-right: 12px;
+    font-variant-numeric: tabular-nums;
   }
 
   .ellipsis {

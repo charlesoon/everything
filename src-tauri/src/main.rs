@@ -79,6 +79,7 @@ pub struct EntryDto {
     pub dir: String,
     pub is_dir: bool,
     pub ext: Option<String>,
+    pub size: Option<i64>,
     pub mtime: Option<i64>,
 }
 
@@ -575,6 +576,12 @@ fn sort_clause(sort_by: &str, sort_dir: &str, prefix: &str) -> String {
         }
         ("dir", "desc") => {
             format!("{prefix}dir COLLATE NOCASE DESC, {prefix}name COLLATE NOCASE ASC")
+        }
+        ("size", "asc") => {
+            format!("COALESCE({prefix}size, 0) ASC, {prefix}name COLLATE NOCASE ASC")
+        }
+        ("size", "desc") => {
+            format!("COALESCE({prefix}size, 0) DESC, {prefix}name COLLATE NOCASE ASC")
         }
         _ => format!("{prefix}name COLLATE NOCASE ASC, {prefix}path COLLATE NOCASE ASC"),
     }
@@ -1258,6 +1265,7 @@ fn entry_from_index_row(row: IndexRow) -> EntryDto {
         dir: row.dir,
         is_dir: row.is_dir == 1,
         ext: row.ext,
+        size: row.size,
         mtime: row.mtime,
     }
 }
@@ -2437,7 +2445,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryDto> {
         dir: row.get(2)?,
         is_dir: row.get::<_, i64>(3)? == 1,
         ext: row.get(4)?,
-        mtime: row.get(5)?,
+        size: row.get(5)?,
+        mtime: row.get(6)?,
     })
 }
 
@@ -2714,7 +2723,7 @@ fn execute_search(
         SearchMode::Empty => {
             let sql = format!(
                 r#"
-                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                 FROM entries e
                 ORDER BY {order_by}
                 LIMIT ?1 OFFSET ?2
@@ -2847,7 +2856,7 @@ fn execute_search(
         SearchMode::GlobName { name_like } => {
             let sql = format!(
                 r#"
-                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                 FROM entries e
                 WHERE e.name LIKE ?1 ESCAPE '\'
                 ORDER BY {order_by}
@@ -2866,7 +2875,7 @@ fn execute_search(
         SearchMode::ExtSearch { ext, name_like: _ } => {
             let sql = format!(
                 r#"
-                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                 FROM entries e
                 WHERE e.ext = ?1
                 ORDER BY {order_by}
@@ -2898,7 +2907,7 @@ fn execute_search(
                 if let Some(ext_val) = ext_shortcut {
                     let sql = format!(
                         r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                         FROM entries e
                         WHERE (e.dir = ?1 OR (e.dir >= ?2 AND e.dir < ?3))
                           AND e.ext = ?4
@@ -2926,7 +2935,7 @@ fn execute_search(
                 } else {
                     let sql = format!(
                         r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                         FROM entries e
                         WHERE (e.dir = ?1 OR (e.dir >= ?2 AND e.dir < ?3))
                           AND e.name LIKE ?4 ESCAPE '\'
@@ -2961,7 +2970,7 @@ fn execute_search(
                 if let Some(ext_val) = ext_shortcut {
                     let sql = format!(
                         r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                         FROM entries e
                         WHERE e.ext = ?1
                           AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
@@ -3004,7 +3013,7 @@ fn execute_search(
                         if let Some(ref pfx) = prefix_like {
                             let sql = format!(
                                 r#"
-                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                                 FROM entries e INDEXED BY idx_entries_name_nocase
                                 WHERE e.name LIKE ?1 ESCAPE '\'
                                   AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
@@ -3038,7 +3047,7 @@ fn execute_search(
 
                         let sql = format!(
                             r#"
-                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                             FROM entries e
                             WHERE (e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\')
                               AND e.name LIKE ?3 ESCAPE '\'
@@ -3176,6 +3185,21 @@ async fn search(
             entries: execution.results,
             mode_label: execution.mode_label,
         })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn quick_look(path: String) -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Command::new("qlmanage")
+            .args(["-p", &path])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3381,6 +3405,7 @@ async fn rename(
 
         let new_path = parent.join(&validated_name);
         if new_path == old_path {
+            let meta = fs::symlink_metadata(&old_path).ok();
             return Ok(EntryDto {
                 path: path.clone(),
                 name: old_path
@@ -3390,9 +3415,9 @@ async fn rename(
                 dir: parent.to_string_lossy().to_string(),
                 is_dir: old_path.is_dir(),
                 ext: extension_for(&old_path, old_path.is_dir()),
-                mtime: fs::symlink_metadata(&old_path)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
+                size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len() as i64),
+                mtime: meta
+                    .and_then(|m| m.modified().ok())
                     .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64),
             });
@@ -3431,15 +3456,16 @@ async fn rename(
 
         emit_status_counts(&app, &state)?;
 
+        let new_meta = fs::symlink_metadata(&new_path).ok();
         Ok(EntryDto {
             path: new_path.to_string_lossy().to_string(),
             name: validated_name,
             dir: parent.to_string_lossy().to_string(),
             is_dir: original_is_dir,
             ext: extension_for(&new_path, original_is_dir),
-            mtime: fs::symlink_metadata(&new_path)
-                .ok()
-                .and_then(|meta| meta.modified().ok())
+            size: new_meta.as_ref().filter(|m| m.is_file()).map(|m| m.len() as i64),
+            mtime: new_meta
+                .and_then(|m| m.modified().ok())
                 .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64),
         })
@@ -3854,7 +3880,7 @@ fn start_bench_runner(app_handle: AppHandle, state: AppState) {
 
 #[cfg(target_os = "macos")]
 fn register_global_shortcut(app: &AppHandle) -> AppResult<()> {
-    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::KeyF);
+    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyF);
 
     app.global_shortcut()
         .on_shortcut(shortcut, move |app_handle, _, _| {
@@ -4021,6 +4047,7 @@ pub fn run() {
             reset_index,
             search,
             fd_search,
+            quick_look,
             open,
             open_with,
             reveal_in_finder,
@@ -4053,6 +4080,7 @@ mod tests {
             dir: parent,
             is_dir: false,
             ext: None,
+            size: None,
             mtime: None,
         }
     }
