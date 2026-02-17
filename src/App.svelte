@@ -3,13 +3,34 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { startDrag } from '@crabnebula/tauri-plugin-drag';
 
   const rowHeight = 28;
-  const defaultLimit = 300;
+  const PAGE_SIZE = 500;
+  let homePrefix = '';
+  const columnKeys = ['name', 'modified', 'path'];
+  const minColumnWidth = {
+    name: 180,
+    modified: 140,
+    path: 240
+  };
+  const defaultColumnRatios = {
+    name: 0.35,
+    modified: 0.2,
+    path: 0.45
+  };
 
   let query = '';
   let results = [];
+  let searchMode = 'db';
+  let liveTotal = 0;
+  let liveSearching = false;
+  let liveLatencyMs = null;
+  let liveTimedOut = false;
+  let dbLatencyMs = null;
+  let dbLastQuery = '';
   let selectedIndices = new Set();
+  let selectionAnchor = -1;
   let lastSelectedIndex = -1;
   let editing = {
     active: false,
@@ -29,15 +50,29 @@
   let sortBy = 'name';
   let sortDir = 'asc';
 
+  let hasMore = true;
+  let loadingMore = false;
+  let searchGeneration = 0;
+
   let scanned = 0;
   let indexed = 0;
   let currentPath = '';
 
   let searchInputEl;
   let renameInputEl;
+  let tableAreaEl;
   let tableContainer;
   let scrollTop = 0;
+  let headerScrollLeft = 0;
   let viewportHeight = 520;
+  let lastTableWidth = 0;
+  let resizingColumn = '';
+  let resizeCleanup = null;
+  let colWidths = {
+    name: 280,
+    modified: 180,
+    path: 420
+  };
 
   let contextMenu = {
     visible: false,
@@ -47,10 +82,16 @@
 
   let toast = '';
   let searchTimer;
+  let lastSearchFiredAt = 0;
   let toastTimer;
+  let statusRefreshTimer;
+  let statusRefreshInFlight = false;
 
   const iconCache = new Map();
   const iconLoading = new Set();
+
+  let highlightCache = new Map();
+  let highlightCacheQuery = '';
 
   const folderFallbackIcon =
     "data:image/svg+xml;utf8," +
@@ -64,11 +105,13 @@
     );
 
   $: totalHeight = results.length * rowHeight;
-  $: startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 6);
-  $: visibleCount = Math.ceil(viewportHeight / rowHeight) + 12;
+  $: startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 10);
+  $: visibleCount = Math.ceil(viewportHeight / rowHeight) + 20;
   $: endIndex = Math.min(results.length, startIndex + visibleCount);
   $: visibleRows = results.slice(startIndex, endIndex);
   $: translateY = startIndex * rowHeight;
+  $: tableMinWidth = totalColumnWidth(colWidths);
+  $: tableGridStyle = `--col-name:${colWidths.name}px;--col-modified:${colWidths.modified}px;--col-path:${colWidths.path}px;--table-min-width:${tableMinWidth}px;--header-offset:${-headerScrollLeft}px;`;
 
   $: {
     for (const entry of visibleRows) {
@@ -92,6 +135,50 @@
       binary += String.fromCharCode(...part);
     }
     return btoa(binary);
+  }
+
+  function highlightSegments(name, q) {
+    q = (q || '').trim();
+    if (!q) return [{ text: name, hl: false }];
+
+    // Reset cache when query changes
+    if (q !== highlightCacheQuery) {
+      highlightCache = new Map();
+      highlightCacheQuery = q;
+    }
+
+    // Check cache
+    const cached = highlightCache.get(name);
+    if (cached) return cached;
+
+    if (q.includes('/')) q = q.slice(q.lastIndexOf('/') + 1);
+    q = q.replace(/[*?]/g, '');
+    const terms = q.split(/\s+/).filter(Boolean);
+    if (terms.length === 0) return [{ text: name, hl: false }];
+
+    const lower = name.toLowerCase();
+    const marks = new Uint8Array(name.length);
+    for (const t of terms) {
+      const tl = t.toLowerCase();
+      let idx = lower.indexOf(tl);
+      while (idx !== -1) {
+        for (let i = idx; i < idx + tl.length; i++) marks[i] = 1;
+        idx = lower.indexOf(tl, idx + 1);
+      }
+    }
+
+    const segs = [];
+    let i = 0;
+    while (i < name.length) {
+      const m = marks[i];
+      let j = i + 1;
+      while (j < name.length && marks[j] === m) j++;
+      segs.push({ text: name.slice(i, j), hl: m === 1 });
+      i = j;
+    }
+
+    highlightCache.set(name, segs);
+    return segs;
   }
 
   function iconKey(entry) {
@@ -127,8 +214,128 @@
     }
   }
 
+  function totalColumnWidth(widths) {
+    return columnKeys.reduce((sum, key) => sum + widths[key], 0);
+  }
+
+  function normalizeColumnWidths(widths, targetTotal) {
+    const next = {};
+    for (const key of columnKeys) {
+      next[key] = Math.max(minColumnWidth[key], Math.round(widths[key]));
+    }
+
+    let delta = Math.round(targetTotal - totalColumnWidth(next));
+    if (delta > 0) {
+      next.path += delta;
+      return next;
+    }
+
+    if (delta < 0) {
+      let remaining = -delta;
+      const shrinkOrder = ['path', 'name', 'modified'];
+
+      for (const key of shrinkOrder) {
+        const available = next[key] - minColumnWidth[key];
+        if (available <= 0) {
+          continue;
+        }
+
+        const cut = Math.min(available, remaining);
+        next[key] -= cut;
+        remaining -= cut;
+        if (remaining === 0) {
+          break;
+        }
+      }
+    }
+
+    return next;
+  }
+
+  function syncColumnWidthsToContainer(preserveExisting = true) {
+    const width = tableContainer?.clientWidth || tableAreaEl?.clientWidth;
+    if (!width) {
+      return;
+    }
+
+    let base;
+    if (!preserveExisting || lastTableWidth === 0) {
+      base = {
+        name: width * defaultColumnRatios.name,
+        modified: width * defaultColumnRatios.modified,
+        path: width * defaultColumnRatios.path
+      };
+    } else {
+      const scale = width / lastTableWidth;
+      base = {
+        name: colWidths.name * scale,
+        modified: colWidths.modified * scale,
+        path: colWidths.path * scale
+      };
+    }
+
+    colWidths = normalizeColumnWidths(base, width);
+    lastTableWidth = width;
+  }
+
   function updateViewportHeight() {
     viewportHeight = tableContainer?.clientHeight || 520;
+    syncColumnWidthsToContainer(true);
+  }
+
+  function startColumnResize(event, leftKey) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const index = columnKeys.indexOf(leftKey);
+    if (index < 0 || index >= columnKeys.length - 1) {
+      return;
+    }
+
+    const rightKey = columnKeys[index + 1];
+    const startX = event.clientX;
+    const startLeft = colWidths[leftKey];
+    const startRight = colWidths[rightKey];
+    const pairWidth = startLeft + startRight;
+
+    resizeCleanup?.();
+    resizingColumn = leftKey;
+
+    const onMove = (moveEvent) => {
+      const delta = moveEvent.clientX - startX;
+      const minLeft = minColumnWidth[leftKey];
+      const minRight = minColumnWidth[rightKey];
+      const maxLeft = pairWidth - minRight;
+      const nextLeft = Math.min(maxLeft, Math.max(minLeft, startLeft + delta));
+      const nextRight = pairWidth - nextLeft;
+
+      colWidths = {
+        ...colWidths,
+        [leftKey]: Math.round(nextLeft),
+        [rightKey]: Math.round(nextRight)
+      };
+    };
+
+    const onUp = () => {
+      cleanup();
+    };
+
+    const cleanup = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      resizingColumn = '';
+      if (resizeCleanup === cleanup) {
+        resizeCleanup = null;
+      }
+    };
+
+    resizeCleanup = cleanup;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   }
 
   function selectedPaths() {
@@ -138,11 +345,13 @@
 
   function clearSelection() {
     selectedIndices = new Set();
+    selectionAnchor = -1;
     lastSelectedIndex = -1;
   }
 
   function selectSingle(index) {
     selectedIndices = new Set([index]);
+    selectionAnchor = index;
     lastSelectedIndex = index;
   }
 
@@ -154,32 +363,31 @@
       next.add(index);
     }
     selectedIndices = next;
+    selectionAnchor = index;
     lastSelectedIndex = index;
   }
 
   function selectRange(index) {
-    const anchor = lastSelectedIndex >= 0 ? lastSelectedIndex : index;
+    const anchor = selectionAnchor >= 0 ? selectionAnchor : index;
     const [from, to] = [Math.min(anchor, index), Math.max(anchor, index)];
-    const next = new Set(selectedIndices);
+    const next = new Set();
     for (let i = from; i <= to; i += 1) {
       next.add(i);
     }
     selectedIndices = next;
-  }
-
-  function primaryIndex() {
-    if (selectedIndices.size === 0) {
-      return -1;
-    }
-    return Math.min(...selectedIndices);
+    lastSelectedIndex = index;
   }
 
   function primaryEntry() {
-    const idx = primaryIndex();
+    const idx = lastSelectedIndex >= 0 ? lastSelectedIndex : -1;
     return idx >= 0 ? results[idx] : null;
   }
 
   async function refreshStatus() {
+    if (statusRefreshInFlight) {
+      return;
+    }
+    statusRefreshInFlight = true;
     try {
       const status = await invoke('get_index_status');
       indexStatus = {
@@ -189,30 +397,113 @@
         permissionErrors: status.permissionErrors ?? 0,
         message: status.message
       };
+      if (typeof status.scanned === 'number') {
+        scanned = status.scanned;
+      }
+      if (typeof status.indexed === 'number') {
+        indexed = status.indexed;
+      }
+      if (typeof status.currentPath === 'string') {
+        currentPath = status.currentPath;
+      }
     } catch (err) {
       showToast(`상태 조회 실패: ${String(err)}`);
+    } finally {
+      statusRefreshInFlight = false;
     }
   }
 
   function scheduleSearch() {
+    if (searchMode === 'live') return;
+    searchGeneration += 1;
+    const scheduledGen = searchGeneration;
     clearTimeout(searchTimer);
-    const delay = query.trim().length <= 1 ? 50 : 0;
-    searchTimer = setTimeout(() => {
+
+    const now = performance.now();
+    if (now - lastSearchFiredAt >= 200) {
+      // Leading edge: fire immediately if enough time has passed
+      lastSearchFiredAt = now;
       void runSearch();
-    }, delay);
+    } else {
+      // Trailing edge: debounce
+      searchTimer = setTimeout(() => {
+        if (scheduledGen !== searchGeneration) {
+          return;
+        }
+        lastSearchFiredAt = performance.now();
+        void runSearch();
+      }, 200);
+    }
+  }
+
+  function toggleSearchMode() {
+    searchMode = searchMode === 'db' ? 'live' : 'db';
+    results = [];
+    liveTotal = 0;
+    liveLatencyMs = null;
+    liveTimedOut = false;
+    clearSelection();
+    if (searchMode === 'db') {
+      void runSearch();
+    }
+  }
+
+  async function runLiveSearch() {
+    if (!query.trim()) {
+      results = [];
+      liveTotal = 0;
+      liveLatencyMs = null;
+      liveTimedOut = false;
+      return;
+    }
+    searchGeneration += 1;
+    const gen = searchGeneration;
+    const startedAt = performance.now();
+    liveSearching = true;
+    liveTimedOut = false;
+    try {
+      const result = await invoke('fd_search', {
+        query,
+        limit: PAGE_SIZE,
+        offset: 0,
+        sort_by: sortBy,
+        sort_dir: sortDir
+      });
+      if (gen !== searchGeneration) return;
+      results = Array.isArray(result.entries) ? result.entries : [];
+      liveTotal = result.total;
+      liveLatencyMs = Math.max(0, Math.round(performance.now() - startedAt));
+      liveTimedOut = result.timedOut || false;
+      hasMore = results.length < liveTotal;
+      updateViewportHeight();
+    } catch (err) {
+      if (gen !== searchGeneration) return;
+      showToast(`Live 검색 실패: ${String(err)}`);
+    } finally {
+      liveSearching = false;
+    }
   }
 
   async function runSearch() {
+    searchGeneration += 1;
+    const gen = searchGeneration;
+    const startedAt = performance.now();
     try {
       const keepPaths = new Set(selectedPaths());
       const next = await invoke('search', {
         query,
-        limit: defaultLimit,
+        limit: PAGE_SIZE,
+        offset: 0,
         sort_by: sortBy,
         sort_dir: sortDir
       });
 
+      if (gen !== searchGeneration) return;
+
+      dbLatencyMs = Math.round(performance.now() - startedAt);
+      dbLastQuery = query;
       results = Array.isArray(next) ? next : [];
+      hasMore = results.length >= PAGE_SIZE;
 
       const restored = new Set();
       for (let i = 0; i < results.length; i += 1) {
@@ -221,14 +512,48 @@
         }
       }
       selectedIndices = restored;
-      if (selectedIndices.size === 0 && results.length > 0 && query.trim().length > 0) {
-        selectedIndices = new Set([0]);
-        lastSelectedIndex = 0;
-      }
 
       updateViewportHeight();
     } catch (err) {
+      if (gen !== searchGeneration) return;
       showToast(`검색 실패: ${String(err)}`);
+    }
+  }
+
+  async function loadMore() {
+    if (!hasMore || loadingMore) return;
+    const gen = searchGeneration;
+    loadingMore = true;
+    try {
+      if (searchMode === 'live') {
+        const result = await invoke('fd_search', {
+          query,
+          limit: PAGE_SIZE,
+          offset: results.length,
+          sort_by: sortBy,
+          sort_dir: sortDir
+        });
+        if (gen !== searchGeneration) return;
+        const arr = Array.isArray(result.entries) ? result.entries : [];
+        if (arr.length > 0) results = [...results, ...arr];
+        hasMore = results.length < result.total;
+      } else {
+        const batch = await invoke('search', {
+          query,
+          limit: PAGE_SIZE,
+          offset: results.length,
+          sort_by: sortBy,
+          sort_dir: sortDir
+        });
+        if (gen !== searchGeneration) return;
+        const arr = Array.isArray(batch) ? batch : [];
+        if (arr.length > 0) results = [...results, ...arr];
+        hasMore = arr.length >= PAGE_SIZE;
+      }
+    } catch (err) {
+      showToast(`추가 로드 실패: ${String(err)}`);
+    } finally {
+      loadingMore = false;
     }
   }
 
@@ -237,7 +562,7 @@
       return;
     }
 
-    const current = primaryIndex() >= 0 ? primaryIndex() : 0;
+    const current = lastSelectedIndex >= 0 ? lastSelectedIndex : 0;
     const next = Math.max(0, Math.min(results.length - 1, current + delta));
 
     if (withRange) {
@@ -262,7 +587,11 @@
       sortBy = column;
       sortDir = 'asc';
     }
-    void runSearch();
+    if (searchMode === 'live') {
+      void runLiveSearch();
+    } else {
+      void runSearch();
+    }
   }
 
   function sortMark(column) {
@@ -307,6 +636,171 @@
       event.preventDefault();
       handleRowClick(event, index);
     }
+  }
+
+  const DRAG_THRESHOLD = 5;
+  let dragCleanup = null;
+  const dragImgCache = new Map();
+
+  function dragPathsForIndex(index) {
+    const entry = results[index];
+    if (!entry) {
+      return [];
+    }
+
+    if (selectedIndices.has(index) && selectedIndices.size > 0) {
+      return selectedPaths();
+    }
+
+    return [entry.path];
+  }
+
+  function getDragIconEl(entry) {
+    const src = iconFor(entry);
+    let img = dragImgCache.get(src);
+    if (!img) {
+      img = new Image();
+      img.src = src;
+      dragImgCache.set(src, img);
+    }
+    return img.complete && img.naturalWidth > 0 ? img : null;
+  }
+
+  function fillRoundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function buildDragPreview(index) {
+    const entry = results[index];
+    if (!entry) return null;
+
+    const count = selectedIndices.has(index) ? selectedIndices.size : 1;
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+    const w = 260;
+    const h = 28;
+    const stackGap = count > 1 ? 4 : 0;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h + stackGap;
+    const ctx = canvas.getContext('2d');
+
+    if (count > 1) {
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = isDark ? '#5a6070' : '#b0c4de';
+      fillRoundRect(ctx, 3, 0, w - 3, h, 5);
+      ctx.globalAlpha = 1.0;
+    }
+
+    const ry = stackGap;
+    ctx.fillStyle = isDark ? 'rgba(58, 64, 74, 0.94)' : 'rgba(214, 231, 255, 0.94)';
+    fillRoundRect(ctx, 0, ry, w, h, 5);
+
+    ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(5, ry);
+    ctx.arcTo(w, ry, w, ry + h, 5);
+    ctx.arcTo(w, ry + h, 0, ry + h, 5);
+    ctx.arcTo(0, ry + h, 0, ry, 5);
+    ctx.arcTo(0, ry, w, ry, 5);
+    ctx.closePath();
+    ctx.stroke();
+
+    const iconEl = getDragIconEl(entry);
+    if (iconEl) {
+      ctx.drawImage(iconEl, 6, ry + 6, 16, 16);
+    } else {
+      ctx.fillStyle = entry.isDir ? '#d9b34f' : '#8d98a5';
+      fillRoundRect(ctx, 6, ry + 6, 16, 16, 2);
+    }
+
+    ctx.fillStyle = isDark ? '#e6e6e8' : '#1a1a1a';
+    ctx.font = '12px -apple-system, "SF Pro Text", system-ui, sans-serif';
+    ctx.textBaseline = 'middle';
+
+    let nameMaxW = w - 34;
+    if (count > 1) nameMaxW -= 34;
+
+    let name = entry.name;
+    if (ctx.measureText(name).width > nameMaxW) {
+      while (name.length > 4 && ctx.measureText(name + '\u2026').width > nameMaxW) {
+        name = name.slice(0, -1);
+      }
+      name += '\u2026';
+    }
+    ctx.fillText(name, 28, ry + h / 2 + 1);
+
+    if (count > 1) {
+      const badge = String(count);
+      ctx.font = 'bold 10px -apple-system, system-ui, sans-serif';
+      const tw = ctx.measureText(badge).width;
+      const bw = Math.max(20, tw + 10);
+      const bx = w - bw - 6;
+      const by = ry + (h - 18) / 2;
+
+      ctx.fillStyle = isDark ? '#5b8bd9' : '#007aff';
+      fillRoundRect(ctx, bx, by, bw, 18, 9);
+
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(badge, bx + bw / 2, by + 9);
+    }
+
+    return canvas.toDataURL('image/png');
+  }
+
+  function handleRowMouseDown(event, index) {
+    if (event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey) return;
+    if (editing.active) return;
+
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let dragging = false;
+
+    dragCleanup?.();
+
+    const onMove = (e) => {
+      if (dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
+
+      dragging = true;
+      cleanup();
+
+      if (!selectedIndices.has(index)) {
+        selectSingle(index);
+      }
+
+      const paths = dragPathsForIndex(index);
+      if (paths.length > 0) {
+        const icon = buildDragPreview(index);
+        startDrag({ item: paths, icon }).catch(() => {});
+      }
+    };
+
+    const onUp = () => cleanup();
+
+    const cleanup = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      if (dragCleanup === cleanup) dragCleanup = null;
+    };
+
+    dragCleanup = cleanup;
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
   }
 
   async function handleRowDoubleClick(index) {
@@ -372,8 +866,7 @@
     }
 
     try {
-      const payload = await invoke('copy_paths', { paths });
-      await navigator.clipboard.writeText(payload);
+      await invoke('copy_paths', { paths });
       showToast(`경로 ${paths.length}개 복사 완료`);
     } catch (err) {
       showToast(`경로 복사 실패: ${String(err)}`);
@@ -406,6 +899,11 @@
   }
 
   async function resetIndex() {
+    if (indexStatus.state === 'Indexing') {
+      showToast('인덱싱 진행 중입니다. 완료 후 다시 시도해 주세요.');
+      return;
+    }
+
     try {
       await invoke('reset_index');
       scanned = 0;
@@ -416,6 +914,7 @@
       showToast('인덱스를 초기화하고 재구축을 시작했습니다.');
     } catch (err) {
       showToast(`인덱스 초기화 실패: ${String(err)}`);
+      await refreshStatus();
     }
   }
 
@@ -428,7 +927,7 @@
       return;
     }
 
-    const idx = primaryIndex();
+    const idx = lastSelectedIndex;
     if (idx < 0 || !results[idx]) {
       return;
     }
@@ -493,15 +992,25 @@
     searchInputEl?.select();
   }
 
+  function isTextInputTarget(target) {
+    return (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      target?.isContentEditable
+    );
+  }
+
   async function handleKeydown(event) {
     const isMetaSelectAll = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a';
-    if (isMetaSelectAll) {
-      const target = event.target;
-      const isTextInput =
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target?.isContentEditable;
+    const isMetaCopy = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'c';
+    const target = event.target;
+    const isTextInput = isTextInputTarget(target);
 
+    if (isMetaCopy && isTextInput) {
+      return;
+    }
+
+    if (isMetaSelectAll) {
       if (isTextInput) {
         event.preventDefault();
         if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
@@ -523,6 +1032,13 @@
         cancelRename();
         return;
       }
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      clearSelection();
+      searchInputEl?.focus();
       return;
     }
 
@@ -551,6 +1067,11 @@
     }
 
     if (event.key === 'Enter') {
+      if (searchMode === 'live' && event.target === searchInputEl) {
+        event.preventDefault();
+        await runLiveSearch();
+        return;
+      }
       event.preventDefault();
       await startRename();
       return;
@@ -593,24 +1114,14 @@
     }
   }
 
-  function formatKind(entry) {
-    if (entry.isDir) {
-      return 'Folder';
-    }
-
-    if (entry.ext) {
-      return entry.ext.toUpperCase();
-    }
-
-    return 'File';
-  }
-
   function formatModified(entry) {
     if (!entry.mtime) {
       return '';
     }
 
-    return new Date(entry.mtime * 1000).toLocaleString();
+    const d = new Date(entry.mtime * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
   function formatLastUpdated(timestamp) {
@@ -621,15 +1132,41 @@
     return new Date(timestamp * 1000).toLocaleString();
   }
 
+  function displayPath(path) {
+    if (!path) {
+      return path;
+    }
+
+    if (!homePrefix) {
+      return path;
+    }
+
+    if (path === homePrefix) {
+      return '~';
+    }
+
+    if (path.startsWith(`${homePrefix}/`)) {
+      return `~${path.slice(homePrefix.length)}`;
+    }
+
+    return path;
+  }
+
   let unlistenFns = [];
 
   onMount(async () => {
     updateViewportHeight();
 
     await refreshStatus();
-    if (!localStorage.getItem('fastfind-fda-notice-v1')) {
+    try {
+      homePrefix = await invoke('get_home_dir');
+    } catch {
+      homePrefix = '';
+    }
+
+    if (!localStorage.getItem('everything-fda-notice-v1')) {
       showToast('전체 디스크 검색을 위해 macOS Full Disk Access 권한이 필요할 수 있습니다.');
-      localStorage.setItem('fastfind-fda-notice-v1', '1');
+      localStorage.setItem('everything-fda-notice-v1', '1');
     }
     await focusSearch();
     await runSearch();
@@ -638,6 +1175,12 @@
       scanned = event.payload.scanned;
       indexed = event.payload.indexed;
       currentPath = event.payload.currentPath;
+      if (indexStatus.state !== 'Indexing') {
+        indexStatus = {
+          ...indexStatus,
+          state: 'Indexing'
+        };
+      }
     });
 
     const unlistenState = await listen('index_state', (event) => {
@@ -656,9 +1199,7 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      if (query.trim().length === 0) {
-        void runSearch();
-      }
+      void runSearch();
     });
 
     const unlistenFocus = await listen('focus_search', () => {
@@ -669,11 +1210,18 @@
 
     window.addEventListener('resize', updateViewportHeight);
     window.addEventListener('click', onGlobalClick);
+    statusRefreshTimer = setInterval(() => {
+      if (indexStatus.state === 'Indexing') {
+        void refreshStatus();
+      }
+    }, 5000);
   });
 
   onDestroy(async () => {
     clearTimeout(searchTimer);
     clearTimeout(toastTimer);
+    clearInterval(statusRefreshTimer);
+    resizeCleanup?.();
 
     for (const unlisten of unlistenFns) {
       unlisten();
@@ -688,28 +1236,56 @@
 
 <div class="app-shell">
   <header class="search-bar">
+    <button class="mode-toggle" on:click={toggleSearchMode} title={searchMode === 'db' ? 'DB 모드: 인덱스 기반 즉시 검색' : 'Live 모드: fd 기반 Enter 검색'}>
+      {searchMode === 'db' ? 'DB' : 'Live'}
+    </button>
     <input
       bind:this={searchInputEl}
       class="search-input"
       type="text"
       bind:value={query}
       on:input={scheduleSearch}
-      placeholder="파일/폴더 이름 검색"
+      placeholder={searchMode === 'db' ? '파일/폴더 이름 검색' : '검색어 입력 후 Enter'}
       autocomplete="off"
       spellcheck="false"
     />
   </header>
 
-  <section class="table-area">
+  <section class="table-area" bind:this={tableAreaEl} style={tableGridStyle}>
     <div class="table-header">
-      <button type="button" class="col name col-button" on:click={() => handleHeaderSort('name')}>
-        Name{sortMark('name')}
-      </button>
-      <div class="col path">Path</div>
-      <div class="col kind">Kind</div>
-      <button type="button" class="col modified col-button" on:click={() => handleHeaderSort('mtime')}>
-        Modified{sortMark('mtime')}
-      </button>
+      <div class="table-header-track">
+        <div class="col name">
+          <button type="button" class="col-button" on:click={() => handleHeaderSort('name')}>
+            Name{sortMark('name')}
+          </button>
+          <button
+            type="button"
+            class="col-resizer"
+            class:active={resizingColumn === 'name'}
+            on:mousedown={(event) => startColumnResize(event, 'name')}
+            aria-label="Resize Name column"
+          />
+        </div>
+
+        <div class="col modified">
+          <button type="button" class="col-button" on:click={() => handleHeaderSort('mtime')}>
+            Modified{sortMark('mtime')}
+          </button>
+          <button
+            type="button"
+            class="col-resizer"
+            class:active={resizingColumn === 'modified'}
+            on:mousedown={(event) => startColumnResize(event, 'modified')}
+            aria-label="Resize Modified column"
+          />
+        </div>
+
+        <div class="col path">
+          <button type="button" class="col-button" on:click={() => handleHeaderSort('dir')}>
+            Path{sortMark('dir')}
+          </button>
+        </div>
+      </div>
     </div>
 
     <div
@@ -717,6 +1293,11 @@
       bind:this={tableContainer}
       on:scroll={() => {
         scrollTop = tableContainer.scrollTop;
+        headerScrollLeft = tableContainer.scrollLeft;
+        const scrollBottom = scrollTop + tableContainer.clientHeight;
+        if (scrollBottom >= totalHeight - rowHeight * 10) {
+          void loadMore();
+        }
       }}
     >
       <div class="spacer" style={`height:${totalHeight}px`}>
@@ -725,6 +1306,7 @@
             {@const index = startIndex + localIndex}
             <div
               class="row {selectedIndices.has(index) ? 'selected' : ''}"
+              on:mousedown={(event) => handleRowMouseDown(event, index)}
               on:click={(event) => handleRowClick(event, index)}
               on:keydown={(event) => handleRowA11yKeydown(event, index)}
               on:dblclick={() => handleRowDoubleClick(index)}
@@ -743,12 +1325,11 @@
                     on:click|stopPropagation
                   />
                 {:else}
-                  <span class="ellipsis">{entry.name}</span>
+                  <span class="ellipsis">{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
                 {/if}
               </div>
-              <div class="cell path ellipsis">{entry.dir}</div>
-              <div class="cell kind">{formatKind(entry)}</div>
               <div class="cell modified">{formatModified(entry)}</div>
+              <div class="cell path ellipsis">{displayPath(entry.dir)}</div>
             </div>
           {/each}
         </div>
@@ -757,13 +1338,37 @@
   </section>
 
   <footer class="status-bar">
-    <span>Index: {indexStatus.state}</span>
-    <span>Entries: {indexStatus.entriesCount.toLocaleString()}</span>
-    <span>Last Updated: {formatLastUpdated(indexStatus.lastUpdated)}</span>
-    <button class="status-btn" on:click={resetIndex}>Reset Index</button>
+    {#if searchMode === 'live'}
+      <span>Live Search</span>
+      {#if liveSearching}
+        <span class="live-indicator">Searching...</span>
+      {:else if liveTotal > 0}
+        <span>{liveTotal.toLocaleString()} results</span>
+      {/if}
+      {#if liveLatencyMs !== null}
+        <span>Latency: {liveLatencyMs} ms</span>
+      {/if}
+      {#if liveTimedOut}
+        <span class="status-warning">Timeout (일부 결과)</span>
+      {/if}
+    {:else}
+      <span>Index: {indexStatus.state}</span>
+      <span>Entries: {indexStatus.entriesCount.toLocaleString()}</span>
+      {#if dbLatencyMs !== null && dbLastQuery}
+        <span>"{dbLastQuery}" {dbLatencyMs} ms · {results.length} results</span>
+      {/if}
+    {/if}
+    <button
+      class="status-btn"
+      on:click={resetIndex}
+      disabled={indexStatus.state === 'Indexing'}
+      title={indexStatus.state === 'Indexing' ? '인덱싱 진행 중에는 reset 할 수 없습니다.' : '인덱스를 초기화하고 다시 구축합니다.'}
+    >
+      Reset Index
+    </button>
     {#if indexStatus.state === 'Indexing'}
       <span class="index-progress">Scanned {scanned.toLocaleString()} / Indexed {indexed.toLocaleString()}</span>
-      <span class="path-preview">{currentPath}</span>
+      <span class="path-preview">{displayPath(currentPath)}</span>
     {/if}
     {#if indexStatus.permissionErrors > 0}
       <span class="status-warning">권한 오류: {indexStatus.permissionErrors.toLocaleString()}건</span>
@@ -792,13 +1397,70 @@
 </div>
 
 <style>
+  :global(:root) {
+    color-scheme: light dark;
+    --bg-app: #f4f5f7;
+    --text-primary: #0f1720;
+    --text-muted: #4d5a6a;
+    --bar-grad-top: #f7f8fa;
+    --bar-grad-bottom: #eceff3;
+    --surface-header: #eff2f6;
+    --surface: #ffffff;
+    --border-soft: #d8dde4;
+    --border-input: #b9c2cd;
+    --focus-ring: #6f96e6;
+    --row-border: #f0f3f6;
+    --row-hover: #eef5ff;
+    --row-selected: #d6e7ff;
+    --button-bg: #ffffff;
+    --button-border: #b8c3cf;
+    --button-text: #304256;
+    --menu-bg: #ffffff;
+    --menu-border: #cfd6df;
+    --menu-hover: #edf3ff;
+    --menu-text: #213042;
+    --error-text: #b64545;
+    --warning-text: #8f6500;
+    --toast-bg: rgba(29, 37, 49, 0.95);
+    --toast-text: #ffffff;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :global(:root) {
+      --bg-app: #1f1f1f;
+      --text-primary: #e6e6e8;
+      --text-muted: #a7a7af;
+      --bar-grad-top: #1f1f1f;
+      --bar-grad-bottom: #1f1f1f;
+      --surface-header: #1f1f1f;
+      --surface: #1c1c1e;
+      --border-soft: #303033;
+      --border-input: #4a4a50;
+      --focus-ring: #5b8bd9;
+      --row-border: #2a2a2e;
+      --row-hover: #2d2d31;
+      --row-selected: #3a404a;
+      --button-bg: #2a2a2e;
+      --button-border: #4a4a50;
+      --button-text: #e1e1e4;
+      --menu-bg: #252529;
+      --menu-border: #3a3a40;
+      --menu-hover: #333338;
+      --menu-text: #e2e2e6;
+      --error-text: #ff9d9d;
+      --warning-text: #e0c670;
+      --toast-bg: rgba(24, 24, 26, 0.95);
+      --toast-text: #f3f3f4;
+    }
+  }
+
   :global(html, body) {
     margin: 0;
     width: 100%;
     height: 100%;
     overflow: hidden;
-    background: #f4f5f7;
-    color: #0f1720;
+    background: var(--bg-app);
+    color: var(--text-primary);
     font-family: 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif;
   }
 
@@ -811,89 +1473,186 @@
     display: grid;
     grid-template-rows: auto 1fr auto;
     height: 100%;
+    min-width: 0;
   }
 
   .search-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     padding: 8px;
-    background: linear-gradient(180deg, #f7f8fa 0%, #eceff3 100%);
-    border-bottom: 1px solid #d8dde4;
+    background: linear-gradient(180deg, var(--bar-grad-top) 0%, var(--bar-grad-bottom) 100%);
+    border-bottom: 1px solid var(--border-soft);
+    min-width: 0;
+  }
+
+  .mode-toggle {
+    flex: 0 0 auto;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--button-border);
+    border-radius: 6px;
+    background: var(--button-bg);
+    color: var(--button-text);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    user-select: none;
+  }
+
+  .mode-toggle:hover {
+    filter: brightness(1.06);
   }
 
   .search-input {
+    display: block;
+    box-sizing: border-box;
     width: 100%;
+    min-width: 0;
+    flex: 1 1 auto;
     height: 32px;
-    border: 1px solid #b9c2cd;
+    border: 1px solid var(--border-input);
     border-radius: 6px;
     padding: 0 10px;
     font-size: 14px;
-    background: #ffffff;
+    background: var(--surface);
+    color: var(--text-primary);
+  }
+
+  .search-input::placeholder {
+    color: var(--text-muted);
+    opacity: 0.85;
+  }
+
+  .search-input:focus {
+    outline: none;
+    border-color: var(--focus-ring);
+    box-shadow: 0 0 0 2px rgba(125, 169, 255, 0.25);
   }
 
   .table-area {
     display: grid;
     grid-template-rows: auto 1fr;
     min-height: 0;
+    min-width: 0;
   }
 
-  .table-header,
+  .table-header-track,
   .row {
     display: grid;
-    grid-template-columns: minmax(260px, 2fr) minmax(320px, 3fr) 120px 190px;
+    grid-template-columns: var(--col-name, 35%) var(--col-modified, 20%) var(--col-path, 45%);
     align-items: center;
+    min-width: var(--table-min-width, 0px);
+    width: max(var(--table-min-width, 0px), 100%);
   }
 
   .table-header {
     height: 30px;
-    border-bottom: 1px solid #d8dde4;
-    background: #eff2f6;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--surface-header);
     user-select: none;
+    overflow: hidden;
   }
 
-  .col {
-    padding: 0 8px;
-    font-size: 12px;
-    font-weight: 600;
-    color: #445060;
-    cursor: default;
+  .table-header-track {
+    height: 100%;
+    transform: translateX(var(--header-offset, 0px));
+    will-change: transform;
+  }
+
+  .table-header .col {
+    position: relative;
+    min-width: 0;
+    height: 100%;
   }
 
   .col-button {
-    border: none;
-    margin: 0;
-    background: transparent;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    box-sizing: border-box;
+    padding: 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--text-muted);
     text-align: left;
+    margin: 0;
+    border: none;
+    background: transparent;
     cursor: pointer;
+  }
+
+  .col-resizer {
+    position: absolute;
+    top: 0;
+    right: -4px;
+    width: 8px;
+    height: 100%;
+    border: none;
+    padding: 0;
+    background: transparent;
+    cursor: col-resize;
+    z-index: 30;
+  }
+
+  .col-resizer::after {
+    content: '';
+    position: absolute;
+    top: 7px;
+    bottom: 7px;
+    left: 50%;
+    width: 1px;
+    transform: translateX(-50%);
+    background: var(--border-soft);
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+
+  .table-header .col:hover .col-resizer::after,
+  .col-resizer.active::after {
+    opacity: 1;
   }
 
   .table-body {
     overflow: auto;
     min-height: 0;
-    background: #ffffff;
+    min-width: 0;
+    background: var(--surface);
   }
 
   .spacer {
     position: relative;
+    min-width: var(--table-min-width, 0px);
+    width: max(var(--table-min-width, 0px), 100%);
   }
 
   .rows {
     position: absolute;
     top: 0;
     left: 0;
-    right: 0;
+    min-width: var(--table-min-width, 0px);
+    width: max(var(--table-min-width, 0px), 100%);
   }
 
   .row {
     height: 28px;
-    border-bottom: 1px solid #f0f3f6;
+    border-bottom: 1px solid var(--row-border);
     cursor: default;
+    -webkit-user-select: none;
+    user-select: none;
+    outline: none;
   }
 
   .row:hover {
-    background: #eef5ff;
+    background: var(--row-hover);
   }
 
   .row.selected {
-    background: #d6e7ff;
+    background: var(--row-selected);
   }
 
   .cell {
@@ -908,10 +1667,21 @@
     min-width: 0;
   }
 
+  .cell.path,
+  .cell.modified {
+    min-width: 0;
+  }
+
   .ellipsis {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .hl {
+    background: none;
+    color: inherit;
+    font-weight: 700;
   }
 
   .file-icon {
@@ -924,10 +1694,11 @@
     width: 100%;
     height: 20px;
     font-size: 12px;
-    border: 1px solid #8bb0ff;
+    border: 1px solid var(--focus-ring);
     border-radius: 4px;
     padding: 0 4px;
-    background: #ffffff;
+    background: var(--surface);
+    color: var(--text-primary);
   }
 
   .status-bar {
@@ -935,22 +1706,33 @@
     align-items: center;
     gap: 14px;
     padding: 6px 8px;
-    background: #eff2f6;
-    border-top: 1px solid #d8dde4;
+    background: var(--surface-header);
+    border-top: 1px solid var(--border-soft);
     font-size: 11px;
-    color: #4d5a6a;
+    color: var(--text-muted);
     white-space: nowrap;
     overflow: hidden;
+    min-width: 0;
   }
 
   .status-btn {
-    border: 1px solid #b8c3cf;
+    border: 1px solid var(--button-border);
     border-radius: 5px;
-    background: #ffffff;
-    color: #304256;
+    background: var(--button-bg);
+    color: var(--button-text);
     font-size: 11px;
     height: 22px;
     padding: 0 8px;
+  }
+
+  .status-btn:hover {
+    filter: brightness(1.06);
+  }
+
+  .status-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+    filter: none;
   }
 
   .path-preview {
@@ -958,22 +1740,27 @@
     text-overflow: ellipsis;
   }
 
+  .live-indicator {
+    color: var(--focus-ring);
+    font-weight: 600;
+  }
+
   .status-error {
-    color: #b64545;
+    color: var(--error-text);
   }
 
   .status-warning {
-    color: #8f6500;
+    color: var(--warning-text);
   }
 
   .context-menu {
     position: fixed;
     z-index: 200;
     width: 220px;
-    border: 1px solid #cfd6df;
+    border: 1px solid var(--menu-border);
     border-radius: 8px;
     box-shadow: 0 10px 28px rgba(26, 34, 44, 0.2);
-    background: #ffffff;
+    background: var(--menu-bg);
     overflow: hidden;
   }
 
@@ -984,19 +1771,19 @@
     background: transparent;
     padding: 8px 10px;
     font-size: 12px;
-    color: #213042;
+    color: var(--menu-text);
   }
 
   .context-menu button:hover {
-    background: #edf3ff;
+    background: var(--menu-hover);
   }
 
   .toast {
     position: fixed;
     right: 14px;
     bottom: 18px;
-    background: rgba(29, 37, 49, 0.95);
-    color: #ffffff;
+    background: var(--toast-bg);
+    color: var(--toast-text);
     border-radius: 8px;
     padding: 9px 12px;
     font-size: 12px;
