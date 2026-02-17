@@ -27,7 +27,9 @@ use walkdir::WalkDir;
 mod fd_search;
 #[cfg(target_os = "macos")]
 mod fsevent_watcher;
+mod gitignore_filter;
 mod query;
+mod spotlight_search;
 use fd_search::{FdSearchCache, FdSearchResultDto};
 use query::{escape_like, parse_query, SearchMode};
 
@@ -37,8 +39,32 @@ const MAX_LIMIT: u32 = 1000;
 const BATCH_SIZE: usize = 10_000;
 const RECENT_OP_TTL: Duration = Duration::from_secs(2);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+const NEGATIVE_CACHE_FALLBACK_WINDOW: Duration = Duration::from_millis(550);
 const DB_VERSION: i32 = 4;
 const DEFERRED_DIR_NAMES: &[&str] = &["Library", ".Trash", ".Trashes"];
+const SHALLOW_SCAN_DEPTH: usize = 6;
+const JWALK_NUM_THREADS: usize = 4;
+
+const BUILTIN_SKIP_NAMES: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".Trash",
+    ".Trashes",
+    ".npm",
+    ".cache",
+    "CMakeFiles",
+    ".qtc_clangd",
+    "__pycache__",
+    ".gradle",
+];
+
+const BUILTIN_SKIP_PATHS: &[&str] = &[
+    "Library/Caches",
+    "Library/Developer/CoreSimulator",
+    "Library/Logs",
+    ".vscode/extensions",
+];
 
 type AppResult<T> = Result<T, String>;
 static SEARCH_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -101,6 +127,13 @@ struct SearchExecution {
     offset: u32,
     mode_label: String,
     results: Vec<EntryDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchResultDto {
+    entries: Vec<EntryDto>,
+    mode_label: String,
 }
 
 #[allow(dead_code)]
@@ -185,7 +218,7 @@ struct IndexStatus {
 impl Default for IndexStatus {
     fn default() -> Self {
         Self {
-            state: IndexState::Ready,
+            state: IndexState::Indexing,
             entries_count: 0,
             last_updated: None,
             permission_errors: 0,
@@ -232,7 +265,23 @@ struct AppState {
     recent_ops: Arc<Mutex<Vec<RecentOp>>>,
     icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>,
+    negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>,
     ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,
+    gitignore: gitignore_filter::SharedGitignoreFilter,
+}
+
+#[derive(Debug, Clone)]
+struct NegativeNameEntry {
+    query_lower: String,
+    created_at: Instant,
+    fallback_checked: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NegativeCacheHit {
+    query_lower: String,
+    age: Duration,
+    fallback_checked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +408,7 @@ fn init_db(db_path: &Path) -> AppResult<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_entries_dir ON entries(dir);
+        CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
         CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_entries_ext ON entries(ext);
@@ -372,6 +422,16 @@ fn init_db(db_path: &Path) -> AppResult<()> {
         "#,
     )
     .map_err(|e| e.to_string())?;
+
+    let legacy_index_migration_key = "migration_drop_idx_entries_dir_name_nocase_v1";
+    let migrated = get_meta(&conn, legacy_index_migration_key)
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !migrated {
+        conn.execute_batch("DROP INDEX IF EXISTS idx_entries_dir_name_nocase;")
+            .map_err(|e| e.to_string())?;
+        set_meta(&conn, legacy_index_migration_key, "1")?;
+    }
 
     Ok(())
 }
@@ -427,6 +487,76 @@ fn current_permission_errors(state: &AppState) -> u64 {
 
 fn invalidate_search_caches(state: &AppState) {
     state.fd_search_cache.lock().take();
+    state.negative_name_cache.lock().clear();
+}
+
+fn prune_negative_name_cache(cache: &mut Vec<NegativeNameEntry>) {
+    let now = Instant::now();
+    cache.retain(|entry| now.duration_since(entry.created_at) <= NEGATIVE_CACHE_TTL);
+}
+
+fn negative_name_cache_lookup(state: &AppState, query: &str) -> Option<NegativeCacheHit> {
+    if query.is_empty() {
+        return None;
+    }
+    let q = query.to_lowercase();
+    let now = Instant::now();
+    let mut cache = state.negative_name_cache.lock();
+    prune_negative_name_cache(&mut cache);
+    cache
+        .iter()
+        .find(|entry| q.contains(&entry.query_lower))
+        .map(|entry| NegativeCacheHit {
+            query_lower: entry.query_lower.clone(),
+            age: now.duration_since(entry.created_at),
+            fallback_checked: entry.fallback_checked,
+        })
+}
+
+fn remember_negative_name_query(state: &AppState, query: &str) {
+    if query.is_empty() {
+        return;
+    }
+    let normalized = query.to_lowercase();
+    let mut cache = state.negative_name_cache.lock();
+    prune_negative_name_cache(&mut cache);
+
+    if cache
+        .iter()
+        .any(|existing| existing.query_lower == normalized)
+    {
+        return;
+    }
+
+    cache.push(NegativeNameEntry {
+        query_lower: normalized,
+        created_at: Instant::now(),
+        fallback_checked: false,
+    });
+    const MAX_NEGATIVE_CACHE: usize = 512;
+    if cache.len() > MAX_NEGATIVE_CACHE {
+        let drop_count = cache.len() - MAX_NEGATIVE_CACHE;
+        cache.drain(0..drop_count);
+    }
+}
+
+fn remove_negative_name_query(state: &AppState, query: &str) {
+    if query.is_empty() {
+        return;
+    }
+    let normalized = query.to_lowercase();
+    let mut cache = state.negative_name_cache.lock();
+    cache.retain(|entry| entry.query_lower != normalized);
+}
+
+fn mark_negative_name_fallback_checked(state: &AppState, query_lower: &str) {
+    let mut cache = state.negative_name_cache.lock();
+    if let Some(entry) = cache
+        .iter_mut()
+        .find(|entry| entry.query_lower == query_lower)
+    {
+        entry.fallback_checked = true;
+    }
 }
 
 fn sort_clause(sort_by: &str, sort_dir: &str, prefix: &str) -> String {
@@ -464,6 +594,7 @@ fn extract_ext_from_like(like_pattern: &str) -> Option<String> {
         || ext.contains('_')
         || ext.contains('\\')
         || ext.contains('/')
+        || ext.contains('.')
     {
         return None;
     }
@@ -675,6 +806,73 @@ fn load_gitignore_roots(home_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
     roots
 }
 
+#[cfg(target_os = "macos")]
+fn macos_tcc_ignore_roots(home_dir: &Path) -> Vec<PathBuf> {
+    let library = home_dir.join("Library");
+    let app_support = library.join("Application Support");
+    let caches = library.join("Caches");
+
+    let dirs: Vec<PathBuf> = vec![
+        home_dir.join(".Trash"),
+        library.join("Accounts"),
+        library.join("AppleMediaServices"),
+        library.join("Assistant").join("SiriVocabulary"),
+        library.join("Autosave Information"),
+        library.join("Biome"),
+        library.join("Calendars"),
+        library.join("com.apple.aiml.instrumentation"),
+        library.join("ContainerManager"),
+        library.join("Cookies"),
+        library.join("CoreFollowUp"),
+        library.join("Daemon Containers"),
+        library.join("DoNotDisturb"),
+        library.join("DuetExpertCenter"),
+        library.join("Group Containers"),
+        library.join("HomeKit"),
+        library.join("IdentityServices"),
+        library.join("IntelligencePlatform"),
+        library.join("Mail"),
+        library.join("Messages"),
+        library.join("Metadata").join("CoreSpotlight"),
+        library.join("PersonalizationPortrait"),
+        library.join("Reminders"),
+        library.join("Safari"),
+        library.join("Sharing"),
+        library.join("Shortcuts"),
+        library.join("StatusKit"),
+        library.join("Suggestions"),
+        library.join("Trial"),
+        library.join("Weather"),
+        app_support.join("AddressBook"),
+        app_support.join("CallHistoryDB"),
+        app_support.join("CallHistoryTransactions"),
+        app_support.join("CloudDocs"),
+        app_support.join("com.apple.avfoundation"),
+        app_support.join("com.apple.sharedfilelist"),
+        app_support.join("com.apple.TCC"),
+        app_support.join("DifferentialPrivacy"),
+        app_support.join("FaceTime"),
+        app_support.join("FileProvider"),
+        app_support.join("Knowledge"),
+        caches.join("CloudKit"),
+        caches.join("com.apple.ap.adprivacyd"),
+        caches.join("com.apple.containermanagerd"),
+        caches.join("com.apple.findmy.fmfcore"),
+        caches.join("com.apple.findmy.fmipcore"),
+        caches.join("com.apple.homed"),
+        caches.join("com.apple.HomeKit"),
+        caches.join("com.apple.Safari"),
+        caches.join("FamilyCircle"),
+    ];
+
+    dirs.into_iter().filter(|p| p.exists()).collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_tcc_ignore_roots(_home_dir: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn effective_ignore_rules(
     home_dir: &Path,
     cwd: &Path,
@@ -693,6 +891,7 @@ fn effective_ignore_rules(
     for root in pathignore_roots
         .into_iter()
         .chain(load_gitignore_roots(home_dir, cwd).into_iter())
+        .chain(macos_tcc_ignore_roots(home_dir).into_iter())
     {
         let key = root.to_string_lossy().to_string();
         if seen.insert(key) {
@@ -700,7 +899,10 @@ fn effective_ignore_rules(
         }
     }
 
-    for pattern in pathignore_patterns {
+    for pattern in pathignore_patterns
+        .into_iter()
+        .chain(builtin_ignore_patterns(home_dir))
+    {
         let key = ignore_pattern_key(&pattern);
         if seen_patterns.insert(key) {
             patterns.push(pattern);
@@ -708,6 +910,20 @@ fn effective_ignore_rules(
     }
 
     (roots, patterns)
+}
+
+fn builtin_ignore_patterns(home_dir: &Path) -> Vec<IgnorePattern> {
+    let home = normalize_slashes(home_dir.to_string_lossy().to_string());
+    vec![
+        // ~/Library/Application Support/*/Cache*
+        IgnorePattern::Glob(format!("{home}/Library/Application Support/*/Cache*")),
+        // ~/Library/Application Support/*/Code Cache
+        IgnorePattern::Glob(format!("{home}/Library/Application Support/*/Code Cache")),
+        // ~/.rustup/toolchains/*/share/doc
+        IgnorePattern::Glob(format!("{home}/.rustup/toolchains/*/share/doc")),
+        // ~/.pyenv/versions/*/lib
+        IgnorePattern::Glob(format!("{home}/.pyenv/versions/*/lib")),
+    ]
 }
 
 fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
@@ -876,26 +1092,51 @@ fn should_skip_path(
     ignored_roots: &[PathBuf],
     ignored_patterns: &[IgnorePattern],
 ) -> bool {
+    should_skip_path_ext(path, ignored_roots, ignored_patterns, None, None)
+}
+
+fn should_skip_path_ext(
+    path: &Path,
+    ignored_roots: &[PathBuf],
+    ignored_patterns: &[IgnorePattern],
+    gitignore: Option<&gitignore_filter::GitignoreFilter>,
+    is_dir_hint: Option<bool>,
+) -> bool {
     let s = normalize_slashes(path.to_string_lossy().to_string());
 
-    let builtin = s.contains("/.git/")
-        || s.ends_with("/.git")
-        || s.contains("/node_modules/")
-        || s.ends_with("/node_modules")
-        || s.contains("/Library/Caches/")
-        || s.ends_with("/Library/Caches")
-        || s.contains("/.Trash/")
-        || s.ends_with("/.Trash")
-        || s.contains("/.Trashes/")
-        || s.ends_with("/.Trashes");
+    // Single-component builtin names: check path segments
+    if s.split('/').any(|seg| BUILTIN_SKIP_NAMES.contains(&seg)) {
+        return true;
+    }
 
-    builtin
-        || ignored_roots
-            .iter()
-            .any(|root| path == root || path.starts_with(root))
-        || ignored_patterns
-            .iter()
-            .any(|pattern| matches_ignore_pattern(&s, pattern))
+    // Multi-component builtin paths
+    if BUILTIN_SKIP_PATHS.iter().any(|pat| {
+        let infix = format!("/{pat}/");
+        let suffix = format!("/{pat}");
+        s.contains(&infix) || s.ends_with(&suffix)
+    }) {
+        return true;
+    }
+
+    if ignored_roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+    {
+        return true;
+    }
+    if ignored_patterns
+        .iter()
+        .any(|pattern| matches_ignore_pattern(&s, pattern))
+    {
+        return true;
+    }
+    if let Some(gi) = gitignore {
+        let is_dir = is_dir_hint.unwrap_or_else(|| path.is_dir());
+        if gi.is_ignored(path, is_dir) {
+            return true;
+        }
+    }
+    false
 }
 
 fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
@@ -908,8 +1149,7 @@ fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
         .map(|ext| ext.to_lowercase())
 }
 
-fn index_row_from_path(path: &Path) -> Option<IndexRow> {
-    let metadata = fs::symlink_metadata(path).ok()?;
+fn index_row_from_path_and_metadata(path: &Path, metadata: &fs::Metadata) -> Option<IndexRow> {
     let is_dir = metadata.is_dir();
 
     let name = path
@@ -953,50 +1193,19 @@ fn index_row_from_path(path: &Path) -> Option<IndexRow> {
     })
 }
 
+fn index_row_from_path(path: &Path) -> Option<IndexRow> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    index_row_from_path_and_metadata(path, &metadata)
+}
+
 fn index_row_from_walkdir_entry(entry: &walkdir::DirEntry) -> Option<IndexRow> {
-    let path = entry.path();
     let metadata = entry.metadata().ok()?;
-    let is_dir = metadata.is_dir();
+    index_row_from_path_and_metadata(entry.path(), &metadata)
+}
 
-    let name = path
-        .file_name()
-        .map(|v| v.to_string_lossy().to_string())
-        .or_else(|| {
-            if path == Path::new("/") {
-                Some("/".to_string())
-            } else {
-                None
-            }
-        })?;
-
-    let dir = path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "/".to_string());
-
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
-
-    let size = if metadata.is_file() {
-        Some(metadata.len() as i64)
-    } else {
-        None
-    };
-
-    Some(IndexRow {
-        path: path.to_string_lossy().to_string(),
-        name,
-        dir,
-        is_dir: if is_dir { 1 } else { 0 },
-        ext: extension_for(path, is_dir),
-        mtime,
-        size,
-        indexed_at: now_epoch(),
-        run_id: 0,
-    })
+fn index_row_from_jwalk_entry(entry: &jwalk::DirEntry<((), ())>) -> Option<IndexRow> {
+    let metadata = entry.metadata().ok()?;
+    index_row_from_path_and_metadata(&entry.path(), &metadata)
 }
 
 fn collect_rows_shallow(
@@ -1376,7 +1585,7 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
 
     {
         let mut stmt = tx
-            .prepare("DELETE FROM entries WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\\\'")
+            .prepare("DELETE FROM entries WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")
             .map_err(|e| e.to_string())?;
 
         for path in raw_paths {
@@ -1617,6 +1826,7 @@ fn run_incremental_index_inner(
         state.path_ignores.as_ref(),
         state.path_ignore_patterns.as_ref(),
     );
+    let gi_filter = state.gitignore.clone();
 
     let last_run_id: i64 = get_meta(conn, "last_run_id")
         .and_then(|v| v.parse().ok())
@@ -1659,10 +1869,12 @@ fn run_incremental_index_inner(
         for dir_entry in entries.flatten() {
             let child_path = dir_entry.path();
 
-            if should_skip_path(
+            if should_skip_path_ext(
                 &child_path,
                 &runtime_ignored_roots,
                 &runtime_ignored_patterns,
+                Some(&gi_filter),
+                None,
             ) {
                 continue;
             }
@@ -1708,93 +1920,166 @@ fn run_incremental_index_inner(
         roots.len()
     ));
 
-    for root in &roots {
-        let root_started = Instant::now();
-        let mut root_scanned = 0u64;
-        let mut root_indexed = 0u64;
-        let mut root_permission_errors = 0u64;
-        let root_str = root.to_string_lossy().to_string();
-        let existing = preload_existing_entries(conn, &root_str);
+    // 2-pass indexing: shallow first (depth <= SHALLOW_SCAN_DEPTH), then deep
+    // Both passes use jwalk for parallel scanning
+    let arc_ignored_roots = Arc::new(runtime_ignored_roots.clone());
+    let arc_ignored_patterns = Arc::new(runtime_ignored_patterns.clone());
 
-        let iter = WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                !should_skip_path(
-                    entry.path(),
-                    &runtime_ignored_roots,
-                    &runtime_ignored_patterns,
-                )
-            });
+    for pass in 0..2u8 {
+        let pass_label = if pass == 0 { "shallow" } else { "deep" };
+        let pass_started = Instant::now();
+        let mut pass_scanned = 0u64;
+        let mut pass_indexed = 0u64;
 
-        for entry in iter {
-            match entry {
-                Ok(entry) => {
-                    let path = entry.path();
-                    if path == root.as_path() {
-                        continue;
-                    }
-                    scanned += 1;
-                    root_scanned += 1;
-                    current_path = path.to_string_lossy().to_string();
+        for root in &roots {
+            let root_started = Instant::now();
+            let mut root_scanned = 0u64;
+            let mut root_indexed = 0u64;
+            let mut root_permission_errors = 0u64;
+            let root_str = root.to_string_lossy().to_string();
+            let existing = preload_existing_entries(conn, &root_str);
 
-                    if let Some(mut row) = index_row_from_walkdir_entry(&entry) {
-                        row.run_id = current_run_id;
-                        if let Some((old_mtime, old_size)) = existing.get(&row.path) {
-                            if *old_mtime == row.mtime && *old_size == row.size {
-                                stamp_batch.push(row.path);
+            let gi_ref = gi_filter.clone();
+            let skip_roots = arc_ignored_roots.clone();
+            let skip_patterns = arc_ignored_patterns.clone();
+
+            let mut builder = jwalk::WalkDir::new(root)
+                .follow_links(false)
+                .skip_hidden(false)
+                .parallelism(jwalk::Parallelism::RayonNewPool(JWALK_NUM_THREADS));
+            if pass == 0 {
+                builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
+            }
+            let walker = builder
+                .process_read_dir(move |_depth, path, _state, children| {
+                    children.retain(|entry_result| {
+                        entry_result
+                            .as_ref()
+                            .map(|entry| {
+                                let full_path = path.join(&entry.file_name);
+                                let is_dir = Some(entry.file_type.is_dir());
+                                !should_skip_path_ext(
+                                    &full_path,
+                                    &skip_roots,
+                                    &skip_patterns,
+                                    Some(&gi_ref),
+                                    is_dir,
+                                )
+                            })
+                            .unwrap_or(false)
+                    });
+                });
+
+            for result in walker {
+                match result {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path == root.as_path() {
+                            continue;
+                        }
+
+                        // Pass 1: skip shallow entries already indexed in pass 0
+                        if pass == 1 && entry.depth <= SHALLOW_SCAN_DEPTH {
+                            continue;
+                        }
+
+                        scanned += 1;
+                        root_scanned += 1;
+                        current_path = path.to_string_lossy().to_string();
+
+                        if let Some(mut row) = index_row_from_jwalk_entry(&entry) {
+                            row.run_id = current_run_id;
+                            if let Some((old_mtime, old_size)) = existing.get(&row.path) {
+                                if *old_mtime == row.mtime && *old_size == row.size {
+                                    stamp_batch.push(row.path);
+                                } else {
+                                    indexed += 1;
+                                    root_indexed += 1;
+                                    batch.push(row);
+                                }
                             } else {
                                 indexed += 1;
                                 root_indexed += 1;
                                 batch.push(row);
                             }
-                        } else {
-                            indexed += 1;
-                            root_indexed += 1;
-                            batch.push(row);
+                        }
+
+                        if batch.len() >= BATCH_SIZE {
+                            upsert_rows(conn, &batch)?;
+                            batch.clear();
+                        }
+
+                        if stamp_batch.len() >= BATCH_SIZE {
+                            stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
+                            stamp_batch.clear();
+                        }
+
+                        if last_emit.elapsed() >= Duration::from_millis(200) {
+                            set_progress(state, scanned, indexed, &current_path);
+                            emit_index_progress(app, scanned, indexed, current_path.clone());
+                            last_emit = Instant::now();
+                        }
+                        if perf_log_enabled() && last_perf_emit.elapsed() >= Duration::from_secs(1) {
+                            perf_log(format!(
+                                "index_progress pass={} scanned={} indexed={} current_path={}",
+                                pass_label, scanned, indexed, current_path
+                            ));
+                            last_perf_emit = Instant::now();
                         }
                     }
-
-                    if batch.len() >= BATCH_SIZE {
-                        upsert_rows(conn, &batch)?;
-                        batch.clear();
+                    Err(err) => {
+                        scanned += 1;
+                        root_scanned += 1;
+                        permission_errors += 1;
+                        root_permission_errors += 1;
+                        if permission_errors <= 20 || perf_log_enabled() {
+                            eprintln!("[index] permission error: {}", err);
+                        }
                     }
-
-                    if stamp_batch.len() >= BATCH_SIZE {
-                        stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-                        stamp_batch.clear();
-                    }
-
-                    if last_emit.elapsed() >= Duration::from_millis(200) {
-                        set_progress(state, scanned, indexed, &current_path);
-                        emit_index_progress(app, scanned, indexed, current_path.clone());
-                        last_emit = Instant::now();
-                    }
-                    if perf_log_enabled() && last_perf_emit.elapsed() >= Duration::from_secs(1) {
-                        perf_log(format!(
-                            "index_progress scanned={} indexed={} current_path={}",
-                            scanned, indexed, current_path
-                        ));
-                        last_perf_emit = Instant::now();
-                    }
-                }
-                Err(_) => {
-                    scanned += 1;
-                    root_scanned += 1;
-                    permission_errors += 1;
-                    root_permission_errors += 1;
                 }
             }
+
+            pass_scanned += root_scanned;
+            pass_indexed += root_indexed;
+
+            perf_log(format!(
+                "index_root_done pass={} root={} elapsed_ms={} scanned={} indexed={} permission_errors={}",
+                pass_label,
+                root.to_string_lossy(),
+                root_started.elapsed().as_millis(),
+                root_scanned,
+                root_indexed,
+                root_permission_errors,
+            ));
+        }
+
+        // Flush between passes
+        if !batch.is_empty() {
+            upsert_rows(conn, &batch)?;
+            batch.clear();
+        }
+        if !stamp_batch.is_empty() {
+            stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
+            stamp_batch.clear();
         }
 
         perf_log(format!(
-            "index_root_done root={} elapsed_ms={} scanned={} indexed={} permission_errors={}",
-            root.to_string_lossy(),
-            root_started.elapsed().as_millis(),
-            root_scanned,
-            root_indexed,
-            root_permission_errors,
+            "index_pass_done pass={} elapsed_ms={} scanned={} indexed={}",
+            pass_label,
+            pass_started.elapsed().as_millis(),
+            pass_scanned,
+            pass_indexed,
         ));
+
+        // After shallow pass, emit progress so UI shows searchable state early
+        if pass == 0 {
+            let _ = emit_status_counts(app, state);
+            let _ = app.emit("index_updated", IndexUpdatedEvent {
+                entries_count: state.status.lock().entries_count,
+                last_updated: now_epoch(),
+                permission_errors,
+            });
+        }
     }
 
     if !batch.is_empty() {
@@ -1841,7 +2126,7 @@ fn run_incremental_index_inner(
         status.current_path = current_path.clone();
         status.message = if permission_errors > 0 {
             Some(format!(
-                "권한/접근 오류 {}건이 발생했습니다.",
+                "{} permission/access error(s) occurred.",
                 permission_errors
             ))
         } else {
@@ -1854,7 +2139,7 @@ fn run_incremental_index_inner(
         app,
         "Ready",
         if permission_errors > 0 {
-            Some(format!("권한/접근 오류 {}건", permission_errors))
+            Some(format!("{} permission/access error(s)", permission_errors))
         } else {
             None
         },
@@ -1968,6 +2253,10 @@ fn process_watcher_paths(app: &AppHandle, state: &AppState, pending: &mut HashSe
         return;
     }
 
+    if state.indexing_active.load(AtomicOrdering::Acquire) {
+        return;
+    }
+
     let mut batch: Vec<PathBuf> = pending.drain().collect();
     batch.sort();
 
@@ -1979,13 +2268,16 @@ fn process_watcher_paths(app: &AppHandle, state: &AppState, pending: &mut HashSe
             }
         }
         Err(err) => {
+            if state.indexing_active.load(AtomicOrdering::Acquire) {
+                return;
+            }
             let mut status = state.status.lock();
             if !matches!(status.state, IndexState::Indexing) {
                 status.state = IndexState::Error;
             }
-            status.message = Some(format!("watcher 업데이트 실패: {err}"));
+            status.message = Some(format!("Watcher update failed: {err}"));
             drop(status);
-            emit_index_state(app, "Error", Some(format!("watcher 업데이트 실패: {err}")));
+            emit_index_state(app, "Error", Some(format!("Watcher update failed: {err}")));
         }
     }
 }
@@ -1999,8 +2291,15 @@ fn persist_event_id(db_path: &Path, event_id: u64) -> AppResult<()> {
     set_meta(&conn, "last_event_id", &event_id.to_string())
 }
 
+const MUST_SCAN_THRESHOLD: usize = 10;
+
 #[cfg(target_os = "macos")]
-fn start_fsevent_watcher_worker(app: AppHandle, state: AppState, since_event_id: Option<u64>) {
+fn start_fsevent_watcher_worker(
+    app: AppHandle,
+    state: AppState,
+    since_event_id: Option<u64>,
+    conditional: bool,
+) {
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel();
 
@@ -2011,20 +2310,29 @@ fn start_fsevent_watcher_worker(app: AppHandle, state: AppState, since_event_id:
                     set_state(
                         &state,
                         IndexState::Error,
-                        Some(format!("FSEvents watcher 초기화 실패: {err}")),
+                        Some(format!("FSEvents watcher initialization failed: {err}")),
                     );
                     emit_index_state(
                         &app,
                         "Error",
-                        Some(format!("FSEvents watcher 초기화 실패: {err}")),
+                        Some(format!("FSEvents watcher initialization failed: {err}")),
                     );
                     return;
                 }
             };
 
+        if conditional {
+            perf_log("conditional_startup: watcher started, awaiting history replay");
+            set_state(&state, IndexState::Ready, None);
+            emit_index_state(&app, "Ready", None);
+        }
+
         let mut pending_paths: HashSet<PathBuf> = HashSet::new();
         let mut deadline: Option<Instant> = None;
         let mut last_flush = Instant::now();
+        let mut must_scan_count: usize = 0;
+        let mut replay_phase = conditional;
+        let mut full_scan_triggered = false;
 
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -2038,20 +2346,40 @@ fn start_fsevent_watcher_worker(app: AppHandle, state: AppState, since_event_id:
                     deadline = Some(Instant::now() + WATCH_DEBOUNCE);
                 }
                 Ok(fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
-                    let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
-                    let rows = collect_rows_recursive(&path, &ignored_roots, &ignored_patterns);
-                    if !rows.is_empty() {
-                        if let Ok(mut conn) = db_connection(&state.db_path) {
-                            let _ = upsert_rows(&mut conn, &rows);
-                            invalidate_search_caches(&state);
-                            let _ = emit_status_counts(&app, &state);
+                    must_scan_count += 1;
+                    if replay_phase && must_scan_count >= MUST_SCAN_THRESHOLD && !full_scan_triggered {
+                        perf_log(format!(
+                            "conditional_startup: MustScanSubDirs={} >= threshold, triggering full scan",
+                            must_scan_count
+                        ));
+                        full_scan_triggered = true;
+                        let _ = start_full_index_worker(app.clone(), state.clone());
+                    }
+                    if !state.indexing_active.load(AtomicOrdering::Acquire) {
+                        let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
+                        let rows = collect_rows_recursive(&path, &ignored_roots, &ignored_patterns);
+                        if !rows.is_empty() {
+                            if let Ok(mut conn) = db_connection(&state.db_path) {
+                                let _ = upsert_rows(&mut conn, &rows);
+                                invalidate_search_caches(&state);
+                                let _ = emit_status_counts(&app, &state);
+                            }
                         }
                     }
                 }
                 Ok(fsevent_watcher::FsEvent::HistoryDone) => {
-                    // Replay complete — flush any pending paths
                     process_watcher_paths(&app, &state, &mut pending_paths);
                     deadline = None;
+                    if replay_phase {
+                        replay_phase = false;
+                        if !full_scan_triggered {
+                            perf_log(format!(
+                                "conditional_startup: HistoryDone, MustScanSubDirs={}, skipping full scan",
+                                must_scan_count
+                            ));
+                            let _ = emit_status_counts(&app, &state);
+                        }
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -2083,13 +2411,13 @@ fn validate_new_name(new_name: &str) -> AppResult<String> {
     let trimmed = new_name.trim();
 
     if trimmed.is_empty() {
-        return Err("새 이름은 비어 있을 수 없습니다.".to_string());
+        return Err("New name cannot be empty.".to_string());
     }
     if trimmed.contains('/') {
-        return Err("새 이름에 '/' 문자를 포함할 수 없습니다.".to_string());
+        return Err("New name cannot contain '/'.".to_string());
     }
     if trimmed == "." || trimmed == ".." {
-        return Err("유효하지 않은 이름입니다.".to_string());
+        return Err("Invalid name.".to_string());
     }
 
     Ok(trimmed.to_string())
@@ -2159,7 +2487,11 @@ fn load_system_icon_png(_ext: &str) -> Option<Vec<u8>> {
 #[tauri::command]
 fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
     let snapshot = state.status.lock().clone();
-    let state_label = if state.indexing_active.load(AtomicOrdering::Acquire) {
+    let state_label = if matches!(snapshot.state, IndexState::Error) {
+        snapshot.state.as_str().to_string()
+    } else if state.indexing_active.load(AtomicOrdering::Acquire)
+        || !state.db_ready.load(AtomicOrdering::Acquire)
+    {
         "Indexing".to_string()
     } else {
         snapshot.state.as_str().to_string()
@@ -2191,7 +2523,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if state.indexing_active.load(AtomicOrdering::Acquire) {
-            return Err("인덱싱 진행 중에는 reset 할 수 없습니다.".to_string());
+            return Err("Cannot reset while indexing is in progress.".to_string());
         }
 
         let conn = db_connection(&state.db_path)?;
@@ -2271,14 +2603,28 @@ fn execute_search(
     let (runtime_ignored_roots, runtime_ignored_patterns) = cached_effective_ignore_rules(state);
 
     if !state.db_ready.load(AtomicOrdering::Acquire) {
+        let spotlight = spotlight_search::search_spotlight(&state.home_dir, &query);
+        let mode_label = if spotlight.entries.is_empty() {
+            "db_not_ready".to_string()
+        } else if spotlight.timed_out {
+            "spotlight_timeout".to_string()
+        } else {
+            "spotlight".to_string()
+        };
+        perf_log(format!(
+            "spotlight_fallback db_not_ready query={:?} results={} timed_out={}",
+            query,
+            spotlight.entries.len(),
+            spotlight.timed_out
+        ));
         return Ok(SearchExecution {
             query,
             sort_by,
             sort_dir,
             effective_limit,
             offset,
-            mode_label: "db_not_ready".to_string(),
-            results: Vec::new(),
+            mode_label,
+            results: spotlight.entries,
         });
     }
 
@@ -2289,6 +2635,7 @@ fn execute_search(
     let mut results = Vec::with_capacity(effective_limit as usize);
 
     let mode = parse_query(&query);
+    let is_name_mode = matches!(&mode, SearchMode::NameSearch { .. });
     let allow_find_fallback = !is_indexing
         && matches!(
             &mode,
@@ -2302,6 +2649,59 @@ fn execute_search(
         SearchMode::PathSearch { .. } => "path",
     }
     .to_string();
+
+    if is_name_mode && !is_indexing && offset == 0 {
+        if let Some(cache_hit) = negative_name_cache_lookup(state, &query) {
+            if cache_hit.age >= WATCH_DEBOUNCE
+                && cache_hit.age <= NEGATIVE_CACHE_FALLBACK_WINDOW
+                && !cache_hit.fallback_checked
+            {
+                let fallback_results = find_search(
+                    &state.home_dir,
+                    &runtime_ignored_roots,
+                    &runtime_ignored_patterns,
+                    &query,
+                    effective_limit as usize,
+                    &sort_by,
+                    &sort_dir,
+                );
+                if !fallback_results.is_empty() {
+                    remove_negative_name_query(state, &cache_hit.query_lower);
+                    perf_log(format!(
+                        "search_negative_cache_fallback_hit query={:?} age_ms={} results={}",
+                        query,
+                        cache_hit.age.as_millis(),
+                        fallback_results.len()
+                    ));
+                    return Ok(SearchExecution {
+                        query,
+                        sort_by,
+                        sort_dir,
+                        effective_limit,
+                        offset,
+                        mode_label: "find_fallback".to_string(),
+                        results: fallback_results,
+                    });
+                }
+                mark_negative_name_fallback_checked(state, &cache_hit.query_lower);
+            }
+
+            perf_log(format!(
+                "search_negative_cache_hit query={:?} age_ms={}",
+                query,
+                cache_hit.age.as_millis()
+            ));
+            return Ok(SearchExecution {
+                query,
+                sort_by,
+                sort_dir,
+                effective_limit,
+                offset,
+                mode_label: "name_neg_cache".to_string(),
+                results: Vec::new(),
+            });
+        }
+    }
 
     match mode {
         SearchMode::Empty => {
@@ -2461,32 +2861,64 @@ fn execute_search(
                 let dir_exact = abs_dir.to_string_lossy().to_string();
                 let dir_prefix = format!("{}/", dir_exact);
                 let dir_prefix_end = format!("{}0", dir_exact);
-                let sql = format!(
-                    r#"
-                    SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
-                    FROM entries e
-                    WHERE (e.dir = ?1 OR (e.dir >= ?2 AND e.dir < ?3))
-                      AND e.name LIKE ?4 ESCAPE '\'
-                    ORDER BY {order_by}
-                    LIMIT ?5 OFFSET ?6
-                    "#,
-                );
-                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(
-                        params![
-                            dir_exact,
-                            dir_prefix,
-                            dir_prefix_end,
-                            name_like,
-                            effective_limit,
-                            offset
-                        ],
-                        row_to_entry,
-                    )
-                    .map_err(|e| e.to_string())?;
-                for row in rows {
-                    results.push(row.map_err(|e| e.to_string())?);
+                let ext_shortcut = extract_ext_from_like(&name_like);
+
+                if let Some(ext_val) = ext_shortcut {
+                    let sql = format!(
+                        r#"
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                        FROM entries e
+                        WHERE (e.dir = ?1 OR (e.dir >= ?2 AND e.dir < ?3))
+                          AND e.ext = ?4
+                        ORDER BY {order_by}
+                        LIMIT ?5 OFFSET ?6
+                        "#,
+                    );
+                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                dir_exact,
+                                dir_prefix,
+                                dir_prefix_end,
+                                ext_val,
+                                effective_limit,
+                                offset
+                            ],
+                            row_to_entry,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for row in rows {
+                        results.push(row.map_err(|e| e.to_string())?);
+                    }
+                } else {
+                    let sql = format!(
+                        r#"
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                        FROM entries e
+                        WHERE (e.dir = ?1 OR (e.dir >= ?2 AND e.dir < ?3))
+                          AND e.name LIKE ?4 ESCAPE '\'
+                        ORDER BY {order_by}
+                        LIMIT ?5 OFFSET ?6
+                        "#,
+                    );
+                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                dir_exact,
+                                dir_prefix,
+                                dir_prefix_end,
+                                name_like,
+                                effective_limit,
+                                offset
+                            ],
+                            row_to_entry,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for row in rows {
+                        results.push(row.map_err(|e| e.to_string())?);
+                    }
                 }
             } else {
                 let dir_suffix = escape_like(&dir_hint);
@@ -2577,9 +3009,30 @@ fn execute_search(
         mode_label = "find_fallback".to_string();
     }
 
+    if results.is_empty() && !query.is_empty() && offset == 0 && is_indexing {
+        let spotlight = spotlight_search::search_spotlight(&state.home_dir, &query);
+        if !spotlight.entries.is_empty() {
+            perf_log(format!(
+                "spotlight_fallback indexing query={:?} results={} timed_out={}",
+                query,
+                spotlight.entries.len(),
+                spotlight.timed_out
+            ));
+            results = spotlight.entries;
+            mode_label = if spotlight.timed_out {
+                "spotlight_timeout".to_string()
+            } else {
+                "spotlight".to_string()
+            };
+        }
+    }
+
     results = filter_ignored_entries(results, &runtime_ignored_roots, &runtime_ignored_patterns);
     if sort_by == "name" && offset == 0 {
         sort_entries_with_relevance(&mut results, &query, &sort_by, &sort_dir);
+    }
+    if is_name_mode && !is_indexing && offset == 0 && results.is_empty() && !query.is_empty() {
+        remember_negative_name_query(state, &query);
     }
 
     Ok(SearchExecution {
@@ -2602,7 +3055,7 @@ async fn search(
     sort_by: Option<String>,
     sort_dir: Option<String>,
     state: State<'_, AppState>,
-) -> AppResult<Vec<EntryDto>> {
+) -> AppResult<SearchResultDto> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
@@ -2637,7 +3090,10 @@ async fn search(
             ));
         }
 
-        Ok(execution.results)
+        Ok(SearchResultDto {
+            entries: execution.results,
+            mode_label: execution.mode_label,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2646,14 +3102,24 @@ async fn search(
 #[tauri::command]
 async fn open(paths: Vec<String>) -> AppResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
-        for path in paths {
-            let status = Command::new("open")
-                .arg(&path)
-                .status()
+        for path in &paths {
+            let output = Command::new("open")
+                .arg(path)
+                .output()
                 .map_err(|e| e.to_string())?;
 
-            if !status.success() {
-                return Err(format!("열기 실패: {path}"));
+            if !output.status.success() && Path::new(path).is_dir() {
+                let fallback = Command::new("open")
+                    .args(["-R", path])
+                    .status()
+                    .map_err(|e| e.to_string())?;
+
+                if !fallback.success() {
+                    return Err(format!("Failed to open: {path}"));
+                }
+            } else if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Failed to open: {path} ({stderr})",));
             }
         }
 
@@ -2676,7 +3142,7 @@ fn reveal_in_finder_impl(paths: Vec<String>) -> AppResult<()> {
             .map_err(|e| e.to_string())?;
 
         if !status.success() {
-            return Err(format!("Finder에서 표시 실패: {}", paths[0]));
+            return Err(format!("Failed to reveal in Finder: {}", paths[0]));
         }
 
         return Ok(());
@@ -2697,7 +3163,7 @@ fn reveal_in_finder_impl(paths: Vec<String>) -> AppResult<()> {
             .map_err(|e| e.to_string())?;
 
         if !status.success() {
-            return Err(format!("Finder 열기 실패: {}", parent.to_string_lossy()));
+            return Err(format!("Failed to open in Finder: {}", parent.to_string_lossy()));
         }
     }
 
@@ -2709,24 +3175,24 @@ fn copy_with_command(program: &str, args: &[&str], text: &str) -> AppResult<()> 
         .args(args)
         .stdin(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{program} 실행 실패: {e}"))?;
+        .map_err(|e| format!("Failed to run {program}: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(text.as_bytes())
-            .map_err(|e| format!("클립보드 쓰기 실패: {e}"))?;
+            .map_err(|e| format!("Failed to write to clipboard: {e}"))?;
     } else {
-        return Err("클립보드 입력 스트림을 열 수 없습니다.".to_string());
+        return Err("Cannot open clipboard input stream.".to_string());
     }
 
     let status = child
         .wait()
-        .map_err(|e| format!("{program} 종료 대기 실패: {e}"))?;
+        .map_err(|e| format!("Failed to wait for {program}: {e}"))?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{program} 실행이 실패했습니다."))
+        Err(format!("{program} execution failed."))
     }
 }
 
@@ -2758,7 +3224,7 @@ fn copy_text_to_clipboard(text: &str) -> AppResult<()> {
     }
 
     Err(last_error.unwrap_or_else(|| {
-        "지원되는 클립보드 도구를 찾지 못했습니다. wl-copy, xclip, xsel 중 하나를 설치하세요."
+        "No supported clipboard tool found. Please install wl-copy, xclip, or xsel."
             .to_string()
     }))
 }
@@ -2822,12 +3288,12 @@ async fn rename(
         let old_path = PathBuf::from(&path);
 
         if !old_path.exists() {
-            return Err("원본 파일이 존재하지 않습니다.".to_string());
+            return Err("Source file does not exist.".to_string());
         }
 
         let parent = old_path
             .parent()
-            .ok_or_else(|| "상위 디렉토리를 찾을 수 없습니다.".to_string())?;
+            .ok_or_else(|| "Parent directory not found.".to_string())?;
 
         let new_path = parent.join(&validated_name);
         if new_path == old_path {
@@ -2849,7 +3315,7 @@ async fn rename(
         }
 
         if new_path.exists() {
-            return Err("동일한 이름의 파일/폴더가 이미 존재합니다.".to_string());
+            return Err("A file/folder with the same name already exists.".to_string());
         }
 
         let original_is_dir = old_path.is_dir();
@@ -2866,7 +3332,7 @@ async fn rename(
             }
         } else {
             let row = index_row_from_path(&new_path)
-                .ok_or_else(|| "변경된 파일 정보를 읽을 수 없습니다.".to_string())?;
+                .ok_or_else(|| "Cannot read renamed file info.".to_string())?;
             let _ = upsert_rows(&mut conn, &[row])?;
         }
 
@@ -3161,7 +3627,7 @@ fn start_bench_runner(app_handle: AppHandle, state: AppState) {
                     index_indexed: snapshot.indexed,
                     index_entries_count: snapshot.entries_count,
                     index_permission_errors: snapshot.permission_errors,
-                    index_message: Some("index ready 대기 시간 초과".to_string()),
+                    index_message: Some("Timed out waiting for index ready".to_string()),
                     search_iterations: iterations,
                     search_results: Vec::new(),
                 };
@@ -3315,7 +3781,7 @@ fn register_global_shortcut(app: &AppHandle) -> AppResult<()> {
             }
             let _ = app_handle.emit("focus_search", ());
         })
-        .map_err(|e| format!("글로벌 단축키 등록 실패: {e}"))
+        .map_err(|e| format!("Failed to register global shortcut: {e}"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3329,7 +3795,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     let app_data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| format!("app data dir 조회 실패: {e}"))?;
+        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
     let db_path = app_data_dir.join("index.db");
@@ -3341,6 +3807,8 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             path_ignores.push(root);
         }
     }
+
+    let gitignore = gitignore_filter::build_shared_filter(&home_dir);
 
     let state = AppState {
         db_path,
@@ -3354,7 +3822,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         recent_ops: Arc::new(Mutex::new(Vec::new())),
         icon_cache: Arc::new(Mutex::new(HashMap::new())),
         fd_search_cache: Arc::new(Mutex::new(None)),
+        negative_name_cache: Arc::new(Mutex::new(Vec::new())),
         ignore_cache: Arc::new(Mutex::new(None)),
+        gitignore,
     };
 
     app.manage(state.clone());
@@ -3403,15 +3873,16 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                     > 0;
 
                 if stored_event_id.is_some() && has_entries {
+                    // Conditional startup: try watcher replay first, skip full scan if OK
                     start_fsevent_watcher_worker(
                         app_handle.clone(),
                         state.clone(),
                         stored_event_id,
+                        true,
                     );
-                    let _ = start_full_index_worker(app_handle.clone(), state.clone());
                 } else {
                     let _ = start_full_index_worker(app_handle.clone(), state.clone());
-                    start_fsevent_watcher_worker(app_handle.clone(), state.clone(), None);
+                    start_fsevent_watcher_worker(app_handle.clone(), state.clone(), None, false);
                 }
             }
         }
@@ -3514,6 +3985,25 @@ mod tests {
         ))
     }
 
+    fn test_state_for(db_path: PathBuf, home_dir: PathBuf, cwd: PathBuf) -> AppState {
+        AppState {
+            db_path,
+            home_dir: home_dir.clone(),
+            cwd,
+            path_ignores: Arc::new(Vec::new()),
+            path_ignore_patterns: Arc::new(Vec::new()),
+            db_ready: Arc::new(AtomicBool::new(true)),
+            indexing_active: Arc::new(AtomicBool::new(false)),
+            status: Arc::new(Mutex::new(IndexStatus::default())),
+            recent_ops: Arc::new(Mutex::new(Vec::new())),
+            icon_cache: Arc::new(Mutex::new(HashMap::new())),
+            fd_search_cache: Arc::new(Mutex::new(None)),
+            negative_name_cache: Arc::new(Mutex::new(Vec::new())),
+            ignore_cache: Arc::new(Mutex::new(None)),
+            gitignore: gitignore_filter::build_shared_filter(&home_dir),
+        }
+    }
+
     #[test]
     fn should_skip_path_for_ignored_descendant() {
         let ignored = vec![PathBuf::from(
@@ -3583,6 +4073,91 @@ mod tests {
     }
 
     #[test]
+    fn resolved_dir_range_excludes_sibling_with_same_prefix() {
+        let dir_exact = "/Users/user/Projects";
+        let dir_prefix = format!("{}/", dir_exact);
+        let dir_prefix_end = format!("{}0", dir_exact);
+
+        let in_scope = |dir: &str| {
+            dir == dir_exact || (dir >= dir_prefix.as_str() && dir < dir_prefix_end.as_str())
+        };
+
+        assert!(in_scope("/Users/user/Projects"));
+        assert!(in_scope("/Users/user/Projects/src"));
+        assert!(in_scope("/Users/user/Projects/src/deeper"));
+
+        assert!(!in_scope("/Users/user/Projects-archived"));
+        assert!(!in_scope("/Users/user/Projects.archived"));
+        assert!(!in_scope("/Users/user/Projects_archived"));
+        assert!(!in_scope("/Users/user/Projectz"));
+    }
+
+    #[test]
+    fn execute_search_resolved_path_does_not_include_prefixed_sibling_dirs() {
+        let root = temp_case_dir("resolved_path_scope_execute");
+        let projects_src = root.join("Projects").join("src");
+        let archived_src = root.join("Projects-archived").join("src");
+        fs::create_dir_all(&projects_src).unwrap();
+        fs::create_dir_all(&archived_src).unwrap();
+
+        let db_path = root.join("index.db");
+        init_db(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        let now = now_epoch();
+
+        let project_path = projects_src.join("main.rs");
+        let archived_path = archived_src.join("legacy.rs");
+
+        conn.execute(
+            "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+             VALUES(?1, ?2, ?3, 0, ?4, NULL, NULL, ?5, 1)",
+            params![
+                project_path.to_string_lossy().to_string(),
+                "main.rs",
+                projects_src.to_string_lossy().to_string(),
+                "rs",
+                now
+            ],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+             VALUES(?1, ?2, ?3, 0, ?4, NULL, NULL, ?5, 1)",
+            params![
+                archived_path.to_string_lossy().to_string(),
+                "legacy.rs",
+                archived_src.to_string_lossy().to_string(),
+                "rs",
+                now
+            ],
+        )
+        .unwrap();
+
+        let state = test_state_for(db_path.clone(), root.clone(), root.clone());
+        let result = execute_search(
+            &state,
+            "Projects/ *.rs".to_string(),
+            Some(300),
+            Some(0),
+            Some("name".to_string()),
+            Some("asc".to_string()),
+        )
+        .unwrap();
+
+        assert!(result
+            .results
+            .iter()
+            .any(|entry| entry.path == project_path.to_string_lossy()));
+        assert!(result
+            .results
+            .iter()
+            .all(|entry| !entry.path.contains("Projects-archived")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn find_file_upward_locates_repo_level_pathignore() {
         let root = temp_case_dir("pathignore_upward");
         let nested = root.join("src-tauri").join("target");
@@ -3604,6 +4179,76 @@ mod tests {
 
         let found = find_git_root(&nested);
         assert_eq!(found, Some(root.clone()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_ext_from_like_rejects_multi_dot() {
+        assert_eq!(extract_ext_from_like("%.tar.gz"), None);
+        assert_eq!(extract_ext_from_like("%.d.ts"), None);
+        assert_eq!(extract_ext_from_like("%.rs"), Some("rs".to_string()));
+        assert_eq!(extract_ext_from_like("%.png"), Some("png".to_string()));
+    }
+
+    #[test]
+    fn negative_cache_fallback_removes_matched_key_not_query() {
+        let state = test_state_for(
+            PathBuf::from("/tmp/neg_cache_test.db"),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+        );
+
+        remember_negative_name_query(&state, "abc");
+
+        let hit = negative_name_cache_lookup(&state, "xabc");
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().query_lower, "abc");
+
+        remove_negative_name_query(&state, "abc");
+
+        let hit_after = negative_name_cache_lookup(&state, "xabc");
+        assert!(hit_after.is_none());
+    }
+
+    #[test]
+    fn path_search_multi_dot_ext_uses_like_not_ext_shortcut() {
+        let root = temp_case_dir("multi_dot_ext");
+        let proj_dir = root.join("Projects");
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let db_path = root.join("index.db");
+        init_db(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        let now = now_epoch();
+
+        let file_path = proj_dir.join("archive.tar.gz");
+        conn.execute(
+            "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+             VALUES(?1, ?2, ?3, 0, ?4, NULL, NULL, ?5, 1)",
+            params![
+                file_path.to_string_lossy().to_string(),
+                "archive.tar.gz",
+                proj_dir.to_string_lossy().to_string(),
+                "gz",
+                now
+            ],
+        )
+        .unwrap();
+
+        let state = test_state_for(db_path, root.clone(), root.clone());
+        let result = execute_search(
+            &state,
+            "Projects/ *.tar.gz".to_string(),
+            Some(300),
+            Some(0),
+            Some("name".to_string()),
+            Some("asc".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(result.results.len(), 1);
+        assert!(result.results[0].name == "archive.tar.gz");
 
         let _ = fs::remove_dir_all(root);
     }
