@@ -1,0 +1,7 @@
+~/.cursor/
+~/.gemini
+.git
+node_modules
+~/Library/Developer/Xcode/DerivedData/
+.moc
+**/target

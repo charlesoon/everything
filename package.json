@@ -1,5 +1,5 @@
 {
-  "name": "fastfind",
+  "name": "everything",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,9 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "lint": "npm run build && cargo check --manifest-path src-tauri/Cargo.toml",
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml --no-run",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@crabnebula/tauri-plugin-drag": "^2.1.0",
     "@tauri-apps/api": "^2.0.0",
     "svelte": "^4.2.19"
   },

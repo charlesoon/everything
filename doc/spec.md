@@ -3,7 +3,7 @@
 ⸻
 
 0. 문서 정보
-	•	제품명(가칭): FastFind
+	•	제품명(가칭): Everything
 	•	플랫폼: macOS
 	•	기술 스택: Tauri v2 + Rust + Svelte
 	•	목표: Everything급(체감) 초고속 파일/폴더 "이름 기반" 검색
