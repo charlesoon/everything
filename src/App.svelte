@@ -819,14 +819,20 @@
       return;
     }
 
+    results = [];
+    clearSelection();
+    scanned = 0;
+    indexed = 0;
+    currentPath = '';
+    dbLatencyMs = null;
+    dbLastQuery = '';
+    indexStatus = { ...indexStatus, state: 'Indexing', entriesCount: 0, message: null };
+    indexingStartTime = Date.now();
+    indexingElapsed = '';
+    indexingFinishedAt = '';
+
     try {
       await invoke('reset_index');
-      scanned = 0;
-      indexed = 0;
-      currentPath = '';
-      results = [];
-      clearSelection();
-      showToast('Index reset and rebuild started.');
     } catch (err) {
       showToast(`Failed to reset index: ${String(err)}`);
       await refreshStatus();
@@ -1702,6 +1708,7 @@
     font-size: 11px;
     height: 22px;
     padding: 0 8px;
+    cursor: pointer;
   }
 
   .status-btn:hover {

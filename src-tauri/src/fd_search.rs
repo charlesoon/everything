@@ -348,9 +348,9 @@ pub fn run_fd_search(
                 .map(|e| e.to_lowercase())
         };
 
-        let mtime = dir_entry
-            .metadata()
-            .ok()
+        let meta = dir_entry.metadata().ok();
+        let size = meta.as_ref().filter(|m| m.is_file()).map(|m| m.len() as i64);
+        let mtime = meta
             .and_then(|m| m.modified().ok())
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
@@ -366,6 +366,7 @@ pub fn run_fd_search(
             dir: dir_string,
             is_dir,
             ext,
+            size,
             mtime,
         });
 

@@ -83,8 +83,9 @@ pub fn search_spotlight(home_dir: &Path, query: &str) -> SpotlightResult {
                 .map(|e| e.to_lowercase())
         };
 
-        let mtime = std::fs::symlink_metadata(path)
-            .ok()
+        let meta = std::fs::symlink_metadata(path).ok();
+        let size = meta.as_ref().filter(|m| m.is_file()).map(|m| m.len() as i64);
+        let mtime = meta
             .and_then(|m| m.modified().ok())
             .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
@@ -95,6 +96,7 @@ pub fn search_spotlight(home_dir: &Path, query: &str) -> SpotlightResult {
             dir,
             is_dir,
             ext,
+            size,
             mtime,
         });
 
