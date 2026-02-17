@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1A1A2E"/>
+      <stop offset="100%" stop-color="#16213E"/>
+    </linearGradient>
+    <linearGradient id="orange1" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#FF8C00"/>
+      <stop offset="100%" stop-color="#E06000"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg1)"/>
+  <!-- Magnifying glass ring = the "e" bowl -->
+  <circle cx="224" cy="224" r="120" fill="none" stroke="url(#orange1)" stroke-width="44"/>
+  <!-- "e" crossbar -->
+  <line x1="148" y1="224" x2="344" y2="224" stroke="url(#orange1)" stroke-width="40" stroke-linecap="round"/>
+  <!-- "e" opening (cut out bottom-right of ring) -->
+  <path d="M310,290 A120,120 0 0,0 344,224" fill="none" stroke="url(#bg1)" stroke-width="52"/>
+  <!-- Handle -->
+  <line x1="314" y1="314" x2="420" y2="420" stroke="url(#orange1)" stroke-width="44" stroke-linecap="round"/>
+  <!-- Subtle lens reflection -->
+  <ellipse cx="185" cy="175" rx="30" ry="18" fill="#FFFFFF" opacity="0.12" transform="rotate(-30 185 175)"/>
+</svg>

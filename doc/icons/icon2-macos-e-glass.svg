@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F8F8FA"/>
+      <stop offset="100%" stop-color="#E0E0E8"/>
+    </linearGradient>
+    <linearGradient id="orange2" x1="0.3" y1="0" x2="0.7" y2="1">
+      <stop offset="0%" stop-color="#FF9A2E"/>
+      <stop offset="100%" stop-color="#D4650A"/>
+    </linearGradient>
+    <filter id="shadow2">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.2"/>
+    </filter>
+  </defs>
+  <!-- macOS-style light background -->
+  <rect width="512" height="512" rx="112" fill="url(#bg2)"/>
+  <rect x="4" y="4" width="504" height="504" rx="110" fill="none" stroke="#CCC" stroke-width="1" opacity="0.5"/>
+  <!-- Shadow group -->
+  <g filter="url(#shadow2)">
+    <!-- "e" as magnifying glass - thicker, bolder -->
+    <circle cx="220" cy="218" r="110" fill="none" stroke="url(#orange2)" stroke-width="38"/>
+    <!-- "e" crossbar -->
+    <line x1="150" y1="218" x2="330" y2="218" stroke="url(#orange2)" stroke-width="34" stroke-linecap="round"/>
+    <!-- "e" gap (erase bottom-right arc) -->
+    <path d="M298,286 A110,110 0 0,0 330,218" fill="none" stroke="url(#bg2)" stroke-width="46"/>
+    <!-- Handle -->
+    <line x1="300" y1="298" x2="408" y2="406" stroke="url(#orange2)" stroke-width="42" stroke-linecap="round"/>
+  </g>
+  <!-- Glass reflection highlight -->
+  <ellipse cx="180" cy="168" rx="36" ry="20" fill="#FFFFFF" opacity="0.35" transform="rotate(-35 180 168)"/>
+</svg>

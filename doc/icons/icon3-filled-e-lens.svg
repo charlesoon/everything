@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FF8C00"/>
+      <stop offset="100%" stop-color="#CC5500"/>
+    </linearGradient>
+    <linearGradient id="inner3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFB347"/>
+      <stop offset="100%" stop-color="#FF8C00"/>
+    </linearGradient>
+  </defs>
+  <!-- Full orange background -->
+  <rect width="512" height="512" rx="112" fill="url(#bg3)"/>
+  <!-- White "e"-magnifier cutout style -->
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+    <!-- Lens circle -->
+    <circle cx="216" cy="216" r="116" stroke-width="42"/>
+    <!-- "e" crossbar -->
+    <line x1="142" y1="216" x2="332" y2="216" stroke-width="38"/>
+    <!-- Handle -->
+    <line x1="300" y1="300" x2="412" y2="412" stroke-width="46"/>
+  </g>
+  <!-- "e" opening gap -->
+  <path d="M300,284 A116,116 0 0,0 332,216" fill="none" stroke="url(#bg3)" stroke-width="50"/>
+  <!-- Inner lens tint -->
+  <circle cx="216" cy="216" r="92" fill="#FFFFFF" opacity="0.08"/>
+  <!-- Reflection -->
+  <ellipse cx="178" cy="168" rx="32" ry="16" fill="#FFFFFF" opacity="0.2" transform="rotate(-30 178 168)"/>
+</svg>
