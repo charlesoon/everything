@@ -22,13 +22,10 @@
 
   let query = '';
   let results = [];
-  let searchMode = 'db';
-  let liveTotal = 0;
-  let liveSearching = false;
-  let liveLatencyMs = null;
-  let liveTimedOut = false;
+
   let dbLatencyMs = null;
   let dbLastQuery = '';
+  let searchModeLabel = '';
   let selectedIndices = new Set();
   let selectionAnchor = -1;
   let lastSelectedIndex = -1;
@@ -40,12 +37,16 @@
   };
 
   let indexStatus = {
-    state: 'Ready',
+    state: 'Unknown',
     entriesCount: 0,
     lastUpdated: null,
     permissionErrors: 0,
     message: null
   };
+
+  let indexingStartTime = null;
+  let indexingElapsed = '';
+  let indexingFinishedAt = '';
 
   let sortBy = 'name';
   let sortDir = 'asc';
@@ -85,7 +86,9 @@
   let lastSearchFiredAt = 0;
   let toastTimer;
   let statusRefreshTimer;
+  let elapsedTimer;
   let statusRefreshInFlight = false;
+  let lastReadyCount = 0;
 
   const iconCache = new Map();
   const iconLoading = new Set();
@@ -390,6 +393,7 @@
     statusRefreshInFlight = true;
     try {
       const status = await invoke('get_index_status');
+      const prevState = indexStatus.state;
       indexStatus = {
         state: status.state,
         entriesCount: status.entriesCount,
@@ -397,6 +401,11 @@
         permissionErrors: status.permissionErrors ?? 0,
         message: status.message
       };
+      if (status.state === 'Indexing' && prevState !== 'Indexing') {
+        startElapsedTimer();
+      } else if (status.state !== 'Indexing' && prevState === 'Indexing') {
+        stopElapsedTimer();
+      }
       if (typeof status.scanned === 'number') {
         scanned = status.scanned;
       }
@@ -407,14 +416,13 @@
         currentPath = status.currentPath;
       }
     } catch (err) {
-      showToast(`상태 조회 실패: ${String(err)}`);
+      showToast(`Failed to get status: ${String(err)}`);
     } finally {
       statusRefreshInFlight = false;
     }
   }
 
   function scheduleSearch() {
-    if (searchMode === 'live') return;
     searchGeneration += 1;
     const scheduledGen = searchGeneration;
     clearTimeout(searchTimer);
@@ -436,54 +444,6 @@
     }
   }
 
-  function toggleSearchMode() {
-    searchMode = searchMode === 'db' ? 'live' : 'db';
-    results = [];
-    liveTotal = 0;
-    liveLatencyMs = null;
-    liveTimedOut = false;
-    clearSelection();
-    if (searchMode === 'db') {
-      void runSearch();
-    }
-  }
-
-  async function runLiveSearch() {
-    if (!query.trim()) {
-      results = [];
-      liveTotal = 0;
-      liveLatencyMs = null;
-      liveTimedOut = false;
-      return;
-    }
-    searchGeneration += 1;
-    const gen = searchGeneration;
-    const startedAt = performance.now();
-    liveSearching = true;
-    liveTimedOut = false;
-    try {
-      const result = await invoke('fd_search', {
-        query,
-        limit: PAGE_SIZE,
-        offset: 0,
-        sort_by: sortBy,
-        sort_dir: sortDir
-      });
-      if (gen !== searchGeneration) return;
-      results = Array.isArray(result.entries) ? result.entries : [];
-      liveTotal = result.total;
-      liveLatencyMs = Math.max(0, Math.round(performance.now() - startedAt));
-      liveTimedOut = result.timedOut || false;
-      hasMore = results.length < liveTotal;
-      updateViewportHeight();
-    } catch (err) {
-      if (gen !== searchGeneration) return;
-      showToast(`Live 검색 실패: ${String(err)}`);
-    } finally {
-      liveSearching = false;
-    }
-  }
-
   async function runSearch() {
     searchGeneration += 1;
     const gen = searchGeneration;
@@ -502,7 +462,9 @@
 
       dbLatencyMs = Math.round(performance.now() - startedAt);
       dbLastQuery = query;
-      results = Array.isArray(next) ? next : [];
+      const entries = Array.isArray(next.entries) ? next.entries : [];
+      searchModeLabel = next.modeLabel || '';
+      results = entries;
       hasMore = results.length >= PAGE_SIZE;
 
       const restored = new Set();
@@ -516,7 +478,7 @@
       updateViewportHeight();
     } catch (err) {
       if (gen !== searchGeneration) return;
-      showToast(`검색 실패: ${String(err)}`);
+      showToast(`Search failed: ${String(err)}`);
     }
   }
 
@@ -525,33 +487,19 @@
     const gen = searchGeneration;
     loadingMore = true;
     try {
-      if (searchMode === 'live') {
-        const result = await invoke('fd_search', {
-          query,
-          limit: PAGE_SIZE,
-          offset: results.length,
-          sort_by: sortBy,
-          sort_dir: sortDir
-        });
-        if (gen !== searchGeneration) return;
-        const arr = Array.isArray(result.entries) ? result.entries : [];
-        if (arr.length > 0) results = [...results, ...arr];
-        hasMore = results.length < result.total;
-      } else {
-        const batch = await invoke('search', {
-          query,
-          limit: PAGE_SIZE,
-          offset: results.length,
-          sort_by: sortBy,
-          sort_dir: sortDir
-        });
-        if (gen !== searchGeneration) return;
-        const arr = Array.isArray(batch) ? batch : [];
-        if (arr.length > 0) results = [...results, ...arr];
-        hasMore = arr.length >= PAGE_SIZE;
-      }
+      const batch = await invoke('search', {
+        query,
+        limit: PAGE_SIZE,
+        offset: results.length,
+        sort_by: sortBy,
+        sort_dir: sortDir
+      });
+      if (gen !== searchGeneration) return;
+      const arr = Array.isArray(batch.entries) ? batch.entries : [];
+      if (arr.length > 0) results = [...results, ...arr];
+      hasMore = arr.length >= PAGE_SIZE;
     } catch (err) {
-      showToast(`추가 로드 실패: ${String(err)}`);
+      showToast(`Failed to load more: ${String(err)}`);
     } finally {
       loadingMore = false;
     }
@@ -587,11 +535,7 @@
       sortBy = column;
       sortDir = 'asc';
     }
-    if (searchMode === 'live') {
-      void runLiveSearch();
-    } else {
-      void runSearch();
-    }
+    void runSearch();
   }
 
   function sortMark(column) {
@@ -809,7 +753,7 @@
       await tick();
     }
     await invoke('open', { paths: [results[index].path] }).catch((err) => {
-      showToast(`열기 실패: ${String(err)}`);
+      showToast(`Failed to open: ${String(err)}`);
     });
   }
 
@@ -829,7 +773,7 @@
     try {
       await invoke('open', { paths });
     } catch (err) {
-      showToast(`열기 실패: ${String(err)}`);
+      showToast(`Failed to open: ${String(err)}`);
     }
   }
 
@@ -842,7 +786,7 @@
     try {
       await invoke('open_with', { path: target.path });
     } catch (err) {
-      showToast(`Open With 실패: ${String(err)}`);
+      showToast(`Open With failed: ${String(err)}`);
     }
   }
 
@@ -855,7 +799,7 @@
     try {
       await invoke('reveal_in_finder', { paths });
     } catch (err) {
-      showToast(`Finder 표시 실패: ${String(err)}`);
+      showToast(`Failed to reveal in Finder: ${String(err)}`);
     }
   }
 
@@ -867,9 +811,9 @@
 
     try {
       await invoke('copy_paths', { paths });
-      showToast(`경로 ${paths.length}개 복사 완료`);
+      showToast(`Copied ${paths.length} path(s)`);
     } catch (err) {
-      showToast(`경로 복사 실패: ${String(err)}`);
+      showToast(`Failed to copy path: ${String(err)}`);
     }
   }
 
@@ -881,8 +825,8 @@
 
     const message =
       paths.length === 1
-        ? '선택한 항목을 휴지통으로 이동할까요?'
-        : `${paths.length}개 항목을 휴지통으로 이동할까요?`;
+        ? 'Move selected item to Trash?'
+        : `Move ${paths.length} items to Trash?`;
 
     if (!window.confirm(message)) {
       return;
@@ -890,17 +834,17 @@
 
     try {
       await invoke('move_to_trash', { paths });
-      showToast('휴지통으로 이동했습니다.');
+      showToast('Moved to Trash.');
       clearSelection();
       await runSearch();
     } catch (err) {
-      showToast(`휴지통 이동 실패: ${String(err)}`);
+      showToast(`Failed to move to Trash: ${String(err)}`);
     }
   }
 
   async function resetIndex() {
     if (indexStatus.state === 'Indexing') {
-      showToast('인덱싱 진행 중입니다. 완료 후 다시 시도해 주세요.');
+      showToast('Indexing in progress. Please try again after it completes.');
       return;
     }
 
@@ -911,9 +855,9 @@
       currentPath = '';
       results = [];
       clearSelection();
-      showToast('인덱스를 초기화하고 재구축을 시작했습니다.');
+      showToast('Index reset and rebuild started.');
     } catch (err) {
-      showToast(`인덱스 초기화 실패: ${String(err)}`);
+      showToast(`Failed to reset index: ${String(err)}`);
       await refreshStatus();
     }
   }
@@ -975,7 +919,7 @@
       cancelRename();
       await runSearch();
     } catch (err) {
-      showToast(`이름 변경 실패: ${String(err)}`);
+      showToast(`Failed to rename: ${String(err)}`);
       await tick();
       renameInputEl?.focus();
     }
@@ -1067,11 +1011,6 @@
     }
 
     if (event.key === 'Enter') {
-      if (searchMode === 'live' && event.target === searchInputEl) {
-        event.preventDefault();
-        await runLiveSearch();
-        return;
-      }
       event.preventDefault();
       await startRename();
       return;
@@ -1132,6 +1071,37 @@
     return new Date(timestamp * 1000).toLocaleString();
   }
 
+  function formatElapsed(ms) {
+    const totalSec = Math.floor(ms / 1000);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return min > 0 ? `${min}m ${sec}s` : `${sec}s`;
+  }
+
+  function updateElapsed() {
+    if (indexingStartTime && indexStatus.state === 'Indexing') {
+      indexingElapsed = formatElapsed(Date.now() - indexingStartTime);
+    }
+  }
+
+  function startElapsedTimer() {
+    clearInterval(elapsedTimer);
+    indexingStartTime = Date.now();
+    indexingElapsed = '0s';
+    indexingFinishedAt = '';
+    elapsedTimer = setInterval(updateElapsed, 1000);
+  }
+
+  function stopElapsedTimer() {
+    clearInterval(elapsedTimer);
+    if (indexingStartTime) {
+      const elapsed = Date.now() - indexingStartTime;
+      indexingFinishedAt = `${formatElapsed(elapsed)}`;
+    }
+    indexingStartTime = null;
+    indexingElapsed = '';
+  }
+
   function displayPath(path) {
     if (!path) {
       return path;
@@ -1157,20 +1127,6 @@
   onMount(async () => {
     updateViewportHeight();
 
-    await refreshStatus();
-    try {
-      homePrefix = await invoke('get_home_dir');
-    } catch {
-      homePrefix = '';
-    }
-
-    if (!localStorage.getItem('everything-fda-notice-v1')) {
-      showToast('전체 디스크 검색을 위해 macOS Full Disk Access 권한이 필요할 수 있습니다.');
-      localStorage.setItem('everything-fda-notice-v1', '1');
-    }
-    await focusSearch();
-    await runSearch();
-
     const unlistenProgress = await listen('index_progress', (event) => {
       scanned = event.payload.scanned;
       indexed = event.payload.indexed;
@@ -1184,11 +1140,21 @@
     });
 
     const unlistenState = await listen('index_state', (event) => {
+      const prevState = indexStatus.state;
       indexStatus = {
         ...indexStatus,
         state: event.payload.state,
         message: event.payload.message ?? null
       };
+
+      if (event.payload.state === 'Indexing' && prevState !== 'Indexing') {
+        if (prevState === 'Ready') {
+          lastReadyCount = indexStatus.entriesCount;
+        }
+        startElapsedTimer();
+      } else if (event.payload.state !== 'Indexing' && prevState === 'Indexing') {
+        stopElapsedTimer();
+      }
     });
 
     const unlistenUpdated = await listen('index_updated', (event) => {
@@ -1208,19 +1174,34 @@
 
     unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus];
 
+    await refreshStatus();
+    try {
+      homePrefix = await invoke('get_home_dir');
+    } catch {
+      homePrefix = '';
+    }
+
+    if (!localStorage.getItem('everything-fda-notice-v1')) {
+      showToast('macOS Full Disk Access permission may be required for full disk search.');
+      localStorage.setItem('everything-fda-notice-v1', '1');
+    }
+    await focusSearch();
+    await runSearch();
+
     window.addEventListener('resize', updateViewportHeight);
     window.addEventListener('click', onGlobalClick);
     statusRefreshTimer = setInterval(() => {
-      if (indexStatus.state === 'Indexing') {
+      if (indexStatus.state === 'Indexing' || indexStatus.state === 'Unknown') {
         void refreshStatus();
       }
-    }, 5000);
+    }, 1000);
   });
 
   onDestroy(async () => {
     clearTimeout(searchTimer);
     clearTimeout(toastTimer);
     clearInterval(statusRefreshTimer);
+    clearInterval(elapsedTimer);
     resizeCleanup?.();
 
     for (const unlisten of unlistenFns) {
@@ -1236,16 +1217,13 @@
 
 <div class="app-shell">
   <header class="search-bar">
-    <button class="mode-toggle" on:click={toggleSearchMode} title={searchMode === 'db' ? 'DB 모드: 인덱스 기반 즉시 검색' : 'Live 모드: fd 기반 Enter 검색'}>
-      {searchMode === 'db' ? 'DB' : 'Live'}
-    </button>
     <input
       bind:this={searchInputEl}
       class="search-input"
       type="text"
       bind:value={query}
       on:input={scheduleSearch}
-      placeholder={searchMode === 'db' ? '파일/폴더 이름 검색' : '검색어 입력 후 Enter'}
+      placeholder="Search file/folder names"
       autocomplete="off"
       spellcheck="false"
     />
@@ -1338,31 +1316,31 @@
   </section>
 
   <footer class="status-bar">
-    {#if searchMode === 'live'}
-      <span>Live Search</span>
-      {#if liveSearching}
-        <span class="live-indicator">Searching...</span>
-      {:else if liveTotal > 0}
-        <span>{liveTotal.toLocaleString()} results</span>
+    {#if indexStatus.state === 'Indexing'}
+        {#if indexStatus.entriesCount > 0}
+          <span class="status-searchable">&#9679; Searchable</span>
+          <span>Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} {indexingElapsed}{/if} · {indexStatus.entriesCount.toLocaleString()} entries</span>
+        {:else}
+          <span>Starting indexing...{#if indexingElapsed} ({indexingElapsed}){/if}</span>
+        {/if}
+      {:else}
+        <span>Index: {indexStatus.state}</span>
+        <span>Entries: {indexStatus.entriesCount.toLocaleString()}</span>
+        {#if indexingFinishedAt}
+          <span>Indexed in {indexingFinishedAt}</span>
+        {/if}
       {/if}
-      {#if liveLatencyMs !== null}
-        <span>Latency: {liveLatencyMs} ms</span>
+      {#if searchModeLabel === 'spotlight' || searchModeLabel === 'spotlight_timeout'}
+        <span class="status-spotlight">Spotlight fallback{#if searchModeLabel === 'spotlight_timeout'} (partial results){/if}</span>
       {/if}
-      {#if liveTimedOut}
-        <span class="status-warning">Timeout (일부 결과)</span>
-      {/if}
-    {:else}
-      <span>Index: {indexStatus.state}</span>
-      <span>Entries: {indexStatus.entriesCount.toLocaleString()}</span>
       {#if dbLatencyMs !== null && dbLastQuery}
         <span>"{dbLastQuery}" {dbLatencyMs} ms · {results.length} results</span>
       {/if}
-    {/if}
     <button
       class="status-btn"
       on:click={resetIndex}
       disabled={indexStatus.state === 'Indexing'}
-      title={indexStatus.state === 'Indexing' ? '인덱싱 진행 중에는 reset 할 수 없습니다.' : '인덱스를 초기화하고 다시 구축합니다.'}
+      title={indexStatus.state === 'Indexing' ? 'Cannot reset while indexing is in progress.' : 'Reset and rebuild the index.'}
     >
       Reset Index
     </button>
@@ -1371,7 +1349,7 @@
       <span class="path-preview">{displayPath(currentPath)}</span>
     {/if}
     {#if indexStatus.permissionErrors > 0}
-      <span class="status-warning">권한 오류: {indexStatus.permissionErrors.toLocaleString()}건</span>
+      <span class="status-warning">Permission errors: {indexStatus.permissionErrors.toLocaleString()}</span>
     {/if}
     {#if indexStatus.message}
       <span class="status-error">{indexStatus.message}</span>
@@ -1484,25 +1462,6 @@
     background: linear-gradient(180deg, var(--bar-grad-top) 0%, var(--bar-grad-bottom) 100%);
     border-bottom: 1px solid var(--border-soft);
     min-width: 0;
-  }
-
-  .mode-toggle {
-    flex: 0 0 auto;
-    height: 32px;
-    padding: 0 10px;
-    border: 1px solid var(--button-border);
-    border-radius: 6px;
-    background: var(--button-bg);
-    color: var(--button-text);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: nowrap;
-    user-select: none;
-  }
-
-  .mode-toggle:hover {
-    filter: brightness(1.06);
   }
 
   .search-input {
@@ -1740,17 +1699,21 @@
     text-overflow: ellipsis;
   }
 
-  .live-indicator {
-    color: var(--focus-ring);
-    font-weight: 600;
-  }
-
   .status-error {
     color: var(--error-text);
   }
 
   .status-warning {
     color: var(--warning-text);
+  }
+
+  .status-searchable {
+    color: #22c55e;
+    font-weight: 600;
+  }
+  .status-spotlight {
+    color: #f59e0b;
+    font-weight: 600;
   }
 
   .context-menu {
