@@ -99,3 +99,27 @@ cargo run --manifest-path src-tauri/Cargo.toml
 ## 산출물
 - cold report: `/tmp/everything-bench-cold.json`
 - warm report: `/tmp/everything-bench-warm.json`
+
+## 클로드 피드백 반영 후 재측정 (warm-opt3)
+- report: `/tmp/everything-bench-warm-opt3.json`
+
+핵심 변경:
+- `PathSearch` resolved 분기에서 safe 범위(`dir = exact OR dir in [exact/, exact0)`) 유지 + `ext_shortcut` 적용
+- `NameSearch` no-match negative cache(부분문자열 포함 기준, 전체 결과 0건일 때만 저장)
+- 인덱스 보정: `idx_entries_dir` 유지, `idx_entries_dir_ext_name_nocase` 추가
+
+주요 지표 변화(warm 대비):
+- `TC07 (Projects/ *.rs)`: `9.245ms -> 4.811ms` (약 48% 개선)
+- `TC08 (no-match)`: `7.479ms -> 2.666ms` (약 64% 개선, 2회차부터 `name_neg_cache` hit)
+
+## Minor issue 보완 후 재측정 (warm-opt5)
+- report: `/tmp/everything-bench-warm-opt5.json`
+
+추가 보완:
+- negative cache에 TTL/age 추적 및 one-shot fallback 체크 플래그 추가
+- fallback 시도는 `WATCH_DEBOUNCE` 이후의 좁은 창에서만 1회 수행
+- legacy index drop을 meta 기반 1회 마이그레이션으로 이동
+
+주요 지표 변화(warm 대비):
+- `TC07 (Projects/ *.rs)`: `9.245ms -> 3.948ms`
+- `TC08 (no-match)`: `7.479ms -> 2.493ms`
