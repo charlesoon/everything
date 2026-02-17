@@ -2757,7 +2757,7 @@ fn execute_search(
                 let prefix_sql = format!(
                     r#"
                     SELECT path, name, dir, is_dir, ext, mtime
-                    FROM entries
+                    FROM entries INDEXED BY idx_entries_name_nocase
                     WHERE name LIKE ?1 ESCAPE '\'
                       AND name COLLATE NOCASE != ?2
                     ORDER BY {bare_order}
@@ -2777,38 +2777,69 @@ fn execute_search(
             }
 
             if results.is_empty() && offset == 0 {
-                let phase2_start = Instant::now();
+                // Phase 2a: quick existence check with tight budget.
+                // Contains-match (LIKE '%q%') requires full scan — use a short
+                // probe to avoid 30ms stalls on no-match queries.
+                let probe_start = Instant::now();
                 conn.progress_handler(
-                    10_000,
-                    Some(move || phase2_start.elapsed().as_millis() > 30),
+                    5_000,
+                    Some(move || probe_start.elapsed().as_millis() > 8),
                 );
 
-                let phase2_sql = format!(
-                    r#"
-                    SELECT path, name, dir, is_dir, ext, mtime
-                    FROM entries
+                let probe_sql = r#"
+                    SELECT 1 FROM entries
                     WHERE name LIKE ?1 ESCAPE '\'
                       AND name COLLATE NOCASE != ?2
                       AND name NOT LIKE ?3 ESCAPE '\'
-                    ORDER BY {bare_order}
-                    LIMIT ?4
-                    "#,
-                );
-                if let Ok(mut stmt2) = conn.prepare(&phase2_sql) {
-                    if let Ok(rows2) = stmt2.query_map(
-                        params![name_like, exact_query, prefix_like, effective_limit],
-                        row_to_entry,
-                    ) {
-                        for row in rows2 {
-                            match row {
-                                Ok(entry) => results.push(entry),
-                                Err(_) => break,
+                    LIMIT 1
+                "#;
+                let has_match = conn
+                    .prepare(probe_sql)
+                    .and_then(|mut s| {
+                        s.query_row(
+                            params![name_like, exact_query, prefix_like],
+                            |_| Ok(true),
+                        )
+                    })
+                    .unwrap_or(false);
+
+                conn.progress_handler(0, None::<fn() -> bool>);
+
+                // Phase 2b: fetch full results only when probe found a match.
+                if has_match {
+                    let phase2_start = Instant::now();
+                    conn.progress_handler(
+                        10_000,
+                        Some(move || phase2_start.elapsed().as_millis() > 30),
+                    );
+
+                    let phase2_sql = format!(
+                        r#"
+                        SELECT path, name, dir, is_dir, ext, mtime
+                        FROM entries
+                        WHERE name LIKE ?1 ESCAPE '\'
+                          AND name COLLATE NOCASE != ?2
+                          AND name NOT LIKE ?3 ESCAPE '\'
+                        ORDER BY {bare_order}
+                        LIMIT ?4
+                        "#,
+                    );
+                    if let Ok(mut stmt2) = conn.prepare(&phase2_sql) {
+                        if let Ok(rows2) = stmt2.query_map(
+                            params![name_like, exact_query, prefix_like, effective_limit],
+                            row_to_entry,
+                        ) {
+                            for row in rows2 {
+                                match row {
+                                    Ok(entry) => results.push(entry),
+                                    Err(_) => break,
+                                }
                             }
                         }
                     }
-                }
 
-                conn.progress_handler(0, None::<fn() -> bool>);
+                    conn.progress_handler(0, None::<fn() -> bool>);
+                }
             }
         }
 
@@ -2954,43 +2985,98 @@ fn execute_search(
                         results.push(row.map_err(|e| e.to_string())?);
                     }
                 } else {
-                    let path_start = Instant::now();
-                    conn.progress_handler(
-                        10_000,
-                        Some(move || path_start.elapsed().as_millis() > 30),
-                    );
+                    // Phase A: fast prefix search via name index
+                    // "%main%" -> strip leading '%' -> "main%" can use idx_entries_name_nocase
+                    let prefix_like = if name_like.starts_with('%') {
+                        let rest = &name_like[1..];
+                        if !rest.is_empty() && !rest.starts_with('%') {
+                            Some(rest.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Already a prefix pattern (e.g. "test%"), use as-is
+                        Some(name_like.clone())
+                    };
 
-                    let sql = format!(
-                        r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
-                        FROM entries e
-                        WHERE (e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\')
-                          AND e.name LIKE ?3 ESCAPE '\'
-                        ORDER BY {order_by}
-                        LIMIT ?4 OFFSET ?5
-                        "#,
-                    );
-                    if let Ok(mut stmt) = conn.prepare(&sql) {
-                        if let Ok(rows) = stmt.query_map(
-                            params![
-                                dir_like_exact,
-                                dir_like_sub,
-                                name_like,
-                                effective_limit,
-                                offset
-                            ],
-                            row_to_entry,
-                        ) {
-                            for row in rows {
-                                match row {
-                                    Ok(entry) => results.push(entry),
-                                    Err(_) => break,
+                    if offset == 0 {
+                        if let Some(ref pfx) = prefix_like {
+                            let sql = format!(
+                                r#"
+                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                                FROM entries e INDEXED BY idx_entries_name_nocase
+                                WHERE e.name LIKE ?1 ESCAPE '\'
+                                  AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
+                                ORDER BY {order_by}
+                                LIMIT ?4
+                                "#,
+                            );
+                            if let Ok(mut stmt) = conn.prepare(&sql) {
+                                if let Ok(rows) = stmt.query_map(
+                                    params![
+                                        pfx,
+                                        dir_like_exact,
+                                        dir_like_sub,
+                                        effective_limit
+                                    ],
+                                    row_to_entry,
+                                ) {
+                                    for row in rows {
+                                        match row {
+                                            Ok(entry) => results.push(entry),
+                                            Err(_) => break,
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
 
-                    conn.progress_handler(0, None::<fn() -> bool>);
+                    // Phase B: time-budgeted contains fallback if prefix found too few
+                    if results.len() < effective_limit as usize {
+                        let path_start = Instant::now();
+                        conn.progress_handler(
+                            10_000,
+                            Some(move || path_start.elapsed().as_millis() > 30),
+                        );
+
+                        let sql = format!(
+                            r#"
+                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.mtime
+                            FROM entries e
+                            WHERE (e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\')
+                              AND e.name LIKE ?3 ESCAPE '\'
+                            ORDER BY {order_by}
+                            LIMIT ?4 OFFSET ?5
+                            "#,
+                        );
+                        if let Ok(mut stmt) = conn.prepare(&sql) {
+                            if let Ok(rows) = stmt.query_map(
+                                params![
+                                    dir_like_exact,
+                                    dir_like_sub,
+                                    name_like,
+                                    effective_limit,
+                                    offset
+                                ],
+                                row_to_entry,
+                            ) {
+                                for row in rows {
+                                    match row {
+                                        Ok(entry) => results.push(entry),
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                        }
+
+                        conn.progress_handler(0, None::<fn() -> bool>);
+
+                        // Deduplicate (Phase A prefix results overlap with Phase B contains)
+                        let mut seen = std::collections::HashSet::new();
+                        results.retain(|e| seen.insert(e.path.clone()));
+                        results.truncate(effective_limit as usize);
+                    }
                 }
             }
         }
