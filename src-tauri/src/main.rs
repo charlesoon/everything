@@ -1950,25 +1950,24 @@ fn run_incremental_index_inner(
             if pass == 0 {
                 builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
             }
-            let walker = builder
-                .process_read_dir(move |_depth, path, _state, children| {
-                    children.retain(|entry_result| {
-                        entry_result
-                            .as_ref()
-                            .map(|entry| {
-                                let full_path = path.join(&entry.file_name);
-                                let is_dir = Some(entry.file_type.is_dir());
-                                !should_skip_path_ext(
-                                    &full_path,
-                                    &skip_roots,
-                                    &skip_patterns,
-                                    Some(&gi_ref),
-                                    is_dir,
-                                )
-                            })
-                            .unwrap_or(false)
-                    });
+            let walker = builder.process_read_dir(move |_depth, path, _state, children| {
+                children.retain(|entry_result| {
+                    entry_result
+                        .as_ref()
+                        .map(|entry| {
+                            let full_path = path.join(&entry.file_name);
+                            let is_dir = Some(entry.file_type.is_dir());
+                            !should_skip_path_ext(
+                                &full_path,
+                                &skip_roots,
+                                &skip_patterns,
+                                Some(&gi_ref),
+                                is_dir,
+                            )
+                        })
+                        .unwrap_or(false)
                 });
+            });
 
             for result in walker {
                 match result {
@@ -2019,7 +2018,8 @@ fn run_incremental_index_inner(
                             emit_index_progress(app, scanned, indexed, current_path.clone());
                             last_emit = Instant::now();
                         }
-                        if perf_log_enabled() && last_perf_emit.elapsed() >= Duration::from_secs(1) {
+                        if perf_log_enabled() && last_perf_emit.elapsed() >= Duration::from_secs(1)
+                        {
                             perf_log(format!(
                                 "index_progress pass={} scanned={} indexed={} current_path={}",
                                 pass_label, scanned, indexed, current_path
@@ -2074,11 +2074,14 @@ fn run_incremental_index_inner(
         // After shallow pass, emit progress so UI shows searchable state early
         if pass == 0 {
             let _ = emit_status_counts(app, state);
-            let _ = app.emit("index_updated", IndexUpdatedEvent {
-                entries_count: state.status.lock().entries_count,
-                last_updated: now_epoch(),
-                permission_errors,
-            });
+            let _ = app.emit(
+                "index_updated",
+                IndexUpdatedEvent {
+                    entries_count: state.status.lock().entries_count,
+                    last_updated: now_epoch(),
+                    permission_errors,
+                },
+            );
         }
     }
 
@@ -2347,7 +2350,10 @@ fn start_fsevent_watcher_worker(
                 }
                 Ok(fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
                     must_scan_count += 1;
-                    if replay_phase && must_scan_count >= MUST_SCAN_THRESHOLD && !full_scan_triggered {
+                    if replay_phase
+                        && must_scan_count >= MUST_SCAN_THRESHOLD
+                        && !full_scan_triggered
+                    {
                         perf_log(format!(
                             "conditional_startup: MustScanSubDirs={} >= threshold, triggering full scan",
                             must_scan_count
@@ -2356,7 +2362,8 @@ fn start_fsevent_watcher_worker(
                         let _ = start_full_index_worker(app.clone(), state.clone());
                     }
                     if !state.indexing_active.load(AtomicOrdering::Acquire) {
-                        let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
+                        let (ignored_roots, ignored_patterns) =
+                            cached_effective_ignore_rules(&state);
                         let rows = collect_rows_recursive(&path, &ignored_roots, &ignored_patterns);
                         if !rows.is_empty() {
                             if let Ok(mut conn) = db_connection(&state.db_path) {
@@ -2781,10 +2788,7 @@ fn execute_search(
                 // Contains-match (LIKE '%q%') requires full scan — use a short
                 // probe to avoid 30ms stalls on no-match queries.
                 let probe_start = Instant::now();
-                conn.progress_handler(
-                    5_000,
-                    Some(move || probe_start.elapsed().as_millis() > 8),
-                );
+                conn.progress_handler(5_000, Some(move || probe_start.elapsed().as_millis() > 8));
 
                 let probe_sql = r#"
                     SELECT 1 FROM entries
@@ -2796,10 +2800,7 @@ fn execute_search(
                 let has_match = conn
                     .prepare(probe_sql)
                     .and_then(|mut s| {
-                        s.query_row(
-                            params![name_like, exact_query, prefix_like],
-                            |_| Ok(true),
-                        )
+                        s.query_row(params![name_like, exact_query, prefix_like], |_| Ok(true))
                     })
                     .unwrap_or(false);
 
@@ -3013,12 +3014,7 @@ fn execute_search(
                             );
                             if let Ok(mut stmt) = conn.prepare(&sql) {
                                 if let Ok(rows) = stmt.query_map(
-                                    params![
-                                        pfx,
-                                        dir_like_exact,
-                                        dir_like_sub,
-                                        effective_limit
-                                    ],
+                                    params![pfx, dir_like_exact, dir_like_sub, effective_limit],
                                     row_to_entry,
                                 ) {
                                     for row in rows {
@@ -3249,7 +3245,10 @@ fn reveal_in_finder_impl(paths: Vec<String>) -> AppResult<()> {
             .map_err(|e| e.to_string())?;
 
         if !status.success() {
-            return Err(format!("Failed to open in Finder: {}", parent.to_string_lossy()));
+            return Err(format!(
+                "Failed to open in Finder: {}",
+                parent.to_string_lossy()
+            ));
         }
     }
 
@@ -3310,8 +3309,7 @@ fn copy_text_to_clipboard(text: &str) -> AppResult<()> {
     }
 
     Err(last_error.unwrap_or_else(|| {
-        "No supported clipboard tool found. Please install wl-copy, xclip, or xsel."
-            .to_string()
+        "No supported clipboard tool found. Please install wl-copy, xclip, or xsel.".to_string()
     }))
 }
 
@@ -3856,7 +3854,7 @@ fn start_bench_runner(app_handle: AppHandle, state: AppState) {
 
 #[cfg(target_os = "macos")]
 fn register_global_shortcut(app: &AppHandle) -> AppResult<()> {
-    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyF);
+    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::ALT), Code::KeyF);
 
     app.global_shortcut()
         .on_shortcut(shortcut, move |app_handle, _, _| {
