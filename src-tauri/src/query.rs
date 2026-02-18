@@ -72,10 +72,17 @@ pub fn parse_query(query: &str) -> SearchMode {
             format!("%{}%", escape_like(name_part))
         };
 
+        let dir_hint = dir_part
+            .split('/')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+
         return SearchMode::PathSearch {
             path_like,
             name_like,
-            dir_hint: dir_part.to_string(),
+            dir_hint,
         };
     }
 

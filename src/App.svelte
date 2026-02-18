@@ -418,21 +418,26 @@
   async function runSearch() {
     searchGeneration += 1;
     const gen = searchGeneration;
+    const searchQuery = query;
+    const searchSortBy = sortBy;
+    const searchSortDir = sortDir;
     const startedAt = performance.now();
     try {
       const keepPaths = new Set(selectedPaths());
       const next = await invoke('search', {
-        query,
+        query: searchQuery,
         limit: PAGE_SIZE,
         offset: 0,
-        sort_by: sortBy,
-        sort_dir: sortDir
+        sort_by: searchSortBy,
+        sort_dir: searchSortDir
       });
 
-      if (gen !== searchGeneration) return;
+      if (gen !== searchGeneration) {
+        if (searchQuery !== query || searchSortBy !== sortBy || searchSortDir !== sortDir) return;
+      }
 
       dbLatencyMs = Math.round(performance.now() - startedAt);
-      dbLastQuery = query;
+      dbLastQuery = searchQuery;
       const entries = Array.isArray(next.entries) ? next.entries : [];
       searchModeLabel = next.modeLabel || '';
       results = entries;
@@ -448,7 +453,9 @@
 
       updateViewportHeight();
     } catch (err) {
-      if (gen !== searchGeneration) return;
+      if (gen !== searchGeneration) {
+        if (searchQuery !== query || searchSortBy !== sortBy || searchSortDir !== sortDir) return;
+      }
       showToast(`Search failed: ${String(err)}`);
     }
   }
@@ -1168,7 +1175,8 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      void runSearch();
+      if (query && results.length > 0) return;
+      scheduleSearch();
     });
 
     const unlistenFocus = await listen('focus_search', () => {
@@ -1336,7 +1344,6 @@
   <footer class="status-bar">
     {#if indexStatus.state === 'Indexing'}
         {#if indexStatus.entriesCount > 0}
-          <span class="status-searchable">&#9679; Searchable</span>
           <span>Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if} · {indexStatus.entriesCount.toLocaleString()} entries</span>
         {:else}
           <span>Starting indexing...{#if indexingElapsed} ({indexingElapsed}){/if}</span>
@@ -1734,10 +1741,6 @@
     color: var(--warning-text);
   }
 
-  .status-searchable {
-    color: #22c55e;
-    font-weight: 600;
-  }
   .status-spotlight {
     color: #f59e0b;
     font-weight: 600;
