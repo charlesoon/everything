@@ -13,14 +13,13 @@
   const minColumnWidth = {
     name: 180,
     path: 240,
-    size: 70,
+    size: 75,
     modified: 120
   };
   const defaultColumnRatios = {
     name: 0.3,
     path: 0.45,
-    size: 0.1,
-    modified: 0.15
+    size: 0.1
   };
 
   let query = '';
@@ -75,7 +74,7 @@
   let colWidths = {
     name: 250,
     path: 350,
-    size: 70,
+    size: 75,
     modified: 120
   };
 
@@ -229,13 +228,36 @@
 
     const saved = loadColWidths();
     if (saved) {
-      colWidths = saved;
+      const total = columnKeys.reduce((s, k) => s + saved[k], 0);
+      if (Math.abs(total - width) > 2) {
+        const scale = (width - saved.modified) / (total - saved.modified);
+        let scaledName = Math.max(minColumnWidth.name, Math.round(saved.name * scale));
+        let scaledSize = Math.max(minColumnWidth.size, Math.round(saved.size * scale));
+        let rawPath = width - saved.modified - scaledName - scaledSize;
+        if (rawPath < minColumnWidth.path) {
+          const shortfall = minColumnWidth.path - rawPath;
+          const nameReduction = Math.min(shortfall, scaledName - minColumnWidth.name);
+          scaledName -= nameReduction;
+          const remaining = shortfall - nameReduction;
+          if (remaining > 0) {
+            scaledSize -= Math.min(remaining, scaledSize - minColumnWidth.size);
+          }
+          rawPath = width - saved.modified - scaledName - scaledSize;
+        }
+        const scaledPath = Math.max(minColumnWidth.path, rawPath);
+        colWidths = { name: scaledName, path: scaledPath, size: scaledSize, modified: saved.modified };
+      } else {
+        colWidths = saved;
+      }
     } else {
+      const fixedModified = minColumnWidth.modified;
+      const rest = width - fixedModified;
+      const ratioSum = defaultColumnRatios.name + defaultColumnRatios.path + defaultColumnRatios.size;
       colWidths = {
-        name: Math.max(minColumnWidth.name, Math.round(width * defaultColumnRatios.name)),
-        path: Math.max(minColumnWidth.path, Math.round(width * defaultColumnRatios.path)),
-        size: Math.max(minColumnWidth.size, Math.round(width * defaultColumnRatios.size)),
-        modified: Math.max(minColumnWidth.modified, Math.round(width * defaultColumnRatios.modified))
+        name: Math.max(minColumnWidth.name, Math.round(rest * defaultColumnRatios.name / ratioSum)),
+        path: Math.max(minColumnWidth.path, Math.round(rest * defaultColumnRatios.path / ratioSum)),
+        size: Math.max(minColumnWidth.size, Math.round(rest * defaultColumnRatios.size / ratioSum)),
+        modified: fixedModified
       };
     }
     lastTableWidth = width;
@@ -275,25 +297,27 @@
 
     const startX = event.clientX;
     const startLeft = colWidths[leftKey];
+    const rightKey = columnKeys[index + 1];
+    const startRight = colWidths[rightKey];
 
     resizeCleanup?.();
     resizingColumn = leftKey;
 
-    const rightKey = columnKeys[index + 1];
-    const startRight = colWidths[rightKey];
-
     const onMove = (moveEvent) => {
-      const delta = moveEvent.clientX - startX;
-      const maxLeft = startLeft + startRight - minColumnWidth[rightKey];
-      const maxRight = startLeft + startRight - minColumnWidth[leftKey];
-      const nextLeft = Math.min(maxLeft, Math.max(minColumnWidth[leftKey], Math.round(startLeft + delta)));
-      const nextRight = Math.min(maxRight, Math.max(minColumnWidth[rightKey], Math.round(startRight - delta)));
-
-      colWidths = {
-        ...colWidths,
-        [leftKey]: nextLeft,
-        [rightKey]: nextRight
-      };
+      const delta = Math.round(moveEvent.clientX - startX);
+      if (leftKey === 'name') {
+        // Two-column trade: name and path swap space, each respects its minimum
+        const nextLeft = Math.max(
+          minColumnWidth[leftKey],
+          Math.min(startLeft + delta, startLeft + startRight - minColumnWidth[rightKey])
+        );
+        const nextRight = startLeft + startRight - nextLeft;
+        colWidths = { ...colWidths, [leftKey]: nextLeft, [rightKey]: nextRight };
+      } else {
+        // path splitter: path grows unconstrained (allows horizontal scroll on right drag)
+        const nextLeft = Math.max(minColumnWidth[leftKey], startLeft + delta);
+        colWidths = { ...colWidths, [leftKey]: nextLeft };
+      }
     };
 
     const onUp = () => {
@@ -1175,7 +1199,7 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      if (query.trim() && results.length > 0) return;
+      if (results.length > 0) return;
       scheduleSearch();
     });
 
@@ -1274,13 +1298,6 @@
           <button type="button" class="col-button" on:click={() => handleHeaderSort('size')}>
             Size{#if sortBy === 'size'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
           </button>
-          <button
-            type="button"
-            class="col-resizer"
-            class:active={resizingColumn === 'size'}
-            on:mousedown={(event) => startColumnResize(event, 'size')}
-            aria-label="Resize Size column"
-          />
         </div>
 
         <div class="col modified">
@@ -1508,6 +1525,7 @@
   .search-input::placeholder {
     color: var(--text-muted);
     opacity: 0.85;
+    font-size: 12px;
   }
 
   .search-input:focus {
@@ -1526,9 +1544,8 @@
   .table-header-track,
   .row {
     display: grid;
-    grid-template-columns: var(--col-name, 30%) minmax(var(--col-path, 240px), 1fr) var(--col-size, 10%) var(--col-modified, 15%);
+    grid-template-columns: var(--col-name) var(--col-path) var(--col-size) var(--col-modified);
     align-items: center;
-    min-width: var(--table-min-width, 0px);
     width: max(var(--table-min-width, 0px), 100%);
   }
 
@@ -1611,7 +1628,6 @@
 
   .spacer {
     position: relative;
-    min-width: var(--table-min-width, 0px);
     width: max(var(--table-min-width, 0px), 100%);
   }
 
@@ -1619,7 +1635,6 @@
     position: absolute;
     top: 0;
     left: 0;
-    min-width: var(--table-min-width, 0px);
     width: max(var(--table-min-width, 0px), 100%);
   }
 

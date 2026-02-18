@@ -17,7 +17,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rusqlite::{params, params_from_iter, Connection, types::Value as SqlValue};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "macos")]
@@ -2305,9 +2305,8 @@ fn process_watcher_paths(
             if changed > 0 {
                 invalidate_search_caches(state);
                 touch_status_updated(state);
-                let _ = update_status_counts(state);
                 if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                    emit_status_counts(app, state);
+                    let _ = refresh_and_emit_status_counts(app, state);
                     *last_status_emit = Instant::now();
                     *pending_status_emit = false;
                 } else {
@@ -2389,14 +2388,17 @@ fn start_fsevent_watcher_worker(
             let wait = match deadline {
                 Some(due) => {
                     let now = Instant::now();
-                    if now >= due { Duration::from_millis(0) } else { due - now }
+                    if now >= due {
+                        Duration::from_millis(0)
+                    } else {
+                        due - now
+                    }
                 }
                 None => Duration::from_secs(1),
             };
             match rx.recv_timeout(wait) {
                 Ok(fsevent_watcher::FsEvent::Paths(paths)) => {
-                    let (ignored_roots, ignored_patterns) =
-                        cached_effective_ignore_rules(&state);
+                    let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
                     let prev_len = pending_paths.len();
                     for path in paths {
                         if !should_skip_path(&path, &ignored_roots, &ignored_patterns) {
@@ -2429,9 +2431,8 @@ fn start_fsevent_watcher_worker(
                                 if upsert_rows(&mut conn, &rows).is_ok() {
                                     invalidate_search_caches(&state);
                                     touch_status_updated(&state);
-                                    let _ = update_status_counts(&state);
                                     if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                                        emit_status_counts(&app, &state);
+                                        let _ = refresh_and_emit_status_counts(&app, &state);
                                         last_status_emit = Instant::now();
                                         pending_status_emit = false;
                                     } else {
@@ -2482,7 +2483,7 @@ fn start_fsevent_watcher_worker(
             }
 
             if pending_status_emit && last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                emit_status_counts(&app, &state);
+                let _ = refresh_and_emit_status_counts(&app, &state);
                 last_status_emit = Instant::now();
                 pending_status_emit = false;
             }
@@ -2693,7 +2694,7 @@ fn execute_search(
 ) -> AppResult<SearchExecution> {
     let query = query.trim().to_string();
     let base_limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let effective_limit = if query.chars().count() <= 1 {
+    let effective_limit = if !query.is_empty() && query.chars().count() <= 1 {
         base_limit.min(SHORT_QUERY_LIMIT)
     } else {
         base_limit
@@ -2885,7 +2886,10 @@ fn execute_search(
                         // Contains-match (LIKE '%q%') requires full scan — use a short
                         // probe to avoid 30ms stalls on no-match queries.
                         let probe_start = Instant::now();
-                        conn.progress_handler(5_000, Some(move || probe_start.elapsed().as_millis() > 8));
+                        conn.progress_handler(
+                            5_000,
+                            Some(move || probe_start.elapsed().as_millis() > 8),
+                        );
 
                         let probe_sql = r#"
                             SELECT 1 FROM entries
@@ -2897,7 +2901,9 @@ fn execute_search(
                         let has_match = conn
                             .prepare(probe_sql)
                             .and_then(|mut s| {
-                                s.query_row(params![name_like, exact_query, prefix_like], |_| Ok(true))
+                                s.query_row(params![name_like, exact_query, prefix_like], |_| {
+                                    Ok(true)
+                                })
                             })
                             .unwrap_or(false);
 
@@ -3007,7 +3013,9 @@ fn execute_search(
                             sql_params.push(SqlValue::Text(pfx_end));
                             dir_conditions.push(format!(
                                 "(e.dir = ?{} OR (e.dir >= ?{} AND e.dir < ?{}))",
-                                i + 1, i + 2, i + 3
+                                i + 1,
+                                i + 2,
+                                i + 3
                             ));
                         }
                         let dir_where = dir_conditions.join(" OR ");
@@ -3128,7 +3136,12 @@ fn execute_search(
                                     );
                                     if let Ok(mut stmt) = conn.prepare(&sql) {
                                         if let Ok(rows) = stmt.query_map(
-                                            params![pfx, dir_like_exact, dir_like_sub, effective_limit],
+                                            params![
+                                                pfx,
+                                                dir_like_exact,
+                                                dir_like_sub,
+                                                effective_limit
+                                            ],
                                             row_to_entry,
                                         ) {
                                             for row in rows {
@@ -3559,7 +3572,10 @@ async fn rename(
                 dir: parent.to_string_lossy().to_string(),
                 is_dir: old_path.is_dir(),
                 ext: extension_for(&old_path, old_path.is_dir()),
-                size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len() as i64),
+                size: meta
+                    .as_ref()
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len() as i64),
                 mtime: meta
                     .and_then(|m| m.modified().ok())
                     .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
@@ -3607,7 +3623,10 @@ async fn rename(
             dir: parent.to_string_lossy().to_string(),
             is_dir: original_is_dir,
             ext: extension_for(&new_path, original_is_dir),
-            size: new_meta.as_ref().filter(|m| m.is_file()).map(|m| m.len() as i64),
+            size: new_meta
+                .as_ref()
+                .filter(|m| m.is_file())
+                .map(|m| m.len() as i64),
             mtime: new_meta
                 .and_then(|m| m.modified().ok())
                 .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
@@ -4567,7 +4586,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.results.len(), 2, "should find both files under log/ and log/archive/");
+        assert_eq!(
+            result.results.len(),
+            2,
+            "should find both files under log/ and log/archive/"
+        );
         let names: Vec<&str> = result.results.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"20260211_14.txt"));
         assert!(names.contains(&"old.log"));
@@ -4583,7 +4606,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result2.results.len(), 2, "glob * should also list all files");
+        assert_eq!(
+            result2.results.len(),
+            2,
+            "glob * should also list all files"
+        );
 
         // Query with trailing dot: "jp.naver.line/log/ *." — name_like becomes "%."
         let result3 = execute_search(
@@ -4598,7 +4625,11 @@ mod tests {
 
         // "*." matches files ending with "." — none of our test files end with "."
         // so this correctly returns 0 (this is expected, NOT a bug)
-        assert_eq!(result3.results.len(), 0, "*. matches only files ending with dot");
+        assert_eq!(
+            result3.results.len(),
+            0,
+            "*. matches only files ending with dot"
+        );
 
         // But plain "/" at end should list all
         let result4 = execute_search(
@@ -4611,7 +4642,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result4.results.len(), 2, "trailing slash should list all files");
+        assert_eq!(
+            result4.results.len(),
+            2,
+            "trailing slash should list all files"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
