@@ -4065,6 +4065,12 @@ fn register_global_shortcut(_app: &AppHandle) -> AppResult<()> {
 fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     let bench_mode = bench_mode_enabled();
 
+    #[cfg(target_os = "macos")]
+    if let Some(window) = app.get_webview_window("main") {
+        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+        let _ = apply_vibrancy(&window, NSVisualEffectMaterial::UnderWindowBackground, None, None);
+    }
+
     let app_data_dir = app
         .path()
         .app_data_dir()

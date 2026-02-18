@@ -1420,58 +1420,58 @@
 <style>
   :global(:root) {
     color-scheme: light dark;
-    --bg-app: #f4f5f7;
-    --text-primary: #0f1720;
-    --text-muted: #4d5a6a;
-    --bar-grad-top: #f7f8fa;
-    --bar-grad-bottom: #eceff3;
-    --surface-header: #eff2f6;
-    --surface: #ffffff;
-    --border-soft: #d8dde4;
-    --border-input: #b9c2cd;
+    --bg-app: transparent;
+    --text-primary: #0d1826;
+    --text-muted: #48596c;
+    --bar-grad-top: rgba(255, 255, 255, 0.48);
+    --bar-grad-bottom: rgba(248, 250, 253, 0.42);
+    --surface-header: rgba(252, 252, 255, 0.40);
+    --surface: rgba(255, 255, 255, 0.22);
+    --border-soft: rgba(0, 0, 0, 0.07);
+    --border-input: rgba(0, 0, 0, 0.13);
     --focus-ring: #6f96e6;
-    --row-border: #f0f3f6;
-    --row-hover: #eef5ff;
-    --row-selected: #d6e7ff;
-    --button-bg: #ffffff;
-    --button-border: #b8c3cf;
-    --button-text: #304256;
-    --menu-bg: #ffffff;
-    --menu-border: #cfd6df;
-    --menu-hover: #edf3ff;
-    --menu-text: #213042;
+    --row-border: rgba(0, 0, 0, 0.032);
+    --row-hover: rgba(255, 255, 255, 0.52);
+    --row-selected: rgba(55, 125, 255, 0.17);
+    --button-bg: rgba(255, 255, 255, 0.62);
+    --button-border: rgba(0, 0, 0, 0.10);
+    --button-text: #2c3e50;
+    --menu-bg: rgba(240, 241, 248, 0.90);
+    --menu-border: rgba(0, 0, 0, 0.06);
+    --menu-hover: rgba(255, 255, 255, 0.62);
+    --menu-text: #1a2a38;
     --error-text: #b64545;
     --warning-text: #8f6500;
-    --toast-bg: rgba(29, 37, 49, 0.95);
+    --toast-bg: rgba(18, 22, 32, 0.90);
     --toast-text: #ffffff;
   }
 
   @media (prefers-color-scheme: dark) {
     :global(:root) {
-      --bg-app: #1f1f1f;
-      --text-primary: #e6e6e8;
-      --text-muted: #a7a7af;
-      --bar-grad-top: #1f1f1f;
-      --bar-grad-bottom: #1f1f1f;
-      --surface-header: #1f1f1f;
-      --surface: #1c1c1e;
-      --border-soft: #303033;
-      --border-input: #4a4a50;
+      --bg-app: transparent;
+      --text-primary: #e6e6ea;
+      --text-muted: #9494a4;
+      --bar-grad-top: rgba(38, 38, 46, 0.52);
+      --bar-grad-bottom: rgba(30, 30, 38, 0.46);
+      --surface-header: rgba(32, 32, 40, 0.46);
+      --surface: rgba(18, 18, 26, 0.32);
+      --border-soft: rgba(255, 255, 255, 0.065);
+      --border-input: rgba(255, 255, 255, 0.14);
       --focus-ring: #5b8bd9;
-      --row-border: #2a2a2e;
-      --row-hover: #2d2d31;
-      --row-selected: #3a404a;
-      --button-bg: #2a2a2e;
-      --button-border: #4a4a50;
-      --button-text: #e1e1e4;
-      --menu-bg: #252529;
-      --menu-border: #3a3a40;
-      --menu-hover: #333338;
-      --menu-text: #e2e2e6;
+      --row-border: rgba(255, 255, 255, 0.026);
+      --row-hover: rgba(255, 255, 255, 0.054);
+      --row-selected: rgba(85, 145, 255, 0.22);
+      --button-bg: rgba(255, 255, 255, 0.072);
+      --button-border: rgba(255, 255, 255, 0.11);
+      --button-text: #d6d6e0;
+      --menu-bg: rgba(36, 36, 46, 0.90);
+      --menu-border: rgba(255, 255, 255, 0.066);
+      --menu-hover: rgba(255, 255, 255, 0.062);
+      --menu-text: #e0e0e8;
       --error-text: #ff9d9d;
       --warning-text: #e0c670;
-      --toast-bg: rgba(24, 24, 26, 0.95);
-      --toast-text: #f3f3f4;
+      --toast-bg: rgba(10, 10, 16, 0.93);
+      --toast-text: #f2f2f6;
     }
   }
 
@@ -1480,7 +1480,7 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
-    background: var(--bg-app);
+    background: transparent;
     color: var(--text-primary);
     font-family: 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif;
   }
@@ -1515,11 +1515,13 @@
     flex: 1 1 auto;
     height: 32px;
     border: 1px solid var(--border-input);
-    border-radius: 6px;
+    border-radius: 8px;
     padding: 0 10px;
     font-size: 14px;
     background: var(--surface);
     color: var(--text-primary);
+    backdrop-filter: blur(12px) saturate(160%);
+    -webkit-backdrop-filter: blur(12px) saturate(160%);
   }
 
   .search-input::placeholder {
@@ -1766,9 +1768,11 @@
     z-index: 200;
     width: 220px;
     border: 1px solid var(--menu-border);
-    border-radius: 8px;
-    box-shadow: 0 10px 28px rgba(26, 34, 44, 0.2);
+    border-radius: 10px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.16), inset 0 0 0 0.5px rgba(255, 255, 255, 0.18);
     background: var(--menu-bg);
+    backdrop-filter: blur(28px) saturate(180%);
+    -webkit-backdrop-filter: blur(28px) saturate(180%);
     overflow: hidden;
   }
 
@@ -1792,9 +1796,12 @@
     bottom: 18px;
     background: var(--toast-bg);
     color: var(--toast-text);
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 9px 12px;
     font-size: 12px;
     z-index: 250;
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
   }
 </style>
