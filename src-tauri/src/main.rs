@@ -3978,7 +3978,7 @@ fn start_bench_runner(app_handle: AppHandle, state: AppState) {
 
 #[cfg(target_os = "macos")]
 fn register_global_shortcut(app: &AppHandle) -> AppResult<()> {
-    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyF);
+    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
 
     app.global_shortcut()
         .on_shortcut(shortcut, move |app_handle, _, _| {
