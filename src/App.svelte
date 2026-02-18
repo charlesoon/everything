@@ -1199,7 +1199,7 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      if (query.trim() && results.length > 0) return;
+      if (results.length > 0) return;
       scheduleSearch();
     });
 
