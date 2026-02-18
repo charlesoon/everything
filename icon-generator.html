@@ -33,18 +33,21 @@
             </linearGradient>
         </defs>
 
-        <!-- Icon Base Shape (Squircle) -->
-        <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#glass-gradient)" />
+        <!-- Scale down to ~80% with transparent padding for macOS dock -->
+        <g transform="translate(512, 512) scale(0.8) translate(-512, -512)">
+            <!-- Icon Base Shape (Squircle) -->
+            <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#glass-gradient)" />
 
-        <!-- Magnifier Group: Scaled 0.65 (relative to 1024 canvas) and Centered -->
-        <g transform="translate(536, 496) scale(1.3) translate(-256, -256)">
-            <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="272" cy="220" r="112" stroke="#A95500" stroke-width="40" />
-                <line x1="192" y1="300" x2="94" y2="402" stroke="#A95500" stroke-width="40" />
-                <circle cx="272" cy="220" r="112" stroke="#FF9700" stroke-width="32" />
-                <line x1="192" y1="300" x2="94" y2="402" stroke="#FF9700" stroke-width="32" />
-                <ellipse cx="240" cy="190" rx="40" ry="25" fill="white" fill-opacity="0.2"
-                    transform="rotate(-45, 240, 190)" />
+            <!-- Magnifier Group -->
+            <g transform="translate(536, 496) scale(1.55) translate(-256, -256)">
+                <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="272" cy="220" r="112" stroke="#A95500" stroke-width="64" />
+                    <line x1="192" y1="300" x2="94" y2="402" stroke="#A95500" stroke-width="64" />
+                    <circle cx="272" cy="220" r="112" stroke="#FF9700" stroke-width="54" />
+                    <line x1="192" y1="300" x2="94" y2="402" stroke="#FF9700" stroke-width="54" />
+                    <ellipse cx="240" cy="190" rx="40" ry="25" fill="white" fill-opacity="0.2"
+                        transform="rotate(-45, 240, 190)" />
+                </g>
             </g>
         </g>
     </svg>
