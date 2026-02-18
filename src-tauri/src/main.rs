@@ -1624,6 +1624,13 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
                 continue;
             }
 
+            if normalized == "/" {
+                deleted += stmt_children
+                    .execute(params!["/", "0"])
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+
             deleted += stmt_exact
                 .execute(params![&normalized])
                 .map_err(|e| e.to_string())?;
@@ -2280,6 +2287,7 @@ fn process_watcher_paths(
     state: &AppState,
     pending: &mut HashSet<PathBuf>,
     last_status_emit: &mut Instant,
+    pending_status_emit: &mut bool,
 ) {
     if pending.is_empty() {
         return;
@@ -2297,9 +2305,13 @@ fn process_watcher_paths(
             if changed > 0 {
                 invalidate_search_caches(state);
                 touch_status_updated(state);
+                let _ = update_status_counts(state);
                 if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
                     emit_status_counts(app, state);
                     *last_status_emit = Instant::now();
+                    *pending_status_emit = false;
+                } else {
+                    *pending_status_emit = true;
                 }
             }
         }
@@ -2367,6 +2379,7 @@ fn start_fsevent_watcher_worker(
         let mut deadline: Option<Instant> = None;
         let mut last_flush = Instant::now();
         let mut last_status_emit = Instant::now();
+        let mut pending_status_emit = false;
         let mut last_count_refresh = Instant::now();
         let mut must_scan_count: usize = 0;
         let mut replay_phase = conditional;
@@ -2413,19 +2426,30 @@ fn start_fsevent_watcher_worker(
                         let rows = collect_rows_recursive(&path, &ignored_roots, &ignored_patterns);
                         if !rows.is_empty() {
                             if let Ok(mut conn) = db_connection(&state.db_path) {
-                                let _ = upsert_rows(&mut conn, &rows);
-                                invalidate_search_caches(&state);
-                                touch_status_updated(&state);
-                                if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                                    emit_status_counts(&app, &state);
-                                    last_status_emit = Instant::now();
+                                if upsert_rows(&mut conn, &rows).is_ok() {
+                                    invalidate_search_caches(&state);
+                                    touch_status_updated(&state);
+                                    let _ = update_status_counts(&state);
+                                    if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
+                                        emit_status_counts(&app, &state);
+                                        last_status_emit = Instant::now();
+                                        pending_status_emit = false;
+                                    } else {
+                                        pending_status_emit = true;
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 Ok(fsevent_watcher::FsEvent::HistoryDone) => {
-                    process_watcher_paths(&app, &state, &mut pending_paths, &mut last_status_emit);
+                    process_watcher_paths(
+                        &app,
+                        &state,
+                        &mut pending_paths,
+                        &mut last_status_emit,
+                        &mut pending_status_emit,
+                    );
                     deadline = None;
                     if replay_phase {
                         replay_phase = false;
@@ -2435,6 +2459,8 @@ fn start_fsevent_watcher_worker(
                                 must_scan_count
                             ));
                             let _ = refresh_and_emit_status_counts(&app, &state);
+                            last_status_emit = Instant::now();
+                            pending_status_emit = false;
                         }
                     }
                 }
@@ -2444,9 +2470,21 @@ fn start_fsevent_watcher_worker(
 
             if let Some(due) = deadline {
                 if Instant::now() >= due {
-                    process_watcher_paths(&app, &state, &mut pending_paths, &mut last_status_emit);
+                    process_watcher_paths(
+                        &app,
+                        &state,
+                        &mut pending_paths,
+                        &mut last_status_emit,
+                        &mut pending_status_emit,
+                    );
                     deadline = None;
                 }
+            }
+
+            if pending_status_emit && last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
+                emit_status_counts(&app, &state);
+                last_status_emit = Instant::now();
+                pending_status_emit = false;
             }
 
             // Periodic event_id flush
@@ -4311,6 +4349,48 @@ mod tests {
         assert!(!in_scope("/Users/user/Projects.archived"));
         assert!(!in_scope("/Users/user/Projects_archived"));
         assert!(!in_scope("/Users/user/Projectz"));
+    }
+
+    #[test]
+    fn delete_paths_root_clears_all_entries() {
+        let root = temp_case_dir("delete_paths_root");
+        let dir_a = root.join("alpha");
+        let dir_b = root.join("beta").join("nested");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let db_path = root.join("index.db");
+        init_db(&db_path).unwrap();
+        let mut conn = db_connection(&db_path).unwrap();
+        let now = now_epoch();
+
+        for (path, name, dir, ext) in [
+            (dir_a.join("a.txt"), "a.txt", dir_a.clone(), "txt"),
+            (dir_b.join("b.rs"), "b.rs", dir_b.clone(), "rs"),
+        ] {
+            conn.execute(
+                "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+                 VALUES(?1, ?2, ?3, 0, ?4, NULL, NULL, ?5, 1)",
+                params![
+                    path.to_string_lossy().to_string(),
+                    name,
+                    dir.to_string_lossy().to_string(),
+                    ext,
+                    now
+                ],
+            )
+            .unwrap();
+        }
+
+        let deleted = delete_paths(&mut conn, &["/".to_string()]).unwrap();
+        assert!(deleted >= 2);
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
