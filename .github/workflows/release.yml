@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Everything ${{ github.ref_name }}"
+          releaseBody: |
+            macOS 전용 파일 검색 앱
+
+            ## 설치 방법
+            1. DMG 파일을 다운로드합니다
+            2. DMG를 열고 Everything.app을 Applications 폴더로 드래그합니다
+            3. 최초 실행 시 "확인되지 않은 개발자" 경고가 나타나면:
+               - `시스템 설정 > 개인정보 보호 및 보안` 에서 "확인 없이 열기" 클릭
+               - 또는 터미널에서: `xattr -cr /Applications/Everything.app`
+          releaseDraft: true
+          prerelease: false
