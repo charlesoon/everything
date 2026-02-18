@@ -875,6 +875,7 @@ fn macos_tcc_ignore_roots(home_dir: &Path) -> Vec<PathBuf> {
         library.join("DuetExpertCenter"),
         library.join("Group Containers"),
         library.join("HomeKit"),
+        library.join("Developer").join("Xcode").join("DerivedData"),
         library.join("IdentityServices"),
         library.join("IntelligencePlatform"),
         library.join("Mail"),
