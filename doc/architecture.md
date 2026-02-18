@@ -1,6 +1,6 @@
 # Architecture
 
-macOS "Everything" — 홈 디렉토리 전체를 SQLite에 인덱싱하여 sub-50ms 파일/폴더 이름 검색을 제공하는 Tauri v2 데스크톱 앱.
+macOS "Everything" — a Tauri v2 desktop app that indexes the entire home directory into SQLite for sub-50ms file/folder name search.
 
 ## Tech Stack
 
@@ -8,8 +8,8 @@ macOS "Everything" — 홈 디렉토리 전체를 SQLite에 인덱싱하여 sub-
 |-------|-----------|
 | App framework | Tauri v2 |
 | Backend | Rust (rusqlite, jwalk, fsevent-sys, ignore) |
-| Frontend | Svelte 4 (단일 컴포넌트) |
-| DB | SQLite WAL mode, LIKE 기반 검색 |
+| Frontend | Svelte 4 (single component) |
+| DB | SQLite WAL mode, LIKE-based search |
 | Build | Vite 5, Cargo |
 
 ---
@@ -18,32 +18,32 @@ macOS "Everything" — 홈 디렉토리 전체를 SQLite에 인덱싱하여 sub-
 
 ```
 src-tauri/src/
-├── main.rs              # 앱 상태, DB, 인덱싱, 검색, 파일 액션, IPC 핸들러
-├── query.rs             # 검색 쿼리 파서 (SearchMode 분류)
-├── fd_search.rs         # jwalk 기반 라이브 파일시스템 검색
-├── fsevent_watcher.rs   # FSEvents 직접 바인딩 (macOS only)
-├── gitignore_filter.rs  # .gitignore 재귀 탐색 및 매칭
-└── spotlight_search.rs  # mdfind 기반 Spotlight 검색 fallback
+├── main.rs              # App state, DB, indexing, search, file actions, IPC handlers
+├── query.rs             # Search query parser (SearchMode classification)
+├── fd_search.rs         # jwalk-based live filesystem search
+├── fsevent_watcher.rs   # Direct FSEvents binding (macOS only)
+├── gitignore_filter.rs  # Recursive .gitignore discovery and matching
+└── spotlight_search.rs  # mdfind-based Spotlight search fallback
 
 src/
-├── main.js              # Svelte 마운트 포인트
-└── App.svelte           # 전체 UI (1,755줄 단일 컴포넌트)
+├── main.js              # Svelte mount point
+└── App.svelte           # Entire UI (1,755-line single component)
 ```
 
-### 모듈 의존성
+### Module Dependencies
 
 ```
-main.rs ──→ query.rs            (쿼리 파싱)
-        ──→ fd_search.rs        (라이브 검색)
-        ──→ fsevent_watcher.rs  (파일 감시, macOS only)
-        ──→ gitignore_filter.rs (.gitignore 필터)
+main.rs ──→ query.rs            (query parsing)
+        ──→ fd_search.rs        (live search)
+        ──→ fsevent_watcher.rs  (file watching, macOS only)
+        ──→ gitignore_filter.rs (.gitignore filtering)
         ──→ spotlight_search.rs (Spotlight fallback)
 
-query.rs           독립 (의존성 없음)
+query.rs           standalone (no dependencies)
 fd_search.rs    ──→ main.rs (EntryDto, should_skip_path, IgnorePattern)
 spotlight_search.rs ──→ main.rs (EntryDto)
-gitignore_filter.rs    독립 (ignore 크레이트만 사용)
-fsevent_watcher.rs     독립 (fsevent-sys만 사용)
+gitignore_filter.rs    standalone (only ignore crate)
+fsevent_watcher.rs     standalone (only fsevent-sys)
 ```
 
 ---
@@ -52,32 +52,32 @@ fsevent_watcher.rs     독립 (fsevent-sys만 사용)
 
 ```rust
 struct AppState {
-    db_path: PathBuf,                     // index.db 경로
+    db_path: PathBuf,                     // index.db path
     home_dir: PathBuf,                    // $HOME
-    cwd: PathBuf,                         // 현재 작업 디렉토리
-    db_ready: Arc<AtomicBool>,            // DB 초기화 완료 여부
-    indexing_active: Arc<AtomicBool>,     // 인덱싱 진행 중 플래그
-    status: Arc<Mutex<IndexStatus>>,      // 인덱싱 상태 (state, counts)
-    path_ignores: Arc<Vec<PathBuf>>,      // 무시 경로 목록
-    path_ignore_patterns: Arc<Vec<IgnorePattern>>,  // 무시 패턴 (glob)
+    cwd: PathBuf,                         // current working directory
+    db_ready: Arc<AtomicBool>,            // DB initialization complete flag
+    indexing_active: Arc<AtomicBool>,     // indexing in-progress flag
+    status: Arc<Mutex<IndexStatus>>,      // indexing state (state, counts)
+    path_ignores: Arc<Vec<PathBuf>>,      // ignored path list
+    path_ignore_patterns: Arc<Vec<IgnorePattern>>,  // ignore patterns (glob)
     gitignore: SharedGitignoreFilter,     // Arc<GitignoreFilter>
-    recent_ops: Arc<Mutex<Vec<RecentOp>>>,          // rename/trash 2초 TTL 캐시
-    icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,   // 확장자→PNG 아이콘
-    fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>, // 라이브 검색 캐시
-    negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>, // 0건 검색어 60초 캐시
-    ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,      // 무시 규칙 mtime 캐시
+    recent_ops: Arc<Mutex<Vec<RecentOp>>>,          // rename/trash 2-second TTL cache
+    icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,   // extension→PNG icon
+    fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>, // live search cache
+    negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>, // zero-result query 60s cache
+    ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,      // ignore rules mtime cache
 }
 ```
 
-모든 필드가 `Arc`로 래핑되어 `Clone` 가능. Tauri `State<AppState>`로 IPC 핸들러에 주입.
+All fields are wrapped in `Arc` for `Clone` support. Injected into IPC handlers via Tauri `State<AppState>`.
 
 ---
 
 ## DB Schema
 
-**위치**: `<app_data_dir>/index.db` | **버전**: `PRAGMA user_version = 4`
+**Location**: `<app_data_dir>/index.db` | **Version**: `PRAGMA user_version = 4`
 
-### entries 테이블
+### entries table
 
 ```sql
 CREATE TABLE entries (
@@ -94,35 +94,35 @@ CREATE TABLE entries (
 );
 ```
 
-### 인덱스
+### Indexes
 
-| 인덱스 | 용도 |
-|--------|------|
+| Index | Purpose |
+|-------|---------|
 | `idx_entries_name_nocase` | `name COLLATE NOCASE` — NameSearch prefix/contains |
-| `idx_entries_dir` | `dir` — PathSearch 디렉토리 범위 |
+| `idx_entries_dir` | `dir` — PathSearch directory scope |
 | `idx_entries_dir_ext_name_nocase` | `(dir, ext, name)` — PathSearch + ext shortcut |
 | `idx_entries_ext` | `ext` — ExtSearch |
-| `idx_entries_ext_name` | `(ext, name)` — ExtSearch + 정렬 |
-| `idx_entries_mtime` | `mtime` — 수정일 정렬 |
-| `idx_entries_run_id` | `run_id` — 증분 인덱싱 stale row 삭제 |
+| `idx_entries_ext_name` | `(ext, name)` — ExtSearch + sorting |
+| `idx_entries_mtime` | `mtime` — modified date sorting |
+| `idx_entries_run_id` | `run_id` — stale row deletion during incremental indexing |
 
-### meta 테이블
+### meta table
 
 ```sql
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ```
 
-| key | 용도 |
-|-----|------|
-| `last_run_id` | 마지막 인덱싱 run ID (증분 비교 기준) |
-| `last_event_id` | FSEvents event ID (재시작 시 replay 시작점) |
+| Key | Purpose |
+|-----|---------|
+| `last_run_id` | Last indexing run ID (baseline for incremental comparison) |
+| `last_event_id` | FSEvents event ID (replay starting point on restart) |
 
-### Pragma 설정
+### Pragma Settings
 
 ```
 journal_mode=WAL  synchronous=NORMAL  temp_store=MEMORY  busy_timeout=3000
-인덱싱 중: cache_size=64MB  mmap_size=256MB  wal_autocheckpoint=OFF
-인덱싱 후: cache_size=16MB  mmap_size=0     wal_autocheckpoint=1000 → TRUNCATE
+During indexing: cache_size=64MB  mmap_size=256MB  wal_autocheckpoint=OFF
+After indexing:  cache_size=16MB  mmap_size=0     wal_autocheckpoint=1000 → TRUNCATE
 ```
 
 ---
@@ -130,65 +130,65 @@ journal_mode=WAL  synchronous=NORMAL  temp_store=MEMORY  busy_timeout=3000
 ## Startup Sequence
 
 ```
-앱 시작
+App launch
   │
-  ├─ 경로 확인: app_data_dir, db_path, home_dir, cwd
-  ├─ 무시 규칙 로드: .pathignore + .gitignore roots + TCC roots
-  ├─ GitignoreFilter 빌드: $HOME 하위 비숨김 디렉토리 depth 3까지 탐색
-  ├─ AppState 구성 및 등록
-  ├─ 글로벌 단축키 등록: Cmd+Shift+F → 창 표시 + focus_search 이벤트
+  ├─ Resolve paths: app_data_dir, db_path, home_dir, cwd
+  ├─ Load ignore rules: .pathignore + .gitignore roots + TCC roots
+  ├─ Build GitignoreFilter: scan non-hidden dirs under $HOME up to depth 3
+  ├─ Construct and register AppState
+  ├─ Register global shortcut: Cmd+Shift+Space → show window + focus_search event
   │
-  └─ 백그라운드 스레드 시작
+  └─ Start background thread
        │
-       ├─ init_db(): 테이블/인덱스 생성, 버전 체크 (불일치 시 전체 재생성)
-       ├─ purge_ignored_entries(): 무시 대상 기존 DB 엔트리 삭제
-       ├─ db_ready = true (검색 가능)
-       ├─ emit_status_counts → 프론트엔드에 현재 엔트리 수 전달
+       ├─ init_db(): create tables/indexes, version check (recreate on mismatch)
+       ├─ purge_ignored_entries(): delete existing DB entries for ignored paths
+       ├─ db_ready = true (search now available)
+       ├─ emit_status_counts → send current entry count to frontend
        │
-       ├─ [조건부 시작] last_event_id 존재 AND DB에 엔트리 있음?
-       │    ├─ YES → FSEvents watcher (replay 모드) 시작
-       │    │         replay 성공 → Ready (full scan 생략)
+       ├─ [Conditional start] last_event_id exists AND DB has entries?
+       │    ├─ YES → Start FSEvents watcher (replay mode)
+       │    │         Replay succeeds → Ready (skip full scan)
        │    │         MustScanSubDirs ≥ 10 → full scan fallback
        │    │
-       │    └─ NO  → 증분 인덱싱 시작 + FSEvents watcher (since now) 시작
+       │    └─ NO  → Start incremental indexing + FSEvents watcher (since now)
        │
-       └─ 아이콘 프리워밍: 20개 주요 확장자 미리 로드
+       └─ Icon prewarming: preload 20 common extensions
 ```
 
 ---
 
 ## Indexing Flow
 
-### 증분 인덱싱 (`run_incremental_index`)
+### Incremental Indexing (`run_incremental_index`)
 
 ```
 run_incremental_index
   │
-  ├─ 인덱싱 pragma 설정 (대용량 캐시, mmap)
+  ├─ Set indexing pragmas (large cache, mmap)
   ├─ current_run_id = last_run_id + 1
-  ├─ 기존 entries HashMap 프리로드: path → (mtime, size)
+  ├─ Preload existing entries HashMap: path → (mtime, size)
   │
-  ├─ $HOME 자식 디렉토리 분류
-  │    ├─ priority roots: Library/.Trash 제외한 일반 디렉토리
+  ├─ Classify $HOME child directories
+  │    ├─ priority roots: normal dirs excluding Library/.Trash
   │    └─ deferred roots: Library, .Trash, .Trashes
   │
-  ├─ Pass 0 (shallow): jwalk depth ≤ 6, priority → deferred 순
-  │    ├─ mtime+size 변경 없음 → UPDATE run_id만 (경량)
-  │    ├─ 변경 또는 신규 → INSERT/UPDATE (전체 컬럼)
-  │    ├─ 10,000건마다 batch commit
-  │    └─ 200ms마다 index_progress 이벤트 emit
-  │    └─ Pass 0 완료 → index_updated 이벤트 (조기 검색 가능)
+  ├─ Pass 0 (shallow): jwalk depth ≤ 6, priority → deferred order
+  │    ├─ No mtime+size change → UPDATE run_id only (lightweight)
+  │    ├─ Changed or new → INSERT/UPDATE (all columns)
+  │    ├─ Batch commit every 10,000 rows
+  │    └─ Emit index_progress event every 200ms
+  │    └─ Pass 0 complete → index_updated event (early search available)
   │
-  ├─ Pass 1 (deep): jwalk 무제한 depth, depth > 6만 처리
-  │    └─ (같은 증분 로직)
+  ├─ Pass 1 (deep): jwalk unlimited depth, only depth > 6 entries
+  │    └─ (same incremental logic)
   │
   ├─ Cleanup: DELETE FROM entries WHERE run_id < current_run_id
   ├─ meta.last_run_id = current_run_id
-  ├─ ANALYZE + pragma 복원 + WAL checkpoint
-  └─ index_state=Ready, index_updated 이벤트 emit
+  ├─ ANALYZE + restore pragmas + WAL checkpoint
+  └─ index_state=Ready, index_updated event emit
 ```
 
-### 무시 체계
+### Ignore System
 
 ```
 should_skip_path(path)
@@ -197,75 +197,75 @@ should_skip_path(path)
   │                       CMakeFiles, .qtc_clangd, __pycache__, .gradle
   ├─ BUILTIN_SKIP_PATHS: Library/Caches, Library/Developer/CoreSimulator,
   │                       Library/Logs, .vscode/extensions
-  ├─ .pathignore: 프로젝트 루트 및 $HOME에서 로드
-  ├─ macOS TCC roots: ~/Library/Mail, Safari, Messages 등 ~40개
-  ├─ IgnorePattern::AnySegment: **/target 등 어느 depth에서든 매칭
-  ├─ IgnorePattern::Glob: 와일드카드 패턴 매칭
-  └─ gitignore_filter: .gitignore 규칙 (ignore 크레이트)
+  ├─ .pathignore: loaded from project root and $HOME
+  ├─ macOS TCC roots: ~/Library/Mail, Safari, Messages, etc. (~40 paths)
+  ├─ IgnorePattern::AnySegment: **/target etc., matches at any depth
+  ├─ IgnorePattern::Glob: wildcard pattern matching
+  └─ gitignore_filter: .gitignore rules (ignore crate)
 ```
 
 ---
 
 ## Search Flow
 
-### 쿼리 분류 (`query.rs`)
+### Query Classification (`query.rs`)
 
-| 입력 패턴 | SearchMode | 예시 |
-|-----------|-----------|------|
-| 빈 문자열 | `Empty` | `""` |
-| `*` 또는 `?` 포함 | `GlobName` | `*.rs`, `test?` |
-| `*.ext` (단순 확장자) | `ExtSearch` | `*.pdf` |
-| `/` 포함 | `PathSearch` | `src/ main`, `Projects/ *.rs` |
-| 그 외 | `NameSearch` | `readme`, `config` |
+| Input Pattern | SearchMode | Example |
+|---------------|-----------|---------|
+| Empty string | `Empty` | `""` |
+| Contains `*` or `?` | `GlobName` | `*.rs`, `test?` |
+| Simple `*.ext` | `ExtSearch` | `*.pdf` |
+| Contains `/` | `PathSearch` | `src/ main`, `Projects/ *.rs` |
+| Everything else | `NameSearch` | `readme`, `config` |
 
-### 검색 실행 시퀀스 (`execute_search`)
+### Search Execution Sequence (`execute_search`)
 
 ```
-사용자 입력
+User input
   │
-  ├─ DB 미준비 → Spotlight fallback (mdfind) → 반환
+  ├─ DB not ready → Spotlight fallback (mdfind) → return
   │
-  ├─ 쿼리 파싱 → SearchMode 결정
+  ├─ Parse query → determine SearchMode
   │
-  ├─ [NameSearch] negative cache 확인
-  │    ├─ 캐시 hit (300-550ms 이내, 미확인) → find 명령 1회 fallback
-  │    └─ 캐시 hit (그 외) → 빈 결과 즉시 반환
+  ├─ [NameSearch] Check negative cache
+  │    ├─ Cache hit (within 300-550ms, unconfirmed) → find command single fallback
+  │    └─ Cache hit (otherwise) → return empty result immediately
   │
-  ├─ DB 검색 (모드별)
+  ├─ DB search (by mode)
   │    │
   │    ├─ Empty: SELECT ... ORDER BY sort LIMIT offset
   │    │
   │    ├─ NameSearch (3-phase):
-  │    │    Phase 0: name = query (정확 매칭)
-  │    │    Phase 1: name LIKE 'query%' (접두사, idx_entries_name_nocase)
+  │    │    Phase 0: name = query (exact match)
+  │    │    Phase 1: name LIKE 'query%' (prefix, idx_entries_name_nocase)
   │    │    Phase 2: 8ms probe → 30ms fetch (name LIKE '%query%')
   │    │
-  │    ├─ GlobName: name LIKE (glob→LIKE 변환)
+  │    ├─ GlobName: name LIKE (glob→LIKE conversion)
   │    │
-  │    ├─ ExtSearch: ext = 'ext' (인덱스 직접 조회)
+  │    ├─ ExtSearch: ext = 'ext' (direct index lookup)
   │    │
   │    └─ PathSearch:
-  │         dir 힌트 해석 가능 → dir 범위 쿼리 + ext shortcut
-  │         dir 힌트 해석 불가 → dir LIKE + 2-phase probe
+  │         dir hint resolvable → dir scoped query + ext shortcut
+  │         dir hint unresolvable → dir LIKE + 2-phase probe
   │
-  ├─ 결과 0건 + 인덱싱 아님 + GlobName/ExtSearch
-  │    → find 명령 fallback (maxdepth 8)
+  ├─ Zero results + not indexing + GlobName/ExtSearch
+  │    → find command fallback (maxdepth 8)
   │
-  ├─ 결과 0건 + 인덱싱 중
-  │    → Spotlight fallback (mdfind, 3초 타임아웃, 최대 300건)
+  ├─ Zero results + indexing
+  │    → Spotlight fallback (mdfind, 3s timeout, max 300 results)
   │
-  ├─ 후처리
-  │    ├─ 무시 규칙 필터링
-  │    ├─ 관련성 정렬 (name sort, offset=0일 때)
-  │    │    rank 0: 정확 매칭
-  │    │    rank 1: 접두사 매칭
-  │    │    rank 2: 이름 포함
-  │    │    rank 3: 경로 끝 매칭
-  │    │    rank 4: 경로 포함
-  │    │    동일 rank 내 얕은 경로 우선
-  │    └─ NameSearch 0건 → negative cache 저장 (60초 TTL)
+  ├─ Post-processing
+  │    ├─ Ignore rules filtering
+  │    ├─ Relevance sorting (name sort, when offset=0)
+  │    │    rank 0: exact match
+  │    │    rank 1: prefix match
+  │    │    rank 2: name contains
+  │    │    rank 3: path-end match
+  │    │    rank 4: path contains
+  │    │    shallower paths preferred within same rank
+  │    └─ NameSearch zero results → save to negative cache (60s TTL)
   │
-  └─ SearchResultDto { entries, modeLabel } 반환
+  └─ Return SearchResultDto { entries, modeLabel }
 ```
 
 ### Spotlight Fallback (`spotlight_search.rs`)
@@ -273,12 +273,12 @@ should_skip_path(path)
 ```
 search_spotlight(home_dir, query)
   │
-  ├─ query < 2자 → 빈 결과
-  ├─ mdfind -name <query> -onlyin <home_dir> 실행
-  ├─ stdout 스트리밍 읽기
-  │    ├─ 3초 타임아웃 → timed_out = true, 중단
-  │    └─ 300건 도달 → 중단
-  ├─ child process kill
+  ├─ query < 2 chars → empty result
+  ├─ Execute mdfind -name <query> -onlyin <home_dir>
+  ├─ Stream stdout
+  │    ├─ 3s timeout → timed_out = true, abort
+  │    └─ 300 results reached → abort
+  ├─ Kill child process
   └─ SpotlightResult { entries, timed_out }
 ```
 
@@ -286,122 +286,122 @@ search_spotlight(home_dir, query)
 
 ## Watcher Flow
 
-### FSEvents 아키텍처 (`fsevent_watcher.rs`)
+### FSEvents Architecture (`fsevent_watcher.rs`)
 
 ```
 FsEventWatcher::new(root, since_event_id, tx)
   │
-  ├─ fsevent_sys 직접 바인딩 (notify 크레이트 미사용)
+  ├─ Direct fsevent_sys binding (notify crate not used)
   ├─ Flags: FileEvents | NoDefer
-  ├─ Latency: 0.3초
-  ├─ 전용 스레드 "everything-fsevents"에서 CFRunLoop 실행
+  ├─ Latency: 0.3s
+  ├─ Runs CFRunLoop on dedicated thread "everything-fsevents"
   │
-  └─ 콜백 → FsEvent 분류
-       ├─ HistoryDone      (replay 완료)
-       ├─ MustScanSubDirs  (subtree 재스캔 필요)
-       └─ Paths            (일반 파일 변경)
+  └─ Callback → FsEvent classification
+       ├─ HistoryDone      (replay complete)
+       ├─ MustScanSubDirs  (subtree rescan needed)
+       └─ Paths            (normal file changes)
 ```
 
-### Watcher 이벤트 처리 (`start_fsevent_watcher_worker`)
+### Watcher Event Processing (`start_fsevent_watcher_worker`)
 
 ```
-이벤트 수신 루프 (100ms recv_timeout)
+Event receive loop (100ms recv_timeout)
   │
-  ├─ Paths → pending_paths에 추가, 디바운스 타이머 설정 (300ms)
+  ├─ Paths → add to pending_paths, set debounce timer (300ms)
   │
-  ├─ MustScanSubDirs → 즉시 subtree 재스캔 + upsert
-  │    (conditional startup 중 count ≥ 10 → full scan 트리거)
+  ├─ MustScanSubDirs → immediate subtree rescan + upsert
+  │    (during conditional startup, count ≥ 10 → trigger full scan)
   │
-  ├─ HistoryDone → pending 즉시 flush
-  │    (conditional startup 종료)
+  ├─ HistoryDone → flush pending immediately
+  │    (end conditional startup)
   │
-  ├─ 디바운스 만료 → process_watcher_paths()
-  │    ├─ indexing_active 중이면 스킵
-  │    ├─ 각 경로: should_skip / is_recently_touched 체크
-  │    ├─ 존재하는 경로 → upsert (디렉토리면 자식도)
-  │    └─ 없는 경로 → DB에서 삭제
+  ├─ Debounce expired → process_watcher_paths()
+  │    ├─ Skip if indexing_active
+  │    ├─ Each path: check should_skip / is_recently_touched
+  │    ├─ Existing paths → upsert (including children for directories)
+  │    └─ Missing paths → delete from DB
   │
-  └─ 30초마다 last_event_id를 meta 테이블에 flush
+  └─ Flush last_event_id to meta table every 30s
 ```
 
 ---
 
 ## IPC Commands
 
-| Command | 방향 | 설명 |
-|---------|------|------|
-| `get_index_status` | FE→BE | 인덱싱 상태, 엔트리 수, 진행률 |
-| `get_home_dir` | FE→BE | 홈 디렉토리 경로 |
-| `start_full_index` | FE→BE | 전체 재인덱싱 트리거 |
-| `reset_index` | FE→BE | DB 초기화 후 재인덱싱 |
-| `search` | FE→BE | DB 검색 → `SearchResultDto { entries, modeLabel }` |
-| `fd_search` | FE→BE | jwalk 라이브 검색 → `FdSearchResultDto { entries, total, timedOut }` |
-| `open` | FE→BE | `open` 명령으로 열기 (디렉토리 실패 시 `open -R` fallback) |
-| `open_with` | FE→BE | Finder에서 보기 |
-| `reveal_in_finder` | FE→BE | `open -R` (단일) / 부모 디렉토리 열기 (다중) |
-| `copy_paths` | FE→BE | 경로 클립보드 복사 (pbcopy) |
-| `move_to_trash` | FE→BE | 휴지통 이동 + DB 삭제 |
-| `rename` | FE→BE | 이름 변경 + DB 갱신 → 새 EntryDto 반환 |
-| `get_file_icon` | FE→BE | 확장자별 시스템 아이콘 PNG 반환 |
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `get_index_status` | FE→BE | Indexing state, entry count, progress |
+| `get_home_dir` | FE→BE | Home directory path |
+| `start_full_index` | FE→BE | Trigger full re-indexing |
+| `reset_index` | FE→BE | Reset DB and re-index |
+| `search` | FE→BE | DB search → `SearchResultDto { entries, modeLabel }` |
+| `fd_search` | FE→BE | jwalk live search → `FdSearchResultDto { entries, total, timedOut }` |
+| `open` | FE→BE | Open via `open` command (fallback to `open -R` for directories) |
+| `open_with` | FE→BE | Reveal in Finder |
+| `reveal_in_finder` | FE→BE | `open -R` (single) / open parent directory (multi) |
+| `copy_paths` | FE→BE | Copy paths to clipboard (pbcopy) |
+| `move_to_trash` | FE→BE | Move to trash + delete from DB |
+| `rename` | FE→BE | Rename + DB update → return new EntryDto |
+| `get_file_icon` | FE→BE | Return system icon PNG per extension |
 
 ## Backend Events
 
-| Event | Payload | 시점 |
-|-------|---------|------|
-| `index_progress` | `{ scanned, indexed, currentPath }` | 인덱싱 중 200ms 간격 |
-| `index_state` | `{ state, message }` | Indexing/Ready/Error 전환 시 |
-| `index_updated` | `{ entriesCount, lastUpdated, permissionErrors }` | 인덱싱 완료, watcher 업데이트, 파일 액션 후 |
-| `focus_search` | (없음) | Cmd+Shift+F 글로벌 단축키 |
+| Event | Payload | Timing |
+|-------|---------|--------|
+| `index_progress` | `{ scanned, indexed, currentPath }` | Every 200ms during indexing |
+| `index_state` | `{ state, message }` | On Indexing/Ready/Error transitions |
+| `index_updated` | `{ entriesCount, lastUpdated, permissionErrors }` | After indexing complete, watcher updates, file actions |
+| `focus_search` | (none) | Cmd+Shift+Space global shortcut |
 
 ---
 
 ## Frontend Architecture
 
-### 단일 컴포넌트 (`App.svelte`)
+### Single Component (`App.svelte`)
 
-검색 입력, 가상 스크롤 테이블, 인라인 이름 변경, 컨텍스트 메뉴, 키보드 단축키, 아이콘 캐시, 상태 바를 모두 포함하는 1,755줄 단일 컴포넌트.
+A 1,755-line single component containing search input, virtual-scrolled table, inline rename, context menu, keyboard shortcuts, icon cache, and status bar.
 
-### 상태 관리
+### State Management
 
-Svelte 리액티브 변수 사용 (store 미사용).
+Uses Svelte reactive variables (no stores).
 
-| 카테고리 | 주요 변수 |
-|---------|----------|
-| 검색 | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir` |
-| 선택 | `selectedIndices` (Set), `selectionAnchor`, `lastSelectedIndex` |
-| 편집 | `editing { active, path, index, draftName }` |
-| 인덱싱 | `indexStatus`, `scanned`, `indexed`, `currentPath`, `lastReadyCount` |
-| 가상 스크롤 | `scrollTop`, `viewportHeight`, `colWidths` |
-| 캐시 | `iconCache` (Map), `highlightCache` (Map) |
+| Category | Key Variables |
+|----------|--------------|
+| Search | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir` |
+| Selection | `selectedIndices` (Set), `selectionAnchor`, `lastSelectedIndex` |
+| Editing | `editing { active, path, index, draftName }` |
+| Indexing | `indexStatus`, `scanned`, `indexed`, `currentPath`, `lastReadyCount` |
+| Virtual scroll | `scrollTop`, `viewportHeight`, `colWidths` |
+| Cache | `iconCache` (Map), `highlightCache` (Map) |
 
-### 검색 입력 → 결과 시퀀스
+### Search Input → Result Sequence
 
 ```
-사용자 타이핑
+User typing
   │
   ├─ on:input → scheduleSearch()
-  │    ├─ 200ms 이상 경과 → 즉시 실행 (leading edge)
-  │    └─ 200ms 미만 → 200ms 후 실행 (trailing edge)
+  │    ├─ 200ms+ elapsed → execute immediately (leading edge)
+  │    └─ < 200ms → execute after 200ms (trailing edge)
   │
   ├─ runSearch()
-  │    ├─ searchGeneration++ (stale 응답 방지)
+  │    ├─ searchGeneration++ (prevent stale responses)
   │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir })
-  │    ├─ 응답: { entries, modeLabel }
+  │    ├─ Response: { entries, modeLabel }
   │    ├─ results = entries
   │    ├─ searchModeLabel = modeLabel
-  │    └─ 선택 경로 기반 복원
+  │    └─ Selection restoration based on path
   │
-  └─ 무한 스크롤
-       스크롤 하단 10행 이내 → loadMore()
+  └─ Infinite scroll
+       Within 10 rows of bottom → loadMore()
        → invoke('search', { offset: results.length })
-       → results에 append
+       → append to results
 ```
 
-### 가상 스크롤
+### Virtual Scroll
 
 ```
-고정 행 높이: 28px
-버퍼: 상하 10행 (총 overscan ~20행)
+Fixed row height: 28px
+Buffer: 10 rows above and below (total overscan ~20 rows)
 
 scrollTop
   → startIndex = max(0, floor(scrollTop / 28) - 10)
@@ -410,49 +410,49 @@ scrollTop
   → translateY = startIndex * 28
 
 DOM:
-  <div class="table-body">          ← 스크롤 컨테이너
-    <div style="height:{totalHeight}px">  ← 전체 가상 높이
-      <div style="transform:translateY({translateY}px)">  ← 오프셋
+  <div class="table-body">          ← scroll container
+    <div style="height:{totalHeight}px">  ← total virtual height
+      <div style="transform:translateY({translateY}px)">  ← offset
         {#each visibleRows}...
       </div>
     </div>
   </div>
 ```
 
-### 키보드 단축키
+### Keyboard Shortcuts
 
-| 키 | 동작 |
-|----|------|
-| `Escape` | 선택 해제, 검색 입력 포커스 |
-| `↑` / `↓` | 선택 이동 (Shift: 범위 선택) |
-| `PageUp` / `PageDown` | 페이지 단위 이동 |
-| `Enter` | 인라인 이름 변경 시작 |
-| `F2` | 인라인 이름 변경 시작 |
-| `Cmd+O` | 선택 항목 열기 |
-| `Cmd+Enter` | Finder에서 보기 |
-| `Cmd+C` | 경로 복사 |
-| `Cmd+A` | 전체 선택 |
-| `Delete` / `Cmd+⌫` | 휴지통 이동 |
+| Key | Action |
+|-----|--------|
+| `Escape` | Deselect, focus search input |
+| `Up` / `Down` | Move selection (Shift: range select) |
+| `PageUp` / `PageDown` | Page-level navigation |
+| `Enter` | Start inline rename |
+| `F2` | Start inline rename |
+| `Cmd+O` | Open selected items |
+| `Cmd+Enter` | Reveal in Finder |
+| `Cmd+C` | Copy paths |
+| `Cmd+A` | Select all |
+| `Delete` / `Cmd+Backspace` | Move to trash |
 
-### 컨텍스트 메뉴
+### Context Menu
 
-우클릭 시 표시: Open, Open With, Reveal in Finder, Copy Path, Move to Trash, Rename (단일 선택 시)
+Shown on right-click: Open, Open With, Reveal in Finder, Copy Path, Move to Trash, Rename (single-select only)
 
-### 아이콘 시스템
+### Icon System
 
 ```
-visibleRows 변경
-  → ensureIcon(entry) 호출
-  → iconCache에 있으면 즉시 반환
-  → 없으면 invoke('get_file_icon', { ext })
-       → 백엔드: swift -e NSWorkspace 16x16 PNG
-       → base64 data URI로 변환 후 iconCache에 저장
-  → 시작 시 20개 주요 확장자 프리워밍
+visibleRows change
+  → call ensureIcon(entry)
+  → if in iconCache, return immediately
+  → if not, invoke('get_file_icon', { ext })
+       → backend: swift -e NSWorkspace 16x16 PNG
+       → convert to base64 data URI, store in iconCache
+  → Prewarm 20 common extensions at startup
 ```
 
-### 테마
+### Theme
 
-시스템 설정 연동 (`prefers-color-scheme: dark`). CSS 커스텀 프로퍼티 기반.
+Syncs with system settings (`prefers-color-scheme: dark`). Based on CSS custom properties.
 
 ```css
 :root {
@@ -461,34 +461,34 @@ visibleRows 변경
 }
 ```
 
-### 상태 바
+### Status Bar
 
-| 상태 | 표시 내용 |
-|------|----------|
-| 인덱싱 중 (엔트리 있음) | `● 검색 가능` + 진행률% + 경과 시간 + 엔트리 수 |
-| 인덱싱 중 (엔트리 없음) | `인덱싱 시작 중...` |
-| Ready | `Index: Ready` + 엔트리 수 + 인덱싱 소요 시간 |
-| Spotlight fallback | 주황색 `Spotlight 임시 검색` |
-| 검색 완료 | `"query" Xms · N results` |
+| State | Display |
+|-------|---------|
+| Indexing (has entries) | `● Searchable` + progress % + elapsed time + entry count |
+| Indexing (no entries) | `Starting indexing...` |
+| Ready | `Index: Ready` + entry count + indexing duration |
+| Spotlight fallback | Orange `Spotlight temporary search` |
+| Search complete | `"query" Xms · N results` |
 
 ---
 
 ## Key Constants
 
-| 상수 | 값 | 위치 |
-|------|---|------|
-| `DEFAULT_LIMIT` | 300 | 검색 기본 결과 수 |
-| `SHORT_QUERY_LIMIT` | 100 | 1자 쿼리 결과 제한 |
-| `MAX_LIMIT` | 1,000 | 최대 결과 수 |
-| `BATCH_SIZE` | 10,000 | DB 배치 쓰기 단위 |
-| `SHALLOW_SCAN_DEPTH` | 6 | Pass 0 최대 depth |
-| `JWALK_NUM_THREADS` | 4 | 병렬 워커 수 |
-| `WATCH_DEBOUNCE` | 300ms | 파일 변경 디바운스 |
-| `RECENT_OP_TTL` | 2s | rename/trash 중복 방지 |
-| `NEGATIVE_CACHE_TTL` | 60s | 0건 검색어 캐시 |
-| `SPOTLIGHT_TIMEOUT` | 3s | mdfind 타임아웃 |
-| `SPOTLIGHT_MAX_RESULTS` | 300 | mdfind 최대 결과 |
-| `MUST_SCAN_THRESHOLD` | 10 | replay 중 full scan 트리거 |
-| `EVENT_ID_FLUSH_INTERVAL` | 30s | event_id DB 저장 주기 |
-| `PAGE_SIZE` (FE) | 500 | 프론트엔드 페이지 크기 |
-| `rowHeight` (FE) | 28px | 가상 스크롤 행 높이 |
+| Constant | Value | Location |
+|----------|-------|----------|
+| `DEFAULT_LIMIT` | 300 | Default search result count |
+| `SHORT_QUERY_LIMIT` | 100 | Single-char query result limit |
+| `MAX_LIMIT` | 1,000 | Maximum result count |
+| `BATCH_SIZE` | 10,000 | DB batch write unit |
+| `SHALLOW_SCAN_DEPTH` | 6 | Pass 0 max depth |
+| `JWALK_NUM_THREADS` | 4 | Parallel worker count |
+| `WATCH_DEBOUNCE` | 300ms | File change debounce |
+| `RECENT_OP_TTL` | 2s | Rename/trash duplicate prevention |
+| `NEGATIVE_CACHE_TTL` | 60s | Zero-result query cache |
+| `SPOTLIGHT_TIMEOUT` | 3s | mdfind timeout |
+| `SPOTLIGHT_MAX_RESULTS` | 300 | mdfind max results |
+| `MUST_SCAN_THRESHOLD` | 10 | Full scan trigger during replay |
+| `EVENT_ID_FLUSH_INTERVAL` | 30s | event_id DB save interval |
+| `PAGE_SIZE` (FE) | 500 | Frontend page size |
+| `rowHeight` (FE) | 28px | Virtual scroll row height |

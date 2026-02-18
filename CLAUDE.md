@@ -69,7 +69,7 @@ npm run dev
 
 ## Design Spec
 
-Full product spec is at `doc/spec.md` (Korean). Key SLOs: search p95 < 30ms backend, < 50ms with UI render. Default result limit 300 (100 for single-char queries, max 1000).
+Full product spec is at `doc/spec.md` (English) and `doc/spec_KR.md` (Korean). Key SLOs: search p95 < 30ms backend, < 50ms with UI render. Default result limit 300 (100 for single-char queries, max 1000).
 
 ## Conventions
 
