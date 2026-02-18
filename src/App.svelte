@@ -922,7 +922,7 @@
     try {
       await invoke('rename', {
         path: current.path,
-        new_name: nextName
+        newName: nextName
       });
       cancelRename();
       await runSearch();
