@@ -490,10 +490,6 @@ fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
     Ok((entries_count, last_updated))
 }
 
-fn current_permission_errors(state: &AppState) -> u64 {
-    state.status.lock().permission_errors
-}
-
 fn invalidate_search_caches(state: &AppState) {
     state.fd_search_cache.lock().take();
     state.negative_name_cache.lock().clear();
@@ -1255,28 +1251,6 @@ fn index_row_from_jwalk_entry(entry: &jwalk::DirEntry<((), ())>) -> Option<Index
     index_row_from_path_and_metadata(&entry.path(), &metadata)
 }
 
-fn collect_rows_shallow(
-    dir_path: &Path,
-    ignored_roots: &[PathBuf],
-    ignored_patterns: &[IgnorePattern],
-) -> Vec<IndexRow> {
-    let mut rows = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(dir_path) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if should_skip_path(&entry_path, ignored_roots, ignored_patterns) {
-                continue;
-            }
-            if let Some(row) = index_row_from_path(&entry_path) {
-                rows.push(row);
-            }
-        }
-    }
-
-    rows
-}
-
 fn collect_rows_recursive(
     root: &Path,
     ignored_roots: &[PathBuf],
@@ -1632,8 +1606,11 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
     let mut deleted = 0;
 
     {
-        let mut stmt = tx
-            .prepare("DELETE FROM entries WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")
+        let mut stmt_exact = tx
+            .prepare("DELETE FROM entries WHERE path = ?1")
+            .map_err(|e| e.to_string())?;
+        let mut stmt_children = tx
+            .prepare("DELETE FROM entries WHERE path >= ?1 AND path < ?2")
             .map_err(|e| e.to_string())?;
 
         for path in raw_paths {
@@ -1647,19 +1624,16 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
                 continue;
             }
 
-            let like_prefix = if normalized == "/" {
-                "/".to_string()
-            } else {
-                normalized
-            };
-            let pattern = if like_prefix == "/" {
-                "/%".to_string()
-            } else {
-                format!("{}/%", escape_like(&like_prefix))
-            };
+            deleted += stmt_exact
+                .execute(params![&normalized])
+                .map_err(|e| e.to_string())?;
 
-            deleted += stmt
-                .execute(params![like_prefix, pattern])
+            // Delete children using B-tree range scan: path >= "{normalized}/" AND path < "{normalized}0"
+            // '/' is 0x2F and '0' is 0x30 (the next byte), so this captures all children exactly.
+            let range_start = format!("{normalized}/");
+            let range_end = format!("{normalized}0");
+            deleted += stmt_children
+                .execute(params![&range_start, &range_end])
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -1718,15 +1692,24 @@ fn set_progress(state: &AppState, scanned: u64, indexed: u64, current_path: &str
     status.current_path = current_path.to_string();
 }
 
-fn emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
-    let (entries_count, last_updated) = update_status_counts(state)?;
+fn emit_status_counts(app: &AppHandle, state: &AppState) {
+    let status = state.status.lock();
     emit_index_updated(
         app,
-        entries_count,
-        last_updated.unwrap_or_else(now_epoch),
-        current_permission_errors(state),
+        status.entries_count,
+        status.last_updated.unwrap_or_else(now_epoch),
+        status.permission_errors,
     );
+}
+
+fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
+    update_status_counts(state)?;
+    emit_status_counts(app, state);
     Ok(())
+}
+
+fn touch_status_updated(state: &AppState) {
+    state.status.lock().last_updated = Some(now_epoch());
 }
 
 fn start_full_index_worker(app: AppHandle, state: AppState) -> AppResult<()> {
@@ -2121,7 +2104,7 @@ fn run_incremental_index_inner(
 
         // After shallow pass, emit progress so UI shows searchable state early
         if pass == 0 {
-            let _ = emit_status_counts(app, state);
+            let _ = refresh_and_emit_status_counts(app, state);
             let _ = app.emit(
                 "index_updated",
                 IndexUpdatedEvent {
@@ -2263,24 +2246,15 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
             continue;
         }
 
-        if path.exists() {
-            let is_dir = fs::symlink_metadata(path)
-                .map(|meta| meta.is_dir())
-                .unwrap_or(false);
-
-            if is_dir {
-                if let Some(row) = index_row_from_path(path) {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if let Some(row) = index_row_from_path_and_metadata(path, &metadata) {
                     to_upsert_map.insert(row.path.clone(), row);
                 }
-
-                for row in collect_rows_shallow(path, &ignored_roots, &ignored_patterns) {
-                    to_upsert_map.insert(row.path.clone(), row);
-                }
-            } else if let Some(row) = index_row_from_path(path) {
-                to_upsert_map.insert(row.path.clone(), row);
             }
-        } else {
-            to_delete.push(path_str);
+            Err(_) => {
+                to_delete.push(path_str);
+            }
         }
     }
 
@@ -2299,7 +2273,14 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
     Ok(changed)
 }
 
-fn process_watcher_paths(app: &AppHandle, state: &AppState, pending: &mut HashSet<PathBuf>) {
+const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+fn process_watcher_paths(
+    app: &AppHandle,
+    state: &AppState,
+    pending: &mut HashSet<PathBuf>,
+    last_status_emit: &mut Instant,
+) {
     if pending.is_empty() {
         return;
     }
@@ -2315,7 +2296,11 @@ fn process_watcher_paths(app: &AppHandle, state: &AppState, pending: &mut HashSe
         Ok(changed) => {
             if changed > 0 {
                 invalidate_search_caches(state);
-                let _ = emit_status_counts(app, state);
+                touch_status_updated(state);
+                if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
+                    emit_status_counts(app, state);
+                    *last_status_emit = Instant::now();
+                }
             }
         }
         Err(err) => {
@@ -2381,20 +2366,33 @@ fn start_fsevent_watcher_worker(
         let mut pending_paths: HashSet<PathBuf> = HashSet::new();
         let mut deadline: Option<Instant> = None;
         let mut last_flush = Instant::now();
+        let mut last_status_emit = Instant::now();
+        let mut last_count_refresh = Instant::now();
         let mut must_scan_count: usize = 0;
         let mut replay_phase = conditional;
         let mut full_scan_triggered = false;
 
         loop {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            let wait = match deadline {
+                Some(due) => {
+                    let now = Instant::now();
+                    if now >= due { Duration::from_millis(0) } else { due - now }
+                }
+                None => Duration::from_secs(1),
+            };
+            match rx.recv_timeout(wait) {
                 Ok(fsevent_watcher::FsEvent::Paths(paths)) => {
+                    let (ignored_roots, ignored_patterns) =
+                        cached_effective_ignore_rules(&state);
+                    let prev_len = pending_paths.len();
                     for path in paths {
-                        if let Some(parent) = path.parent() {
-                            pending_paths.insert(parent.to_path_buf());
+                        if !should_skip_path(&path, &ignored_roots, &ignored_patterns) {
+                            pending_paths.insert(path);
                         }
-                        pending_paths.insert(path);
                     }
-                    deadline = Some(Instant::now() + WATCH_DEBOUNCE);
+                    if pending_paths.len() > prev_len {
+                        deadline = Some(Instant::now() + WATCH_DEBOUNCE);
+                    }
                 }
                 Ok(fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
                     must_scan_count += 1;
@@ -2417,13 +2415,17 @@ fn start_fsevent_watcher_worker(
                             if let Ok(mut conn) = db_connection(&state.db_path) {
                                 let _ = upsert_rows(&mut conn, &rows);
                                 invalidate_search_caches(&state);
-                                let _ = emit_status_counts(&app, &state);
+                                touch_status_updated(&state);
+                                if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
+                                    emit_status_counts(&app, &state);
+                                    last_status_emit = Instant::now();
+                                }
                             }
                         }
                     }
                 }
                 Ok(fsevent_watcher::FsEvent::HistoryDone) => {
-                    process_watcher_paths(&app, &state, &mut pending_paths);
+                    process_watcher_paths(&app, &state, &mut pending_paths, &mut last_status_emit);
                     deadline = None;
                     if replay_phase {
                         replay_phase = false;
@@ -2432,7 +2434,7 @@ fn start_fsevent_watcher_worker(
                                 "conditional_startup: HistoryDone, MustScanSubDirs={}, skipping full scan",
                                 must_scan_count
                             ));
-                            let _ = emit_status_counts(&app, &state);
+                            let _ = refresh_and_emit_status_counts(&app, &state);
                         }
                     }
                 }
@@ -2442,7 +2444,7 @@ fn start_fsevent_watcher_worker(
 
             if let Some(due) = deadline {
                 if Instant::now() >= due {
-                    process_watcher_paths(&app, &state, &mut pending_paths);
+                    process_watcher_paths(&app, &state, &mut pending_paths, &mut last_status_emit);
                     deadline = None;
                 }
             }
@@ -2452,6 +2454,12 @@ fn start_fsevent_watcher_worker(
                 let eid = watcher.last_event_id();
                 let _ = persist_event_id(&state.db_path, eid);
                 last_flush = Instant::now();
+            }
+
+            // Periodic count refresh to keep in-memory counts accurate
+            if last_count_refresh.elapsed() >= EVENT_ID_FLUSH_INTERVAL {
+                let _ = update_status_counts(&state);
+                last_count_refresh = Instant::now();
             }
         }
 
@@ -3474,7 +3482,7 @@ async fn move_to_trash(
         let _ = delete_paths(&mut conn, &deleted_targets)?;
         invalidate_search_caches(&state);
 
-        emit_status_counts(&app, &state)?;
+        refresh_and_emit_status_counts(&app, &state)?;
         Ok(())
     })
     .await
@@ -3552,7 +3560,7 @@ async fn rename(
             Some(new_path.to_string_lossy().to_string()),
         );
 
-        emit_status_counts(&app, &state)?;
+        refresh_and_emit_status_counts(&app, &state)?;
 
         let new_meta = fs::symlink_metadata(&new_path).ok();
         Ok(EntryDto {
@@ -4010,6 +4018,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
     let cwd = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
     let (mut path_ignores, path_ignore_patterns) = load_pathignore_rules(&home_dir, &cwd);
+    if !path_ignores.iter().any(|r| r == &app_data_dir) {
+        path_ignores.push(app_data_dir.clone());
+    }
     for root in load_gitignore_roots(&home_dir, &cwd) {
         if !path_ignores.iter().any(|r| r == &root) {
             path_ignores.push(root);
@@ -4059,7 +4070,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         }
         state.db_ready.store(true, AtomicOrdering::Release);
 
-        let _ = emit_status_counts(&app_handle, &state);
+        let _ = refresh_and_emit_status_counts(&app_handle, &state);
 
         #[cfg(target_os = "macos")]
         {

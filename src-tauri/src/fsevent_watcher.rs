@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-const LATENCY_SECONDS: cf::CFTimeInterval = 0.3;
+const LATENCY_SECONDS: cf::CFTimeInterval = 2.0;
 
 pub enum FsEvent {
     Paths(Vec<PathBuf>),
@@ -114,7 +114,7 @@ impl FsEventWatcher {
             copy_description: None,
         };
 
-        let flags = fs::kFSEventStreamCreateFlagFileEvents | fs::kFSEventStreamCreateFlagNoDefer;
+        let flags = fs::kFSEventStreamCreateFlagFileEvents;
 
         let stream = unsafe {
             let c_path = std::ffi::CString::new(root_str).map_err(|e| e.to_string())?;
