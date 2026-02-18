@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
-  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="272" cy="220" r="122" stroke="#0B3A73" stroke-width="72"/>
-    <line x1="186" y1="308" x2="78" y2="420" stroke="#0B3A73" stroke-width="72"/>
-
-    <circle cx="272" cy="220" r="122" stroke="#36A2FF" stroke-width="62"/>
-    <line x1="186" y1="308" x2="78" y2="420" stroke="#36A2FF" stroke-width="62"/>
-  </g>
-</svg>

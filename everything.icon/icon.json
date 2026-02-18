@@ -34,14 +34,14 @@
           "blend-mode" : "normal",
           "fill" : "automatic",
           "hidden" : false,
-          "image-name" : "everything-icon-1-classic-orange 2.svg",
-          "name" : "everything-icon-1-classic-orange 2",
+          "image-name" : "everything-icon-1-classic-orange.svg",
+          "name" : "everything-icon-1-classic-orange",
           "opacity" : 0.8,
           "position" : {
             "scale" : 1,
             "translation-in-points" : [
-              20,
-              -3
+              12,
+              -8
             ]
           }
         }
@@ -108,7 +108,7 @@
           "value" : 0.5
         }
       ],
-      "hidden" : false,
+      "hidden" : true,
       "layers" : [
 
       ],
