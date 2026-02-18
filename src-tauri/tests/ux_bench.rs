@@ -20,6 +20,7 @@ const DEFAULT_LIMIT: u32 = 300;
 const SHORT_QUERY_LIMIT: u32 = 100;
 const BATCH_SIZE: usize = 10_000;
 const DB_VERSION: i32 = 4;
+static BENCH_DB_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 // SLO thresholds
 const SLO_FAST_MS: f64 = 10.0;
@@ -27,6 +28,24 @@ const SLO_OK_MS: f64 = 30.0;
 const SLO_WARN_MS: f64 = 50.0;
 
 // ── DB helpers ──
+
+fn make_bench_db_path(scenario: &str) -> (PathBuf, PathBuf) {
+    let safe_scenario: String = scenario
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let seq = BENCH_DB_INSTANCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let epoch_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let bench_dir =
+        PathBuf::from(BENCH_DB_DIR).join(format!("{safe_scenario}_{pid}_{seq}_{epoch_nanos}"));
+    fs::create_dir_all(&bench_dir).expect("create bench dir");
+    let db_path = bench_dir.join("ux_bench.db");
+    (bench_dir, db_path)
+}
 
 fn db_connection(db_path: &Path) -> Connection {
     let conn = Connection::open(db_path).expect("open DB");
@@ -1336,10 +1355,7 @@ fn run_test_cases(conn: &Connection, label: &str) -> Vec<CaseResult> {
 #[test]
 fn scenario_a_fresh_index() {
     let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
-    let bench_dir = PathBuf::from(BENCH_DB_DIR);
-    let _ = fs::remove_dir_all(&bench_dir);
-    fs::create_dir_all(&bench_dir).expect("create bench dir");
-    let db_path = bench_dir.join("ux_bench.db");
+    let (bench_dir, db_path) = make_bench_db_path("scenario_a_fresh_index");
     init_db(&db_path);
 
     let sep = "=".repeat(100);
@@ -1531,10 +1547,7 @@ fn scenario_b_restart_and_search() {
 #[test]
 fn scenario_c_search_during_indexing() {
     let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
-    let bench_dir = PathBuf::from(BENCH_DB_DIR);
-    let _ = fs::remove_dir_all(&bench_dir);
-    fs::create_dir_all(&bench_dir).expect("create bench dir");
-    let db_path = bench_dir.join("ux_bench.db");
+    let (bench_dir, db_path) = make_bench_db_path("scenario_c_search_during_indexing");
     init_db(&db_path);
 
     let sep = "=".repeat(100);
