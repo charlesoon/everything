@@ -13,7 +13,7 @@
   const minColumnWidth = {
     name: 180,
     path: 240,
-    size: 80,
+    size: 70,
     modified: 120
   };
   const defaultColumnRatios = {
@@ -75,7 +75,7 @@
   let colWidths = {
     name: 250,
     path: 350,
-    size: 80,
+    size: 70,
     modified: 120
   };
 
@@ -279,13 +279,20 @@
     resizeCleanup?.();
     resizingColumn = leftKey;
 
+    const rightKey = columnKeys[index + 1];
+    const startRight = colWidths[rightKey];
+
     const onMove = (moveEvent) => {
       const delta = moveEvent.clientX - startX;
-      const nextLeft = Math.max(minColumnWidth[leftKey], Math.round(startLeft + delta));
+      const maxLeft = startLeft + startRight - minColumnWidth[rightKey];
+      const maxRight = startLeft + startRight - minColumnWidth[leftKey];
+      const nextLeft = Math.min(maxLeft, Math.max(minColumnWidth[leftKey], Math.round(startLeft + delta)));
+      const nextRight = Math.min(maxRight, Math.max(minColumnWidth[rightKey], Math.round(startRight - delta)));
 
       colWidths = {
         ...colWidths,
-        [leftKey]: nextLeft
+        [leftKey]: nextLeft,
+        [rightKey]: nextRight
       };
     };
 
@@ -428,8 +435,8 @@
         query: searchQuery,
         limit: PAGE_SIZE,
         offset: 0,
-        sort_by: searchSortBy,
-        sort_dir: searchSortDir
+        sortBy: searchSortBy,
+        sortDir: searchSortDir
       });
 
       if (gen !== searchGeneration) {
@@ -469,8 +476,8 @@
         query,
         limit: PAGE_SIZE,
         offset: results.length,
-        sort_by: sortBy,
-        sort_dir: sortDir
+        sortBy: sortBy,
+        sortDir: sortDir
       });
       if (gen !== searchGeneration) return;
       const arr = Array.isArray(batch.entries) ? batch.entries : [];
@@ -514,13 +521,6 @@
       sortDir = 'asc';
     }
     void runSearch();
-  }
-
-  function sortMark(column) {
-    if (sortBy !== column) {
-      return '';
-    }
-    return sortDir === 'asc' ? ' ▲' : ' ▼';
   }
 
   function handleRowClick(event, index) {
@@ -1175,7 +1175,7 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      if (query && results.length > 0) return;
+      if (results.length > 0) return;
       scheduleSearch();
     });
 
@@ -1246,7 +1246,7 @@
       <div class="table-header-track">
         <div class="col name">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('name')}>
-            Name{sortMark('name')}
+            Name{#if sortBy === 'name'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
           </button>
           <button
             type="button"
@@ -1259,7 +1259,7 @@
 
         <div class="col path">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('dir')}>
-            Path{sortMark('dir')}
+            Path{#if sortBy === 'dir'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
           </button>
           <button
             type="button"
@@ -1272,7 +1272,7 @@
 
         <div class="col size">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('size')}>
-            Size{sortMark('size')}
+            Size{#if sortBy === 'size'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
           </button>
           <button
             type="button"
@@ -1285,7 +1285,7 @@
 
         <div class="col modified">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('mtime')}>
-            Modified{sortMark('mtime')}
+            Modified{#if sortBy === 'mtime'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
           </button>
         </div>
       </div>
@@ -1331,7 +1331,7 @@
                   <span class="ellipsis">{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
                 {/if}
               </div>
-              <div class="cell path ellipsis">{displayPath(entry.dir)}</div>
+              <div class="cell path"><span class="ellipsis">{displayPath(entry.dir)}</span></div>
               <div class="cell size">{formatSize(entry)}</div>
               <div class="cell modified">{formatModified(entry)}</div>
             </div>
@@ -1660,7 +1660,7 @@
 
   .cell.size {
     text-align: right;
-    padding-right: 12px;
+    padding-right: 8px;
     font-variant-numeric: tabular-nums;
   }
 
