@@ -808,6 +808,7 @@ dependencies = [
  "jwalk",
  "notify",
  "parking_lot",
+ "png",
  "rayon",
  "rusqlite",
  "serde",

@@ -1,3 +1,4 @@
+pub mod com_guard;
 pub mod volume;
 pub mod path_resolver;
 pub mod mft_indexer;
@@ -5,6 +6,7 @@ pub mod usn_watcher;
 pub mod rdcw_watcher;
 pub mod context_menu;
 pub mod search_catchup;
+pub mod icon;
 
 use tauri::AppHandle;
 
@@ -19,33 +21,44 @@ use crate::{
 use std::collections::{HashMap, HashSet};
 
 pub fn start_windows_indexing(app: AppHandle, state: AppState) {
+    let win_started = std::time::Instant::now();
+    eprintln!("[startup/win] start_windows_indexing entered");
+
+    // ── Synchronous meta read ──
+    // Read DB meta BEFORE spawning the thread so we can set Ready state
+    // immediately when index_complete=true. This eliminates the race condition
+    // where the frontend's refreshStatus() runs before the spawned thread
+    // gets scheduled by the OS.
+    let (stored_usn, stored_journal_id, index_complete) = match db_connection(&state.db_path) {
+        Ok(conn) => {
+            let usn = get_meta(&conn, "win_last_usn")
+                .and_then(|v| v.parse::<i64>().ok());
+            let jid = get_meta(&conn, "win_journal_id")
+                .and_then(|v| v.parse::<u64>().ok());
+            let ic = get_meta(&conn, "index_complete")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            (usn, jid, ic)
+        }
+        Err(e) => {
+            eprintln!("[startup/win] DB connection failed: {e}");
+            (None, None, false)
+        }
+    };
+
+    eprintln!(
+        "[startup/win] +{}ms startup check: stored_usn={:?} stored_journal_id={:?} index_complete={}",
+        win_started.elapsed().as_millis(), stored_usn, stored_journal_id, index_complete
+    );
+
+    // Set Ready eagerly so the frontend never sees a stale "Indexing" default.
+    // The spawned thread will refine this (MFT scan, catchup, etc.).
+    if index_complete {
+        eprintln!("[startup/win] +{}ms setting Ready eagerly (index_complete=true)", win_started.elapsed().as_millis());
+        set_ready_with_cached_counts(&app, &state);
+    }
+
     std::thread::spawn(move || {
-        let win_started = std::time::Instant::now();
-        eprintln!("[startup/win] start_windows_indexing entered");
-        let conn = match db_connection(&state.db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[win] DB connection failed: {e}");
-                let _ = start_full_index_worker(app, state);
-                return;
-            }
-        };
-
-        let stored_usn = get_meta(&conn, "win_last_usn")
-            .and_then(|v| v.parse::<i64>().ok());
-        let stored_journal_id = get_meta(&conn, "win_journal_id")
-            .and_then(|v| v.parse::<u64>().ok());
-        let index_complete = get_meta(&conn, "index_complete")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-        drop(conn);
-
-        eprintln!(
-            "[startup/win] +{}ms startup check: stored_usn={:?} stored_journal_id={:?} index_complete={}",
-            win_started.elapsed().as_millis(), stored_usn, stored_journal_id, index_complete
-        );
-
         // Try conditional startup: resume from USN if we have prior state AND index was complete
         if stored_usn.is_some() && stored_journal_id.is_some() && index_complete {
             eprintln!("[startup/win] +{}ms attempting USN resume...", win_started.elapsed().as_millis());
@@ -78,7 +91,9 @@ pub fn start_windows_indexing(app: AppHandle, state: AppState) {
                 // USN watcher is started by the background DB upsert thread
             }
             Err(e) => {
-                // scan_mft sets indexing_active=true before failing; reset it.
+                // scan_mft only sets indexing_active after open_volume succeeds,
+                // so if we're here from an early open_volume failure, it's still false.
+                // Reset unconditionally for safety.
                 state.indexing_active.store(false, AtomicOrdering::Release);
 
                 if index_complete {

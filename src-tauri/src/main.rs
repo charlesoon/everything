@@ -2731,9 +2731,19 @@ if let tiff = image.tiffRepresentation,
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn load_system_icon_png(ext: &str) -> Option<Vec<u8>> {
+    win::icon::load_icon_png_by_ext(ext)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn load_system_icon_png(_ext: &str) -> Option<Vec<u8>> {
     None
+}
+
+#[cfg(target_os = "windows")]
+fn is_per_file_icon_ext(ext: &str) -> bool {
+    matches!(ext, "exe" | "lnk" | "ico" | "url" | "scr" | "appx")
 }
 
 #[tauri::command]
@@ -4036,21 +4046,50 @@ async fn show_context_menu(
 }
 
 #[tauri::command]
-async fn get_file_icon(ext: String, state: State<'_, AppState>) -> AppResult<Vec<u8>> {
+async fn get_file_icon(
+    path: Option<String>,
+    ext: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<u8>> {
     let state = state.inner().clone();
     Ok(tauri::async_runtime::spawn_blocking(move || {
-        let key = if ext.trim().is_empty() {
+        let ext_lower = if ext.trim().is_empty() {
             "__default__".to_string()
         } else {
             ext.to_lowercase()
         };
 
-        if let Some(cached) = state.icon_cache.lock().get(&key).cloned() {
+        #[cfg(target_os = "windows")]
+        let cache_key = {
+            if is_per_file_icon_ext(&ext_lower) {
+                path.as_deref().unwrap_or(&ext_lower).to_string()
+            } else {
+                ext_lower.clone()
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let cache_key = ext_lower.clone();
+
+        if let Some(cached) = state.icon_cache.lock().get(&cache_key).cloned() {
             return cached;
         }
 
-        let icon = load_system_icon_png(&key).unwrap_or_default();
-        state.icon_cache.lock().insert(key, icon.clone());
+        #[cfg(target_os = "windows")]
+        let icon = {
+            let from_path = path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .and_then(win::icon::load_icon_png);
+            from_path.or_else(|| load_system_icon_png(&ext_lower))
+        };
+        #[cfg(not(target_os = "windows"))]
+        let icon = {
+            let _ = path;
+            load_system_icon_png(&ext_lower)
+        };
+
+        let icon = icon.unwrap_or_default();
+        state.icon_cache.lock().insert(cache_key, icon.clone());
         icon
     })
     .await
@@ -4556,6 +4595,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             start_bench_runner(app_handle.clone(), state.clone());
         }
 
+        #[cfg(not(target_os = "windows"))]
         if !bench_mode {
             let icon_cache = state.icon_cache.clone();
             std::thread::spawn(move || {

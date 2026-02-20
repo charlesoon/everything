@@ -39,6 +39,7 @@ windows = { version = "0.58", features = [
 ] }
 notify = "7"
 rayon = "1"
+png = "0.17"
 
 [features]
 default = ["custom-protocol"]

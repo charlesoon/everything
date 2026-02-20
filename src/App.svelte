@@ -189,11 +189,13 @@
     return segs;
   }
 
+  const perFileIconExts = new Set(['exe', 'lnk', 'ico', 'url', 'scr', 'appx']);
+
   function iconKey(entry) {
-    if (entry.isDir) {
-      return '__folder__';
-    }
-    return entry.ext || '__file__';
+    if (entry.isDir) return '__folder__';
+    const ext = (entry.ext || '').toLowerCase();
+    if (perFileIconExts.has(ext)) return entry.path;
+    return ext || '__file__';
   }
 
   function iconFor(entry) {
@@ -208,7 +210,10 @@
 
     iconLoading.add(key);
     try {
-      const bytes = await invoke('get_file_icon', { ext: entry.isDir ? 'folder' : entry.ext || '' });
+      const bytes = await invoke('get_file_icon', {
+        path: entry.path,
+        ext: entry.isDir ? 'folder' : entry.ext || '',
+      });
       if (Array.isArray(bytes) && bytes.length > 0) {
         const image = `data:image/png;base64,${bytesToBase64(Uint8Array.from(bytes))}`;
         iconCache.set(key, image);
@@ -1241,16 +1246,17 @@
     unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus];
     flog(`[startup/fe] +${ms()}ms all listeners registered`);
 
-    // Show Svelte UI immediately: remove skeleton, focus search input.
-    // Window is already visible (visible:true in tauri.conf.json) showing the skeleton.
+    // Fetch backend state IMMEDIATELY after listeners are registered.
+    // Events emitted before listener registration are lost, so this
+    // is the only reliable way to get the current state.
+    await refreshStatus();
+    flog(`[startup/fe] +${ms()}ms refreshStatus done (state=${indexStatus.state})`);
+
+    // Show Svelte UI: remove skeleton, focus search input.
     await tick();
     document.getElementById('skeleton')?.remove();
     await focusSearch();
     flog(`[startup/fe] +${ms()}ms WINDOW VISIBLE — skeleton removed`);
-
-    // Remaining setup happens with the window already visible
-    await refreshStatus();
-    flog(`[startup/fe] +${ms()}ms refreshStatus done (state=${indexStatus.state})`);
 
     try {
       homePrefix = await invoke('get_home_dir');
