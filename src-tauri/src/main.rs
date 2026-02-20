@@ -52,7 +52,7 @@ const DEFERRED_DIR_NAMES: &[&str] = &[
     "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs",
 ];
 const SHALLOW_SCAN_DEPTH: usize = 6;
-const JWALK_NUM_THREADS: usize = 4;
+const JWALK_NUM_THREADS: usize = 8;
 
 pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".git",
@@ -65,6 +65,13 @@ pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".qtc_clangd",
     "__pycache__",
     ".gradle",
+    "DerivedData",
+];
+
+/// Path segments whose name ends with one of these suffixes are skipped.
+/// e.g. "*.build" skips Xcode intermediate build directories like "MyApp.build".
+pub(crate) const BUILTIN_SKIP_SUFFIXES: &[&str] = &[
+    ".build", // Xcode intermediate build dir (MyApp.build, Objects-normal, etc.)
 ];
 
 pub(crate) const BUILTIN_SKIP_PATHS: &[&str] = &[
@@ -1211,7 +1218,10 @@ pub(crate) fn should_skip_path_ext(
     let s = normalize_slashes(path.to_string_lossy().to_string());
 
     // Single-component builtin names: check path segments
-    if s.split('/').any(|seg| BUILTIN_SKIP_NAMES.contains(&seg)) {
+    if s.split('/').any(|seg| {
+        BUILTIN_SKIP_NAMES.contains(&seg)
+            || BUILTIN_SKIP_SUFFIXES.iter().any(|suf| seg.ends_with(suf))
+    }) {
         return true;
     }
 
@@ -1807,6 +1817,7 @@ pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) 
 
 /// Load cached entries count from meta table (instant) and emit Ready state + counts.
 /// Used on Windows startup paths where the index is already complete from a prior run.
+#[cfg(target_os = "windows")]
 pub(crate) fn set_ready_with_cached_counts(app: &AppHandle, state: &AppState) {
     let (count, last_updated) = db_connection(&state.db_path)
         .ok()
@@ -1840,6 +1851,7 @@ pub(crate) fn start_full_index_worker(app: AppHandle, state: AppState) -> AppRes
     start_full_index_worker_inner(app, state, false)
 }
 
+#[cfg(target_os = "windows")]
 pub(crate) fn start_full_index_worker_silent(app: AppHandle, state: AppState) -> AppResult<()> {
     start_full_index_worker_inner(app, state, true)
 }
@@ -1996,6 +2008,7 @@ fn run_incremental_index_inner(
     state: &AppState,
     conn: &mut Connection,
 ) -> AppResult<()> {
+
     let (runtime_ignored_roots, runtime_ignored_patterns) = effective_ignore_rules(
         &state.home_dir,
         &state.cwd,
@@ -2008,6 +2021,8 @@ fn run_incremental_index_inner(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let current_run_id = last_run_id + 1;
+    // Fresh index: DB was empty, skip preload/stamp, single unlimited-depth pass
+    let is_fresh = last_run_id == 0;
 
     let mut scanned: u64 = 0;
     let mut indexed: u64 = 0;
@@ -2081,6 +2096,7 @@ fn run_incremental_index_inner(
         }
     }
 
+
     // Flush home-level stamp batch
     if stamp_batch.len() >= BATCH_SIZE {
         stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
@@ -2101,7 +2117,12 @@ fn run_incremental_index_inner(
     let arc_ignored_roots = Arc::new(runtime_ignored_roots.clone());
     let arc_ignored_patterns = Arc::new(runtime_ignored_patterns.clone());
 
+
     for pass in 0..2u8 {
+        // Fresh index: single unlimited-depth pass — avoids double filesystem traversal
+        if pass == 1 && is_fresh {
+            break;
+        }
         let pass_label = if pass == 0 { "shallow" } else { "deep" };
         let pass_started = Instant::now();
         let mut pass_scanned = 0u64;
@@ -2113,7 +2134,14 @@ fn run_incremental_index_inner(
             let mut root_indexed = 0u64;
             let mut root_permission_errors = 0u64;
             let root_str = root.to_string_lossy().to_string();
-            let existing = preload_existing_entries(conn, &root_str);
+
+            // Fresh index: DB is empty, preload is unnecessary
+            let existing = if is_fresh {
+                HashMap::new()
+            } else {
+                let e = preload_existing_entries(conn, &root_str);
+                e
+            };
 
             let gi_ref = gi_filter.clone();
             let skip_roots = arc_ignored_roots.clone();
@@ -2123,7 +2151,8 @@ fn run_incremental_index_inner(
                 .follow_links(false)
                 .skip_hidden(false)
                 .parallelism(jwalk::Parallelism::RayonNewPool(JWALK_NUM_THREADS));
-            if pass == 0 {
+            // Fresh index: no depth limit — walk everything in one pass
+            if pass == 0 && !is_fresh {
                 builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
             }
             let walker = builder.process_read_dir(move |_depth, path, _state, children| {
@@ -2153,7 +2182,7 @@ fn run_incremental_index_inner(
                             continue;
                         }
 
-                        // Pass 1: skip shallow entries already indexed in pass 0
+                        // Pass 1 (incremental only): skip shallow entries already indexed in pass 0
                         if pass == 1 && entry.depth <= SHALLOW_SCAN_DEPTH {
                             continue;
                         }
@@ -2164,7 +2193,12 @@ fn run_incremental_index_inner(
 
                         if let Some(mut row) = index_row_from_jwalk_entry(&entry) {
                             row.run_id = current_run_id;
-                            if let Some((old_mtime, old_size)) = existing.get(&row.path) {
+                            if is_fresh {
+                                // Fresh index: all entries are new, skip existing check
+                                indexed += 1;
+                                root_indexed += 1;
+                                batch.push(row);
+                            } else if let Some((old_mtime, old_size)) = existing.get(&row.path) {
                                 if *old_mtime == row.mtime && *old_size == row.size {
                                     stamp_batch.push(row.path);
                                 } else {
@@ -2218,6 +2252,9 @@ fn run_incremental_index_inner(
             pass_scanned += root_scanned;
             pass_indexed += root_indexed;
 
+            eprintln!("[timing]   walk_{} {} {}ms scanned={} indexed={} err={}",
+                pass_label, root_str, root_started.elapsed().as_millis(),
+                root_scanned, root_indexed, root_permission_errors);
             perf_log(format!(
                 "index_root_done pass={} root={} elapsed_ms={} scanned={} indexed={} permission_errors={}",
                 pass_label,
@@ -2247,8 +2284,9 @@ fn run_incremental_index_inner(
             pass_indexed,
         ));
 
-        // After shallow pass, emit progress so UI shows searchable state early
-        if pass == 0 {
+        // After shallow pass (incremental only), emit progress so UI shows searchable state early
+        // Fresh index uses per-root emit above instead.
+        if pass == 0 && !is_fresh {
             let _ = refresh_and_emit_status_counts(app, state);
             let _ = app.emit(
                 "index_updated",
@@ -2273,19 +2311,24 @@ fn run_incremental_index_inner(
     emit_index_progress(app, scanned, indexed, current_path.clone());
 
     // Remove entries not seen in this run (deleted files)
-    let deleted_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM entries WHERE run_id < ?1",
+    // Fresh index: DB was empty before this run, no stale entries possible
+    let deleted_count: i64 = if is_fresh {
+        0
+    } else {
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE run_id < ?1",
+                params![current_run_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        conn.execute(
+            "DELETE FROM entries WHERE run_id < ?1",
             params![current_run_id],
-            |row| row.get(0),
         )
-        .unwrap_or(0);
-
-    conn.execute(
-        "DELETE FROM entries WHERE run_id < ?1",
-        params![current_run_id],
-    )
-    .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
+        count
+    };
 
     set_meta(conn, "last_run_id", &current_run_id.to_string())?;
 
@@ -2416,7 +2459,18 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
         return Ok(0);
     }
 
-    let mut conn = db_connection(&state.db_path)?;
+    let op_start = std::time::Instant::now();
+    let mut conn = db_connection(&state.db_path).map_err(|e| {
+        eprintln!(
+            "[watcher] db_connection FAILED after {}ms: {} (upsert={} delete={} indexing_active={})",
+            op_start.elapsed().as_millis(),
+            e,
+            to_upsert.len(),
+            to_delete.len(),
+            state.indexing_active.load(AtomicOrdering::Acquire)
+        );
+        e
+    })?;
     let mut changed = 0;
 
     changed += upsert_rows(&mut conn, &to_upsert)?;
@@ -2429,10 +2483,14 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
 const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(target_os = "macos")]
+const DB_BUSY_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+#[cfg(target_os = "macos")]
 fn process_watcher_paths(
     app: &AppHandle,
     state: &AppState,
     pending: &mut HashSet<PathBuf>,
+    deadline: &mut Option<Instant>,
     last_status_emit: &mut Instant,
     pending_status_emit: &mut bool,
 ) {
@@ -2449,6 +2507,7 @@ fn process_watcher_paths(
 
     match apply_path_changes(state, &batch) {
         Ok(changed) => {
+            *deadline = None;
             if changed > 0 {
                 invalidate_search_caches(state);
                 touch_status_updated(state);
@@ -2462,6 +2521,27 @@ fn process_watcher_paths(
             }
         }
         Err(err) => {
+            let is_busy = err.contains("locked") || err.contains("busy");
+            if is_busy {
+                eprintln!(
+                    "[watcher] DB busy, will retry in {}s: {} | batch_size={}",
+                    DB_BUSY_RETRY_DELAY.as_secs(),
+                    err,
+                    batch.len()
+                );
+                for path in batch {
+                    pending.insert(path);
+                }
+                *deadline = Some(Instant::now() + DB_BUSY_RETRY_DELAY);
+                return;
+            }
+            eprintln!(
+                "[watcher] process_watcher_paths ERROR: {} | batch_size={} indexing_active={}",
+                err,
+                batch.len(),
+                state.indexing_active.load(AtomicOrdering::Acquire)
+            );
+            *deadline = None;
             if state.indexing_active.load(AtomicOrdering::Acquire) {
                 return;
             }
@@ -2576,6 +2656,11 @@ fn start_fsevent_watcher_worker(
                             cached_effective_ignore_rules(&state);
                         let rows = collect_rows_recursive(&path, &ignored_roots, &ignored_patterns);
                         if !rows.is_empty() {
+                            eprintln!(
+                                "[watcher] MustScanSubDirs DB write: rows={} path={}",
+                                rows.len(),
+                                path.display()
+                            );
                             if let Ok(mut conn) = db_connection(&state.db_path) {
                                 if upsert_rows(&mut conn, &rows).is_ok() {
                                     invalidate_search_caches(&state);
@@ -2593,14 +2678,19 @@ fn start_fsevent_watcher_worker(
                     }
                 }
                 Ok(mac::fsevent_watcher::FsEvent::HistoryDone) => {
+                    eprintln!(
+                        "[watcher] HistoryDone: pending_paths={} indexing_active={}",
+                        pending_paths.len(),
+                        state.indexing_active.load(AtomicOrdering::Acquire)
+                    );
                     process_watcher_paths(
                         &app,
                         &state,
                         &mut pending_paths,
+                        &mut deadline,
                         &mut last_status_emit,
                         &mut pending_status_emit,
                     );
-                    deadline = None;
                     if replay_phase {
                         replay_phase = false;
                         if !full_scan_triggered {
@@ -2624,10 +2714,10 @@ fn start_fsevent_watcher_worker(
                         &app,
                         &state,
                         &mut pending_paths,
+                        &mut deadline,
                         &mut last_status_emit,
                         &mut pending_status_emit,
                     );
-                    deadline = None;
                 }
             }
 

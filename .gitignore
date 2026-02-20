@@ -1,9 +1,9 @@
 node_modules
 src-tauri/target
+src-tauri/target-test
 dist
 .DS_Store
 certificates
 .claude
 .entire
-src-tauri/target-test
-
+build

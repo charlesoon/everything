@@ -58,6 +58,7 @@ impl fmt::Debug for MemIndex {
 }
 
 impl MemIndex {
+    #[cfg(target_os = "windows")]
     pub fn build(entries: Vec<CompactEntry>) -> Self {
         let t0 = Instant::now();
         let n = entries.len();
@@ -111,6 +112,7 @@ impl MemIndex {
         self.entries.len()
     }
 
+    #[cfg(target_os = "windows")]
     pub fn entries(&self) -> &[CompactEntry] {
         &self.entries
     }
