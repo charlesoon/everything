@@ -3,8 +3,9 @@
   "checkpoint_id": "58fe448ab243",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 11,
+  "checkpoints_count": 12,
   "files_touched": [
+    ".gitignore",
     "src-tauri/src/main.rs",
     "src-tauri/src/mem_search.rs"
   ],
@@ -22,13 +23,20 @@
       "context": "/58/fe448ab243/1/context.md",
       "content_hash": "/58/fe448ab243/1/content_hash.txt",
       "prompt": "/58/fe448ab243/1/prompt.txt"
+    },
+    {
+      "metadata": "/58/fe448ab243/2/metadata.json",
+      "transcript": "/58/fe448ab243/2/full.jsonl",
+      "context": "/58/fe448ab243/2/context.md",
+      "content_hash": "/58/fe448ab243/2/content_hash.txt",
+      "prompt": "/58/fe448ab243/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 1390,
-    "cache_creation_tokens": 245377,
-    "cache_read_tokens": 18779552,
-    "output_tokens": 29759,
-    "api_call_count": 217
+    "input_tokens": 1568,
+    "cache_creation_tokens": 754217,
+    "cache_read_tokens": 28471167,
+    "output_tokens": 33809,
+    "api_call_count": 299
   }
 }
