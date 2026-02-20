@@ -1,0 +1,17 @@
+터미널에서 claudecc로 실행하면 claude --dangerously-skip-permissions이 실행되도록 명령어 만들어줘
+
+---
+
+@src-tauri/icons/icon.ico 색상이 너무 어두운데 조금 더 밝게 바꿔줘
+
+---
+
+@src-tauri/icons/icon.ico 를 재생성 해줘
+
+---
+
+commit and push
+
+---
+
+@src-tauri/icons/icon.ico 을 디자인처럼 플랫하게 만들어줘. 지금 이미지는 입체적이야
