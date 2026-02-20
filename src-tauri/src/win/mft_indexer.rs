@@ -64,6 +64,12 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     let started = Instant::now();
     eprintln!("[win/mft] starting MFT scan");
 
+    // Open volume FIRST — requires admin privileges.
+    // Do NOT modify state/DB before this succeeds, so a failed open_volume
+    // leaves index_complete and status untouched.
+    let vol = volume::open_volume('C')?;
+    eprintln!("[win/mft] volume opened in {}ms", started.elapsed().as_millis());
+
     state
         .indexing_active
         .store(true, AtomicOrdering::Release);
@@ -82,9 +88,6 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         status.current_path.clear();
     }
     emit_index_state(app, "Indexing", None);
-
-    let vol = volume::open_volume('C')?;
-    eprintln!("[win/mft] volume opened in {}ms", started.elapsed().as_millis());
 
     // ── Pass 1: Enumerate MFT — dirs into resolver, files into Vec ──
     let pass1_started = Instant::now();
