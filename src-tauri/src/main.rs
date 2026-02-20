@@ -10,43 +10,51 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
-        mpsc::{self, RecvTimeoutError},
         Arc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "macos")]
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use walkdir::WalkDir;
 
 mod fd_search;
-#[cfg(target_os = "macos")]
-mod fsevent_watcher;
 mod gitignore_filter;
+#[cfg(target_os = "macos")]
+mod mac;
+mod mem_search;
 mod query;
-mod spotlight_search;
+#[cfg(target_os = "windows")]
+mod win;
 use fd_search::{FdSearchCache, FdSearchResultDto};
 use query::{escape_like, parse_query, SearchMode};
 
 const DEFAULT_LIMIT: u32 = 300;
 const SHORT_QUERY_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 1000;
-const BATCH_SIZE: usize = 10_000;
+pub(crate) const BATCH_SIZE: usize = 10_000;
 const RECENT_OP_TTL: Duration = Duration::from_secs(2);
-const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 const NEGATIVE_CACHE_FALLBACK_WINDOW: Duration = Duration::from_millis(550);
 const DB_VERSION: i32 = 4;
-const DEFERRED_DIR_NAMES: &[&str] = &["Library", ".Trash", ".Trashes"];
+const DEFERRED_DIR_NAMES: &[&str] = &[
+    "Library", ".Trash", ".Trashes",
+    // Windows system directories (deferred when scan_root is C:\)
+    "Windows", "Program Files", "Program Files (x86)",
+    "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs",
+];
 const SHALLOW_SCAN_DEPTH: usize = 6;
 const JWALK_NUM_THREADS: usize = 4;
 
-const BUILTIN_SKIP_NAMES: &[&str] = &[
+pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".git",
     "node_modules",
     ".Trash",
@@ -59,11 +67,18 @@ const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".gradle",
 ];
 
-const BUILTIN_SKIP_PATHS: &[&str] = &[
+pub(crate) const BUILTIN_SKIP_PATHS: &[&str] = &[
+    // macOS
     "Library/Caches",
     "Library/Developer/CoreSimulator",
     "Library/Logs",
+    // Cross-platform
     ".vscode/extensions",
+    // Windows: noisy system directories under AppData
+    "AppData/Local/Temp",
+    "AppData/Local/Microsoft",
+    "AppData/Local/Google",
+    "AppData/Local/Packages",
 ];
 
 type AppResult<T> = Result<T, String>;
@@ -109,6 +124,7 @@ struct IndexProgressEvent {
 struct IndexStateEvent {
     state: String,
     message: Option<String>,
+    is_catchup: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,7 +204,7 @@ struct BenchReport {
 }
 
 #[derive(Debug, Clone)]
-enum IndexState {
+pub(crate) enum IndexState {
     Ready,
     Indexing,
     Error,
@@ -205,15 +221,15 @@ impl IndexState {
 }
 
 #[derive(Debug, Clone)]
-struct IndexStatus {
-    state: IndexState,
-    entries_count: u64,
-    last_updated: Option<i64>,
-    permission_errors: u64,
-    message: Option<String>,
-    scanned: u64,
-    indexed: u64,
-    current_path: String,
+pub(crate) struct IndexStatus {
+    pub(crate) state: IndexState,
+    pub(crate) entries_count: u64,
+    pub(crate) last_updated: Option<i64>,
+    pub(crate) permission_errors: u64,
+    pub(crate) message: Option<String>,
+    pub(crate) scanned: u64,
+    pub(crate) indexed: u64,
+    pub(crate) current_path: String,
 }
 
 impl Default for IndexStatus {
@@ -232,7 +248,8 @@ impl Default for IndexStatus {
 }
 
 #[derive(Debug, Clone)]
-struct RecentOp {
+#[allow(dead_code)]
+pub(crate) struct RecentOp {
     old_path: Option<String>,
     new_path: Option<String>,
     op_type: &'static str,
@@ -240,13 +257,13 @@ struct RecentOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum IgnorePattern {
+pub(crate) enum IgnorePattern {
     AnySegment(String),
     Glob(String),
 }
 
 #[derive(Debug, Clone)]
-struct IgnoreRulesCache {
+pub(crate) struct IgnoreRulesCache {
     roots: Vec<PathBuf>,
     patterns: Vec<IgnorePattern>,
     pathignore_mtime: Option<SystemTime>,
@@ -254,25 +271,33 @@ struct IgnoreRulesCache {
 }
 
 #[derive(Debug, Clone)]
-struct AppState {
-    db_path: PathBuf,
-    home_dir: PathBuf,
-    cwd: PathBuf,
-    path_ignores: Arc<Vec<PathBuf>>,
-    path_ignore_patterns: Arc<Vec<IgnorePattern>>,
-    db_ready: Arc<AtomicBool>,
-    indexing_active: Arc<AtomicBool>,
-    status: Arc<Mutex<IndexStatus>>,
-    recent_ops: Arc<Mutex<Vec<RecentOp>>>,
-    icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>,
-    negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>,
-    ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,
-    gitignore: gitignore_filter::SharedGitignoreFilter,
+pub(crate) struct AppState {
+    pub(crate) db_path: PathBuf,
+    pub(crate) home_dir: PathBuf,
+    pub(crate) scan_root: PathBuf,
+    pub(crate) cwd: PathBuf,
+    pub(crate) path_ignores: Arc<Vec<PathBuf>>,
+    pub(crate) path_ignore_patterns: Arc<Vec<IgnorePattern>>,
+    pub(crate) db_ready: Arc<AtomicBool>,
+    pub(crate) indexing_active: Arc<AtomicBool>,
+    pub(crate) status: Arc<Mutex<IndexStatus>>,
+    pub(crate) recent_ops: Arc<Mutex<Vec<RecentOp>>>,
+    pub(crate) icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub(crate) fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>,
+    pub(crate) negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>,
+    pub(crate) ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,
+    pub(crate) gitignore: Arc<gitignore_filter::LazyGitignoreFilter>,
+    /// In-memory index for instant search while DB upsert runs in background.
+    /// Set by MFT scan, cleared after background DB upsert completes.
+    pub(crate) mem_index: Arc<RwLock<Option<Arc<mem_search::MemIndex>>>>,
+    /// Signal to stop the file watcher (RDCW / USN). Set to true on reset_index.
+    pub(crate) watcher_stop: Arc<AtomicBool>,
+    /// Set to true while a file watcher event loop is running.
+    pub(crate) watcher_active: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
-struct NegativeNameEntry {
+pub(crate) struct NegativeNameEntry {
     query_lower: String,
     created_at: Instant,
     fallback_checked: bool,
@@ -286,19 +311,19 @@ struct NegativeCacheHit {
 }
 
 #[derive(Debug, Clone)]
-struct IndexRow {
-    path: String,
-    name: String,
-    dir: String,
-    is_dir: i64,
-    ext: Option<String>,
-    mtime: Option<i64>,
-    size: Option<i64>,
-    indexed_at: i64,
-    run_id: i64,
+pub(crate) struct IndexRow {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) dir: String,
+    pub(crate) is_dir: i64,
+    pub(crate) ext: Option<String>,
+    pub(crate) mtime: Option<i64>,
+    pub(crate) size: Option<i64>,
+    pub(crate) indexed_at: i64,
+    pub(crate) run_id: i64,
 }
 
-fn now_epoch() -> i64 {
+pub(crate) fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -325,7 +350,7 @@ fn perf_log_enabled() -> bool {
     *PERF_LOG_ENABLED.get_or_init(|| env_truthy("FASTFIND_PERF_LOG") || bench_mode_enabled())
 }
 
-fn perf_log(message: impl AsRef<str>) {
+pub(crate) fn perf_log(message: impl AsRef<str>) {
     if perf_log_enabled() {
         eprintln!("[perf] {}", message.as_ref());
     }
@@ -345,15 +370,21 @@ fn db_connection_with_timeout(db_path: &Path, busy_timeout_ms: u32) -> AppResult
     Ok(conn)
 }
 
-fn db_connection(db_path: &Path) -> AppResult<Connection> {
+pub(crate) fn db_connection(db_path: &Path) -> AppResult<Connection> {
     db_connection_with_timeout(db_path, 3000)
 }
 
 fn db_connection_for_search(db_path: &Path) -> AppResult<Connection> {
-    db_connection_with_timeout(db_path, 200)
+    let conn = db_connection_with_timeout(db_path, 200)?;
+    conn.execute_batch(
+        "PRAGMA cache_size = -32768;
+         PRAGMA mmap_size = 268435456;",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(conn)
 }
 
-fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
+pub(crate) fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         r#"
         PRAGMA synchronous = NORMAL;
@@ -365,7 +396,7 @@ fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
     .map_err(|e| e.to_string())
 }
 
-fn restore_normal_pragmas(conn: &Connection) -> AppResult<()> {
+pub(crate) fn restore_normal_pragmas(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         r#"
         PRAGMA synchronous = NORMAL;
@@ -381,7 +412,9 @@ fn restore_normal_pragmas(conn: &Connection) -> AppResult<()> {
 }
 
 fn init_db(db_path: &Path) -> AppResult<()> {
+    let t = Instant::now();
     let conn = db_connection(db_path)?;
+    eprintln!("[init_db] +{}ms db_connection opened", t.elapsed().as_millis());
 
     let current_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -400,6 +433,7 @@ fn init_db(db_path: &Path) -> AppResult<()> {
         conn.execute_batch(&format!("PRAGMA user_version = {};", DB_VERSION))
             .map_err(|e| e.to_string())?;
     }
+    eprintln!("[init_db] +{}ms version check done (v={})", t.elapsed().as_millis(), current_version);
 
     conn.execute_batch(
         r#"
@@ -416,13 +450,10 @@ fn init_db(db_path: &Path) -> AppResult<()> {
           run_id INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE INDEX IF NOT EXISTS idx_entries_dir ON entries(dir);
         CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
         CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_ext ON entries(ext);
         CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_run_id ON entries(run_id);
 
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
@@ -431,6 +462,7 @@ fn init_db(db_path: &Path) -> AppResult<()> {
         "#,
     )
     .map_err(|e| e.to_string())?;
+    eprintln!("[init_db] +{}ms schema ensured", t.elapsed().as_millis());
 
     let legacy_index_migration_key = "migration_drop_idx_entries_dir_name_nocase_v1";
     let migrated = get_meta(&conn, legacy_index_migration_key)
@@ -441,11 +473,12 @@ fn init_db(db_path: &Path) -> AppResult<()> {
             .map_err(|e| e.to_string())?;
         set_meta(&conn, legacy_index_migration_key, "1")?;
     }
+    eprintln!("[init_db] +{}ms total", t.elapsed().as_millis());
 
     Ok(())
 }
 
-fn get_meta(conn: &Connection, key: &str) -> Option<String> {
+pub(crate) fn get_meta(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row(
         "SELECT value FROM meta WHERE key = ?1",
         params![key],
@@ -454,7 +487,7 @@ fn get_meta(conn: &Connection, key: &str) -> Option<String> {
     .ok()
 }
 
-fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
+pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
         params![key, value],
@@ -482,7 +515,7 @@ fn update_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
     Ok((entries_count, last_updated))
 }
 
-fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
+pub(crate) fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
     let (entries_count, last_updated) = update_counts(state)?;
     let mut status = state.status.lock();
     status.entries_count = entries_count;
@@ -490,7 +523,7 @@ fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
     Ok((entries_count, last_updated))
 }
 
-fn invalidate_search_caches(state: &AppState) {
+pub(crate) fn invalidate_search_caches(state: &AppState) {
     state.fd_search_cache.lock().take();
     state.negative_name_cache.lock().clear();
 }
@@ -582,10 +615,10 @@ fn sort_clause(sort_by: &str, sort_dir: &str, prefix: &str) -> String {
             format!("{prefix}dir COLLATE NOCASE DESC, {prefix}name COLLATE NOCASE ASC")
         }
         ("size", "asc") => {
-            format!("COALESCE({prefix}size, 0) ASC, {prefix}name COLLATE NOCASE ASC")
+            format!("{prefix}size IS NULL ASC, {prefix}size ASC, {prefix}name COLLATE NOCASE ASC")
         }
         ("size", "desc") => {
-            format!("COALESCE({prefix}size, 0) DESC, {prefix}name COLLATE NOCASE ASC")
+            format!("{prefix}size IS NULL ASC, {prefix}size DESC, {prefix}name COLLATE NOCASE ASC")
         }
         _ => format!("{prefix}name COLLATE NOCASE ASC, {prefix}path COLLATE NOCASE ASC"),
     }
@@ -644,7 +677,10 @@ fn resolve_dirs_from_db(conn: &Connection, dir_hint: &str) -> Vec<String> {
         Some(s) if !s.is_empty() => s,
         _ => dir_hint,
     };
-    let path_pattern = format!("%/{}", escape_like(dir_hint));
+    let sep = std::path::MAIN_SEPARATOR;
+    let native_hint = dir_hint.replace('/', &sep.to_string());
+    let escaped_sep = escape_like(&sep.to_string());
+    let path_pattern = format!("%{escaped_sep}{}", escape_like(&native_hint));
     let fetch_limit = (RESOLVE_DIRS_MAX + 1) as i64;
     let mut stmt = match conn.prepare(
         "SELECT path FROM entries WHERE name = ?1 COLLATE NOCASE AND is_dir = 1 AND path LIKE ?2 ESCAPE '\\' LIMIT ?3",
@@ -916,6 +952,32 @@ fn macos_tcc_ignore_roots(_home_dir: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Directories under home that generate heavy background I/O on Windows
+/// (browser caches, Windows Update temp files, UWP package state, etc.).
+/// Pruning these from the MFT subtree eliminates noisy USN records.
+#[cfg(target_os = "windows")]
+fn windows_noisy_roots(home_dir: &Path) -> Vec<PathBuf> {
+    let local = home_dir.join("AppData").join("Local");
+    let dirs = vec![
+        local.join("Temp"),
+        local.join("Microsoft"),
+        local.join("Google"),
+        local.join("Packages"),
+        // C:\ system directories
+        PathBuf::from("C:\\Windows"),
+        PathBuf::from("C:\\$Recycle.Bin"),
+        PathBuf::from("C:\\System Volume Information"),
+        PathBuf::from("C:\\Recovery"),
+        PathBuf::from("C:\\PerfLogs"),
+    ];
+    dirs.into_iter().filter(|p| p.exists()).collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_noisy_roots(_home_dir: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn effective_ignore_rules(
     home_dir: &Path,
     cwd: &Path,
@@ -935,6 +997,7 @@ fn effective_ignore_rules(
         .into_iter()
         .chain(load_gitignore_roots(home_dir, cwd).into_iter())
         .chain(macos_tcc_ignore_roots(home_dir).into_iter())
+        .chain(windows_noisy_roots(home_dir).into_iter())
     {
         let key = root.to_string_lossy().to_string();
         if seen.insert(key) {
@@ -969,7 +1032,7 @@ fn builtin_ignore_patterns(home_dir: &Path) -> Vec<IgnorePattern> {
     ]
 }
 
-fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
+pub(crate) fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
     let home_dir = &state.home_dir;
     let cwd = &state.cwd;
 
@@ -1101,7 +1164,7 @@ fn glob_match_path(pattern: &str, text: &str) -> bool {
     px == pn
 }
 
-fn matches_ignore_pattern(path: &str, pattern: &IgnorePattern) -> bool {
+pub(crate) fn matches_ignore_pattern(path: &str, pattern: &IgnorePattern) -> bool {
     match pattern {
         IgnorePattern::AnySegment(segment) => {
             let suffix = format!("/{segment}");
@@ -1130,7 +1193,7 @@ fn matches_ignore_pattern(path: &str, pattern: &IgnorePattern) -> bool {
     }
 }
 
-fn should_skip_path(
+pub(crate) fn should_skip_path(
     path: &Path,
     ignored_roots: &[PathBuf],
     ignored_patterns: &[IgnorePattern],
@@ -1138,7 +1201,7 @@ fn should_skip_path(
     should_skip_path_ext(path, ignored_roots, ignored_patterns, None, None)
 }
 
-fn should_skip_path_ext(
+pub(crate) fn should_skip_path_ext(
     path: &Path,
     ignored_roots: &[PathBuf],
     ignored_patterns: &[IgnorePattern],
@@ -1192,7 +1255,7 @@ fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
         .map(|ext| ext.to_lowercase())
 }
 
-fn index_row_from_path_and_metadata(path: &Path, metadata: &fs::Metadata) -> Option<IndexRow> {
+pub(crate) fn index_row_from_path_and_metadata(path: &Path, metadata: &fs::Metadata) -> Option<IndexRow> {
     let is_dir = metadata.is_dir();
 
     let name = path
@@ -1320,6 +1383,22 @@ fn entry_cmp(a: &EntryDto, b: &EntryDto, sort_by: &str, sort_dir: &str) -> Order
                 return primary;
             }
             a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        }
+        "size" => {
+            let lhs = a.size.unwrap_or(0);
+            let rhs = b.size.unwrap_or(0);
+            let primary = if sort_dir == "desc" {
+                rhs.cmp(&lhs)
+            } else {
+                lhs.cmp(&rhs)
+            };
+            if primary != Ordering::Equal {
+                return primary;
+            }
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then(a.path.to_lowercase().cmp(&b.path.to_lowercase()))
         }
         _ => {
             let lhs_name = a.name.to_lowercase();
@@ -1553,7 +1632,7 @@ fn find_search(
     entries
 }
 
-fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult<usize> {
+pub(crate) fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
@@ -1597,7 +1676,7 @@ fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult<usize> {
     Ok(rows.len())
 }
 
-fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize> {
+pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize> {
     if raw_paths.is_empty() {
         return Ok(0);
     }
@@ -1614,19 +1693,20 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
             .map_err(|e| e.to_string())?;
 
         for path in raw_paths {
-            let normalized = if path == "/" {
-                "/".to_string()
+            let is_root = path == "/" || path == "\\";
+            let normalized = if is_root {
+                path.clone()
             } else {
-                path.trim_end_matches('/').to_string()
+                path.trim_end_matches(&['/', '\\'][..]).to_string()
             };
 
             if normalized.is_empty() {
                 continue;
             }
 
-            if normalized == "/" {
-                deleted += stmt_children
-                    .execute(params!["/", "0"])
+            if is_root {
+                deleted += tx
+                    .execute("DELETE FROM entries", [])
                     .map_err(|e| e.to_string())?;
                 continue;
             }
@@ -1635,10 +1715,11 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
                 .execute(params![&normalized])
                 .map_err(|e| e.to_string())?;
 
-            // Delete children using B-tree range scan: path >= "{normalized}/" AND path < "{normalized}0"
-            // '/' is 0x2F and '0' is 0x30 (the next byte), so this captures all children exactly.
-            let range_start = format!("{normalized}/");
-            let range_end = format!("{normalized}0");
+            // Delete children using B-tree range scan: path >= "{normalized}{sep}" AND path < "{normalized}\x7F"
+            // \x7F (127) is higher than both '/' (47) and '\' (92), so this captures all children.
+            let sep = std::path::MAIN_SEPARATOR;
+            let range_start = format!("{normalized}{sep}");
+            let range_end = format!("{normalized}\x7F");
             deleted += stmt_children
                 .execute(params![&range_start, &range_end])
                 .map_err(|e| e.to_string())?;
@@ -1649,17 +1730,19 @@ fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize>
     Ok(deleted)
 }
 
-fn emit_index_state(app: &AppHandle, state: &str, message: Option<String>) {
+pub(crate) fn emit_index_state(app: &AppHandle, state: &str, message: Option<String>) {
+    let is_catchup = message.as_ref().map_or(false, |m| m.starts_with("Catchup:"));
     let _ = app.emit(
         "index_state",
         IndexStateEvent {
             state: state.to_string(),
             message,
+            is_catchup,
         },
     );
 }
 
-fn emit_index_updated(
+pub(crate) fn emit_index_updated(
     app: &AppHandle,
     entries_count: u64,
     last_updated: i64,
@@ -1675,7 +1758,7 @@ fn emit_index_updated(
     );
 }
 
-fn emit_index_progress(app: &AppHandle, scanned: u64, indexed: u64, current_path: String) {
+pub(crate) fn emit_index_progress(app: &AppHandle, scanned: u64, indexed: u64, current_path: String) {
     let _ = app.emit(
         "index_progress",
         IndexProgressEvent {
@@ -1686,13 +1769,13 @@ fn emit_index_progress(app: &AppHandle, scanned: u64, indexed: u64, current_path
     );
 }
 
-fn set_state(state: &AppState, next: IndexState, message: Option<String>) {
+pub(crate) fn set_state(state: &AppState, next: IndexState, message: Option<String>) {
     let mut status = state.status.lock();
     status.state = next;
     status.message = message;
 }
 
-fn set_progress(state: &AppState, scanned: u64, indexed: u64, current_path: &str) {
+pub(crate) fn set_progress(state: &AppState, scanned: u64, indexed: u64, current_path: &str) {
     let mut status = state.status.lock();
     status.scanned = scanned;
     status.indexed = indexed;
@@ -1709,17 +1792,59 @@ fn emit_status_counts(app: &AppHandle, state: &AppState) {
     );
 }
 
-fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
-    update_status_counts(state)?;
+pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
+    let (entries_count, last_updated) = update_status_counts(state)?;
+    // Persist cached counts so next startup can read them instantly
+    if let Ok(conn) = db_connection(&state.db_path) {
+        let _ = set_meta(&conn, "cached_entries_count", &entries_count.to_string());
+        if let Some(lu) = last_updated {
+            let _ = set_meta(&conn, "cached_last_updated", &lu.to_string());
+        }
+    }
     emit_status_counts(app, state);
     Ok(())
 }
 
+/// Load cached entries count from meta table (instant) and emit Ready state + counts.
+/// Used on Windows startup paths where the index is already complete from a prior run.
+pub(crate) fn set_ready_with_cached_counts(app: &AppHandle, state: &AppState) {
+    let (count, last_updated) = db_connection(&state.db_path)
+        .ok()
+        .map(|conn| {
+            let c = get_meta(&conn, "cached_entries_count")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let lu = get_meta(&conn, "cached_last_updated")
+                .and_then(|v| v.parse::<i64>().ok());
+            (c, lu)
+        })
+        .unwrap_or((0, None));
+
+    {
+        let mut status = state.status.lock();
+        status.state = IndexState::Ready;
+        status.entries_count = count;
+        status.last_updated = last_updated;
+    }
+
+    emit_index_state(app, "Ready", None);
+    emit_index_updated(app, count, last_updated.unwrap_or_else(now_epoch), 0);
+}
+
+#[cfg(target_os = "macos")]
 fn touch_status_updated(state: &AppState) {
     state.status.lock().last_updated = Some(now_epoch());
 }
 
-fn start_full_index_worker(app: AppHandle, state: AppState) -> AppResult<()> {
+pub(crate) fn start_full_index_worker(app: AppHandle, state: AppState) -> AppResult<()> {
+    start_full_index_worker_inner(app, state, false)
+}
+
+pub(crate) fn start_full_index_worker_silent(app: AppHandle, state: AppState) -> AppResult<()> {
+    start_full_index_worker_inner(app, state, true)
+}
+
+fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) -> AppResult<()> {
     if state
         .indexing_active
         .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
@@ -1729,24 +1854,36 @@ fn start_full_index_worker(app: AppHandle, state: AppState) -> AppResult<()> {
         return Ok(());
     }
 
-    {
-        let mut status = state.status.lock();
-        status.state = IndexState::Indexing;
-        status.message = None;
-        status.scanned = 0;
-        status.indexed = 0;
-        status.current_path.clear();
+    // Mark index as incomplete — cleared when run_incremental_index succeeds
+    if let Ok(c) = db_connection(&state.db_path) {
+        let _ = set_meta(&c, "index_complete", "0");
     }
 
-    emit_index_state(&app, "Indexing", None);
-    perf_log("index_state=Indexing");
+    if !silent {
+        {
+            let mut status = state.status.lock();
+            status.state = IndexState::Indexing;
+            status.message = None;
+            status.scanned = 0;
+            status.indexed = 0;
+            status.current_path.clear();
+        }
+
+        emit_index_state(&app, "Indexing", None);
+        perf_log("index_state=Indexing");
+    } else {
+        perf_log("index_start silent=true (background reindex)");
+    }
 
     std::thread::spawn(move || {
         let result = run_incremental_index(&app, &state);
-        if let Err(err) = result {
-            set_state(&state, IndexState::Error, Some(err.clone()));
-            emit_index_state(&app, "Error", Some(err));
-            perf_log("index_state=Error");
+        if let Err(ref err) = result {
+            eprintln!("[index] run_incremental_index failed: {err}");
+            if !silent {
+                set_state(&state, IndexState::Error, Some(err.clone()));
+                emit_index_state(&app, "Error", Some(err.clone()));
+            }
+            // Silent mode: keep Ready state, just log the error
         }
         state.indexing_active.store(false, AtomicOrdering::Release);
     });
@@ -1830,6 +1967,7 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
 
     match &result {
         Ok(_) => {
+            let _ = set_meta(&conn, "index_complete", "1");
             let snapshot = state.status.lock().clone();
             perf_log(format!(
                 "index_run_done elapsed_ms={} scanned={} indexed={} entries={} permission_errors={} message={:?}",
@@ -1864,7 +2002,7 @@ fn run_incremental_index_inner(
         state.path_ignores.as_ref(),
         state.path_ignore_patterns.as_ref(),
     );
-    let gi_filter = state.gitignore.clone();
+    let gi_filter = state.gitignore.get();
 
     let last_run_id: i64 = get_meta(conn, "last_run_id")
         .and_then(|v| v.parse().ok())
@@ -1880,15 +2018,15 @@ fn run_incremental_index_inner(
     let mut last_emit = Instant::now();
     let mut last_perf_emit = Instant::now();
 
-    // Preload $HOME-level entries (direct children only, not recursive)
-    let home_str = state.home_dir.to_string_lossy().to_string();
-    let home_existing = preload_existing_entries(conn, &home_str);
+    // Preload scan_root-level entries (direct children only, not recursive)
+    let scan_str = state.scan_root.to_string_lossy().to_string();
+    let root_existing = preload_existing_entries(conn, &scan_str);
 
-    // Index $HOME itself
-    if let Some(mut row) = index_row_from_path(&state.home_dir) {
+    // Index scan_root itself
+    if let Some(mut row) = index_row_from_path(&state.scan_root) {
         scanned += 1;
         row.run_id = current_run_id;
-        if let Some((old_mtime, old_size)) = home_existing.get(&row.path) {
+        if let Some((old_mtime, old_size)) = root_existing.get(&row.path) {
             if *old_mtime == row.mtime && *old_size == row.size {
                 stamp_batch.push(row.path);
             } else {
@@ -1903,7 +2041,7 @@ fn run_incremental_index_inner(
     let mut priority_roots: Vec<PathBuf> = Vec::new();
     let mut deferred_roots: Vec<PathBuf> = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&state.home_dir) {
+    if let Ok(entries) = fs::read_dir(&state.scan_root) {
         for dir_entry in entries.flatten() {
             let child_path = dir_entry.path();
 
@@ -1922,7 +2060,7 @@ fn run_incremental_index_inner(
 
             if let Some(mut row) = index_row_from_path(&child_path) {
                 row.run_id = current_run_id;
-                if let Some((old_mtime, old_size)) = home_existing.get(&row.path) {
+                if let Some((old_mtime, old_size)) = root_existing.get(&row.path) {
                     if *old_mtime == row.mtime && *old_size == row.size {
                         stamp_batch.push(row.path);
                     } else {
@@ -1934,7 +2072,7 @@ fn run_incremental_index_inner(
             }
 
             if child_path.is_dir() {
-                if is_deferred_dir(&child_path, &state.home_dir) {
+                if is_deferred_dir(&child_path, &state.scan_root) {
                     deferred_roots.push(child_path);
                 } else {
                     priority_roots.push(child_path);
@@ -2156,6 +2294,11 @@ fn run_incremental_index_inner(
     }
 
     let (entries_count, last_updated) = update_status_counts(state)?;
+    // Persist cached counts for instant startup next time
+    let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
+    if let Some(lu) = last_updated {
+        let _ = set_meta(conn, "cached_last_updated", &lu.to_string());
+    }
     let updated_at = last_updated.unwrap_or_else(now_epoch);
 
     {
@@ -2214,7 +2357,8 @@ fn remember_op(
     });
 }
 
-fn is_recently_touched(state: &AppState, path: &str) -> bool {
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn is_recently_touched(state: &AppState, path: &str) -> bool {
     let mut ops = state.recent_ops.lock();
     trim_recent_ops(&mut ops);
 
@@ -2234,6 +2378,7 @@ fn is_recently_touched(state: &AppState, path: &str) -> bool {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
     let mut to_upsert_map: HashMap<String, IndexRow> = HashMap::new();
@@ -2280,8 +2425,10 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
     Ok(changed)
 }
 
+#[cfg(target_os = "macos")]
 const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+#[cfg(target_os = "macos")]
 fn process_watcher_paths(
     app: &AppHandle,
     state: &AppState,
@@ -2338,6 +2485,7 @@ fn persist_event_id(db_path: &Path, event_id: u64) -> AppResult<()> {
     set_meta(&conn, "last_event_id", &event_id.to_string())
 }
 
+#[cfg(target_os = "macos")]
 const MUST_SCAN_THRESHOLD: usize = 10;
 
 #[cfg(target_os = "macos")]
@@ -2347,11 +2495,12 @@ fn start_fsevent_watcher_worker(
     since_event_id: Option<u64>,
     conditional: bool,
 ) {
+    use std::sync::mpsc::{self, RecvTimeoutError};
     std::thread::spawn(move || {
         let (tx, rx) = mpsc::channel();
 
         let mut watcher =
-            match fsevent_watcher::FsEventWatcher::new(&state.home_dir, since_event_id, tx) {
+            match mac::fsevent_watcher::FsEventWatcher::new(&state.home_dir, since_event_id, tx) {
                 Ok(w) => w,
                 Err(err) => {
                     set_state(
@@ -2397,7 +2546,7 @@ fn start_fsevent_watcher_worker(
                 None => Duration::from_secs(1),
             };
             match rx.recv_timeout(wait) {
-                Ok(fsevent_watcher::FsEvent::Paths(paths)) => {
+                Ok(mac::fsevent_watcher::FsEvent::Paths(paths)) => {
                     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
                     let prev_len = pending_paths.len();
                     for path in paths {
@@ -2409,7 +2558,7 @@ fn start_fsevent_watcher_worker(
                         deadline = Some(Instant::now() + WATCH_DEBOUNCE);
                     }
                 }
-                Ok(fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
+                Ok(mac::fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
                     must_scan_count += 1;
                     if replay_phase
                         && must_scan_count >= MUST_SCAN_THRESHOLD
@@ -2443,7 +2592,7 @@ fn start_fsevent_watcher_worker(
                         }
                     }
                 }
-                Ok(fsevent_watcher::FsEvent::HistoryDone) => {
+                Ok(mac::fsevent_watcher::FsEvent::HistoryDone) => {
                     process_watcher_paths(
                         &app,
                         &state,
@@ -2592,6 +2741,8 @@ fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
     let snapshot = state.status.lock().clone();
     let state_label = if matches!(snapshot.state, IndexState::Error) {
         snapshot.state.as_str().to_string()
+    } else if matches!(snapshot.state, IndexState::Ready) {
+        "Ready".to_string()
     } else if state.indexing_active.load(AtomicOrdering::Acquire)
         || !state.db_ready.load(AtomicOrdering::Acquire)
     {
@@ -2618,7 +2769,15 @@ fn get_home_dir(state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
-    start_full_index_worker(app, state.inner().clone())
+    #[cfg(target_os = "windows")]
+    {
+        win::start_windows_indexing(app, state.inner().clone());
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        start_full_index_worker(app, state.inner().clone())
+    }
 }
 
 #[tauri::command]
@@ -2627,6 +2786,17 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
     tauri::async_runtime::spawn_blocking(move || {
         if state.indexing_active.load(AtomicOrdering::Acquire) {
             return Err("Cannot reset while indexing is in progress.".to_string());
+        }
+
+        // Stop existing file watcher and wait for it to fully exit
+        state.watcher_stop.store(true, AtomicOrdering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.watcher_active.load(AtomicOrdering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                eprintln!("[reset] watcher did not stop within 5s, proceeding anyway");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         let conn = db_connection(&state.db_path)?;
@@ -2649,7 +2819,19 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         invalidate_search_caches(&state);
 
         emit_index_updated(&app, 0, now_epoch(), 0);
-        start_full_index_worker(app, state)
+
+        // Allow new watcher to start
+        state.watcher_stop.store(false, AtomicOrdering::Release);
+
+        #[cfg(target_os = "windows")]
+        {
+            win::start_windows_indexing(app, state);
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            start_full_index_worker(app, state)
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2705,8 +2887,9 @@ fn execute_search(
     let sort_dir = sort_dir.unwrap_or_else(|| "asc".to_string());
     let (runtime_ignored_roots, runtime_ignored_patterns) = cached_effective_ignore_rules(state);
 
+    #[cfg(target_os = "macos")]
     if !state.db_ready.load(AtomicOrdering::Acquire) {
-        let spotlight = spotlight_search::search_spotlight(&state.home_dir, &query);
+        let spotlight = mac::spotlight_search::search_spotlight(&state.home_dir, &query);
         let mode_label = if spotlight.entries.is_empty() {
             "db_not_ready".to_string()
         } else if spotlight.timed_out {
@@ -2750,6 +2933,26 @@ fn execute_search(
         SearchMode::PathSearch { .. } => "path",
     }
     .to_string();
+
+    // Fast path: search in-memory index if available (DB upsert still in progress)
+    {
+        let guard = state.mem_index.read();
+        if let Some(ref mi) = *guard {
+            let mem_results = mem_search::search_mem_index(
+                mi, &query, &mode, effective_limit, offset, &sort_by, &sort_dir,
+            );
+            mode_label = format!("mem_{mode_label}");
+            return Ok(SearchExecution {
+                query,
+                sort_by,
+                sort_dir,
+                effective_limit,
+                offset,
+                mode_label,
+                results: mem_results,
+            });
+        }
+    }
 
     if is_name_mode && !is_indexing && offset == 0 {
         if let Some(cache_hit) = negative_name_cache_lookup(state, &query) {
@@ -2804,10 +3007,12 @@ fn execute_search(
         }
     }
 
+    #[cfg(target_os = "macos")]
     let db_unavailable;
     match db_connection_for_search(&state.db_path) {
         Ok(conn) => {
-            db_unavailable = false;
+            #[cfg(target_os = "macos")]
+            { db_unavailable = false; }
             match &mode {
                 SearchMode::Empty => {
                     let sql = format!(
@@ -2882,40 +3087,15 @@ fn execute_search(
                     }
 
                     if results.is_empty() && offset == 0 {
-                        // Phase 2a: quick existence check with tight budget.
-                        // Contains-match (LIKE '%q%') requires full scan — use a short
-                        // probe to avoid 30ms stalls on no-match queries.
-                        let probe_start = Instant::now();
+                        // Phase 2: contains-match (LIKE '%q%') with tight time budget.
+                        // Combines probe + fetch in one pass to avoid double scan overhead.
+                        let phase2_start = Instant::now();
                         conn.progress_handler(
-                            5_000,
-                            Some(move || probe_start.elapsed().as_millis() > 8),
+                            2_000,
+                            Some(move || phase2_start.elapsed().as_millis() > 5),
                         );
 
-                        let probe_sql = r#"
-                            SELECT 1 FROM entries
-                            WHERE name LIKE ?1 ESCAPE '\'
-                              AND name COLLATE NOCASE != ?2
-                              AND name NOT LIKE ?3 ESCAPE '\'
-                            LIMIT 1
-                        "#;
-                        let has_match = conn
-                            .prepare(probe_sql)
-                            .and_then(|mut s| {
-                                s.query_row(params![name_like, exact_query, prefix_like], |_| {
-                                    Ok(true)
-                                })
-                            })
-                            .unwrap_or(false);
-
-                        conn.progress_handler(0, None::<fn() -> bool>);
-
-                        // Phase 2b: fetch full results only when probe found a match.
-                        if has_match {
-                            let phase2_start = Instant::now();
-                            conn.progress_handler(
-                                10_000,
-                                Some(move || phase2_start.elapsed().as_millis() > 30),
-                            );
+                        {
 
                             let phase2_sql = format!(
                                 r#"
@@ -2941,9 +3121,9 @@ fn execute_search(
                                     }
                                 }
                             }
-
-                            conn.progress_handler(0, None::<fn() -> bool>);
                         }
+
+                        conn.progress_handler(0, None::<fn() -> bool>);
                     }
                 }
 
@@ -3003,11 +3183,12 @@ fn execute_search(
                         let ext_shortcut = extract_ext_from_like(name_like);
                         let mut sql_params: Vec<SqlValue> = Vec::new();
                         let mut dir_conditions = Vec::new();
+                        let sep = std::path::MAIN_SEPARATOR;
 
                         for d in &resolved_dirs {
                             let i = sql_params.len();
-                            let pfx = format!("{}/", d);
-                            let pfx_end = format!("{}0", d);
+                            let pfx = format!("{d}{sep}");
+                            let pfx_end = format!("{d}\x7F");
                             sql_params.push(SqlValue::Text(d.clone()));
                             sql_params.push(SqlValue::Text(pfx));
                             sql_params.push(SqlValue::Text(pfx_end));
@@ -3054,9 +3235,12 @@ fn execute_search(
                             results.push(row.map_err(|e| e.to_string())?);
                         }
                     } else {
-                        let dir_suffix = escape_like(dir_hint);
-                        let dir_like_exact = format!("%/{}", dir_suffix);
-                        let dir_like_sub = format!("%/{}/%", dir_suffix);
+                        let sep = std::path::MAIN_SEPARATOR;
+                        let native_hint = dir_hint.replace('/', &sep.to_string());
+                        let escaped_sep = escape_like(&sep.to_string());
+                        let dir_suffix = escape_like(&native_hint);
+                        let dir_like_exact = format!("%{escaped_sep}{dir_suffix}");
+                        let dir_like_sub = format!("%{escaped_sep}{dir_suffix}{escaped_sep}%");
                         let ext_shortcut = extract_ext_from_like(name_like);
 
                         if let Some(ext_val) = ext_shortcut {
@@ -3159,8 +3343,8 @@ fn execute_search(
                             if results.len() < effective_limit as usize {
                                 let path_start = Instant::now();
                                 conn.progress_handler(
-                                    10_000,
-                                    Some(move || path_start.elapsed().as_millis() > 30),
+                                    2_000,
+                                    Some(move || path_start.elapsed().as_millis() > 5),
                                 );
 
                                 let sql = format!(
@@ -3219,11 +3403,13 @@ fn execute_search(
             }
         }
         Err(_) => {
-            db_unavailable = true;
+            #[cfg(target_os = "macos")]
+            { db_unavailable = true; }
             perf_log(format!("search_db_unavailable query={:?}", query));
         }
     }
 
+    #[cfg(target_os = "macos")]
     if !query.is_empty() && offset == 0 {
         let should_spotlight = if results.is_empty() {
             true
@@ -3233,7 +3419,7 @@ fn execute_search(
             is_indexing || db_unavailable
         };
         if should_spotlight {
-            let spotlight = spotlight_search::search_spotlight(&state.home_dir, &query);
+            let spotlight = mac::spotlight_search::search_spotlight(&state.home_dir, &query);
             if !spotlight.entries.is_empty() {
                 if results.is_empty() {
                     perf_log(format!(
@@ -3350,12 +3536,29 @@ async fn search(
 #[tauri::command]
 async fn quick_look(path: String) -> AppResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
-        Command::new("qlmanage")
-            .args(["-p", &path])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("qlmanage")
+                .args(["-p", &path])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Command::new("explorer")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Command::new("xdg-open")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     })
     .await
@@ -3366,23 +3569,45 @@ async fn quick_look(path: String) -> AppResult<()> {
 async fn open(paths: Vec<String>) -> AppResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
         for path in &paths {
-            let output = Command::new("open")
-                .arg(path)
-                .output()
-                .map_err(|e| e.to_string())?;
-
-            if !output.status.success() && Path::new(path).is_dir() {
-                let fallback = Command::new("open")
-                    .args(["-R", path])
-                    .status()
+            #[cfg(target_os = "macos")]
+            {
+                let output = Command::new("open")
+                    .arg(path)
+                    .output()
                     .map_err(|e| e.to_string())?;
 
-                if !fallback.success() {
+                if !output.status.success() && Path::new(path).is_dir() {
+                    let fallback = Command::new("open")
+                        .args(["-R", path])
+                        .status()
+                        .map_err(|e| e.to_string())?;
+
+                    if !fallback.success() {
+                        return Err(format!("Failed to open: {path}"));
+                    }
+                } else if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("Failed to open: {path} ({stderr})",));
+                }
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let mut cmd = Command::new("cmd");
+                cmd.raw_arg(format!("/C start \"\" \"{}\"", path.replace('"', "")));
+                let status = cmd.status().map_err(|e| e.to_string())?;
+                if !status.success() {
                     return Err(format!("Failed to open: {path}"));
                 }
-            } else if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("Failed to open: {path} ({stderr})",));
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                let status = Command::new("xdg-open")
+                    .arg(path)
+                    .status()
+                    .map_err(|e| e.to_string())?;
+                if !status.success() {
+                    return Err(format!("Failed to open: {path}"));
+                }
             }
         }
 
@@ -3397,39 +3622,67 @@ fn reveal_in_finder_impl(paths: Vec<String>) -> AppResult<()> {
         return Ok(());
     }
 
-    if paths.len() == 1 {
-        let status = Command::new("open")
-            .arg("-R")
-            .arg(&paths[0])
-            .status()
-            .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        if paths.len() == 1 {
+            let status = Command::new("open")
+                .arg("-R")
+                .arg(&paths[0])
+                .status()
+                .map_err(|e| e.to_string())?;
 
-        if !status.success() {
-            return Err(format!("Failed to reveal in Finder: {}", paths[0]));
+            if !status.success() {
+                return Err(format!("Failed to reveal in Finder: {}", paths[0]));
+            }
+
+            return Ok(());
         }
 
-        return Ok(());
-    }
+        let mut unique_parents: HashSet<PathBuf> = HashSet::new();
+        for path in &paths {
+            let p = PathBuf::from(path);
+            if let Some(parent) = p.parent() {
+                unique_parents.insert(parent.to_path_buf());
+            }
+        }
 
-    let mut unique_parents: HashSet<PathBuf> = HashSet::new();
-    for path in paths {
-        let p = PathBuf::from(path);
-        if let Some(parent) = p.parent() {
-            unique_parents.insert(parent.to_path_buf());
+        for parent in unique_parents {
+            let status = Command::new("open")
+                .arg(&parent)
+                .status()
+                .map_err(|e| e.to_string())?;
+
+            if !status.success() {
+                return Err(format!(
+                    "Failed to open in Finder: {}",
+                    parent.to_string_lossy()
+                ));
+            }
         }
     }
 
-    for parent in unique_parents {
-        let status = Command::new("open")
-            .arg(&parent)
-            .status()
-            .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    {
+        for path in &paths {
+            let mut cmd = Command::new("explorer");
+            cmd.raw_arg(format!("/select,\"{}\"", path.replace('"', "")));
+            let _ = cmd.status();
+        }
+    }
 
-        if !status.success() {
-            return Err(format!(
-                "Failed to open in Finder: {}",
-                parent.to_string_lossy()
-            ));
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        for path in &paths {
+            let target = Path::new(path);
+            let dir = if target.is_dir() {
+                path.as_str()
+            } else {
+                target
+                    .parent()
+                    .map(|p| p.to_str().unwrap_or("/"))
+                    .unwrap_or("/")
+            };
+            let _ = Command::new("xdg-open").arg(dir).status();
         }
     }
 
@@ -3682,7 +3935,7 @@ async fn fd_search(
 
         if !cache_hit {
             let result = fd_search::run_fd_search(
-                &state.home_dir,
+                &state.scan_root,
                 &runtime_ignored_roots,
                 &runtime_ignored_patterns,
                 &query,
@@ -3717,6 +3970,69 @@ async fn fd_search(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn frontend_log(msg: String) {
+    eprintln!("{msg}");
+}
+
+#[tauri::command]
+fn get_platform() -> String {
+    if cfg!(target_os = "windows") {
+        "windows".to_string()
+    } else if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else {
+        "linux".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn show_context_menu(
+    paths: Vec<String>,
+    x: f64,
+    y: f64,
+    app: AppHandle,
+) -> AppResult<()> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not found".to_string())?;
+
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let win_pos = window.inner_position().map_err(|e| e.to_string())?;
+    let screen_x = win_pos.x + (x * scale) as i32;
+    let screen_y = win_pos.y + (y * scale) as i32;
+
+    let hwnd_raw = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+
+    // TrackPopupMenu must run on the thread that owns the HWND (main UI thread).
+    // Use a channel to relay the result back to the async context.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
+    app.run_on_main_thread(move || {
+        let result = win::context_menu::show(hwnd_raw, &paths, screen_x, screen_y);
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv().map_err(|e| format!("context menu channel: {e}"))?
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn show_context_menu(
+    _paths: Vec<String>,
+    _x: f64,
+    _y: f64,
+    _app: AppHandle,
+) -> AppResult<()> {
+    Err("Native context menu is only supported on Windows".to_string())
 }
 
 #[tauri::command]
@@ -4063,6 +4379,8 @@ fn register_global_shortcut(_app: &AppHandle) -> AppResult<()> {
 }
 
 fn setup_app(app: &mut tauri::App) -> AppResult<()> {
+    let setup_started = std::time::Instant::now();
+    eprintln!("[startup] setup_app() entered");
     let bench_mode = bench_mode_enabled();
 
     #[cfg(target_os = "macos")]
@@ -4071,6 +4389,22 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         if let Err(e) = apply_vibrancy(&window, NSVisualEffectMaterial::UnderWindowBackground, None, None) {
             eprintln!("[vibrancy] apply failed: {e}");
         }
+        let _ = window.show();
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(window) = app.get_webview_window("main") {
+        use tauri::window::Color;
+        let is_dark = window.theme().map(|t| t == tauri::Theme::Dark).unwrap_or(false);
+        let bg = if is_dark {
+            Color(0x1f, 0x1f, 0x1f, 0xff)
+        } else {
+            Color(0xf4, 0xf5, 0xf7, 0xff)
+        };
+        let _ = window.set_background_color(Some(bg));
+        // Show window after background color is set to avoid white flash.
+        // The skeleton HTML renders on top of this matching background.
+        let _ = window.show();
     }
 
     let app_data_dir = app
@@ -4080,8 +4414,18 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
     let db_path = app_data_dir.join("index.db");
-    let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+    let home_dir = PathBuf::from(
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() }),
+    );
+    let scan_root = if cfg!(windows) {
+        PathBuf::from("C:\\")
+    } else {
+        home_dir.clone()
+    };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
+    eprintln!("[startup] +{}ms loading pathignore rules...", setup_started.elapsed().as_millis());
     let (mut path_ignores, path_ignore_patterns) = load_pathignore_rules(&home_dir, &cwd);
     if !path_ignores.iter().any(|r| r == &app_data_dir) {
         path_ignores.push(app_data_dir.clone());
@@ -4091,12 +4435,14 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             path_ignores.push(root);
         }
     }
+    eprintln!("[startup] +{}ms pathignore done", setup_started.elapsed().as_millis());
 
-    let gitignore = gitignore_filter::build_shared_filter(&home_dir);
+    let gitignore = Arc::new(gitignore_filter::LazyGitignoreFilter::new(home_dir.clone()));
 
     let state = AppState {
         db_path,
         home_dir,
+        scan_root,
         cwd,
         path_ignores: Arc::new(path_ignores),
         path_ignore_patterns: Arc::new(path_ignore_patterns),
@@ -4109,54 +4455,76 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         negative_name_cache: Arc::new(Mutex::new(Vec::new())),
         ignore_cache: Arc::new(Mutex::new(None)),
         gitignore,
+        mem_index: Arc::new(RwLock::new(None)),
+        watcher_stop: Arc::new(AtomicBool::new(false)),
+        watcher_active: Arc::new(AtomicBool::new(false)),
     };
 
+    eprintln!("[startup] +{}ms AppState created", setup_started.elapsed().as_millis());
     app.manage(state.clone());
     if !bench_mode {
         register_global_shortcut(&app.handle())?;
     }
+    eprintln!("[startup] +{}ms global shortcut registered", setup_started.elapsed().as_millis());
     if bench_mode {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.hide();
         }
     }
 
+    eprintln!("[startup] +{}ms setup_app() done, spawning init thread", setup_started.elapsed().as_millis());
+
     let app_handle = app.handle().clone();
     std::thread::spawn(move || {
+        let thread_started = std::time::Instant::now();
+        eprintln!("[startup/thread] init thread started");
+
+        eprintln!("[startup/thread] +{}ms calling init_db...", thread_started.elapsed().as_millis());
         if let Err(err) = init_db(&state.db_path) {
             set_state(&state, IndexState::Error, Some(err.clone()));
             emit_index_state(&app_handle, "Error", Some(err));
             return;
         }
-        if let Err(err) = purge_ignored_entries(&state.db_path, &state.path_ignores) {
-            set_state(&state, IndexState::Error, Some(err.clone()));
-            emit_index_state(&app_handle, "Error", Some(err));
-            return;
-        }
-        state.db_ready.store(true, AtomicOrdering::Release);
+        eprintln!("[startup/thread] +{}ms init_db done", thread_started.elapsed().as_millis());
 
-        let _ = refresh_and_emit_status_counts(&app_handle, &state);
+        state.db_ready.store(true, AtomicOrdering::Release);
+        eprintln!("[startup/thread] +{}ms db_ready=true — launching indexing immediately", thread_started.elapsed().as_millis());
+
+        // Deferred housekeeping — purge + status counts run in background
+        {
+            let hk_app = app_handle.clone();
+            let hk_state = state.clone();
+            std::thread::spawn(move || {
+                // Brief pause so indexing thread can start first
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let hk_started = std::time::Instant::now();
+                let _ = refresh_and_emit_status_counts(&hk_app, &hk_state);
+                eprintln!("[startup/housekeeping] refresh_and_emit_status_counts done in {}ms", hk_started.elapsed().as_millis());
+                if let Err(err) = purge_ignored_entries(&hk_state.db_path, &hk_state.path_ignores) {
+                    eprintln!("[startup/housekeeping] purge_ignored_entries failed: {err}");
+                }
+                eprintln!("[startup/housekeeping] all done in {}ms", hk_started.elapsed().as_millis());
+            });
+        }
 
         #[cfg(target_os = "macos")]
         {
             if bench_mode {
                 let _ = start_full_index_worker(app_handle.clone(), state.clone());
             } else {
-                let stored_event_id = db_connection(&state.db_path)
+                let (stored_event_id, index_complete) = db_connection(&state.db_path)
                     .ok()
-                    .and_then(|conn| get_meta(&conn, "last_event_id"))
-                    .and_then(|v| v.parse::<u64>().ok());
-
-                let has_entries = db_connection(&state.db_path)
-                    .ok()
-                    .and_then(|c| {
-                        c.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get::<_, i64>(0))
-                            .ok()
+                    .map(|c| {
+                        let eid = get_meta(&c, "last_event_id")
+                            .and_then(|v| v.parse::<u64>().ok());
+                        let complete = get_meta(&c, "index_complete")
+                            .map(|v| v == "1")
+                            .unwrap_or(false);
+                        (eid, complete)
                     })
-                    .unwrap_or(0)
-                    > 0;
+                    .unwrap_or((None, false));
 
-                if stored_event_id.is_some() && has_entries {
+                if stored_event_id.is_some() && index_complete {
                     // Conditional startup: try watcher replay first, skip full scan if OK
                     start_fsevent_watcher_worker(
                         app_handle.clone(),
@@ -4165,13 +4533,21 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         true,
                     );
                 } else {
+                    if !index_complete {
+                        eprintln!("[mac] index incomplete — starting full index");
+                    }
                     let _ = start_full_index_worker(app_handle.clone(), state.clone());
                     start_fsevent_watcher_worker(app_handle.clone(), state.clone(), None, false);
                 }
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            win::start_windows_indexing(app_handle.clone(), state.clone());
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = start_full_index_worker(app_handle.clone(), state.clone());
         }
@@ -4228,7 +4604,10 @@ pub fn run() {
             copy_paths,
             move_to_trash,
             rename,
-            get_file_icon
+            get_file_icon,
+            get_platform,
+            show_context_menu,
+            frontend_log
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4275,6 +4654,7 @@ mod tests {
         AppState {
             db_path,
             home_dir: home_dir.clone(),
+            scan_root: home_dir.clone(),
             cwd,
             path_ignores: Arc::new(Vec::new()),
             path_ignore_patterns: Arc::new(Vec::new()),
@@ -4286,7 +4666,10 @@ mod tests {
             fd_search_cache: Arc::new(Mutex::new(None)),
             negative_name_cache: Arc::new(Mutex::new(Vec::new())),
             ignore_cache: Arc::new(Mutex::new(None)),
-            gitignore: gitignore_filter::build_shared_filter(&home_dir),
+            gitignore: Arc::new(gitignore_filter::LazyGitignoreFilter::new(home_dir.clone())),
+            mem_index: Arc::new(RwLock::new(None)),
+            watcher_stop: Arc::new(AtomicBool::new(false)),
+            watcher_active: Arc::new(AtomicBool::new(false)),
         }
     }
 

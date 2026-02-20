@@ -1,6 +1,6 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 pub struct GitignoreFilter {
     matchers: Vec<Gitignore>,
@@ -109,4 +109,39 @@ pub type SharedGitignoreFilter = Arc<GitignoreFilter>;
 
 pub fn build_shared_filter(home_dir: &Path) -> SharedGitignoreFilter {
     Arc::new(GitignoreFilter::build(home_dir))
+}
+
+/// Lazy gitignore filter — defers expensive filesystem scan until first access.
+pub struct LazyGitignoreFilter {
+    home_dir: PathBuf,
+    inner: OnceLock<SharedGitignoreFilter>,
+}
+
+impl std::fmt::Debug for LazyGitignoreFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyGitignoreFilter")
+            .field("initialized", &self.inner.get().is_some())
+            .finish()
+    }
+}
+
+impl LazyGitignoreFilter {
+    pub fn new(home_dir: PathBuf) -> Self {
+        Self {
+            home_dir,
+            inner: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> SharedGitignoreFilter {
+        self.inner
+            .get_or_init(|| {
+                eprintln!("[gitignore] building filter (lazy init)...");
+                let started = std::time::Instant::now();
+                let filter = build_shared_filter(&self.home_dir);
+                eprintln!("[gitignore] filter built in {}ms", started.elapsed().as_millis());
+                filter
+            })
+            .clone()
+    }
 }
