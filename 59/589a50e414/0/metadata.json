@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "59589a50e414",
+  "session_id": "1073a9fc-2514-40be-8f82-2811d2db672b",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-20T12:56:41.75792Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src/App.svelte"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "fbe1e1fcb453",
+  "transcript_identifier_at_start": "42711318-8383-49f3-8997-8d4117370230",
+  "token_usage": {
+    "input_tokens": 39,
+    "cache_creation_tokens": 57025,
+    "cache_read_tokens": 2155399,
+    "output_tokens": 4203,
+    "api_call_count": 37
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-20T12:56:40.816166Z",
+    "agent_lines": 45,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 45,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-al02402336-everything/1073a9fc-2514-40be-8f82-2811d2db672b.jsonl"
+}
