@@ -578,10 +578,16 @@
       selectSingle(index);
     }
 
-    if (platform === 'windows') {
+    if (platform === 'windows' || platform === 'macos') {
+      contextMenu.visible = false;
       const paths = selectedPaths();
       if (paths.length > 0) {
-        invoke('show_context_menu', { paths, x: event.clientX, y: event.clientY });
+        invoke('show_context_menu', {
+          paths,
+          x: event.clientX,
+          y: event.clientY,
+          singleSelection: selectedIndices.size === 1
+        });
       }
       return;
     }
@@ -835,6 +841,20 @@
     }
   }
 
+  async function copyFiles() {
+    const paths = selectedPaths();
+    if (paths.length === 0) {
+      return;
+    }
+
+    try {
+      await invoke('copy_files', { paths });
+      showToast(`Copied ${paths.length} item(s)`);
+    } catch (err) {
+      showToast(`Failed to copy: ${String(err)}`);
+    }
+  }
+
   async function trashSelected() {
     const paths = selectedPaths();
     if (paths.length === 0) {
@@ -1036,7 +1056,11 @@
 
     if (event.key === 'Enter') {
       event.preventDefault();
-      await startRename();
+      if (platform === 'windows') {
+        await openSelected();
+      } else {
+        await startRename();
+      }
       return;
     }
 
@@ -1243,7 +1267,24 @@
       void focusSearch();
     });
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus];
+    const unlistenCtxMenuAction = await listen('context_menu_action', (event) => {
+      switch (event.payload) {
+        case 'open': void openSelected(); break;
+        case 'quick_look': {
+          const e = primaryEntry();
+          if (e) void invoke('quick_look', { path: e.path });
+          break;
+        }
+        case 'open_with': void openWithFallback(); break;
+        case 'reveal': void revealSelected(); break;
+        case 'copy_files': void copyFiles(); break;
+        case 'copy_path': void copySelectedPaths(); break;
+        case 'trash': void trashSelected(); break;
+        case 'rename': void startRename(); break;
+      }
+    });
+
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction];
     flog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
