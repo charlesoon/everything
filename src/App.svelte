@@ -24,6 +24,8 @@
 
   let query = '';
   let results = [];
+  let totalResults = 0;
+  let totalResultsKnown = false;
 
   let dbLatencyMs = null;
   let dbLastQuery = '';
@@ -434,7 +436,7 @@
     }
   }
 
-  function scheduleSearch() {
+  function scheduleSearch(preserveScroll = false) {
     searchGeneration += 1;
     const scheduledGen = searchGeneration;
     clearTimeout(searchTimer);
@@ -443,7 +445,7 @@
     if (now - lastSearchFiredAt >= 200) {
       // Leading edge: fire immediately if enough time has passed
       lastSearchFiredAt = now;
-      void runSearch();
+      void runSearch(preserveScroll);
     } else {
       // Trailing edge: debounce
       searchTimer = setTimeout(() => {
@@ -451,12 +453,12 @@
           return;
         }
         lastSearchFiredAt = performance.now();
-        void runSearch();
+        void runSearch(preserveScroll);
       }, 200);
     }
   }
 
-  async function runSearch() {
+  async function runSearch(preserveScroll = false) {
     searchGeneration += 1;
     const gen = searchGeneration;
     const searchQuery = query;
@@ -480,8 +482,15 @@
       const entries = Array.isArray(next.entries) ? next.entries : [];
       searchModeLabel = next.modeLabel || '';
       results = entries;
-      hasMore = results.length >= PAGE_SIZE;
-      if (tableContainer) tableContainer.scrollTop = 0;
+      if (next.totalCount > 0) {
+        totalResults = next.totalCount;
+        totalResultsKnown = true;
+      } else {
+        totalResults = entries.length;
+        totalResultsKnown = false;
+      }
+      hasMore = totalResultsKnown ? results.length < totalResults : entries.length >= PAGE_SIZE;
+      if (!preserveScroll && tableContainer) tableContainer.scrollTop = 0;
 
       const restored = new Set();
       for (let i = 0; i < results.length; i += 1) {
@@ -513,7 +522,7 @@
       if (gen !== searchGeneration) return;
       const arr = Array.isArray(batch.entries) ? batch.entries : [];
       if (arr.length > 0) results = [...results, ...arr];
-      hasMore = arr.length >= PAGE_SIZE;
+      hasMore = totalResultsKnown ? results.length < totalResults : arr.length >= PAGE_SIZE;
     } catch (err) {
       showToast(`Failed to load more: ${String(err)}`);
     } finally {
@@ -578,10 +587,16 @@
       selectSingle(index);
     }
 
-    if (platform === 'windows') {
+    if (platform === 'windows' || platform === 'macos') {
+      contextMenu.visible = false;
       const paths = selectedPaths();
       if (paths.length > 0) {
-        invoke('show_context_menu', { paths, x: event.clientX, y: event.clientY });
+        invoke('show_context_menu', {
+          paths,
+          x: event.clientX,
+          y: event.clientY,
+          singleSelection: selectedIndices.size === 1
+        });
       }
       return;
     }
@@ -835,6 +850,20 @@
     }
   }
 
+  async function copyFiles() {
+    const paths = selectedPaths();
+    if (paths.length === 0) {
+      return;
+    }
+
+    try {
+      await invoke('copy_files', { paths });
+      showToast(`Copied ${paths.length} item(s)`);
+    } catch (err) {
+      showToast(`Failed to copy: ${String(err)}`);
+    }
+  }
+
   async function trashSelected() {
     const paths = selectedPaths();
     if (paths.length === 0) {
@@ -867,6 +896,8 @@
     }
 
     results = [];
+    totalResults = 0;
+    totalResultsKnown = false;
     clearSelection();
     scanned = 0;
     indexed = 0;
@@ -1036,7 +1067,11 @@
 
     if (event.key === 'Enter') {
       event.preventDefault();
-      await startRename();
+      if (platform === 'windows') {
+        await openSelected();
+      } else {
+        await startRename();
+      }
       return;
     }
 
@@ -1236,14 +1271,31 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      scheduleSearch();
+      scheduleSearch(true);
     });
 
     const unlistenFocus = await listen('focus_search', () => {
       void focusSearch();
     });
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus];
+    const unlistenCtxMenuAction = await listen('context_menu_action', (event) => {
+      switch (event.payload) {
+        case 'open': void openSelected(); break;
+        case 'quick_look': {
+          const e = primaryEntry();
+          if (e) void invoke('quick_look', { path: e.path });
+          break;
+        }
+        case 'open_with': void openWithFallback(); break;
+        case 'reveal': void revealSelected(); break;
+        case 'copy_files': void copyFiles(); break;
+        case 'copy_path': void copySelectedPaths(); break;
+        case 'trash': void trashSelected(); break;
+        case 'rename': void startRename(); break;
+      }
+    });
+
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction];
     flog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
@@ -1427,7 +1479,7 @@
         <span class="status-spotlight">Spotlight fallback{#if searchModeLabel === 'spotlight_timeout'} (partial results){/if}</span>
       {/if}
       {#if dbLatencyMs !== null && dbLastQuery}
-        <span>"{dbLastQuery}" {dbLatencyMs} ms · {results.length} results</span>
+        <span>"{dbLastQuery}" {dbLatencyMs} ms · {totalResults} results</span>
       {/if}
     <button
       class="status-btn"
