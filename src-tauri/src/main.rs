@@ -3866,6 +3866,46 @@ fn copy_paths(paths: Vec<String>) -> AppResult<()> {
     copy_text_to_clipboard(&paths.join("\n"))
 }
 
+#[cfg(target_os = "macos")]
+fn copy_files_to_clipboard(paths: &[String]) -> AppResult<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let file_exprs: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("POSIX file \"{}\"", escaped)
+        })
+        .collect();
+    let script = if file_exprs.len() == 1 {
+        format!("set the clipboard to {}", file_exprs[0])
+    } else {
+        format!("set the clipboard to {{{}}}", file_exprs.join(", "))
+    };
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Failed to copy files to clipboard".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn copy_files(paths: Vec<String>) -> AppResult<()> {
+    copy_files_to_clipboard(&paths)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn copy_files(_paths: Vec<String>) -> AppResult<()> {
+    Err("copy_files is only supported on macOS".to_string())
+}
+
 #[tauri::command]
 async fn move_to_trash(
     paths: Vec<String>,
@@ -4094,6 +4134,7 @@ async fn show_context_menu(
     paths: Vec<String>,
     x: f64,
     y: f64,
+    _single_selection: bool,
     app: AppHandle,
 ) -> AppResult<()> {
     let window = app
@@ -4124,15 +4165,89 @@ async fn show_context_menu(
     .map_err(|e| e.to_string())?
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn show_context_menu(
+    _paths: Vec<String>,
+    x: f64,
+    y: f64,
+    single_selection: bool,
+    app: AppHandle,
+) -> AppResult<()> {
+    use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
+
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not found".to_string())?;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
+    let app_clone = app.clone();
+    app.run_on_main_thread(move || {
+        let app = app_clone;
+        let result = (|| -> Result<(), tauri::Error> {
+            let open = MenuItem::with_id(&app, "ctx_open", "Open", true, None::<&str>)?;
+            let quick_look =
+                MenuItem::with_id(&app, "ctx_quick_look", "Quick Look", true, None::<&str>)?;
+            let open_with =
+                MenuItem::with_id(&app, "ctx_open_with", "Open With...", true, None::<&str>)?;
+            let sep1 = PredefinedMenuItem::separator(&app)?;
+            let reveal = MenuItem::with_id(
+                &app,
+                "ctx_reveal",
+                "Reveal in Finder",
+                true,
+                None::<&str>,
+            )?;
+            let sep2 = PredefinedMenuItem::separator(&app)?;
+            let copy_files =
+                MenuItem::with_id(&app, "ctx_copy_files", "Copy", true, None::<&str>)?;
+            let copy_path =
+                MenuItem::with_id(&app, "ctx_copy_path", "Copy Path", true, None::<&str>)?;
+            let sep3 = PredefinedMenuItem::separator(&app)?;
+            let trash = MenuItem::with_id(
+                &app,
+                "ctx_trash",
+                "Move to Trash",
+                true,
+                None::<&str>,
+            )?;
+            let rename =
+                MenuItem::with_id(&app, "ctx_rename", "Rename", true, None::<&str>)?;
+
+            let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![
+                &open, &quick_look, &open_with, &sep1, &reveal, &sep2, &copy_files, &copy_path, &sep3, &trash,
+            ];
+            if single_selection {
+                items.push(&rename);
+            }
+
+            let menu = Menu::with_items(&app, &items)?;
+            // Position is window-relative logical pixels, matching clientX/clientY.
+            window.popup_menu_at(&menu, tauri::LogicalPosition::new(x, y))?;
+            Ok(())
+        })();
+        let _ = tx.send(result.map_err(|e| e.to_string()));
+    })
+    .map_err(|e| e.to_string())?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        rx.recv().map_err(|e| format!("context menu channel: {e}"))?
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[tauri::command]
 async fn show_context_menu(
     _paths: Vec<String>,
     _x: f64,
     _y: f64,
+    _single_selection: bool,
     _app: AppHandle,
 ) -> AppResult<()> {
-    Err("Native context menu is only supported on Windows".to_string())
+    Err("Native context menu is only supported on Windows and macOS".to_string())
 }
 
 #[tauri::command]
@@ -4594,6 +4709,25 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     if !bench_mode {
         register_global_shortcut(&app.handle())?;
     }
+    // Context menu item IDs use the "ctx_" prefix by convention.
+    // All matching IDs are forwarded as "context_menu_action" events to the frontend.
+    #[cfg(target_os = "macos")]
+    {
+        app.handle().on_menu_event(|app, event| {
+            let action = match event.id().as_ref() {
+                "ctx_open" => "open",
+                "ctx_quick_look" => "quick_look",
+                "ctx_open_with" => "open_with",
+                "ctx_reveal" => "reveal",
+                "ctx_copy_files" => "copy_files",
+                "ctx_copy_path" => "copy_path",
+                "ctx_trash" => "trash",
+                "ctx_rename" => "rename",
+                _ => return,
+            };
+            let _ = app.emit("context_menu_action", action);
+        });
+    }
     eprintln!("[startup] +{}ms global shortcut registered", setup_started.elapsed().as_millis());
     if bench_mode {
         if let Some(window) = app.get_webview_window("main") {
@@ -4732,6 +4866,7 @@ pub fn run() {
             open_with,
             reveal_in_finder,
             copy_paths,
+            copy_files,
             move_to_trash,
             rename,
             get_file_icon,
