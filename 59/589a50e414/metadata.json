@@ -3,7 +3,7 @@
   "checkpoint_id": "59589a50e414",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 1,
+  "checkpoints_count": 2,
   "files_touched": [
     "src/App.svelte"
   ],
@@ -14,13 +14,20 @@
       "context": "/59/589a50e414/0/context.md",
       "content_hash": "/59/589a50e414/0/content_hash.txt",
       "prompt": "/59/589a50e414/0/prompt.txt"
+    },
+    {
+      "metadata": "/59/589a50e414/1/metadata.json",
+      "transcript": "/59/589a50e414/1/full.jsonl",
+      "context": "/59/589a50e414/1/context.md",
+      "content_hash": "/59/589a50e414/1/content_hash.txt",
+      "prompt": "/59/589a50e414/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 39,
-    "cache_creation_tokens": 57025,
-    "cache_read_tokens": 2155399,
-    "output_tokens": 4203,
-    "api_call_count": 37
+    "input_tokens": 51,
+    "cache_creation_tokens": 63376,
+    "cache_read_tokens": 2854587,
+    "output_tokens": 4354,
+    "api_call_count": 45
   }
 }
