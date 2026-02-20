@@ -7,26 +7,123 @@
       :root {
         color-scheme: light dark;
         background: #f4f5f7;
+        --sk-bar-top: rgba(255, 255, 255, 0.48);
+        --sk-bar-bottom: rgba(248, 250, 253, 0.42);
+        --sk-surface-header: rgba(252, 252, 255, 0.40);
+        --sk-surface: rgba(255, 255, 255, 0.22);
+        --sk-border: rgba(0, 0, 0, 0.07);
+        --sk-border-input: rgba(0, 0, 0, 0.13);
+        --sk-text-muted: #48596c;
+        --sk-text-primary: #0d1826;
       }
 
       @media (prefers-color-scheme: dark) {
         :root {
           background: #1f1f1f;
+          --sk-bar-top: rgba(38, 38, 46, 0.52);
+          --sk-bar-bottom: rgba(30, 30, 38, 0.46);
+          --sk-surface-header: rgba(32, 32, 40, 0.46);
+          --sk-surface: rgba(18, 18, 26, 0.32);
+          --sk-border: rgba(255, 255, 255, 0.065);
+          --sk-border-input: rgba(255, 255, 255, 0.14);
+          --sk-text-muted: #9494a4;
+          --sk-text-primary: #e6e6ea;
         }
       }
 
-      html,
-      body,
-      #app {
+      html, body, #app {
         margin: 0;
         width: 100%;
         height: 100%;
         background: transparent;
+        overflow: hidden;
+      }
+
+      /* Skeleton UI — replaced when Svelte mounts */
+      #skeleton {
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        height: 100%;
+        font-family: 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif;
+        color: var(--sk-text-primary);
+        background: #f4f5f7;
+        overflow: hidden;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        #skeleton {
+          background: #1f1f1f;
+        }
+      }
+
+      #skeleton .sk-bar {
+        display: flex;
+        align-items: center;
+        padding: 8px;
+        background: linear-gradient(180deg, var(--sk-bar-top) 0%, var(--sk-bar-bottom) 100%);
+        border-bottom: 1px solid var(--sk-border);
+      }
+
+      #skeleton .sk-input {
+        display: block;
+        box-sizing: border-box;
+        width: 100%;
+        height: 32px;
+        border: 1px solid var(--sk-border-input);
+        border-radius: 8px;
+        padding: 0 10px;
+        font-size: 14px;
+        background: var(--sk-surface);
+        color: var(--sk-text-primary);
+      }
+
+      #skeleton .sk-input::placeholder {
+        color: var(--sk-text-muted);
+        opacity: 0.85;
+        font-size: 12px;
+      }
+
+      #skeleton .sk-header {
+        height: 30px;
+        display: flex;
+        align-items: center;
+        padding: 0 8px;
+        background: var(--sk-surface-header);
+        border-bottom: 1px solid var(--sk-border);
+        font-size: 12px;
+        color: var(--sk-text-muted);
+        gap: 24px;
+      }
+
+      #skeleton .sk-body {
+        min-height: 0;
+      }
+
+      #skeleton .sk-footer {
+        display: flex;
+        align-items: center;
+        padding: 6px 8px;
+        background: var(--sk-surface-header);
+        border-top: 1px solid var(--sk-border);
+        font-size: 11px;
+        color: var(--sk-text-muted);
       }
     </style>
     <title>Everything</title>
   </head>
   <body>
+    <div id="skeleton">
+      <div class="sk-bar">
+        <input class="sk-input" type="text" placeholder="Search file/folder names" disabled />
+      </div>
+      <div>
+        <div class="sk-header">
+          <span>Name</span><span>Path</span><span>Size</span><span>Modified</span>
+        </div>
+        <div class="sk-body"></div>
+      </div>
+      <div class="sk-footer">Loading...</div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
   </body>

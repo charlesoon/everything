@@ -250,7 +250,7 @@ pub struct LiveSearchResult {
 }
 
 pub fn run_fd_search(
-    home_dir: &Path,
+    scan_root: &Path,
     ignored_roots: &[PathBuf],
     ignored_patterns: &[IgnorePattern],
     query: &str,
@@ -271,12 +271,12 @@ pub fn run_fd_search(
         let dir_str = String::from_utf8_lossy(dir_lower);
         let segment = dir_str.trim_matches('/').split('/').next().unwrap_or("");
         if !segment.is_empty() {
-            find_child_dir_icase(home_dir, segment).unwrap_or_else(|| home_dir.to_path_buf())
+            find_child_dir_icase(scan_root, segment).unwrap_or_else(|| scan_root.to_path_buf())
         } else {
-            home_dir.to_path_buf()
+            scan_root.to_path_buf()
         }
     } else {
-        home_dir.to_path_buf()
+        scan_root.to_path_buf()
     };
 
     let needs_dir = matches!(mode, QueryMode::PathSearch { .. });

@@ -39,11 +39,12 @@
   };
 
   let indexStatus = {
-    state: 'Unknown',
+    state: 'Indexing',
     entriesCount: 0,
     lastUpdated: null,
     permissionErrors: 0,
-    message: null
+    message: null,
+    isCatchup: false
   };
 
   let indexingStartTime = null;
@@ -84,6 +85,7 @@
     y: 0
   };
 
+  let platform = '';
   let toast = '';
   let searchTimer;
   let lastSearchFiredAt = 0;
@@ -417,6 +419,9 @@
       if (typeof status.currentPath === 'string') {
         currentPath = status.currentPath;
       }
+      if (status.state === 'Ready' && prevState !== 'Ready') {
+        scheduleSearch();
+      }
     } catch (err) {
       showToast(`Failed to get status: ${String(err)}`);
     } finally {
@@ -463,9 +468,7 @@
         sortDir: searchSortDir
       });
 
-      if (gen !== searchGeneration) {
-        if (searchQuery !== query || searchSortBy !== sortBy || searchSortDir !== sortDir) return;
-      }
+      if (gen !== searchGeneration) return;
 
       dbLatencyMs = Math.round(performance.now() - startedAt);
       dbLastQuery = searchQuery;
@@ -473,6 +476,7 @@
       searchModeLabel = next.modeLabel || '';
       results = entries;
       hasMore = results.length >= PAGE_SIZE;
+      if (tableContainer) tableContainer.scrollTop = 0;
 
       const restored = new Set();
       for (let i = 0; i < results.length; i += 1) {
@@ -484,9 +488,7 @@
 
       updateViewportHeight();
     } catch (err) {
-      if (gen !== searchGeneration) {
-        if (searchQuery !== query || searchSortBy !== sortBy || searchSortDir !== sortDir) return;
-      }
+      if (gen !== searchGeneration) return;
       showToast(`Search failed: ${String(err)}`);
     }
   }
@@ -544,6 +546,7 @@
       sortBy = column;
       sortDir = 'asc';
     }
+    if (tableContainer) tableContainer.scrollTop = 0;
     void runSearch();
   }
 
@@ -568,6 +571,14 @@
 
     if (!selectedIndices.has(index)) {
       selectSingle(index);
+    }
+
+    if (platform === 'windows') {
+      const paths = selectedPaths();
+      if (paths.length > 0) {
+        invoke('show_context_menu', { paths, x: event.clientX, y: event.clientY });
+      }
+      return;
     }
 
     contextMenu = {
@@ -1072,8 +1083,10 @@
     }
 
     if (event.key === 'Delete' || ((event.metaKey || event.ctrlKey) && event.key === 'Backspace')) {
-      event.preventDefault();
-      await trashSelected();
+      if (!isTextInput) {
+        event.preventDefault();
+        await trashSelected();
+      }
       return;
     }
   }
@@ -1159,7 +1172,18 @@
   let unlistenFns = [];
 
   onMount(async () => {
+    const t0 = performance.now();
+    const ms = () => Math.round(performance.now() - t0);
+    const DEBUG_STARTUP = false;
+    const flog = DEBUG_STARTUP ? (msg) => invoke('frontend_log', { msg }).catch(() => {}) : () => {};
+
+    flog(`[startup/fe] onMount entered`);
+
     updateViewportHeight();
+    flog(`[startup/fe] +${ms()}ms updateViewportHeight done`);
+
+    platform = await invoke('get_platform');
+    flog(`[startup/fe] +${ms()}ms get_platform done`);
 
     const unlistenProgress = await listen('index_progress', (event) => {
       scanned = event.payload.scanned;
@@ -1172,13 +1196,16 @@
         };
       }
     });
+    flog(`[startup/fe] +${ms()}ms listen(index_progress) registered`);
 
     const unlistenState = await listen('index_state', (event) => {
+      flog(`[startup/fe] index_state event received: ${event.payload.state} at +${ms()}ms`);
       const prevState = indexStatus.state;
       indexStatus = {
         ...indexStatus,
         state: event.payload.state,
-        message: event.payload.message ?? null
+        message: event.payload.message ?? null,
+        isCatchup: event.payload.isCatchup ?? false
       };
 
       if (event.payload.state === 'Indexing' && prevState !== 'Indexing') {
@@ -1189,7 +1216,12 @@
       } else if (event.payload.state !== 'Indexing' && prevState === 'Indexing') {
         stopElapsedTimer();
       }
+
+      if (event.payload.state === 'Ready') {
+        scheduleSearch();
+      }
     });
+    flog(`[startup/fe] +${ms()}ms listen(index_state) registered`);
 
     const unlistenUpdated = await listen('index_updated', (event) => {
       indexStatus = {
@@ -1199,7 +1231,6 @@
         permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
       };
 
-      if (results.length > 0) return;
       scheduleSearch();
     });
 
@@ -1208,28 +1239,42 @@
     });
 
     unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus];
+    flog(`[startup/fe] +${ms()}ms all listeners registered`);
 
+    // Show Svelte UI immediately: remove skeleton, focus search input.
+    // Window is already visible (visible:true in tauri.conf.json) showing the skeleton.
+    await tick();
+    document.getElementById('skeleton')?.remove();
+    await focusSearch();
+    flog(`[startup/fe] +${ms()}ms WINDOW VISIBLE — skeleton removed`);
+
+    // Remaining setup happens with the window already visible
     await refreshStatus();
+    flog(`[startup/fe] +${ms()}ms refreshStatus done (state=${indexStatus.state})`);
+
     try {
       homePrefix = await invoke('get_home_dir');
     } catch {
       homePrefix = '';
     }
+    flog(`[startup/fe] +${ms()}ms get_home_dir done`);
 
     if (!localStorage.getItem('everything-fda-notice-v1')) {
       showToast('macOS Full Disk Access permission may be required for full disk search.');
       localStorage.setItem('everything-fda-notice-v1', '1');
     }
-    await focusSearch();
+    flog(`[startup/fe] +${ms()}ms calling runSearch...`);
     await runSearch();
+    flog(`[startup/fe] +${ms()}ms runSearch done`);
 
     window.addEventListener('resize', updateViewportHeight);
     window.addEventListener('click', onGlobalClick);
     statusRefreshTimer = setInterval(() => {
-      if (indexStatus.state === 'Indexing' || indexStatus.state === 'Unknown') {
+      if (indexStatus.state === 'Indexing') {
         void refreshStatus();
       }
     }, 1000);
+    console.log(`[startup/fe] +${ms()}ms onMount complete`);
   });
 
   onDestroy(async () => {
@@ -1386,7 +1431,7 @@
     >
       Reset Index
     </button>
-    {#if indexStatus.state === 'Indexing'}
+    {#if indexStatus.state === 'Indexing' && !indexStatus.isCatchup}
       <span class="index-progress">Scanned {scanned.toLocaleString()} / Indexed {indexed.toLocaleString()}</span>
       <span class="path-preview">{displayPath(currentPath)}</span>
     {/if}
@@ -1394,7 +1439,7 @@
       <span class="status-warning">Permission errors: {indexStatus.permissionErrors.toLocaleString()}</span>
     {/if}
     {#if indexStatus.message}
-      <span class="status-error">{indexStatus.message}</span>
+      <span class={indexStatus.isCatchup ? 'index-progress' : 'status-error'}>{indexStatus.message}</span>
     {/if}
   </footer>
 
@@ -1431,8 +1476,8 @@
     --border-input: rgba(0, 0, 0, 0.13);
     --focus-ring: #6f96e6;
     --row-border: rgba(0, 0, 0, 0.032);
-    --row-hover: rgba(255, 255, 255, 0.52);
-    --row-selected: rgba(55, 125, 255, 0.17);
+    --row-hover: rgba(0, 0, 0, 0.06);
+    --row-selected: rgba(0, 0, 0, 0.12);
     --button-bg: rgba(255, 255, 255, 0.62);
     --button-border: rgba(0, 0, 0, 0.10);
     --button-text: #2c3e50;
@@ -1459,8 +1504,8 @@
       --border-input: rgba(255, 255, 255, 0.14);
       --focus-ring: #5b8bd9;
       --row-border: rgba(255, 255, 255, 0.026);
-      --row-hover: rgba(255, 255, 255, 0.054);
-      --row-selected: rgba(85, 145, 255, 0.22);
+      --row-hover: rgba(255, 255, 255, 0.08);
+      --row-selected: rgba(255, 255, 255, 0.14);
       --button-bg: rgba(255, 255, 255, 0.072);
       --button-border: rgba(255, 255, 255, 0.11);
       --button-text: #d6d6e0;
