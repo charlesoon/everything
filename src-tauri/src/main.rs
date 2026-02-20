@@ -158,6 +158,9 @@ struct SearchExecution {
 struct SearchResultDto {
     entries: Vec<EntryDto>,
     mode_label: String,
+    /// Total number of results matching the query (ignoring LIMIT/OFFSET).
+    /// 0 means unknown — frontend should fall back to entries.length.
+    total_count: u32,
 }
 
 #[allow(dead_code)]
@@ -2966,6 +2969,154 @@ fn search_log_enabled() -> bool {
     *SEARCH_LOG_ENABLED.get_or_init(|| env_truthy("FASTFIND_SEARCH_LOG"))
 }
 
+/// Returns the total number of entries matching `query` without LIMIT/OFFSET.
+/// Returns 0 when the total is unknown or not worth computing (PathSearch with
+/// complex WHERE, non-zero offset, or non-SQL paths).
+fn compute_total_count(db_path: &Path, home_dir: &Path, execution: &SearchExecution) -> u32 {
+    // When fewer results than the limit were returned the total is exact.
+    if (execution.results.len() as u32) < execution.effective_limit {
+        return execution.offset.saturating_add(execution.results.len() as u32);
+    }
+    // For paginated pages after the first we leave total tracking to the frontend.
+    if execution.offset > 0 {
+        return 0;
+    }
+    // Non-SQL fast paths already return all matching entries.
+    if execution.mode_label.starts_with("mem_")
+        || execution.mode_label == "spotlight"
+        || execution.mode_label == "spotlight_timeout"
+        || execution.mode_label == "find_fallback"
+        || execution.mode_label == "name_neg_cache"
+    {
+        return execution.results.len() as u32;
+    }
+    let Ok(conn) = db_connection_for_search(db_path) else {
+        return 0;
+    };
+    let mode = parse_query(&execution.query);
+    match mode {
+        SearchMode::Empty => conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap_or(0),
+        SearchMode::NameSearch { name_like } => {
+            let escaped = escape_like(&execution.query);
+            let prefix_like = format!("{}%", escaped);
+            let prefix_count: u32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
+                    params![prefix_like],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if prefix_count > 0 {
+                prefix_count
+            } else {
+                // Phase-2 contains fallback was used.
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
+                    params![name_like],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0)
+            }
+        }
+        SearchMode::GlobName { name_like } => conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
+                params![name_like],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
+        SearchMode::ExtSearch { ext, .. } => conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE ext = ?1",
+                params![ext],
+                |r| r.get(0),
+            )
+            .unwrap_or(0),
+        SearchMode::PathSearch { name_like, dir_hint, .. } => {
+            let resolved_dirs = resolve_dir_hint(home_dir, &dir_hint)
+                .map(|p| vec![p.to_string_lossy().to_string()])
+                .unwrap_or_default();
+            let resolved_dirs = if resolved_dirs.is_empty() {
+                resolve_dirs_from_db(&conn, &dir_hint)
+            } else {
+                resolved_dirs
+            };
+
+            if !resolved_dirs.is_empty() {
+                let mut sql_params: Vec<SqlValue> = Vec::new();
+                let mut dir_conditions = Vec::new();
+                let sep = std::path::MAIN_SEPARATOR;
+                for d in &resolved_dirs {
+                    let i = sql_params.len();
+                    let pfx = format!("{d}{sep}");
+                    let pfx_end = format!("{d}\x7F");
+                    sql_params.push(SqlValue::Text(d.clone()));
+                    sql_params.push(SqlValue::Text(pfx));
+                    sql_params.push(SqlValue::Text(pfx_end));
+                    dir_conditions.push(format!(
+                        "(e.dir = ?{} OR (e.dir >= ?{} AND e.dir < ?{}))",
+                        i + 1,
+                        i + 2,
+                        i + 3
+                    ));
+                }
+                let dir_where = dir_conditions.join(" OR ");
+                let name_filter = if name_like == "%" {
+                    String::new()
+                } else {
+                    let ext_shortcut = extract_ext_from_like(&name_like);
+                    if let Some(ext_val) = ext_shortcut {
+                        let i = sql_params.len();
+                        sql_params.push(SqlValue::Text(ext_val));
+                        format!(" AND e.ext = ?{}", i + 1)
+                    } else {
+                        let i = sql_params.len();
+                        sql_params.push(SqlValue::Text(name_like.clone()));
+                        format!(" AND e.name LIKE ?{} ESCAPE '\\'", i + 1)
+                    }
+                };
+                let sql = format!(
+                    "SELECT COUNT(*) FROM entries e WHERE ({dir_where}){name_filter}"
+                );
+                conn.query_row(&sql, params_from_iter(sql_params.iter()), |r| r.get(0))
+                    .unwrap_or(0)
+            } else {
+                let sep = std::path::MAIN_SEPARATOR;
+                let native_hint = dir_hint.replace('/', &sep.to_string());
+                let escaped_sep = escape_like(&sep.to_string());
+                let dir_suffix = escape_like(&native_hint);
+                let dir_like_exact = format!("%{escaped_sep}{dir_suffix}");
+                let dir_like_sub = format!("%{escaped_sep}{dir_suffix}{escaped_sep}%");
+                let ext_shortcut = extract_ext_from_like(&name_like);
+                if let Some(ext_val) = ext_shortcut {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM entries e WHERE e.ext = ?1 AND (e.dir LIKE ?2 ESCAPE '\\' OR e.dir LIKE ?3 ESCAPE '\\')",
+                        params![ext_val, dir_like_exact, dir_like_sub],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+                } else if name_like == "%" {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM entries e WHERE e.dir LIKE ?1 ESCAPE '\\' OR e.dir LIKE ?2 ESCAPE '\\'",
+                        params![dir_like_exact, dir_like_sub],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+                } else {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM entries e WHERE (e.dir LIKE ?1 ESCAPE '\\' OR e.dir LIKE ?2 ESCAPE '\\') AND e.name LIKE ?3 ESCAPE '\\'",
+                        params![dir_like_exact, dir_like_sub, name_like],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+                }
+            }
+        }
+    }
+}
+
 fn execute_search(
     state: &AppState,
     query: String,
@@ -3624,9 +3775,11 @@ async fn search(
             ));
         }
 
+        let total_count = compute_total_count(&state.db_path, &state.home_dir, &execution);
         Ok(SearchResultDto {
             entries: execution.results,
             mode_label: execution.mode_label,
+            total_count,
         })
     })
     .await
