@@ -92,6 +92,14 @@ type AppResult<T> = Result<T, String>;
 static SEARCH_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static PERF_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static BENCH_MODE_ENABLED: OnceLock<bool> = OnceLock::new();
+static STARTUP_T0: OnceLock<Instant> = OnceLock::new();
+
+fn startup_elapsed_ms() -> u128 {
+    STARTUP_T0
+        .get()
+        .map(|started| started.elapsed().as_millis())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -304,6 +312,8 @@ pub(crate) struct AppState {
     pub(crate) watcher_stop: Arc<AtomicBool>,
     /// Set to true while a file watcher event loop is running.
     pub(crate) watcher_active: Arc<AtomicBool>,
+    /// Set to true once frontend onMount has completed enough to accept user input.
+    pub(crate) frontend_ready: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -973,8 +983,7 @@ fn windows_noisy_roots(home_dir: &Path) -> Vec<PathBuf> {
         local.join("Microsoft"),
         local.join("Google"),
         local.join("Packages"),
-        // C:\ system directories
-        PathBuf::from("C:\\Windows"),
+        // C:\ system directories (Windows is deferred, not excluded)
         PathBuf::from("C:\\$Recycle.Bin"),
         PathBuf::from("C:\\System Volume Information"),
         PathBuf::from("C:\\Recovery"),
@@ -988,7 +997,7 @@ fn windows_noisy_roots(_home_dir: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn effective_ignore_rules(
+pub(crate) fn effective_ignore_rules(
     home_dir: &Path,
     cwd: &Path,
     base_roots: &[PathBuf],
@@ -1850,6 +1859,7 @@ fn touch_status_updated(state: &AppState) {
     state.status.lock().last_updated = Some(now_epoch());
 }
 
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn start_full_index_worker(app: AppHandle, state: AppState) -> AppResult<()> {
     start_full_index_worker_inner(app, state, false)
 }
@@ -2841,19 +2851,21 @@ fn is_per_file_icon_ext(ext: &str) -> bool {
 
 #[tauri::command]
 fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
+    let started = Instant::now();
     let snapshot = state.status.lock().clone();
+    let snapshot_state = snapshot.state.as_str().to_string();
+    let db_ready = state.db_ready.load(AtomicOrdering::Acquire);
+    let indexing_active = state.indexing_active.load(AtomicOrdering::Acquire);
     let state_label = if matches!(snapshot.state, IndexState::Error) {
         snapshot.state.as_str().to_string()
     } else if matches!(snapshot.state, IndexState::Ready) {
         "Ready".to_string()
-    } else if state.indexing_active.load(AtomicOrdering::Acquire)
-        || !state.db_ready.load(AtomicOrdering::Acquire)
-    {
+    } else if indexing_active || !db_ready {
         "Indexing".to_string()
     } else {
         snapshot.state.as_str().to_string()
     };
-    IndexStatusDto {
+    let dto = IndexStatusDto {
         state: state_label,
         entries_count: snapshot.entries_count,
         last_updated: snapshot.last_updated,
@@ -2862,7 +2874,21 @@ fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
         scanned: snapshot.scanned,
         indexed: snapshot.indexed,
         current_path: snapshot.current_path,
+    };
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[rpc/get_index_status] elapsed={}ms state={} snapshot_state={} db_ready={} indexing_active={} entries={} scanned={} indexed={}",
+            started.elapsed().as_millis(),
+            dto.state,
+            snapshot_state,
+            db_ready,
+            indexing_active,
+            dto.entries_count,
+            dto.scanned,
+            dto.indexed,
+        );
     }
+    dto
 }
 
 #[tauri::command]
@@ -2910,6 +2936,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
 
         {
             let mut status = state.status.lock();
+            status.state = IndexState::Indexing;
             status.entries_count = 0;
             status.last_updated = None;
             status.permission_errors = 0;
@@ -2921,6 +2948,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
 
         invalidate_search_caches(&state);
 
+        emit_index_state(&app, "Indexing", None);
         emit_index_updated(&app, 0, now_epoch(), 0);
 
         // Allow new watcher to start
@@ -3743,9 +3771,10 @@ async fn search(
 ) -> AppResult<SearchResultDto> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let started = Instant::now();
+        let rpc_started = Instant::now();
+        let execute_started = Instant::now();
         let execution = execute_search(&state, query, limit, offset, sort_by, sort_dir)?;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let execute_elapsed_ms = execute_started.elapsed().as_secs_f64() * 1000.0;
 
         log_search(
             &state.db_path,
@@ -3770,12 +3799,35 @@ async fn search(
                 execution.effective_limit,
                 execution.offset,
                 execution.results.len(),
-                elapsed_ms,
+                execute_elapsed_ms,
                 top,
             ));
         }
 
+        let count_started = Instant::now();
         let total_count = compute_total_count(&state.db_path, &state.home_dir, &execution);
+        let count_elapsed_ms = count_started.elapsed().as_secs_f64() * 1000.0;
+        let rpc_elapsed_ms = rpc_started.elapsed().as_secs_f64() * 1000.0;
+        if cfg!(debug_assertions) {
+            let db_ready = state.db_ready.load(AtomicOrdering::Acquire);
+            let indexing_active = state.indexing_active.load(AtomicOrdering::Acquire);
+            eprintln!(
+                "[rpc/search] total={:.3}ms execute={:.3}ms total_count={:.3}ms query={:?} mode={} sort={}/{} limit={} offset={} results={} total_count={} db_ready={} indexing_active={}",
+                rpc_elapsed_ms,
+                execute_elapsed_ms,
+                count_elapsed_ms,
+                execution.query,
+                execution.mode_label,
+                execution.sort_by,
+                execution.sort_dir,
+                execution.effective_limit,
+                execution.offset,
+                execution.results.len(),
+                total_count,
+                db_ready,
+                indexing_active,
+            );
+        }
         Ok(SearchResultDto {
             entries: execution.results,
             mode_label: execution.mode_label,
@@ -4268,6 +4320,14 @@ async fn fd_search(
 #[tauri::command]
 fn frontend_log(msg: String) {
     eprintln!("{msg}");
+}
+
+#[tauri::command]
+fn mark_frontend_ready(state: State<'_, AppState>) {
+    state.frontend_ready.store(true, AtomicOrdering::Release);
+    if cfg!(debug_assertions) {
+        eprintln!("[startup] frontend_ready=true");
+    }
 }
 
 #[tauri::command]
@@ -4791,6 +4851,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
     #[cfg(target_os = "windows")]
     if let Some(window) = app.get_webview_window("main") {
+        eprintln!("[startup +{}ms] windows setup: before window.show()", startup_elapsed_ms());
         use tauri::window::Color;
         let is_dark = window.theme().map(|t| t == tauri::Theme::Dark).unwrap_or(false);
         let bg = if is_dark {
@@ -4802,6 +4863,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         // Show window after background color is set to avoid white flash.
         // The skeleton HTML renders on top of this matching background.
         let _ = window.show();
+        eprintln!("[startup +{}ms] windows setup: window.show() returned", startup_elapsed_ms());
     }
 
     let app_data_dir = app
@@ -4855,6 +4917,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         mem_index: Arc::new(RwLock::new(None)),
         watcher_stop: Arc::new(AtomicBool::new(false)),
         watcher_active: Arc::new(AtomicBool::new(false)),
+        frontend_ready: Arc::new(AtomicBool::new(false)),
     };
 
     eprintln!("[startup] +{}ms AppState created", setup_started.elapsed().as_millis());
@@ -4916,8 +4979,36 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 let hk_started = std::time::Instant::now();
                 let _ = refresh_and_emit_status_counts(&hk_app, &hk_state);
                 eprintln!("[startup/housekeeping] refresh_and_emit_status_counts done in {}ms", hk_started.elapsed().as_millis());
+                // Wait for frontend readiness so initial paint and first input are not contended by purge I/O.
+                const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(180);
+                const POST_READY_GRACE: Duration = Duration::from_secs(2);
+                let wait_started = std::time::Instant::now();
+                while !hk_state.frontend_ready.load(AtomicOrdering::Acquire)
+                    && wait_started.elapsed() < FRONTEND_READY_TIMEOUT
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if hk_state.frontend_ready.load(AtomicOrdering::Acquire) {
+                    eprintln!(
+                        "[startup/housekeeping] frontend_ready observed after {}ms; purging in {}ms",
+                        wait_started.elapsed().as_millis(),
+                        POST_READY_GRACE.as_millis()
+                    );
+                } else {
+                    eprintln!(
+                        "[startup/housekeeping] frontend_ready wait timed out after {}ms; proceeding with purge",
+                        FRONTEND_READY_TIMEOUT.as_millis()
+                    );
+                }
+                std::thread::sleep(POST_READY_GRACE);
+                let purge_started = std::time::Instant::now();
                 if let Err(err) = purge_ignored_entries(&hk_state.db_path, &hk_state.path_ignores) {
                     eprintln!("[startup/housekeeping] purge_ignored_entries failed: {err}");
+                } else {
+                    eprintln!(
+                        "[startup/housekeeping] purge_ignored_entries done in {}ms",
+                        purge_started.elapsed().as_millis()
+                    );
                 }
                 eprintln!("[startup/housekeeping] all done in {}ms", hk_started.elapsed().as_millis());
             });
@@ -4998,10 +5089,44 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let _ = STARTUP_T0.set(Instant::now());
+    eprintln!("[startup +{}ms] run() entered", startup_elapsed_ms());
+    #[cfg(target_os = "windows")]
+    if cfg!(debug_assertions) {
+        // Safety: called at program start before any threads are spawned.
+        // Will require `unsafe` block when migrating to Rust edition 2024.
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--no-proxy-server --disable-http-cache --disk-cache-size=1 --media-cache-size=1",
+        );
+        eprintln!(
+            "[startup +{}ms] set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--no-proxy-server --disable-http-cache --disk-cache-size=1 --media-cache-size=1",
+            startup_elapsed_ms()
+        );
+    }
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_drag::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    if !cfg!(debug_assertions) {
+        builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
+    } else {
+        eprintln!(
+            "[startup +{}ms] debug mode: window-state plugin disabled for startup A/B test",
+            startup_elapsed_ms()
+        );
+    }
+
+    builder
+        .on_page_load(|window, payload| {
+            eprintln!(
+                "[startup/page +{}ms] on_page_load label={} event={:?} url={}",
+                startup_elapsed_ms(),
+                window.label(),
+                payload.event(),
+                payload.url()
+            );
+        })
         .setup(|app| {
             setup_app(app).map_err(|e| {
                 Box::<dyn std::error::Error>::from(io::Error::new(io::ErrorKind::Other, e))
@@ -5025,7 +5150,8 @@ pub fn run() {
             get_file_icon,
             get_platform,
             show_context_menu,
-            frontend_log
+            frontend_log,
+            mark_frontend_ready
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -5088,6 +5214,7 @@ mod tests {
             mem_index: Arc::new(RwLock::new(None)),
             watcher_stop: Arc::new(AtomicBool::new(false)),
             watcher_active: Arc::new(AtomicBool::new(false)),
+            frontend_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 

@@ -2,7 +2,6 @@
   import { onDestroy, onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { startDrag } from '@crabnebula/tauri-plugin-drag';
 
   const rowHeight = 28;
@@ -21,6 +20,7 @@
     path: 0.45,
     size: 0.1
   };
+  const DEBUG_STARTUP = false;
 
   let query = '';
   let results = [];
@@ -59,6 +59,8 @@
   let hasMore = true;
   let loadingMore = false;
   let searchGeneration = 0;
+  let scheduleGeneration = 0;
+  let searchPending = false;
 
   let scanned = 0;
   let indexed = 0;
@@ -95,6 +97,7 @@
   let statusRefreshTimer;
   let elapsedTimer;
   let statusRefreshInFlight = false;
+  let resetInFlight = false;
   let lastReadyCount = 0;
 
   const iconCache = new Map();
@@ -102,6 +105,13 @@
 
   let highlightCache = new Map();
   let highlightCacheQuery = '';
+
+  function startupLog(msg) {
+    if (!DEBUG_STARTUP) {
+      return;
+    }
+    void invoke('frontend_log', { msg }).catch(() => {});
+  }
 
   const folderFallbackIcon =
     "data:image/svg+xml;utf8," +
@@ -120,6 +130,7 @@
   $: endIndex = Math.min(results.length, startIndex + visibleCount);
   $: visibleRows = results.slice(startIndex, endIndex);
   $: translateY = startIndex * rowHeight;
+
   $: tableMinWidth = colWidths.name + colWidths.path + colWidths.size + colWidths.modified;
   $: tableGridStyle = `--col-name:${colWidths.name}px;--col-path:${colWidths.path}px;--col-size:${colWidths.size}px;--col-modified:${colWidths.modified}px;--table-min-width:${tableMinWidth}px;--header-offset:${-headerScrollLeft}px;`;
 
@@ -398,10 +409,13 @@
   }
 
   async function refreshStatus() {
-    if (statusRefreshInFlight) {
+    if (statusRefreshInFlight || resetInFlight) {
+      startupLog('[startup/fe] refreshStatus skipped (in-flight)');
       return;
     }
     statusRefreshInFlight = true;
+    const startedAt = performance.now();
+    startupLog('[startup/fe] refreshStatus start');
     try {
       const status = await invoke('get_index_status');
       const prevState = indexStatus.state;
@@ -427,9 +441,17 @@
         currentPath = status.currentPath;
       }
       if (status.state === 'Ready' && prevState !== 'Ready') {
-        scheduleSearch();
+        scheduleSearch(true);
       }
+      startupLog(
+        `[startup/fe] refreshStatus done in ${Math.round(performance.now() - startedAt)}ms `
+        + `(state=${status.state}, entries=${status.entriesCount}, scanned=${status.scanned ?? 'n/a'}, `
+        + `indexed=${status.indexed ?? 'n/a'})`
+      );
     } catch (err) {
+      startupLog(
+        `[startup/fe] refreshStatus failed in ${Math.round(performance.now() - startedAt)}ms: ${String(err)}`
+      );
       showToast(`Failed to get status: ${String(err)}`);
     } finally {
       statusRefreshInFlight = false;
@@ -437,8 +459,11 @@
   }
 
   function scheduleSearch(preserveScroll = false) {
-    searchGeneration += 1;
-    const scheduledGen = searchGeneration;
+    // Use a separate counter for debounce cancellation so that scheduling
+    // a search does not invalidate in-flight loadMore calls (which check
+    // searchGeneration). Only runSearch bumps searchGeneration.
+    scheduleGeneration += 1;
+    const scheduledGen = scheduleGeneration;
     clearTimeout(searchTimer);
 
     const now = performance.now();
@@ -449,7 +474,7 @@
     } else {
       // Trailing edge: debounce
       searchTimer = setTimeout(() => {
-        if (scheduledGen !== searchGeneration) {
+        if (scheduledGen !== scheduleGeneration) {
           return;
         }
         lastSearchFiredAt = performance.now();
@@ -461,15 +486,21 @@
   async function runSearch(preserveScroll = false) {
     searchGeneration += 1;
     const gen = searchGeneration;
+    searchPending = true;
     const searchQuery = query;
     const searchSortBy = sortBy;
     const searchSortDir = sortDir;
     const startedAt = performance.now();
+    // When preserving scroll, reload at least as many results as currently
+    // loaded so totalHeight stays stable and scrollTop isn't clamped.
+    const fetchLimit = preserveScroll
+      ? Math.max(PAGE_SIZE, results.length)
+      : PAGE_SIZE;
     try {
       const keepPaths = new Set(selectedPaths());
       const next = await invoke('search', {
         query: searchQuery,
-        limit: PAGE_SIZE,
+        limit: fetchLimit,
         offset: 0,
         sortBy: searchSortBy,
         sortDir: searchSortDir
@@ -481,6 +512,14 @@
       dbLastQuery = searchQuery;
       const entries = Array.isArray(next.entries) ? next.entries : [];
       searchModeLabel = next.modeLabel || '';
+
+      // During the await, loadMore may have grown results beyond fetchLimit.
+      // Replacing a larger result set with a smaller one would shrink
+      // totalHeight and cause the browser to clamp scrollTop → scroll jump.
+      // Skip this update; the existing results are still valid (same query/sort).
+      if (preserveScroll && entries.length < results.length) return;
+
+      if (preserveScroll && tableContainer) scrollTop = tableContainer.scrollTop;
       results = entries;
       if (next.totalCount > 0) {
         totalResults = next.totalCount;
@@ -489,7 +528,7 @@
         totalResults = entries.length;
         totalResultsKnown = false;
       }
-      hasMore = totalResultsKnown ? results.length < totalResults : entries.length >= PAGE_SIZE;
+      hasMore = totalResultsKnown ? results.length < totalResults : entries.length >= fetchLimit;
       if (!preserveScroll && tableContainer) tableContainer.scrollTop = 0;
 
       const restored = new Set();
@@ -504,11 +543,13 @@
     } catch (err) {
       if (gen !== searchGeneration) return;
       showToast(`Search failed: ${String(err)}`);
+    } finally {
+      searchPending = false;
     }
   }
 
   async function loadMore() {
-    if (!hasMore || loadingMore) return;
+    if (!hasMore || loadingMore || searchPending) return;
     const gen = searchGeneration;
     loadingMore = true;
     try {
@@ -521,7 +562,10 @@
       });
       if (gen !== searchGeneration) return;
       const arr = Array.isArray(batch.entries) ? batch.entries : [];
-      if (arr.length > 0) results = [...results, ...arr];
+      if (arr.length > 0) {
+        if (tableContainer) scrollTop = tableContainer.scrollTop;
+        results = [...results, ...arr];
+      }
       hasMore = totalResultsKnown ? results.length < totalResults : arr.length >= PAGE_SIZE;
     } catch (err) {
       showToast(`Failed to load more: ${String(err)}`);
@@ -909,11 +953,14 @@
     indexingElapsed = '';
     indexingFinishedAt = '';
 
+    resetInFlight = true;
     try {
       await invoke('reset_index');
     } catch (err) {
       showToast(`Failed to reset index: ${String(err)}`);
       await refreshStatus();
+    } finally {
+      resetInFlight = false;
     }
   }
 
@@ -985,8 +1032,6 @@
   }
 
   async function focusSearch() {
-    await getCurrentWindow().show();
-    await getCurrentWindow().setFocus();
     searchInputEl?.focus();
     searchInputEl?.select();
   }
@@ -1214,116 +1259,135 @@
   onMount(async () => {
     const t0 = performance.now();
     const ms = () => Math.round(performance.now() - t0);
-    const DEBUG_STARTUP = false;
-    const flog = DEBUG_STARTUP ? (msg) => invoke('frontend_log', { msg }).catch(() => {}) : () => {};
+    const step = async (name, fn) => {
+      const startedAt = performance.now();
+      startupLog(`[startup/fe] +${ms()}ms ${name} start`);
+      try {
+        const result = await fn();
+        startupLog(`[startup/fe] +${ms()}ms ${name} done (${Math.round(performance.now() - startedAt)}ms)`);
+        return result;
+      } catch (err) {
+        startupLog(
+          `[startup/fe] +${ms()}ms ${name} failed (${Math.round(performance.now() - startedAt)}ms): ${String(err)}`
+        );
+        throw err;
+      }
+    };
 
-    flog(`[startup/fe] onMount entered`);
+    startupLog('[startup/fe] onMount entered');
 
     updateViewportHeight();
-    flog(`[startup/fe] +${ms()}ms updateViewportHeight done`);
+    startupLog(`[startup/fe] +${ms()}ms updateViewportHeight done`);
 
-    platform = await invoke('get_platform');
-    flog(`[startup/fe] +${ms()}ms get_platform done`);
+    platform = await step('invoke(get_platform)', () => invoke('get_platform'));
 
-    const unlistenProgress = await listen('index_progress', (event) => {
-      scanned = event.payload.scanned;
-      indexed = event.payload.indexed;
-      currentPath = event.payload.currentPath;
-      if (indexStatus.state !== 'Indexing') {
+    const unlistenProgress = await step(
+      'listen(index_progress)',
+      () => listen('index_progress', (event) => {
+        scanned = event.payload.scanned;
+        indexed = event.payload.indexed;
+        currentPath = event.payload.currentPath;
+        if (indexStatus.state !== 'Indexing') {
+          indexStatus = {
+            ...indexStatus,
+            state: 'Indexing'
+          };
+        }
+      })
+    );
+
+    const unlistenState = await step(
+      'listen(index_state)',
+      () => listen('index_state', (event) => {
+        startupLog(`[startup/fe] index_state event received: ${event.payload.state} at +${ms()}ms`);
+        const prevState = indexStatus.state;
         indexStatus = {
           ...indexStatus,
-          state: 'Indexing'
+          state: event.payload.state,
+          message: event.payload.message ?? null,
+          isCatchup: event.payload.isCatchup ?? false
         };
-      }
-    });
-    flog(`[startup/fe] +${ms()}ms listen(index_progress) registered`);
 
-    const unlistenState = await listen('index_state', (event) => {
-      flog(`[startup/fe] index_state event received: ${event.payload.state} at +${ms()}ms`);
-      const prevState = indexStatus.state;
-      indexStatus = {
-        ...indexStatus,
-        state: event.payload.state,
-        message: event.payload.message ?? null,
-        isCatchup: event.payload.isCatchup ?? false
-      };
-
-      if (event.payload.state === 'Indexing' && prevState !== 'Indexing') {
-        if (prevState === 'Ready') {
-          lastReadyCount = indexStatus.entriesCount;
+        if (event.payload.state === 'Indexing' && prevState !== 'Indexing') {
+          if (prevState === 'Ready') {
+            lastReadyCount = indexStatus.entriesCount;
+          }
+          startElapsedTimer();
+        } else if (event.payload.state !== 'Indexing' && prevState === 'Indexing') {
+          stopElapsedTimer();
         }
-        startElapsedTimer();
-      } else if (event.payload.state !== 'Indexing' && prevState === 'Indexing') {
-        stopElapsedTimer();
-      }
 
-      if (event.payload.state === 'Ready') {
-        scheduleSearch();
-      }
-    });
-    flog(`[startup/fe] +${ms()}ms listen(index_state) registered`);
+        if (event.payload.state === 'Ready') {
+          scheduleSearch(true);
+        }
+      })
+    );
 
-    const unlistenUpdated = await listen('index_updated', (event) => {
-      indexStatus = {
-        ...indexStatus,
-        entriesCount: event.payload.entriesCount,
-        lastUpdated: event.payload.lastUpdated,
-        permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
-      };
+    const unlistenUpdated = await step(
+      'listen(index_updated)',
+      () => listen('index_updated', (event) => {
+        indexStatus = {
+          ...indexStatus,
+          entriesCount: event.payload.entriesCount,
+          lastUpdated: event.payload.lastUpdated,
+          permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
+        };
 
-      scheduleSearch(true);
-    });
+        scheduleSearch(true);
+      })
+    );
 
-    const unlistenFocus = await listen('focus_search', () => {
+    const unlistenFocus = await step('listen(focus_search)', () => listen('focus_search', () => {
       void focusSearch();
-    });
+    }));
 
-    const unlistenCtxMenuAction = await listen('context_menu_action', (event) => {
-      switch (event.payload) {
-        case 'open': void openSelected(); break;
-        case 'quick_look': {
-          const e = primaryEntry();
-          if (e) void invoke('quick_look', { path: e.path });
-          break;
+    const unlistenCtxMenuAction = await step(
+      'listen(context_menu_action)',
+      () => listen('context_menu_action', (event) => {
+        switch (event.payload) {
+          case 'open': void openSelected(); break;
+          case 'quick_look': {
+            const e = primaryEntry();
+            if (e) void invoke('quick_look', { path: e.path });
+            break;
+          }
+          case 'open_with': void openWithFallback(); break;
+          case 'reveal': void revealSelected(); break;
+          case 'copy_files': void copyFiles(); break;
+          case 'copy_path': void copySelectedPaths(); break;
+          case 'trash': void trashSelected(); break;
+          case 'rename': void startRename(); break;
         }
-        case 'open_with': void openWithFallback(); break;
-        case 'reveal': void revealSelected(); break;
-        case 'copy_files': void copyFiles(); break;
-        case 'copy_path': void copySelectedPaths(); break;
-        case 'trash': void trashSelected(); break;
-        case 'rename': void startRename(); break;
-      }
-    });
+      })
+    );
 
     unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction];
-    flog(`[startup/fe] +${ms()}ms all listeners registered`);
+    startupLog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
     // Events emitted before listener registration are lost, so this
     // is the only reliable way to get the current state.
-    await refreshStatus();
-    flog(`[startup/fe] +${ms()}ms refreshStatus done (state=${indexStatus.state})`);
+    await step('refreshStatus()', () => refreshStatus());
 
     // Show Svelte UI: remove skeleton, focus search input.
-    await tick();
+    await step('tick()', () => tick());
     document.getElementById('skeleton')?.remove();
-    await focusSearch();
-    flog(`[startup/fe] +${ms()}ms WINDOW VISIBLE — skeleton removed`);
+    await step('invoke(mark_frontend_ready)', () => invoke('mark_frontend_ready'));
+    await step('focusSearch()', () => focusSearch());
+    startupLog(`[startup/fe] +${ms()}ms WINDOW VISIBLE - skeleton removed`);
 
     try {
-      homePrefix = await invoke('get_home_dir');
+      homePrefix = await step('invoke(get_home_dir)', () => invoke('get_home_dir'));
     } catch {
       homePrefix = '';
     }
-    flog(`[startup/fe] +${ms()}ms get_home_dir done`);
+    startupLog(`[startup/fe] +${ms()}ms get_home_dir done`);
 
     if (!localStorage.getItem('everything-fda-notice-v1')) {
       showToast('macOS Full Disk Access permission may be required for full disk search.');
       localStorage.setItem('everything-fda-notice-v1', '1');
     }
-    flog(`[startup/fe] +${ms()}ms calling runSearch...`);
-    await runSearch();
-    flog(`[startup/fe] +${ms()}ms runSearch done`);
+    await step('runSearch()', () => runSearch());
 
     window.addEventListener('resize', updateViewportHeight);
     window.addEventListener('click', onGlobalClick);
@@ -1332,6 +1396,7 @@
         void refreshStatus();
       }
     }, 1000);
+    startupLog(`[startup/fe] +${ms()}ms onMount complete`);
     console.log(`[startup/fe] +${ms()}ms onMount complete`);
   });
 
@@ -1726,6 +1791,7 @@
 
   .table-body {
     overflow: auto;
+    overflow-anchor: none;
     min-height: 0;
     min-width: 0;
     background: var(--surface);

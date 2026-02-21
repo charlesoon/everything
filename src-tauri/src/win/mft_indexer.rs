@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::Path;
@@ -18,7 +19,7 @@ use crate::{
     mem_search::CompactEntry,
     refresh_and_emit_status_counts,
     restore_normal_pragmas, set_indexing_pragmas, set_meta, set_progress,
-    should_skip_path_ext, update_status_counts, upsert_rows,
+    update_status_counts, upsert_rows,
     AppState, IgnorePattern, IndexRow, IndexState, BUILTIN_SKIP_NAMES,
 };
 
@@ -62,13 +63,14 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     let started = Instant::now();
-    eprintln!("[win/mft] starting MFT scan");
+    let ts = || format!("{:.1}s", started.elapsed().as_secs_f32());
+    eprintln!("[win/mft +{}] starting MFT scan", ts());
 
     // Open volume FIRST — requires admin privileges.
     // Do NOT modify state/DB before this succeeds, so a failed open_volume
     // leaves index_complete and status untouched.
     let vol = volume::open_volume('C')?;
-    eprintln!("[win/mft] volume opened in {}ms", started.elapsed().as_millis());
+    eprintln!("[win/mft +{}] volume opened", ts());
 
     state
         .indexing_active
@@ -88,6 +90,10 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         status.current_path.clear();
     }
     emit_index_state(app, "Indexing", None);
+
+    // Pre-trigger gitignore filter build in background (overlaps with MFT enum)
+    let gi_arc = Arc::clone(&state.gitignore);
+    let gi_thread = std::thread::spawn(move || { gi_arc.get(); });
 
     // ── Pass 1: Enumerate MFT — dirs into resolver, files into Vec ──
     let pass1_started = Instant::now();
@@ -123,14 +129,17 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     })?;
 
     eprintln!(
-        "[win/mft] pass1 done: {} records ({} dirs + {} files) in {}ms",
-        total_records, total_dirs, file_entries.len(),
+        "[win/mft +{}] pass1 done: {} records ({} dirs + {} files) in {}ms",
+        ts(), total_records, total_dirs, file_entries.len(),
         pass1_started.elapsed().as_millis()
     );
 
     // ── Pass 1.5: Compute effective ignore rules + collect home subtree dirs ──
     let subtree_started = Instant::now();
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
+
+    // Wait for gitignore filter (built in parallel with pass1, should already be done)
+    let _ = gi_thread.join();
     let gi_filter = state.gitignore.get();
 
     // Build enhanced skip names: BUILTIN_SKIP_NAMES + AnySegment patterns from pathignore
@@ -159,9 +168,9 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         Some(frn) => {
             let subtree = resolver.collect_subtree_pruned(frn, &all_skip_names, &skip_frns);
             eprintln!(
-                "[win/mft] pass1.5: scan_root FRN={} dir_subtree={} dirs \
+                "[win/mft +{}] pass1.5: scan_root FRN={} dir_subtree={} dirs \
                  (pruned from {} total dirs) skip_names={} skip_frns={} in {}ms",
-                frn, subtree.len(), total_dirs,
+                ts(), frn, subtree.len(), total_dirs,
                 all_skip_names.len(), skip_frns.len(),
                 subtree_started.elapsed().as_millis()
             );
@@ -169,8 +178,8 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         }
         None => {
             eprintln!(
-                "[win/mft] pass1.5: scan_root not found in MFT ({}), using all dirs",
-                scan_path_win
+                "[win/mft +{}] pass1.5: scan_root not found in MFT ({}), using all dirs",
+                ts(), scan_path_win
             );
             dir_entries.iter().map(|(frn, _)| *frn).collect()
         }
@@ -184,8 +193,8 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         let _ = resolver.resolve(dir_frn);
     }
     eprintln!(
-        "[win/mft] pre-resolved {} dir paths in {}ms",
-        dir_subtree.len(), preresolve_started.elapsed().as_millis()
+        "[win/mft +{}] pre-resolved {} dir paths in {}ms",
+        ts(), dir_subtree.len(), preresolve_started.elapsed().as_millis()
     );
 
     // All subtree dirs are now in path_cache — frn_map no longer needed
@@ -197,19 +206,64 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     // Get path_cache early — all subtree dirs pre-resolved in pass 1.5
     let path_cache = resolver.path_cache();
 
+    // Pre-compute which dirs are under any gitignore root scope.
+    // Dirs/files outside all gitignore roots skip is_ignored() entirely.
+    let gi_roots: Vec<String> = gi_filter.root_paths().iter()
+        .map(|p| p.to_string_lossy().replace('/', "\\"))
+        .collect();
+    let dirs_under_gi: HashSet<u64> = if gi_roots.is_empty() {
+        HashSet::new()
+    } else {
+        path_cache.iter()
+            .filter(|(_, dir_path)| {
+                gi_roots.iter().any(|root| dir_path.starts_with(root.as_str()))
+            })
+            .map(|(&frn, _)| frn)
+            .collect()
+    };
+    eprintln!(
+        "[win/mft +{}] gitignore scope: {} roots, {}/{} dirs under gitignore",
+        ts(), gi_roots.len(), dirs_under_gi.len(), path_cache.len()
+    );
+
+    // Pre-extract Glob patterns for pruned-subtree skip checks
+    let glob_patterns: Vec<&IgnorePattern> = ignored_patterns
+        .iter()
+        .filter(|p| matches!(p, IgnorePattern::Glob(_)))
+        .collect();
+
+    // Pre-compute backslash versions of BUILTIN_SKIP_PATHS for Windows path matching
+    let skip_path_infixes: Vec<String> = crate::BUILTIN_SKIP_PATHS.iter()
+        .map(|p| format!("\\{}\\", p.replace('/', "\\")))
+        .collect();
+    let skip_path_suffixes: Vec<String> = crate::BUILTIN_SKIP_PATHS.iter()
+        .map(|p| format!("\\{}", p.replace('/', "\\")))
+        .collect();
+
     // --- Process directories (parallel, mtime from USN timestamp) ---
     let dir_results: Vec<CompactEntry> = dir_entries
         .par_iter()
         .filter(|(frn, _)| dir_subtree.contains(frn))
         .filter_map(|(frn, timestamp)| {
             let full_path = path_cache.get(frn)?;
-            if should_skip_path_ext(Path::new(full_path), &ignored_roots, &ignored_patterns, Some(&gi_filter), Some(true)) {
+            let in_gi_scope = dirs_under_gi.contains(frn);
+            if should_skip_dir_in_pruned_subtree(
+                full_path, &gi_filter, &glob_patterns,
+                &skip_path_infixes, &skip_path_suffixes,
+                in_gi_scope,
+            ) {
                 return None;
             }
-            let path = Path::new(full_path);
-            let name = path.file_name()?.to_string_lossy().to_string();
-            let dir = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-            Some(CompactEntry { name, dir, is_dir: true, ext: None, mtime: *timestamp, size: None })
+            // Extract name/dir from Windows path directly (avoid Path allocations)
+            let (dir, name) = match full_path.rfind('\\') {
+                Some(pos) => (&full_path[..pos], &full_path[pos + 1..]),
+                None => ("", full_path.as_str()),
+            };
+            if name.is_empty() { return None; }
+            Some(CompactEntry {
+                name: name.to_string(), dir: dir.to_string(),
+                is_dir: true, ext: None, mtime: *timestamp, size: None,
+            })
         })
         .collect();
 
@@ -218,42 +272,64 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     let mut scanned: u64 = dirs_in_subtree;
     let mut indexed: u64 = dir_indexed;
     let mut filtered_skip: u64 = dirs_in_subtree - dir_indexed;
+
+    eprintln!(
+        "[win/mft +{}] dirs done: scanned={scanned} indexed={indexed} \
+         skip={filtered_skip} resolve_fail=0 in {}ms",
+        ts(), pass2_started.elapsed().as_millis()
+    );
+
+    // ── Progressive Ready: build partial MemIndex from dirs only ──
+    eprintln!("[win/mft +{}] building partial MemIndex ({} dirs)...", ts(), dir_results.len());
+    let early_entries = dir_results.clone();
+    let early_idx = Arc::new(crate::mem_search::MemIndex::build(early_entries));
+    eprintln!("[win/mft +{}] partial MemIndex built", ts());
+    *state.mem_index.write() = Some(Arc::clone(&early_idx));
+    {
+        let mut status = state.status.lock();
+        status.state = IndexState::Ready;
+        status.permission_errors = 0;
+        status.scanned = scanned;
+        status.indexed = indexed;
+        status.message = None;
+        status.entries_count = indexed;
+        status.last_updated = Some(now_epoch());
+    }
+    emit_index_progress(app, scanned, indexed, String::new());
+    emit_index_updated(app, indexed, now_epoch(), 0);
+    emit_index_state(app, "Ready", None);
+    eprintln!(
+        "[win/mft +{}] progressive Ready emitted ({indexed} dirs)",
+        ts()
+    );
+
     let mut mem_entries: Vec<CompactEntry> = Vec::with_capacity(dir_subtree.len() + file_entries.len());
     mem_entries.extend(dir_results);
 
-    eprintln!(
-        "[win/mft] dirs done: scanned={scanned} indexed={indexed} \
-         skip={filtered_skip} resolve_fail=0 in {}ms",
-        pass2_started.elapsed().as_millis()
-    );
-
-    emit_index_progress(app, scanned, indexed, String::new());
-
     // --- Process files (parallel + stat) ---
     let pass2_files_started = Instant::now();
-
-    // Pre-extract only Glob patterns (AnySegment already handled by subtree pruning)
-    let glob_patterns: Vec<&IgnorePattern> = ignored_patterns
-        .iter()
-        .filter(|p| matches!(p, IgnorePattern::Glob(_)))
-        .collect();
 
     let file_results: Vec<CompactEntry> = file_entries
         .par_iter()
         .filter(|entry| dir_subtree.contains(&entry.parent_frn))
         .filter_map(|entry| {
             let parent_path = path_cache.get(&entry.parent_frn)?;
+            let in_gi_scope = dirs_under_gi.contains(&entry.parent_frn);
 
             if should_skip_file_in_pruned_subtree(
                 parent_path, &entry.name, &gi_filter, &glob_patterns,
+                in_gi_scope,
             ) {
                 return None;
             }
 
-            let ext = Path::new(&entry.name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase());
+            let ext = entry.name.rfind('.').and_then(|pos| {
+                if pos > 0 && pos < entry.name.len() - 1 {
+                    Some(entry.name[pos + 1..].to_lowercase())
+                } else {
+                    None
+                }
+            });
 
             Some(CompactEntry {
                 name: entry.name.clone(),
@@ -277,8 +353,8 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     mem_entries.extend(file_results);
 
     eprintln!(
-        "[win/mft] files done: {} files in subtree, indexed={file_indexed} skip={} in {}ms",
-        files_in_subtree,
+        "[win/mft +{}] files done: {} files in subtree, indexed={file_indexed} skip={} in {}ms",
+        ts(), files_in_subtree,
         files_in_subtree - file_indexed,
         pass2_files_started.elapsed().as_millis()
     );
@@ -298,69 +374,65 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
 
     let frn_cache = resolver.into_path_cache(); // also drops resolver.frn_map
 
-    let mem_ms = started.elapsed().as_millis();
+    let entry_count = mem_entries.len();
     eprintln!(
-        "[win/mft] in-memory index ready: indexed={indexed} skip={filtered_skip} \
-         entries={} mem_ms={mem_ms}ms",
-        mem_entries.len(),
+        "[win/mft +{}] full index ready: indexed={indexed} skip={filtered_skip} \
+         entries={entry_count}",
+        ts(),
     );
 
-    // ── Build indexed mem_index → Ready immediately ──
-    let mem_idx = Arc::new(crate::mem_search::MemIndex::build(mem_entries));
-    *state.mem_index.write() = Some(Arc::clone(&mem_idx));
-
+    // Update status counts immediately (files done)
     {
         let mut status = state.status.lock();
-        status.state = IndexState::Ready;
-        status.permission_errors = 0;
         status.scanned = scanned;
         status.indexed = indexed;
-        status.message = None;
         status.entries_count = indexed;
         status.last_updated = Some(now_epoch());
     }
-
     emit_index_progress(app, scanned, indexed, String::new());
     emit_index_updated(app, indexed, now_epoch(), 0);
-    emit_index_state(app, "Ready", None);
 
-    // ── Background: DB upsert + USN watcher start ──
+    // ── Background: MemIndex build + DB upsert + USN watcher start ──
     let bg_state = state.clone();
     let bg_app = app.clone();
     let bg_vol = vol;
-    let bg_mem_idx = Arc::clone(&mem_idx);
 
     eprintln!(
-        "[win/mft] passing {} FRN path entries + {} outside-scan FRNs to USN watcher",
-        frn_cache.len(), outside_scan_frns.len()
+        "[win/mft +{}] passing {} FRN path entries + {} outside-scan FRNs to USN watcher",
+        ts(), frn_cache.len(), outside_scan_frns.len()
     );
 
+    let bg_started = started;
     std::thread::spawn(move || {
-        let bg_started = Instant::now();
-        let entry_count = bg_mem_idx.entries().len();
-        eprintln!("[win/mft/bg] starting background DB upsert ({entry_count} entries)");
+        let ts = || format!("{:.1}s", bg_started.elapsed().as_secs_f32());
 
-        // Phase 1: Bulk insert (mtime from USN, size+mtime from FindFirstFileW cache)
-        let bulk_result = background_db_bulk_insert(&bg_state, bg_mem_idx.entries());
+        // Build full MemIndex (rayon-parallelized) in background
+        drop(early_idx);
+        eprintln!("[win/mft/bg +{}] building full MemIndex ({entry_count} entries)...", ts());
+        let mem_idx = Arc::new(crate::mem_search::MemIndex::build(mem_entries));
+        eprintln!("[win/mft/bg +{}] full MemIndex built", ts());
+        *bg_state.mem_index.write() = Some(Arc::clone(&mem_idx));
 
-        // Phase 2: Finalize DB
+        // DB upsert
+        eprintln!("[win/mft/bg +{}] starting DB upsert ({entry_count} entries)", ts());
+        let bulk_result = background_db_bulk_insert(&bg_state, mem_idx.entries(), bg_started);
+
         match bulk_result {
             Ok((conn, current_run_id)) => {
                 if let Err(e) = background_db_finalize(
-                    conn, &bg_state, &bg_app, &bg_vol, current_run_id, entry_count > 0,
+                    conn, &bg_state, &bg_app, &bg_vol, current_run_id, entry_count > 0, bg_started,
                     || {
-                        // Callback: free MemIndex after primary index is created
-                        drop(bg_mem_idx);
+                        drop(mem_idx);
                         *bg_state.mem_index.write() = None;
-                        eprintln!("[win/mft/bg] MemIndex freed (name index ready, building remaining)");
+                        eprintln!("[win/mft/bg +{}] MemIndex freed (name index ready, building remaining)", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
                     },
                 ) {
-                    eprintln!("[win/mft/bg] DB finalize FAILED: {e}");
+                    eprintln!("[win/mft/bg +{}] DB finalize FAILED: {e}", ts());
                 }
             }
             Err(e) => {
-                eprintln!("[win/mft/bg] DB bulk insert FAILED: {e}");
-                drop(bg_mem_idx);
+                eprintln!("[win/mft/bg +{}] DB bulk insert FAILED: {e}", ts());
+                drop(mem_idx);
                 *bg_state.mem_index.write() = None;
             }
         }
@@ -369,14 +441,10 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
             .indexing_active
             .store(false, AtomicOrdering::Release);
 
-        eprintln!(
-            "[win/mft/bg] background work done in {}ms",
-            bg_started.elapsed().as_millis()
-        );
+        eprintln!("[win/mft/bg +{}] background work done", ts());
 
-        // Start USN watcher with FRN cache + outside-scan FRN set for zero-syscall path resolution
         if let Err(e) = super::usn_watcher::start(bg_app.clone(), bg_state.clone(), frn_cache, outside_scan_frns) {
-            eprintln!("[win/mft/bg] USN watcher failed ({e}), trying RDCW fallback");
+            eprintln!("[win/mft/bg +{}] USN watcher failed ({e}), trying RDCW fallback", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
             if let Err(e2) = super::rdcw_watcher::start(bg_app, bg_state) {
                 eprintln!("[win/mft/bg] RDCW watcher also failed ({e2}), no live updates");
             }
@@ -466,7 +534,9 @@ fn wide_name_to_string(wide: &[u16]) -> String {
 fn background_db_bulk_insert(
     state: &AppState,
     entries: &[CompactEntry],
+    scan_started: Instant,
 ) -> Result<(rusqlite::Connection, i64), String> {
+    let ts = || format!("{:.1}s", scan_started.elapsed().as_secs_f32());
     let mut conn = db_connection(&state.db_path)?;
     set_indexing_pragmas(&conn)?;
 
@@ -485,14 +555,14 @@ fn background_db_bulk_insert(
         DROP INDEX IF EXISTS idx_entries_ext_name;
         "#,
     );
-    eprintln!("[win/mft/bg] indexes dropped");
+    eprintln!("[win/mft/bg +{}] indexes dropped", ts());
 
     // Build dir stat cache: batch-retrieve file size+mtime via FindFirstFileW per directory
     let cache_started = Instant::now();
     let dir_stat_cache = build_dir_stat_cache(entries);
     eprintln!(
-        "[win/mft/bg] dir_stat_cache built: {} dirs in {}ms",
-        dir_stat_cache.len(), cache_started.elapsed().as_millis()
+        "[win/mft/bg +{}] dir_stat_cache built: {} dirs in {}ms",
+        ts(), dir_stat_cache.len(), cache_started.elapsed().as_millis()
     );
 
     let upsert_started = Instant::now();
@@ -531,8 +601,7 @@ fn background_db_bulk_insert(
             .collect();
         upsert_rows(&mut conn, &chunk_rows)?;
     }
-    let upsert_ms = upsert_started.elapsed().as_millis();
-    eprintln!("[win/mft/bg] upsert done: {} entries in {upsert_ms}ms", entries.len());
+    eprintln!("[win/mft/bg +{}] upsert done: {} entries in {}ms", ts(), entries.len(), upsert_started.elapsed().as_millis());
 
     Ok((conn, current_run_id))
 }
@@ -547,8 +616,11 @@ fn background_db_finalize(
     vol: &volume::VolumeHandle,
     current_run_id: i64,
     has_entries: bool,
+    scan_started: Instant,
     free_mem_index: impl FnOnce(),
 ) -> Result<(), String> {
+    let ts = || format!("{:.1}s", scan_started.elapsed().as_secs_f32());
+
     // Cleanup stale entries
     let cleanup_started = Instant::now();
     let deleted_count: i64 = conn
@@ -563,7 +635,7 @@ fn background_db_finalize(
         params![current_run_id],
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[win/mft/bg] cleanup: deleted={deleted_count} in {}ms", cleanup_started.elapsed().as_millis());
+    eprintln!("[win/mft/bg +{}] cleanup: deleted={deleted_count} in {}ms", ts(), cleanup_started.elapsed().as_millis());
 
     set_meta(&conn, "last_run_id", &current_run_id.to_string())?;
 
@@ -573,7 +645,7 @@ fn background_db_finalize(
         "CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);",
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[win/mft/bg] name index created in {}ms", idx_started.elapsed().as_millis());
+    eprintln!("[win/mft/bg +{}] name index created in {}ms", ts(), idx_started.elapsed().as_millis());
 
     // Free MemIndex now — DB search can use the name index
     free_mem_index();
@@ -588,7 +660,7 @@ fn background_db_finalize(
         "#,
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[win/mft/bg] remaining indexes in {}ms", idx2_started.elapsed().as_millis());
+    eprintln!("[win/mft/bg +{}] remaining indexes in {}ms", ts(), idx2_started.elapsed().as_millis());
 
     let _ = restore_normal_pragmas(&conn);
 
@@ -618,6 +690,55 @@ fn background_db_finalize(
     Ok(())
 }
 
+/// Lightweight skip check for directories already in the pruned subtree.
+/// Subtree pruning already handles BUILTIN_SKIP_NAMES, ignored_roots, and
+/// AnySegment patterns. This only checks BUILTIN_SKIP_PATHS (multi-segment),
+/// BUILTIN_SKIP_SUFFIXES, gitignore, and Glob patterns — with zero heap allocations.
+fn should_skip_dir_in_pruned_subtree(
+    full_path: &str,
+    gi_filter: &gitignore_filter::GitignoreFilter,
+    glob_patterns: &[&IgnorePattern],
+    skip_path_infixes: &[String],
+    skip_path_suffixes: &[String],
+    in_gi_scope: bool,
+) -> bool {
+    // BUILTIN_SKIP_PATHS: pre-computed backslash patterns (no allocation)
+    if skip_path_infixes.iter().any(|infix| full_path.contains(infix.as_str()))
+        || skip_path_suffixes.iter().any(|suffix| full_path.ends_with(suffix.as_str()))
+    {
+        return true;
+    }
+
+    // BUILTIN_SKIP_SUFFIXES: check last path segment
+    if let Some(last_seg) = full_path.rsplit('\\').next() {
+        if crate::BUILTIN_SKIP_SUFFIXES.iter().any(|suf| last_seg.ends_with(suf)) {
+            return true;
+        }
+    }
+
+    // Gitignore check — only if this dir is under a gitignore root
+    if in_gi_scope && gi_filter.is_ignored(Path::new(full_path), true) {
+        return true;
+    }
+
+    // Glob patterns (need forward-slash normalization)
+    if !glob_patterns.is_empty() {
+        thread_local! {
+            static BUF: RefCell<String> = RefCell::new(String::with_capacity(512));
+        }
+        return BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.push_str(full_path);
+            // SAFETY: replacing ASCII '\' (0x5C) with '/' (0x2F) preserves UTF-8 validity.
+            unsafe { buf.as_bytes_mut().iter_mut().for_each(|b| if *b == b'\\' { *b = b'/'; }); }
+            glob_patterns.iter().any(|pat| matches_ignore_pattern(&buf, pat))
+        });
+    }
+
+    false
+}
+
 /// Lightweight skip check for files whose parent directory is already in the
 /// pruned subtree. Since subtree pruning already eliminates BUILTIN_SKIP_NAMES,
 /// BUILTIN_SKIP_PATHS, ignored_roots, and AnySegment patterns, this only needs
@@ -627,25 +748,37 @@ fn should_skip_file_in_pruned_subtree(
     file_name: &str,
     gi_filter: &gitignore_filter::GitignoreFilter,
     glob_patterns: &[&IgnorePattern],
+    in_gi_scope: bool,
 ) -> bool {
-    let full_path_str = format!("{}\\{}", parent_path, file_name);
-
-    // Check gitignore
-    if gi_filter.is_ignored(Path::new(&full_path_str), false) {
-        return true;
+    thread_local! {
+        static BUF: RefCell<String> = RefCell::new(String::with_capacity(512));
     }
 
-    // Check Glob patterns only (AnySegment handled by subtree pruning)
-    if !glob_patterns.is_empty() {
-        let normalized = full_path_str.replace('\\', "/");
-        for pat in glob_patterns {
-            if matches_ignore_pattern(&normalized, pat) {
-                return true;
+    BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        buf.clear();
+        buf.push_str(parent_path);
+        buf.push('\\');
+        buf.push_str(file_name);
+
+        // Check gitignore — only if parent dir is under a gitignore root
+        if in_gi_scope && gi_filter.is_ignored(Path::new(buf.as_str()), false) {
+            return true;
+        }
+
+        // Check Glob patterns only (AnySegment handled by subtree pruning)
+        if !glob_patterns.is_empty() {
+            // SAFETY: replacing ASCII '\' (0x5C) with '/' (0x2F) preserves UTF-8 validity.
+            unsafe { buf.as_bytes_mut().iter_mut().for_each(|b| if *b == b'\\' { *b = b'/'; }); }
+            for pat in glob_patterns {
+                if matches_ignore_pattern(&buf, pat) {
+                    return true;
+                }
             }
         }
-    }
 
-    false
+        false
+    })
 }
 
 fn enumerate_mft(
