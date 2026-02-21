@@ -665,6 +665,19 @@ fn extract_ext_from_like(like_pattern: &str) -> Option<String> {
     Some(ext.to_lowercase())
 }
 
+fn normalize_hint_to_native(dir_hint: &str) -> (String, bool) {
+    let native = dir_hint.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+    let is_abs = Path::new(&native).is_absolute();
+    (native, is_abs)
+}
+
+fn last_segment(dir_hint: &str) -> &str {
+    dir_hint
+        .rsplit(|c| c == '/' || c == '\\')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(dir_hint)
+}
+
 fn resolve_dir_hint(home_dir: &Path, dir_hint: &str) -> Option<PathBuf> {
     if dir_hint.is_empty() || contains_glob_meta(dir_hint) {
         return None;
@@ -674,10 +687,13 @@ fn resolve_dir_hint(home_dir: &Path, dir_hint: &str) -> Option<PathBuf> {
         home_dir.to_path_buf()
     } else if let Some(rest) = dir_hint.strip_prefix("~/") {
         home_dir.join(rest)
-    } else if dir_hint.starts_with('/') {
-        PathBuf::from(dir_hint)
     } else {
-        home_dir.join(dir_hint)
+        let (native_hint, is_absolute) = normalize_hint_to_native(dir_hint);
+        if is_absolute {
+            PathBuf::from(native_hint)
+        } else {
+            home_dir.join(native_hint)
+        }
     };
 
     if candidate.is_dir() {
@@ -693,14 +709,16 @@ fn resolve_dirs_from_db(conn: &Connection, dir_hint: &str) -> Vec<String> {
     if dir_hint.is_empty() || contains_glob_meta(dir_hint) {
         return Vec::new();
     }
-    let last_seg = match dir_hint.rsplit('/').next() {
-        Some(s) if !s.is_empty() => s,
-        _ => dir_hint,
-    };
+    let last_seg = last_segment(dir_hint);
     let sep = std::path::MAIN_SEPARATOR;
-    let native_hint = dir_hint.replace('/', &sep.to_string());
-    let escaped_sep = escape_like(&sep.to_string());
-    let path_pattern = format!("%{escaped_sep}{}", escape_like(&native_hint));
+    let (native_hint, is_absolute) = normalize_hint_to_native(dir_hint);
+    let sep_str = sep.to_string();
+    let escaped_sep = escape_like(&sep_str);
+    let path_pattern = if is_absolute {
+        format!("%{}", escape_like(&native_hint))
+    } else {
+        format!("%{escaped_sep}{}", escape_like(&native_hint))
+    };
     let fetch_limit = (RESOLVE_DIRS_MAX + 1) as i64;
     let mut stmt = match conn.prepare(
         "SELECT path FROM entries WHERE name = ?1 COLLATE NOCASE AND is_dir = 1 AND path LIKE ?2 ESCAPE '\\' LIMIT ?3",
@@ -3343,7 +3361,11 @@ fn execute_search(
                         } else {
                             0
                         };
-                        let prefix_sql = format!(
+
+                        // Try indexed prefix search first; fall back to unindexed if
+                        // the index is temporarily unavailable (during background DB
+                        // rebuild the index may be dropped then recreated).
+                        let prefix_sql_indexed = format!(
                             r#"
                             SELECT path, name, dir, is_dir, ext, size, mtime
                             FROM entries INDEXED BY idx_entries_name_nocase
@@ -3353,15 +3375,30 @@ fn execute_search(
                             LIMIT ?3 OFFSET ?4
                             "#,
                         );
-                        let mut stmt = conn.prepare(&prefix_sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(
+                        let prefix_sql_fallback = format!(
+                            r#"
+                            SELECT path, name, dir, is_dir, ext, size, mtime
+                            FROM entries
+                            WHERE name LIKE ?1 ESCAPE '\'
+                              AND name COLLATE NOCASE != ?2
+                            ORDER BY {bare_order}
+                            LIMIT ?3 OFFSET ?4
+                            "#,
+                        );
+                        let stmt_result = conn.prepare(&prefix_sql_indexed)
+                            .or_else(|_| conn.prepare(&prefix_sql_fallback));
+                        if let Ok(mut stmt) = stmt_result {
+                            if let Ok(rows) = stmt.query_map(
                                 params![prefix_like, exact_query, remaining, adj_offset],
                                 row_to_entry,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
+                            ) {
+                                for row in rows {
+                                    match row {
+                                        Ok(entry) => results.push(entry),
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -3515,11 +3552,17 @@ fn execute_search(
                         }
                     } else {
                         let sep = std::path::MAIN_SEPARATOR;
-                        let native_hint = dir_hint.replace('/', &sep.to_string());
-                        let escaped_sep = escape_like(&sep.to_string());
+                        let sep_str = sep.to_string();
+                        let escaped_sep = escape_like(&sep_str);
+                        let (native_hint, is_absolute) = normalize_hint_to_native(dir_hint);
                         let dir_suffix = escape_like(&native_hint);
-                        let dir_like_exact = format!("%{escaped_sep}{dir_suffix}");
-                        let dir_like_sub = format!("%{escaped_sep}{dir_suffix}{escaped_sep}%");
+                        let dir_prefix = if is_absolute {
+                            String::new()
+                        } else {
+                            escaped_sep.clone()
+                        };
+                        let dir_like_exact = format!("%{dir_prefix}{dir_suffix}");
+                        let dir_like_sub = format!("%{dir_prefix}{dir_suffix}{escaped_sep}%");
                         let ext_shortcut = extract_ext_from_like(name_like);
 
                         if let Some(ext_val) = ext_shortcut {
@@ -4880,8 +4923,13 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             Color(0xf4, 0xf5, 0xf7, 0xff)
         };
         let _ = window.set_background_color(Some(bg));
-        // Show window after background color is set to avoid white flash.
-        // The skeleton HTML renders on top of this matching background.
+        if let Err(e) = window.set_decorations(false) {
+            eprintln!(
+                "[startup +{}ms] windows setup: set_decorations(false) failed: {}",
+                startup_elapsed_ms(),
+                e
+            );
+        }
         let _ = window.show();
         eprintln!("[startup +{}ms] windows setup: window.show() returned", startup_elapsed_ms());
     }
@@ -5125,6 +5173,7 @@ pub fn run() {
         );
     }
     let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_decorum::init())
         .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
@@ -5208,7 +5257,14 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!(
+        let base = if cfg!(target_os = "windows") {
+            std::env::current_dir()
+                .map(|dir| dir.join("tmp-test-dirs"))
+                .unwrap_or_else(|_| std::env::temp_dir())
+        } else {
+            std::env::temp_dir()
+        };
+        base.join(format!(
             "everything_{case}_{}_{}",
             std::process::id(),
             stamp

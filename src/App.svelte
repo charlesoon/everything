@@ -2,6 +2,7 @@
   import { onDestroy, onMount, tick } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { startDrag } from '@crabnebula/tauri-plugin-drag';
   import 'overlayscrollbars/overlayscrollbars.css';
   import { OverlayScrollbars } from 'overlayscrollbars';
@@ -13,7 +14,7 @@
     return osViewport || tableContainer;
   }
 
-  const rowHeight = 30;
+  const rowHeight = 26;
   const PAGE_SIZE = 500;
   let homePrefix = '';
   const COL_WIDTHS_KEY = 'everything-col-widths-v2';
@@ -63,7 +64,7 @@
     draftName: ''
   };
 
-  let renameOverlay = { top: 0, left: 0, width: 0 };
+  let renameOverlay = { top: 0, left: 0, maxWidth: 0 };
 
   let indexStatus = {
     state: 'Indexing',
@@ -116,6 +117,8 @@
   };
 
   let platform = '';
+  let isMaximized = false;
+  const appWindow = getCurrentWindow();
   let toast = '';
   let searchTimer;
   let lastSearchFiredAt = 0;
@@ -996,12 +999,6 @@
     return selectedIndices.size > 1;
   }
 
-  function autoResizeRenameInput() {
-    if (!renameInputEl) return;
-    renameInputEl.style.height = '0';
-    renameInputEl.style.height = renameInputEl.scrollHeight + 'px';
-  }
-
   async function startRename() {
     if (isMultiSelected()) {
       return;
@@ -1022,11 +1019,12 @@
     if (rowEl && nameCell && span) {
       const rowRect = rowEl.getBoundingClientRect();
       const spanRect = span.getBoundingClientRect();
-      const nameCellRect = nameCell.getBoundingClientRect();
+      const pathCell = rowEl.querySelector('.cell.path');
+      const rightEdge = pathCell ? pathCell.getBoundingClientRect().right : nameCell.getBoundingClientRect().right;
       renameOverlay = {
         top: rowRect.top,
         left: spanRect.left - 5,
-        width: nameCellRect.right - spanRect.left - 2 - 8
+        maxWidth: rightEdge - spanRect.left + 5 - 8
       };
     }
 
@@ -1040,7 +1038,6 @@
     await tick();
 
     if (renameInputEl) {
-      autoResizeRenameInput();
       renameInputEl.focus();
       const extPos = !entry.isDir ? entry.name.lastIndexOf('.') : -1;
       const selectionEnd = extPos > 0 ? extPos : entry.name.length;
@@ -1085,6 +1082,33 @@
 
   function onGlobalClick() {
     closeContextMenu();
+  }
+
+  let snapTimer = null;
+  let maximizeStateTimer = null;
+
+  function refreshMaximizedStateSoon() {
+    clearTimeout(maximizeStateTimer);
+    maximizeStateTimer = setTimeout(() => {
+      appWindow.isMaximized().then((value) => {
+        isMaximized = value;
+      }).catch(() => {});
+    }, 80);
+  }
+
+  function snapLayoutEnter() {
+    clearTimeout(snapTimer);
+    clearTimeout(maximizeStateTimer);
+    snapTimer = setTimeout(() => {
+      appWindow
+        .setFocus()
+        .then(() => invoke('plugin:decorum|show_snap_overlay'))
+        .catch(() => {});
+    }, 620);
+  }
+  function snapLayoutLeave() {
+    clearTimeout(snapTimer);
+    clearTimeout(maximizeStateTimer);
   }
 
   function onTitleBarMouseDown(event) {
@@ -1353,6 +1377,14 @@
 
     platform = await step('invoke(get_platform)', () => invoke('get_platform'));
 
+    let unlistenResized = null;
+    if (platform === 'windows') {
+      isMaximized = await appWindow.isMaximized().catch(() => false);
+      unlistenResized = await appWindow.onResized(() => {
+        refreshMaximizedStateSoon();
+      });
+    }
+
     const unlistenProgress = await step(
       'listen(index_progress)',
       () => listen('index_progress', (event) => {
@@ -1433,7 +1465,7 @@
       })
     );
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction];
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction, unlistenResized].filter(Boolean);
     startupLog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
@@ -1542,6 +1574,8 @@
   onDestroy(async () => {
     clearTimeout(searchTimer);
     clearTimeout(toastTimer);
+    clearTimeout(snapTimer);
+    clearTimeout(maximizeStateTimer);
     clearInterval(statusRefreshTimer);
     clearInterval(elapsedTimer);
     resizeCleanup?.();
@@ -1576,7 +1610,29 @@
       </svg>
       <span class="title-text">Everything</span>
     </div>
-    <div class="title-right" class:win-title-right={platform === 'windows'}></div>
+    {#if platform === 'windows'}
+      <div class="win-controls">
+        <button class="win-ctrl-btn" on:click={() => appWindow.minimize()} aria-label="Minimize">
+          <svg viewBox="0 0 12 12" width="12" height="12"><line x1="1" y1="6" x2="11" y2="6" stroke="currentColor" stroke-width="1"/></svg>
+        </button>
+        <button class="win-ctrl-btn"
+          on:click={() => appWindow.toggleMaximize()}
+          on:mouseenter={snapLayoutEnter}
+          on:mouseleave={snapLayoutLeave}
+          aria-label={isMaximized ? 'Restore' : 'Maximize'}>
+          {#if isMaximized}
+            <svg viewBox="0 0 12 12" width="12" height="12"><rect x="2.5" y="3.5" width="6" height="6" fill="none" stroke="currentColor" stroke-width="1"/><polyline points="4.5,3.5 4.5,1.5 10.5,1.5 10.5,7.5 8.5,7.5" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+          {:else}
+            <svg viewBox="0 0 12 12" width="12" height="12"><rect x="2" y="2" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+          {/if}
+        </button>
+        <button class="win-ctrl-btn win-ctrl-close" on:click={() => appWindow.close()} aria-label="Close">
+          <svg viewBox="0 0 12 12" width="12" height="12"><line x1="2" y1="2" x2="10" y2="10" stroke="currentColor" stroke-width="1"/><line x1="10" y1="2" x2="2" y2="10" stroke="currentColor" stroke-width="1"/></svg>
+        </button>
+      </div>
+    {:else}
+      <div class="title-right"></div>
+    {/if}
   </div>
 
   <header class="search-bar">
@@ -1585,7 +1641,7 @@
       class="search-input"
       type="text"
       bind:value={query}
-      on:input={scheduleSearch}
+      on:input={() => scheduleSearch()}
       on:focus={clearSelection}
       placeholder="Search file/folder names"
       autocomplete="off"
@@ -1681,7 +1737,6 @@
           Index: {indexStatus.state}
         {/if}
       </span>
-      <span>{indexStatus.entriesCount.toLocaleString()} entries</span>
       {#if indexingFinishedAt && indexStatus.state !== 'Indexing'}
         <span>in {indexingFinishedAt}</span>
       {/if}
@@ -1719,15 +1774,16 @@
   {#if editing.active}
     <div
       class="rename-overlay"
-      style="top:{renameOverlay.top}px; left:{renameOverlay.left}px; width:{renameOverlay.width}px;"
+      style="top:{renameOverlay.top}px; left:{renameOverlay.left}px; max-width:{renameOverlay.maxWidth}px;"
       role="presentation"
       on:mousedown|stopPropagation
     >
-      <textarea
+      <input
+        type="text"
         bind:this={renameInputEl}
-        class="rename-textarea"
+        class="rename-input"
         bind:value={editing.draftName}
-        on:input={autoResizeRenameInput}
+        size={Math.max(1, editing.draftName.length)}
         on:click|stopPropagation
         on:blur={commitRename}
       />
@@ -1972,6 +2028,7 @@
   }
 
   .title-bar {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -1992,10 +2049,13 @@
   }
 
   .win-title-left {
-    width: 16px; /* no traffic lights on Windows; minimal padding */
+    width: 8px;
   }
 
   .title-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2011,8 +2071,35 @@
     -webkit-user-select: none;
   }
 
-  .win-title-right {
-    width: 138px; /* reserve space for Windows min/max/close buttons (~46px each) */
+  .win-controls {
+    display: flex;
+    align-items: stretch;
+    height: 100%;
+    margin-right: -16px;
+  }
+
+  .win-ctrl-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 100%;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: default;
+    outline: none;
+    -webkit-app-region: no-drag;
+  }
+
+  .win-ctrl-btn:hover {
+    background: var(--row-hover);
+  }
+
+  .win-ctrl-close:hover {
+    background: #e81123;
+    color: #fff;
   }
 
   .title-icon {
@@ -2186,7 +2273,7 @@
   }
 
   .row {
-    height: 30px;
+    height: 26px;
     border-bottom: 1px solid var(--row-border);
     cursor: default;
     -webkit-user-select: none;
@@ -2241,24 +2328,23 @@
   .rename-overlay {
     position: fixed;
     z-index: 100;
-    min-width: 120px;
   }
 
-  .rename-textarea {
+  .rename-input {
     display: block;
-    width: 100%;
     box-sizing: border-box;
+    min-width: 120px;
+    width: auto;
     font-family: Inter, 'SF Pro Text', sans-serif;
     font-size: 12px;
     line-height: 18px;
-    padding: 5px 4px 5px 0;
+    height: 26px;
+    padding: 0 4px;
     border: 1.5px solid var(--focus-ring);
     border-radius: 4px;
     background: var(--bg-input, var(--surface));
     color: var(--text-primary);
     outline: none;
-    resize: none;
-    overflow: hidden;
     box-shadow: 0 2px 14px rgba(0, 0, 0, 0.22), 0 0 0 3px rgba(77, 168, 255, 0.13);
   }
 
@@ -2412,6 +2498,7 @@
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
   }
+
 
   /* macOS Style OverlayScrollbars */
   :global(.os-theme-dark) {
