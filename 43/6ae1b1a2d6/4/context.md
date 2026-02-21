@@ -1,0 +1,26 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+rename 했을 때 파일 이름 수정(multi line)을 위해 list item 영역이 넓어지는데.. finder 방식처럼 overlay된 이름 변경 tool이 뜨고 list item의 height가 넓어지지 않게 수정해줘
+
+### Prompt 2
+
+따로 뜨는 입력창이 multi line으로 뜨고 list의 height에는 영향을 주지 않게 바꿔줘
+
+### Prompt 3
+
+[Request interrupted by user]
+
+### Prompt 4
+
+따로 뜨는 입력창이 multi line으로 뜨고 list의 height에는 영향을 주지 않게 바꿔줘. 그리고 다른 라인의 텍스트와 수정하려는 텍스트의 align이 맞게 해줘
+
+### Prompt 5
+
+AS-IS: Image #3
+RENAME: Image #4
+텍스트의 위치가 달라. 텍스트가 같은 위치에서 입력창이 떠서 바꾸는 느낌이면 좋겠어
+
