@@ -7,8 +7,10 @@
   import { OverlayScrollbars } from 'overlayscrollbars';
 
   let osInstance = null;
+  let osViewport = null;
+  let scrollCleanup = null;
   function getScrollEl() {
-    return osInstance ? osInstance.elements().viewport : tableContainer;
+    return osViewport || tableContainer;
   }
 
   const rowHeight = 28;
@@ -1394,8 +1396,6 @@
       showToast('macOS Full Disk Access permission may be required for full disk search.');
       localStorage.setItem('everything-fda-notice-v1', '1');
     }
-    await step('runSearch()', () => runSearch());
-
     window.addEventListener('resize', updateViewportHeight);
     window.addEventListener('click', onGlobalClick);
 
@@ -1409,20 +1409,20 @@
           clickScroll: true
         }
       });
+      osViewport = osInstance.elements().viewport;
+
       let lastScrollY = 0;
       let lastScrollX = 0;
       let scrollTimeoutY = null;
       let scrollTimeoutX = null;
 
-      osInstance.elements().viewport.addEventListener('scroll', () => {
-        const viewport = osInstance.elements().viewport;
-        scrollTop = viewport.scrollTop;
-        headerScrollLeft = viewport.scrollLeft;
+      const onScroll = () => {
+        scrollTop = osViewport.scrollTop;
+        headerScrollLeft = osViewport.scrollLeft;
 
-        // Detect direction to hide the other axis
         if (scrollTop !== lastScrollY) {
           tableContainer.classList.add('scrolling-y');
-          tableContainer.classList.remove('scrolling-x'); // Prevent simultaneous axis hiding
+          tableContainer.classList.remove('scrolling-x');
           clearTimeout(scrollTimeoutY);
           scrollTimeoutY = setTimeout(() => {
             if (tableContainer) tableContainer.classList.remove('scrolling-y');
@@ -1439,12 +1439,21 @@
         lastScrollY = scrollTop;
         lastScrollX = headerScrollLeft;
 
-        const scrollBottom = scrollTop + viewport.clientHeight;
+        const scrollBottom = scrollTop + osViewport.clientHeight;
         if (scrollBottom >= totalHeight - rowHeight * 10) {
           void loadMore();
         }
-      });
+      };
+
+      osViewport.addEventListener('scroll', onScroll);
+      scrollCleanup = () => {
+        clearTimeout(scrollTimeoutY);
+        clearTimeout(scrollTimeoutX);
+        osViewport.removeEventListener('scroll', onScroll);
+      };
     }
+
+    await step('runSearch()', () => runSearch());
 
     statusRefreshTimer = setInterval(() => {
       if (indexStatus.state === 'Indexing') {
@@ -1468,6 +1477,7 @@
 
     window.removeEventListener('resize', updateViewportHeight);
     window.removeEventListener('click', onGlobalClick);
+    scrollCleanup?.();
     if (osInstance) {
       osInstance.destroy();
     }
