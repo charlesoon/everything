@@ -3,6 +3,13 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { startDrag } from '@crabnebula/tauri-plugin-drag';
+  import 'overlayscrollbars/overlayscrollbars.css';
+  import { OverlayScrollbars } from 'overlayscrollbars';
+
+  let osInstance = null;
+  function getScrollEl() {
+    return osInstance ? osInstance.elements().viewport : tableContainer;
+  }
 
   const rowHeight = 28;
   const PAGE_SIZE = 500;
@@ -241,7 +248,7 @@
   }
 
   function syncColumnWidthsToContainer() {
-    const width = tableContainer?.clientWidth || tableAreaEl?.clientWidth;
+    const width = tableContainer ? getScrollEl().clientWidth : tableAreaEl?.clientWidth;
     if (!width || lastTableWidth !== 0) {
       return;
     }
@@ -302,7 +309,7 @@
   }
 
   function updateViewportHeight() {
-    viewportHeight = tableContainer?.clientHeight || 520;
+    viewportHeight = tableContainer ? getScrollEl().clientHeight : 520;
     syncColumnWidthsToContainer();
   }
 
@@ -519,7 +526,7 @@
       // Skip this update; the existing results are still valid (same query/sort).
       if (preserveScroll && entries.length < results.length) return;
 
-      if (preserveScroll && tableContainer) scrollTop = tableContainer.scrollTop;
+      if (preserveScroll && tableContainer) scrollTop = getScrollEl().scrollTop;
       results = entries;
       if (next.totalCount > 0) {
         totalResults = next.totalCount;
@@ -529,7 +536,7 @@
         totalResultsKnown = false;
       }
       hasMore = totalResultsKnown ? results.length < totalResults : entries.length >= fetchLimit;
-      if (!preserveScroll && tableContainer) tableContainer.scrollTop = 0;
+      if (!preserveScroll && tableContainer) getScrollEl().scrollTop = 0;
 
       const restored = new Set();
       for (let i = 0; i < results.length; i += 1) {
@@ -563,7 +570,7 @@
       if (gen !== searchGeneration) return;
       const arr = Array.isArray(batch.entries) ? batch.entries : [];
       if (arr.length > 0) {
-        if (tableContainer) scrollTop = tableContainer.scrollTop;
+        if (tableContainer) scrollTop = getScrollEl().scrollTop;
         results = [...results, ...arr];
       }
       hasMore = totalResultsKnown ? results.length < totalResults : arr.length >= PAGE_SIZE;
@@ -591,9 +598,9 @@
     const top = next * rowHeight;
     const bottom = top + rowHeight;
     if (top < scrollTop) {
-      tableContainer.scrollTop = top;
+      if (tableContainer) getScrollEl().scrollTop = top;
     } else if (bottom > scrollTop + viewportHeight) {
-      tableContainer.scrollTop = bottom - viewportHeight;
+      if (tableContainer) getScrollEl().scrollTop = bottom - viewportHeight;
     }
   }
 
@@ -604,7 +611,7 @@
       sortBy = column;
       sortDir = 'asc';
     }
-    if (tableContainer) tableContainer.scrollTop = 0;
+    if (tableContainer) getScrollEl().scrollTop = 0;
     void runSearch();
   }
 
@@ -1391,6 +1398,54 @@
 
     window.addEventListener('resize', updateViewportHeight);
     window.addEventListener('click', onGlobalClick);
+
+    if (tableContainer) {
+      tableContainer.setAttribute('data-overlayscrollbars-initialize', '');
+      osInstance = OverlayScrollbars(tableContainer, {
+        scrollbars: {
+          theme: 'os-theme-dark',
+          autoHide: 'scroll',
+          autoHideDelay: 500,
+          clickScroll: true
+        }
+      });
+      let lastScrollY = 0;
+      let lastScrollX = 0;
+      let scrollTimeoutY = null;
+      let scrollTimeoutX = null;
+
+      osInstance.elements().viewport.addEventListener('scroll', () => {
+        const viewport = osInstance.elements().viewport;
+        scrollTop = viewport.scrollTop;
+        headerScrollLeft = viewport.scrollLeft;
+
+        // Detect direction to hide the other axis
+        if (scrollTop !== lastScrollY) {
+          tableContainer.classList.add('scrolling-y');
+          tableContainer.classList.remove('scrolling-x'); // Prevent simultaneous axis hiding
+          clearTimeout(scrollTimeoutY);
+          scrollTimeoutY = setTimeout(() => {
+            if (tableContainer) tableContainer.classList.remove('scrolling-y');
+          }, 1500);
+        }
+        if (headerScrollLeft !== lastScrollX) {
+          tableContainer.classList.add('scrolling-x');
+          tableContainer.classList.remove('scrolling-y');
+          clearTimeout(scrollTimeoutX);
+          scrollTimeoutX = setTimeout(() => {
+            if (tableContainer) tableContainer.classList.remove('scrolling-x');
+          }, 1500);
+        }
+        lastScrollY = scrollTop;
+        lastScrollX = headerScrollLeft;
+
+        const scrollBottom = scrollTop + viewport.clientHeight;
+        if (scrollBottom >= totalHeight - rowHeight * 10) {
+          void loadMore();
+        }
+      });
+    }
+
     statusRefreshTimer = setInterval(() => {
       if (indexStatus.state === 'Indexing') {
         void refreshStatus();
@@ -1413,6 +1468,9 @@
 
     window.removeEventListener('resize', updateViewportHeight);
     window.removeEventListener('click', onGlobalClick);
+    if (osInstance) {
+      osInstance.destroy();
+    }
   });
 </script>
 
@@ -1479,14 +1537,6 @@
     <div
       class="table-body"
       bind:this={tableContainer}
-      on:scroll={() => {
-        scrollTop = tableContainer.scrollTop;
-        headerScrollLeft = tableContainer.scrollLeft;
-        const scrollBottom = scrollTop + tableContainer.clientHeight;
-        if (scrollBottom >= totalHeight - rowHeight * 10) {
-          void loadMore();
-        }
-      }}
     >
       <div class="spacer" style={`height:${totalHeight}px`}>
         <div class="rows" style={`transform: translateY(${translateY}px);`}>
@@ -1972,5 +2022,96 @@
     backdrop-filter: blur(20px) saturate(180%);
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+  }
+
+  /* macOS Style OverlayScrollbars */
+  :global(.os-theme-dark) {
+    --os-size: 10px; /* Default width */
+    --os-handle-border-radius: 10px;
+    --os-track-border-radius: 10px;
+    
+    /* Handle colors */
+    --os-handle-bg: rgba(0, 0, 0, 0.25);
+    --os-handle-bg-hover: rgba(0, 0, 0, 0.35);
+    --os-handle-bg-active: rgba(0, 0, 0, 0.45);
+    
+    --os-handle-border: rgba(0, 0, 0, 0.25);
+    --os-handle-border-hover: rgba(0, 0, 0, 0.35);
+    --os-handle-border-active: rgba(0, 0, 0, 0.45);
+
+    /* Track background is transparent by default */
+    --os-track-bg: transparent;
+    --os-track-bg-hover: rgba(0, 0, 0, 0.02);
+    --os-track-bg-active: rgba(0, 0, 0, 0.04);
+
+    --os-track-border: transparent;
+    --os-track-border-hover: rgba(0, 0, 0, 0.02);
+    --os-track-border-active: rgba(0, 0, 0, 0.04);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :global(.os-theme-dark) {
+      --os-handle-bg: rgba(255, 255, 255, 0.25);
+      --os-handle-bg-hover: rgba(255, 255, 255, 0.35);
+      --os-handle-bg-active: rgba(255, 255, 255, 0.45);
+      
+      --os-handle-border: rgba(255, 255, 255, 0.25);
+      --os-handle-border-hover: rgba(255, 255, 255, 0.35);
+      --os-handle-border-active: rgba(255, 255, 255, 0.45);
+      
+      --os-track-bg-hover: rgba(255, 255, 255, 0.02);
+      --os-track-bg-active: rgba(255, 255, 255, 0.04);
+
+      --os-track-border-hover: rgba(255, 255, 255, 0.02);
+      --os-track-border-active: rgba(255, 255, 255, 0.04);
+    }
+  }
+
+  /* Ensure scrollbar hits the very edges of the container, ignoring intersection */
+  :global(.os-scrollbar.os-scrollbar-vertical) {
+    bottom: 0 !important;
+  }
+  :global(.os-scrollbar.os-scrollbar-horizontal) {
+    right: 0 !important;
+  }
+
+  /* Smooth transitions for size and track color, instant fade-in */
+  :global(.os-scrollbar) {
+    transition: width 0.3s ease, height 0.3s ease, opacity 0s, visibility 0s, background-color 0.3s ease !important;
+  }
+  
+  /* Gradual fade-out only when hiding */
+  :global(.os-scrollbar.os-scrollbar-auto-hide-hidden) {
+    transition: width 0.3s ease, height 0.3s ease, opacity 0.4s ease-in-out, visibility 0.4s ease-in-out, background-color 0.3s ease !important;
+  }
+
+  /* Make sure only the active axis stays visible during scrolling or mouse interaction */
+  :global(.scrolling-y .os-scrollbar-horizontal),
+  :global(.scrolling-x .os-scrollbar-vertical),
+  :global([data-overlayscrollbars-initialize]:has(.os-scrollbar-vertical:hover) .os-scrollbar-horizontal),
+  :global([data-overlayscrollbars-initialize]:has(.os-scrollbar-vertical.os-scrollbar-interacting) .os-scrollbar-horizontal),
+  :global([data-overlayscrollbars-initialize]:has(.os-scrollbar-horizontal:hover) .os-scrollbar-vertical),
+  :global([data-overlayscrollbars-initialize]:has(.os-scrollbar-horizontal.os-scrollbar-interacting) .os-scrollbar-vertical) {
+    opacity: 0 !important;
+    visibility: hidden !important;
+    transition: opacity 0.4s ease-in-out, visibility 0.4s ease-in-out !important;
+  }
+
+  :global(.os-scrollbar-track),
+  :global(.os-scrollbar-handle) {
+    transition: width 0.3s ease, height 0.3s ease, background-color 0.3s ease !important;
+  }
+
+  /* Expand size and show track background when hovering over the scrollbar */
+  :global(.os-scrollbar:hover),
+  :global(.os-scrollbar:active),
+  :global(.os-scrollbar.os-scrollbar-interacting) {
+    --os-size: 15px; /* Expanded width */
+    background-color: var(--os-track-bg-hover);
+    border-radius: var(--os-track-border-radius);
+  }
+
+  :global(.os-scrollbar.os-scrollbar-interacting) {
+    background-color: var(--os-track-bg-active);
   }
 </style>
