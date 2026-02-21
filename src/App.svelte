@@ -91,6 +91,7 @@
 
   let searchInputEl;
   let renameInputEl;
+  let renameCommitting = false;
   let tableAreaEl;
   let tableContainer;
   let tableResizeObserver = null;
@@ -1057,10 +1058,12 @@
   }
 
   async function commitRename() {
+    if (renameCommitting) return;
     if (!editing.active || editing.index < 0 || !results[editing.index]) {
       return;
     }
 
+    renameCommitting = true;
     const current = results[editing.index];
     const nextName = editing.draftName;
 
@@ -1075,6 +1078,8 @@
       showToast(`Failed to rename: ${String(err)}`);
       await tick();
       renameInputEl?.focus();
+    } finally {
+      renameCommitting = false;
     }
   }
 
@@ -1454,10 +1459,6 @@
       showToast('macOS Full Disk Access permission may be required for full disk search.');
       localStorage.setItem('everything-fda-notice-v1', '1');
     }
-    flog(`[startup/fe] +${ms()}ms calling runSearch...`);
-    await runSearch();
-    flog(`[startup/fe] +${ms()}ms runSearch done`);
-
     if (typeof ResizeObserver !== 'undefined') {
       tableResizeObserver = new ResizeObserver(() => {
         scheduleViewportHeightUpdate();
@@ -1492,6 +1493,7 @@
       const onScroll = () => {
         scrollTop = osViewport.scrollTop;
         headerScrollLeft = osViewport.scrollLeft;
+        if (editing.active) void commitRename();
 
         if (scrollTop !== lastScrollY) {
           tableContainer.classList.add('scrolling-y');
@@ -1534,7 +1536,7 @@
       }
     }, 1000);
     startupLog(`[startup/fe] +${ms()}ms onMount complete`);
-    console.log(`[startup/fe] +${ms()}ms onMount complete`);
+    if (DEBUG_STARTUP) console.log(`[startup/fe] +${ms()}ms onMount complete`);
   });
 
   onDestroy(async () => {
@@ -1567,14 +1569,14 @@
 
 <div class="app-shell" data-theme={theme}>
   <div class="title-bar" role="presentation" data-tauri-drag-region on:mousedown={onTitleBarMouseDown}>
-    <div class="title-left"></div>
+    <div class="title-left" class:win-title-left={platform === 'windows'}></div>
     <div class="title-center">
       <svg class="title-icon" viewBox="0 0 215 205" fill-rule="evenodd" aria-hidden="true">
         <path d="M85 0c46.9 0 85 38.1 85 85 0 20.1-7.2 38.5-19.2 52.7l40.7 40.8c5.8 5.8 5.8 15.2 0 21-5.8 5.8-15.2 5.8-21 0l-40.7-40.7c-13.6 9.7-30.4 15.2-44.8 15.2-46.9 0-85-42.1-85-89 0-46.9 38.1-85 85-85z m0 32c-29.3 0-53 23.7-53 53 0 29.3 23.7 53 53 53 29.3 0 53-23.7 53-53 0-29.3-23.7-53-53-53z"/>
       </svg>
       <span class="title-text">Everything</span>
     </div>
-    <div class="title-right"></div>
+    <div class="title-right" class:win-title-right={platform === 'windows'}></div>
   </div>
 
   <header class="search-bar">
@@ -1637,15 +1639,6 @@
     <div
       class="table-body"
       bind:this={tableContainer}
-      on:scroll={() => {
-        scrollTop = tableContainer.scrollTop;
-        headerScrollLeft = tableContainer.scrollLeft;
-        if (editing.active) void commitRename();
-        const scrollBottom = scrollTop + tableContainer.clientHeight;
-        if (scrollBottom >= totalHeight - rowHeight * 10) {
-          void loadMore();
-        }
-      }}
     >
       <div class="spacer" style={`height:${totalHeight}px`}>
         <div class="rows" style={`transform: translateY(${translateY}px);`}>
@@ -1998,6 +1991,10 @@
     -webkit-user-select: none;
   }
 
+  .win-title-left {
+    width: 16px; /* no traffic lights on Windows; minimal padding */
+  }
+
   .title-center {
     display: flex;
     align-items: center;
@@ -2012,6 +2009,10 @@
     pointer-events: none;
     user-select: none;
     -webkit-user-select: none;
+  }
+
+  .win-title-right {
+    width: 138px; /* reserve space for Windows min/max/close buttons (~46px each) */
   }
 
   .title-icon {
