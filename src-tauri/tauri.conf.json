@@ -13,11 +13,16 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "Everything",
+        "title": "",
         "label": "main",
         "width": 600,
         "height": 380,
         "transparent": true,
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": {
+          "x": 12,
+          "y": 24
+        },
         "visible": false,
         "resizable": true,
         "fullscreen": false

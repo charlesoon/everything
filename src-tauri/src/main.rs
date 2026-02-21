@@ -4782,10 +4782,17 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
     #[cfg(target_os = "macos")]
     if let Some(window) = app.get_webview_window("main") {
-        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
-        if let Err(e) = apply_vibrancy(&window, NSVisualEffectMaterial::UnderWindowBackground, None, None) {
-            eprintln!("[vibrancy] apply failed: {e}");
-        }
+        use tauri::window::Color;
+        let is_dark = window
+            .theme()
+            .map(|t| t == tauri::Theme::Dark)
+            .unwrap_or(false);
+        let bg = if is_dark {
+            Color(0x1f, 0x1f, 0x1f, 0xff)
+        } else {
+            Color(0xf4, 0xf5, 0xf7, 0xff)
+        };
+        let _ = window.set_background_color(Some(bg));
         let _ = window.show();
     }
 
