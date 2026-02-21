@@ -1013,19 +1013,19 @@
 
     const entry = results[idx];
 
-    // Calculate overlay position mathematically.
-    // Name cell text starts at: padding-left(16) + icon(16) + gap(6) = 38px from cell left.
-    // Textarea has padding-left: 0 and border: 1.5px, so text starts ~2px from overlay left.
-    if (tableContainer) {
-      const rect = tableContainer.getBoundingClientRect();
-      const cellLeft = rect.left - tableContainer.scrollLeft;
-      const textLeft = cellLeft + 38;
-      const cellRight = cellLeft + colWidths.name;
-      const rowTop = rect.top + idx * rowHeight - tableContainer.scrollTop;
+    // Measure overlay position from the actual rendered DOM elements.
+    const visibleIndex = idx - startIndex;
+    const rowEl = tableContainer?.querySelectorAll('.row')?.[visibleIndex];
+    const nameCell = rowEl?.querySelector('.cell.name');
+    const span = nameCell?.querySelector('.ellipsis');
+    if (rowEl && nameCell && span) {
+      const rowRect = rowEl.getBoundingClientRect();
+      const spanRect = span.getBoundingClientRect();
+      const nameCellRect = nameCell.getBoundingClientRect();
       renameOverlay = {
-        top: rowTop,
-        left: textLeft - 2,
-        width: cellRight - textLeft + 2 - 4
+        top: rowRect.top,
+        left: spanRect.left - 5,
+        width: nameCellRect.right - spanRect.left - 2 - 8
       };
     }
 
