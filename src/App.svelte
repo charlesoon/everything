@@ -5,22 +5,36 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { startDrag } from '@crabnebula/tauri-plugin-drag';
 
-  const rowHeight = 28;
+  const rowHeight = 30;
   const PAGE_SIZE = 500;
   let homePrefix = '';
   const COL_WIDTHS_KEY = 'everything-col-widths-v2';
+  const THEME_KEY = 'everything-theme';
   const columnKeys = ['name', 'path', 'size', 'modified'];
   const minColumnWidth = {
     name: 180,
     path: 240,
     size: 75,
-    modified: 120
+    modified: 150
   };
   const defaultColumnRatios = {
     name: 0.3,
     path: 0.45,
     size: 0.1
   };
+
+  const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  let theme = (() => { try { return localStorage.getItem(THEME_KEY) || systemTheme; } catch { return systemTheme; } })();
+  function cycleTheme() {
+    theme = theme === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem(THEME_KEY, theme); } catch {}
+    invoke('set_native_theme', { theme });
+  }
+
+  function sortIconHtml(dir) {
+    const d = dir === 'asc' ? 'M2.5 6.5 L5 4 L7.5 6.5' : 'M2.5 3.5 L5 6 L7.5 3.5';
+    return `<svg class="sort-icon" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg>`;
+  }
 
   let query = '';
   let results = [];
@@ -39,6 +53,8 @@
     index: -1,
     draftName: ''
   };
+
+  let renameOverlay = { top: 0, left: 0, width: 0 };
 
   let indexStatus = {
     state: 'Indexing',
@@ -61,13 +77,13 @@
   let searchGeneration = 0;
 
   let scanned = 0;
-  let indexed = 0;
-  let currentPath = '';
 
   let searchInputEl;
   let renameInputEl;
   let tableAreaEl;
   let tableContainer;
+  let tableResizeObserver = null;
+  let viewportResizeRaf = null;
   let scrollTop = 0;
   let headerScrollLeft = 0;
   let viewportHeight = 520;
@@ -78,7 +94,7 @@
     name: 250,
     path: 350,
     size: 75,
-    modified: 120
+    modified: 150
   };
 
   let contextMenu = {
@@ -295,6 +311,16 @@
     syncColumnWidthsToContainer();
   }
 
+  function scheduleViewportHeightUpdate() {
+    if (viewportResizeRaf !== null) {
+      return;
+    }
+    viewportResizeRaf = requestAnimationFrame(() => {
+      viewportResizeRaf = null;
+      updateViewportHeight();
+    });
+  }
+
   function startColumnResize(event, leftKey) {
     event.preventDefault();
     event.stopPropagation();
@@ -419,12 +445,6 @@
       }
       if (typeof status.scanned === 'number') {
         scanned = status.scanned;
-      }
-      if (typeof status.indexed === 'number') {
-        indexed = status.indexed;
-      }
-      if (typeof status.currentPath === 'string') {
-        currentPath = status.currentPath;
       }
       if (status.state === 'Ready' && prevState !== 'Ready') {
         scheduleSearch();
@@ -659,7 +679,7 @@
     if (!entry) return null;
 
     const count = selectedIndices.has(index) ? selectedIndices.size : 1;
-    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const isDark = theme === 'dark';
 
     const w = 260;
     const h = 28;
@@ -900,8 +920,6 @@
     totalResultsKnown = false;
     clearSelection();
     scanned = 0;
-    indexed = 0;
-    currentPath = '';
     dbLatencyMs = null;
     dbLastQuery = '';
     indexStatus = { ...indexStatus, state: 'Indexing', entriesCount: 0, message: null };
@@ -921,6 +939,12 @@
     return selectedIndices.size > 1;
   }
 
+  function autoResizeRenameInput() {
+    if (!renameInputEl) return;
+    renameInputEl.style.height = '0';
+    renameInputEl.style.height = renameInputEl.scrollHeight + 'px';
+  }
+
   async function startRename() {
     if (isMultiSelected()) {
       return;
@@ -932,6 +956,23 @@
     }
 
     const entry = results[idx];
+
+    // Calculate overlay position mathematically.
+    // Name cell text starts at: padding-left(16) + icon(16) + gap(6) = 38px from cell left.
+    // Textarea has padding-left: 0 and border: 1.5px, so text starts ~2px from overlay left.
+    if (tableContainer) {
+      const rect = tableContainer.getBoundingClientRect();
+      const cellLeft = rect.left - tableContainer.scrollLeft;
+      const textLeft = cellLeft + 38;
+      const cellRight = cellLeft + colWidths.name;
+      const rowTop = rect.top + idx * rowHeight - tableContainer.scrollTop;
+      renameOverlay = {
+        top: rowTop,
+        left: textLeft - 2,
+        width: cellRight - textLeft + 2 - 4
+      };
+    }
+
     editing = {
       active: true,
       path: entry.path,
@@ -942,6 +983,7 @@
     await tick();
 
     if (renameInputEl) {
+      autoResizeRenameInput();
       renameInputEl.focus();
       const extPos = !entry.isDir ? entry.name.lastIndexOf('.') : -1;
       const selectionEnd = extPos > 0 ? extPos : entry.name.length;
@@ -982,6 +1024,17 @@
 
   function onGlobalClick() {
     closeContextMenu();
+  }
+
+  function onTitleBarMouseDown(event) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement && isTextInputTarget(activeElement)) {
+      activeElement.blur();
+    }
   }
 
   async function focusSearch() {
@@ -1028,7 +1081,11 @@
 
       if (event.key === 'Escape') {
         event.preventDefault();
+        const idx = editing.index;
         cancelRename();
+        selectSingle(idx);
+        await tick();
+        tableContainer?.querySelector('.row.selected')?.focus();
         return;
       }
       return;
@@ -1037,7 +1094,6 @@
     if (event.key === 'Escape') {
       event.preventDefault();
       clearSelection();
-      searchInputEl?.focus();
       return;
     }
 
@@ -1222,13 +1278,13 @@
     updateViewportHeight();
     flog(`[startup/fe] +${ms()}ms updateViewportHeight done`);
 
+    invoke('set_native_theme', { theme });
+
     platform = await invoke('get_platform');
     flog(`[startup/fe] +${ms()}ms get_platform done`);
 
     const unlistenProgress = await listen('index_progress', (event) => {
       scanned = event.payload.scanned;
-      indexed = event.payload.indexed;
-      currentPath = event.payload.currentPath;
       if (indexStatus.state !== 'Indexing') {
         indexStatus = {
           ...indexStatus,
@@ -1325,7 +1381,18 @@
     await runSearch();
     flog(`[startup/fe] +${ms()}ms runSearch done`);
 
-    window.addEventListener('resize', updateViewportHeight);
+    if (typeof ResizeObserver !== 'undefined') {
+      tableResizeObserver = new ResizeObserver(() => {
+        scheduleViewportHeightUpdate();
+      });
+      if (tableContainer) {
+        tableResizeObserver.observe(tableContainer);
+      } else if (tableAreaEl) {
+        tableResizeObserver.observe(tableAreaEl);
+      }
+    }
+
+    window.addEventListener('resize', scheduleViewportHeightUpdate);
     window.addEventListener('click', onGlobalClick);
     statusRefreshTimer = setInterval(() => {
       if (indexStatus.state === 'Indexing') {
@@ -1346,14 +1413,31 @@
       unlisten();
     }
 
-    window.removeEventListener('resize', updateViewportHeight);
+    tableResizeObserver?.disconnect();
+    tableResizeObserver = null;
+    if (viewportResizeRaf !== null) {
+      cancelAnimationFrame(viewportResizeRaf);
+      viewportResizeRaf = null;
+    }
+    window.removeEventListener('resize', scheduleViewportHeightUpdate);
     window.removeEventListener('click', onGlobalClick);
   });
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
 
-<div class="app-shell">
+<div class="app-shell" data-theme={theme}>
+  <div class="title-bar" role="presentation" data-tauri-drag-region on:mousedown={onTitleBarMouseDown}>
+    <div class="title-left"></div>
+    <div class="title-center">
+      <svg class="title-icon" viewBox="0 0 215 205" fill-rule="evenodd" aria-hidden="true">
+        <path d="M85 0c46.9 0 85 38.1 85 85 0 20.1-7.2 38.5-19.2 52.7l40.7 40.8c5.8 5.8 5.8 15.2 0 21-5.8 5.8-15.2 5.8-21 0l-40.7-40.7c-13.6 9.7-30.4 15.2-44.8 15.2-46.9 0-85-42.1-85-89 0-46.9 38.1-85 85-85z m0 32c-29.3 0-53 23.7-53 53 0 29.3 23.7 53 53 53 29.3 0 53-23.7 53-53 0-29.3-23.7-53-53-53z"/>
+      </svg>
+      <span class="title-text">Everything</span>
+    </div>
+    <div class="title-right"></div>
+  </div>
+
   <header class="search-bar">
     <input
       bind:this={searchInputEl}
@@ -1373,7 +1457,7 @@
       <div class="table-header-track">
         <div class="col name">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('name')}>
-            Name{#if sortBy === 'name'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
+            Name{#if sortBy === 'name'}{@html sortIconHtml(sortDir)}{/if}
           </button>
           <button
             type="button"
@@ -1386,7 +1470,7 @@
 
         <div class="col path">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('dir')}>
-            Path{#if sortBy === 'dir'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
+            Path{#if sortBy === 'dir'}{@html sortIconHtml(sortDir)}{/if}
           </button>
           <button
             type="button"
@@ -1399,13 +1483,13 @@
 
         <div class="col size">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('size')}>
-            Size{#if sortBy === 'size'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
+            Size{#if sortBy === 'size'}{@html sortIconHtml(sortDir)}{/if}
           </button>
         </div>
 
         <div class="col modified">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('mtime')}>
-            Modified{#if sortBy === 'mtime'}{sortDir === 'asc' ? ' ▲' : ' ▼'}{/if}
+            Modified{#if sortBy === 'mtime'}{@html sortIconHtml(sortDir)}{/if}
           </button>
         </div>
       </div>
@@ -1417,6 +1501,7 @@
       on:scroll={() => {
         scrollTop = tableContainer.scrollTop;
         headerScrollLeft = tableContainer.scrollLeft;
+        if (editing.active) void commitRename();
         const scrollBottom = scrollTop + tableContainer.clientHeight;
         if (scrollBottom >= totalHeight - rowHeight * 10) {
           void loadMore();
@@ -1439,17 +1524,7 @@
             >
               <div class="cell name">
                 <img class="file-icon" src={iconFor(entry)} alt="" />
-
-                {#if editing.active && editing.index === index}
-                  <input
-                    bind:this={renameInputEl}
-                    class="rename-input"
-                    bind:value={editing.draftName}
-                    on:click|stopPropagation
-                  />
-                {:else}
-                  <span class="ellipsis">{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
-                {/if}
+                <span class="ellipsis" class:name-editing={editing.active && editing.index === index}>{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
               </div>
               <div class="cell path"><span class="ellipsis">{displayPath(entry.dir)}</span></div>
               <div class="cell size">{formatSize(entry)}</div>
@@ -1462,44 +1537,70 @@
   </section>
 
   <footer class="status-bar">
-    {#if indexStatus.state === 'Indexing'}
-        {#if indexStatus.entriesCount > 0}
-          <span>Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if} · {indexStatus.entriesCount.toLocaleString()} entries</span>
+    <div class="status-left">
+      <span class="status-state">
+        <span class="state-dot {indexStatus.state === 'Indexing' ? 'indexing' : indexStatus.state === 'Error' ? 'error' : 'ready'}"></span>
+        {#if indexStatus.state === 'Indexing'}
+          Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if}
+          {#if !indexStatus.isCatchup}
+            · {scanned.toLocaleString()} scanned
+          {/if}
         {:else}
-          <span>Starting indexing...{#if indexingElapsed} ({indexingElapsed}){/if}</span>
+          Index: {indexStatus.state}
         {/if}
-      {:else}
-        <span>Index: {indexStatus.state}</span>
-        <span>Entries: {indexStatus.entriesCount.toLocaleString()}</span>
-        {#if indexingFinishedAt}
-          <span>Indexed in {indexingFinishedAt}</span>
-        {/if}
-      {/if}
-      {#if searchModeLabel === 'spotlight' || searchModeLabel === 'spotlight_timeout'}
-        <span class="status-spotlight">Spotlight fallback{#if searchModeLabel === 'spotlight_timeout'} (partial results){/if}</span>
+      </span>
+      <span>{indexStatus.entriesCount.toLocaleString()} entries</span>
+      {#if indexingFinishedAt && indexStatus.state !== 'Indexing'}
+        <span>in {indexingFinishedAt}</span>
       {/if}
       {#if dbLatencyMs !== null && dbLastQuery}
-        <span>"{dbLastQuery}" {dbLatencyMs} ms · {totalResults} results</span>
+        <span>"{dbLastQuery}" {dbLatencyMs}ms · {totalResults} results</span>
       {/if}
-    <button
-      class="status-btn"
-      on:click={resetIndex}
-      disabled={indexStatus.state === 'Indexing'}
-      title={indexStatus.state === 'Indexing' ? 'Cannot reset while indexing is in progress.' : 'Reset and rebuild the index.'}
-    >
-      Reset Index
-    </button>
-    {#if indexStatus.state === 'Indexing' && !indexStatus.isCatchup}
-      <span class="index-progress">Scanned {scanned.toLocaleString()} / Indexed {indexed.toLocaleString()}</span>
-      <span class="path-preview">{displayPath(currentPath)}</span>
-    {/if}
-    {#if indexStatus.permissionErrors > 0}
-      <span class="status-warning">Permission errors: {indexStatus.permissionErrors.toLocaleString()}</span>
-    {/if}
-    {#if indexStatus.message}
-      <span class={indexStatus.isCatchup ? 'index-progress' : 'status-error'}>{indexStatus.message}</span>
-    {/if}
+      {#if searchModeLabel === 'spotlight' || searchModeLabel === 'spotlight_timeout'}
+        <span class="status-spotlight">Spotlight fallback{#if searchModeLabel === 'spotlight_timeout'} (partial){/if}</span>
+      {/if}
+      {#if indexStatus.permissionErrors > 0}
+        <span class="status-warning">{indexStatus.permissionErrors.toLocaleString()} permission errors</span>
+      {/if}
+      {#if indexStatus.message}
+        <span class={indexStatus.isCatchup ? 'index-progress' : 'status-error'}>{indexStatus.message}</span>
+      {/if}
+    </div>
+    <div class="status-right">
+      <button class="status-btn" on:click={cycleTheme} title="Switch theme">
+        {theme === 'dark' ? '☀ Light' : '◑ Dark'}
+      </button>
+      <button
+        class="status-btn rebuild-btn"
+        on:click={resetIndex}
+        disabled={indexStatus.state === 'Indexing'}
+        title={indexStatus.state === 'Indexing' ? 'Cannot reset while indexing is in progress.' : 'Reset and rebuild the index.'}
+      >
+        <svg class="rebuild-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        Rebuild Index
+      </button>
+    </div>
   </footer>
+
+  {#if editing.active}
+    <div
+      class="rename-overlay"
+      style="top:{renameOverlay.top}px; left:{renameOverlay.left}px; width:{renameOverlay.width}px;"
+      role="presentation"
+      on:mousedown|stopPropagation
+    >
+      <textarea
+        bind:this={renameInputEl}
+        class="rename-textarea"
+        bind:value={editing.draftName}
+        on:input={autoResizeRenameInput}
+        on:click|stopPropagation
+        on:blur={commitRename}
+      />
+    </div>
+  {/if}
 
   {#if contextMenu.visible}
     <div class="context-menu" style={`left:${contextMenu.x}px;top:${contextMenu.y}px;`}>
@@ -1578,6 +1679,144 @@
     }
   }
 
+  /* ── Theme: Dark ──────────────────────────────────────────────── */
+  :global([data-theme="dark"]) {
+    color-scheme: dark;
+    --bg-app: #1E1E21;
+    --text-primary: #B8BDC5;
+    --text-muted: #94A3B8;
+    --bar-grad-top: #1E1E21;
+    --bar-grad-bottom: #1E1E21;
+    --surface-header: #1E1E21;
+    --surface: #1E1E21;
+    --bg-input: #161618;
+    --border-soft: #2A2A2D;
+    --border-input: rgba(255, 255, 255, 0.06);
+    --focus-ring: #4DA8FF;
+    --accent: #4DA8FF;
+    --row-border: rgba(255, 255, 255, 0.02);
+    --row-hover: #282828;
+    --row-selected: rgba(77, 168, 255, 0.10);
+    --button-bg: rgba(255, 255, 255, 0.05);
+    --button-border: #2A2A2D;
+    --button-text: #94A3B8;
+    --menu-bg: #252528;
+    --menu-border: #2A2A2D;
+    --menu-hover: rgba(255, 255, 255, 0.04);
+    --menu-text: #E2E8F0;
+    --error-text: #ff9d9d;
+    --warning-text: #e0c670;
+    --toast-bg: rgba(10, 10, 16, 0.93);
+    --toast-text: #f2f2f6;
+  }
+
+  /* ── Theme: Light ─────────────────────────────────────────────── */
+  :global([data-theme="light"]) {
+    color-scheme: light;
+    --bg-app: #F5F5F7;
+    --text-primary: #1C1C1E;
+    --text-muted: #6E6E7A;
+    --bar-grad-top: #F5F5F7;
+    --bar-grad-bottom: #F5F5F7;
+    --surface-header: #F5F5F7;
+    --surface: #F5F5F7;
+    --bg-input: #FFFFFF;
+    --border-soft: #D1D1D6;
+    --border-input: rgba(0, 0, 0, 0.10);
+    --focus-ring: #3A8BF5;
+    --accent: #3A8BF5;
+    --row-border: rgba(0, 0, 0, 0.04);
+    --row-hover: rgba(0, 0, 0, 0.04);
+    --row-selected: rgba(58, 139, 245, 0.10);
+    --button-bg: #FFFFFF;
+    --button-border: #D1D1D6;
+    --button-text: #3C3C43;
+    --menu-bg: #FFFFFF;
+    --menu-border: #D1D1D6;
+    --menu-hover: rgba(0, 0, 0, 0.05);
+    --menu-text: #1C1C1E;
+    --error-text: #D93025;
+    --warning-text: #B45309;
+    --toast-bg: rgba(255, 255, 255, 0.95);
+    --toast-text: #1C1C1E;
+  }
+
+  /* ── Themed element overrides ─────────────────────────────────── */
+  :global([data-theme]) {
+    background: var(--bg-app);
+  }
+
+  /* Search bar: flat, no gradient, no separator */
+  :global([data-theme]) .search-bar {
+    height: 44px;
+    padding: 0 16px;
+    background: var(--bg-app);
+    border-bottom: none;
+  }
+
+  :global([data-theme]) .search-input {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    font-size: 12px;
+    height: 34px;
+    border-radius: 8px;
+  }
+
+  /* Table header: flat bg, 16px edge padding */
+  :global([data-theme]) .table-header {
+    background: var(--bg-app);
+  }
+
+  :global([data-theme]) .col-button {
+    padding: 0 8px;
+  }
+
+  :global([data-theme]) .col.name .col-button {
+    padding-left: 16px;
+  }
+
+  /* Row cells: JetBrains Mono, 16px outer edges */
+  :global([data-theme]) .cell {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  :global([data-theme]) .cell.name {
+    font-family: Inter, 'SF Pro Text', sans-serif;
+    padding-left: 16px;
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+
+  :global([data-theme]) .cell.path {
+    font-size: 11px;
+  }
+
+  :global([data-theme]) .cell.size {
+    font-size: 11px;
+  }
+
+  :global([data-theme]) .cell.modified {
+    padding-right: 16px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  :global([data-theme]) .row.selected {
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+
+  /* Dim path/size/date cells in themed mode */
+  :global([data-theme]) .cell.path,
+  :global([data-theme]) .cell.size,
+  :global([data-theme]) .cell.modified {
+    color: var(--text-muted);
+  }
+
+  :global(:root) {
+    background: transparent;
+  }
+
   :global(html, body) {
     margin: 0;
     width: 100%;
@@ -1585,7 +1824,7 @@
     overflow: hidden;
     background: transparent;
     color: var(--text-primary);
-    font-family: 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-family: Inter, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif;
   }
 
   :global(#app) {
@@ -1595,9 +1834,60 @@
 
   .app-shell {
     display: grid;
-    grid-template-rows: auto 1fr auto;
+    grid-template-rows: auto auto 1fr auto;
     height: 100%;
     min-width: 0;
+  }
+
+  .title-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 44px;
+    padding: 0 16px;
+    background: var(--surface-header);
+    cursor: default;
+    flex-shrink: 0;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .title-left {
+    width: 72px;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .title-center {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .title-right {
+    width: 72px;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .title-icon {
+    width: 14px;
+    height: 14px;
+    fill: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .title-text {
+    font-family: Inter, 'SF Pro Text', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    letter-spacing: -0.01em;
   }
 
   .search-bar {
@@ -1608,6 +1898,7 @@
     background: linear-gradient(180deg, var(--bar-grad-top) 0%, var(--bar-grad-bottom) 100%);
     border-bottom: 1px solid var(--border-soft);
     min-width: 0;
+    flex-shrink: 0;
   }
 
   .search-input {
@@ -1616,12 +1907,12 @@
     width: 100%;
     min-width: 0;
     flex: 1 1 auto;
-    height: 32px;
+    height: 36px;
     border: 1px solid var(--border-input);
-    border-radius: 8px;
+    border-radius: 14px;
     padding: 0 10px;
     font-size: 14px;
-    background: var(--surface);
+    background: var(--bg-input, var(--surface));
     color: var(--text-primary);
     backdrop-filter: blur(12px) saturate(160%);
     -webkit-backdrop-filter: blur(12px) saturate(160%);
@@ -1655,11 +1946,12 @@
   }
 
   .table-header {
-    height: 30px;
+    height: 32px;
     border-bottom: 1px solid var(--border-soft);
     background: var(--surface-header);
     user-select: none;
     overflow: hidden;
+    flex-shrink: 0;
   }
 
   .table-header-track {
@@ -1680,9 +1972,11 @@
     display: flex;
     align-items: center;
     justify-content: flex-start;
+    gap: 4px;
     box-sizing: border-box;
     padding: 0 8px;
-    font-size: 12px;
+    font-family: Inter, 'SF Pro Text', sans-serif;
+    font-size: 11px;
     font-weight: 600;
     line-height: 1;
     color: var(--text-muted);
@@ -1691,6 +1985,13 @@
     border: none;
     background: transparent;
     cursor: pointer;
+  }
+
+  :global(.sort-icon) {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    color: var(--accent);
   }
 
   .col-resizer {
@@ -1744,7 +2045,7 @@
   }
 
   .row {
-    height: 28px;
+    height: 30px;
     border-bottom: 1px solid var(--row-border);
     cursor: default;
     -webkit-user-select: none;
@@ -1766,21 +2067,11 @@
     display: flex;
     align-items: center;
     gap: 6px;
-  }
-
-  .cell.name {
-    min-width: 0;
-  }
-
-  .cell.path,
-  .cell.size,
-  .cell.modified {
     min-width: 0;
   }
 
   .cell.size {
     text-align: right;
-    padding-right: 8px;
     font-variant-numeric: tabular-nums;
   }
 
@@ -1802,29 +2093,64 @@
     flex: 0 0 auto;
   }
 
-  .rename-input {
+  .name-editing {
+    opacity: 0.25;
+  }
+
+  .rename-overlay {
+    position: fixed;
+    z-index: 100;
+    min-width: 120px;
+  }
+
+  .rename-textarea {
+    display: block;
     width: 100%;
-    height: 20px;
+    box-sizing: border-box;
+    font-family: Inter, 'SF Pro Text', sans-serif;
     font-size: 12px;
-    border: 1px solid var(--focus-ring);
+    line-height: 18px;
+    padding: 5px 4px 5px 0;
+    border: 1.5px solid var(--focus-ring);
     border-radius: 4px;
-    padding: 0 4px;
-    background: var(--surface);
+    background: var(--bg-input, var(--surface));
     color: var(--text-primary);
+    outline: none;
+    resize: none;
+    overflow: hidden;
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.22), 0 0 0 3px rgba(77, 168, 255, 0.13);
   }
 
   .status-bar {
     display: flex;
     align-items: center;
-    gap: 14px;
-    padding: 6px 8px;
+    justify-content: space-between;
+    height: 32px;
+    padding: 0 16px;
     background: var(--surface-header);
     border-top: 1px solid var(--border-soft);
+    font-family: 'JetBrains Mono', monospace;
     font-size: 11px;
     color: var(--text-muted);
     white-space: nowrap;
     overflow: hidden;
     min-width: 0;
+    flex-shrink: 0;
+  }
+
+  .status-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .status-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
   }
 
   .status-btn {
@@ -1848,9 +2174,47 @@
     filter: none;
   }
 
-  .path-preview {
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .status-state {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .state-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .state-dot.ready { background: #28C840; }
+  .state-dot.indexing { background: #FEBC2E; }
+  .state-dot.error { background: #FF5F57; }
+
+  .rebuild-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: Inter, 'SF Pro Text', sans-serif;
+    font-size: 10px;
+    font-weight: 500;
+    border-radius: 4px;
+    padding: 0 10px;
+  }
+
+  .rebuild-btn:hover {
+    filter: brightness(1.1);
+  }
+
+  .rebuild-btn:disabled {
+    opacity: 0.5;
+  }
+
+  .rebuild-icon {
+    width: 11px;
+    height: 11px;
+    color: var(--accent);
+    flex-shrink: 0;
   }
 
   .status-error {

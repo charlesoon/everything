@@ -24,6 +24,8 @@
           "y": 24
         },
         "visible": false,
+        "minWidth": 400,
+        "minHeight": 300,
         "resizable": true,
         "fullscreen": false
       }

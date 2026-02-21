@@ -4404,6 +4404,19 @@ async fn show_context_menu(
 }
 
 #[tauri::command]
+async fn set_native_theme(theme: String, app: AppHandle) -> AppResult<()> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not found".to_string())?;
+    let t = if theme == "light" {
+        tauri::Theme::Light
+    } else {
+        tauri::Theme::Dark
+    };
+    window.set_theme(Some(t)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_file_icon(
     path: Option<String>,
     ext: String,
@@ -5032,6 +5045,7 @@ pub fn run() {
             get_file_icon,
             get_platform,
             show_context_menu,
+            set_native_theme,
             frontend_log
         ])
         .run(tauri::generate_context!())
