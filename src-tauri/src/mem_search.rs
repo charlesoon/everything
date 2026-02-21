@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
 
+#[cfg(target_os = "windows")]
+use rayon::prelude::*;
+
 use crate::query::SearchMode;
 use crate::{perf_log, EntryDto};
 
@@ -63,38 +66,44 @@ impl MemIndex {
         let t0 = Instant::now();
         let n = entries.len();
 
-        let mut names_lower = Vec::with_capacity(n);
-        let mut sorted_idx: Vec<u32> = Vec::with_capacity(n);
+        // Phase 1: names_lower in parallel
+        let names_lower: Vec<String> = entries
+            .par_iter()
+            .map(|e| e.name.to_lowercase())
+            .collect();
+        let t1 = t0.elapsed().as_millis();
+
+        // Phase 2: sorted_idx — parallel sort
+        let mut sorted_idx: Vec<u32> = (0..n as u32).collect();
+        sorted_idx.par_sort_unstable_by(|&a, &b| {
+            names_lower[a as usize].cmp(&names_lower[b as usize])
+        });
+        let t2 = t0.elapsed().as_millis();
+
+        // Phase 3: ext_map + dir_map (sequential — HashMap building is inherently serial)
         let mut ext_map: HashMap<String, Vec<u32>> = HashMap::new();
         let mut dir_map: HashMap<String, Vec<u32>> = HashMap::new();
-
         for (i, e) in entries.iter().enumerate() {
             let idx = i as u32;
-            let nl = e.name.to_lowercase();
-            sorted_idx.push(idx);
-            names_lower.push(nl);
-
             if let Some(ref ext) = e.ext {
                 ext_map.entry(ext.clone()).or_default().push(idx);
             }
-
             let dir_lower = e.dir.to_lowercase();
             dir_map.entry(dir_lower).or_default().push(idx);
         }
+        let t3 = t0.elapsed().as_millis();
 
-        sorted_idx.sort_unstable_by(|&a, &b| {
-            names_lower[a as usize].cmp(&names_lower[b as usize])
+        // Phase 4: Sort ext_map values in parallel
+        ext_map.par_iter_mut().for_each(|(_, idxs)| {
+            idxs.sort_unstable_by(|&a, &b| names_lower[a as usize].cmp(&names_lower[b as usize]));
         });
 
-        // Sort ext_map values by name_lower for consistent output
-        for idxs in ext_map.values_mut() {
-            idxs.sort_unstable_by(|&a, &b| names_lower[a as usize].cmp(&names_lower[b as usize]));
-        }
-
         eprintln!(
-            "[mem_index] built: entries={n} ext_keys={} dir_keys={} in {}ms",
+            "[mem_index] built: entries={n} ext_keys={} dir_keys={} \
+             names={}ms sort={}ms maps={}ms total={}ms",
             ext_map.len(),
             dir_map.len(),
+            t1, t2 - t1, t3 - t2,
             t0.elapsed().as_millis(),
         );
 

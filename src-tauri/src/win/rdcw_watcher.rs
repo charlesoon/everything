@@ -16,7 +16,7 @@ use crate::{
     AppState, WATCH_DEBOUNCE,
 };
 
-const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const RENAME_PAIR_TIMEOUT: Duration = Duration::from_millis(500);
 const TS_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -34,18 +34,30 @@ struct RenamePending {
 }
 
 pub fn start(app: AppHandle, state: AppState) -> Result<(), String> {
-    let watch_root = PathBuf::from("C:\\");
+    start_with_roots(app, state, vec![PathBuf::from("C:\\")])
+}
 
+pub fn start_with_roots(
+    app: AppHandle,
+    state: AppState,
+    roots: Vec<PathBuf>,
+) -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
     let mut watcher = RecommendedWatcher::new(tx, Config::default())
         .map_err(|e| format!("notify watcher creation failed: {e}"))?;
 
-    watcher
-        .watch(&watch_root, RecursiveMode::Recursive)
-        .map_err(|e| format!("notify watch failed: {e}"))?;
-
-    eprintln!("[win/rdcw] watcher started on {}", watch_root.display());
+    let mut watched = 0;
+    for root in &roots {
+        match watcher.watch(root, RecursiveMode::Recursive) {
+            Ok(()) => watched += 1,
+            Err(e) => eprintln!("[win/rdcw] skipping {}: {e}", root.display()),
+        }
+    }
+    if watched == 0 {
+        return Err("no directories could be watched".to_string());
+    }
+    eprintln!("[win/rdcw] watcher started on {}/{} root(s)", watched, roots.len());
     state.watcher_active.store(true, AtomicOrdering::Release);
 
     std::thread::spawn(move || {

@@ -2,6 +2,7 @@ pub mod com_guard;
 pub mod volume;
 pub mod path_resolver;
 pub mod mft_indexer;
+pub mod nonadmin_indexer;
 pub mod usn_watcher;
 pub mod rdcw_watcher;
 pub mod context_menu;
@@ -15,7 +16,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 use crate::{
     db_connection, get_meta,
     refresh_and_emit_status_counts, set_ready_with_cached_counts,
-    start_full_index_worker, start_full_index_worker_silent,
+    start_full_index_worker_silent,
     AppState,
 };
 use std::collections::{HashMap, HashSet};
@@ -156,14 +157,18 @@ pub fn start_windows_indexing(app: AppHandle, state: AppState) {
                         set_ready_with_cached_counts(&app, &state);
                         let _ = start_full_index_worker_silent(app.clone(), state.clone());
                     } else {
-                        eprintln!("[win] MFT failed ({e}), index incomplete, DB empty — starting full index");
-                        let _ = start_full_index_worker(app.clone(), state.clone());
+                        // Non-admin fast index: home-dir first → MemIndex → Ready in <30s
+                        // Handles watcher startup internally.
+                        eprintln!("[win] MFT failed ({e}), DB empty — starting non-admin fast index");
+                        nonadmin_indexer::run_nonadmin_index(app, state);
+                        return;
                     }
                 }
 
                 if let Err(e2) = usn_watcher::start(app.clone(), state.clone(), HashMap::new(), HashSet::new()) {
                     eprintln!("[win] USN watcher also failed ({e2}), trying RDCW fallback");
-                    if let Err(e3) = rdcw_watcher::start(app, state) {
+                    let watch_roots = nonadmin_indexer::compute_watch_roots(&state);
+                    if let Err(e3) = rdcw_watcher::start_with_roots(app, state, watch_roots) {
                         eprintln!("[win] RDCW watcher also failed ({e3}), no live updates");
                     }
                 }

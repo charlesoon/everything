@@ -20,6 +20,10 @@ impl GitignoreFilter {
         Self { matchers }
     }
 
+    pub fn root_paths(&self) -> Vec<&Path> {
+        self.matchers.iter().map(|gi| gi.path()).collect()
+    }
+
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         for gi in &self.matchers {
             match gi.matched(path, is_dir) {
