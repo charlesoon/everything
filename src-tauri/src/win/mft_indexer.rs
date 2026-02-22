@@ -18,7 +18,7 @@ use crate::{
     get_meta, gitignore_filter, invalidate_search_caches, matches_ignore_pattern, now_epoch,
     mem_search::CompactEntry,
     refresh_and_emit_status_counts,
-    restore_normal_pragmas, set_indexing_pragmas, set_meta, set_progress,
+    restore_normal_pragmas, set_indexing_pragmas, set_meta, set_progress, set_state,
     update_status_counts, upsert_rows,
     AppState, IgnorePattern, IndexRow, IndexState, BUILTIN_SKIP_NAMES,
 };
@@ -423,7 +423,7 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         eprintln!("[win/mft/bg +{}] starting DB upsert ({entry_count} entries)", ts());
         let bulk_result = background_db_bulk_insert(&bg_state, mem_idx.entries(), bg_started);
 
-        match bulk_result {
+        let bg_ok = match bulk_result {
             Ok((conn, current_run_id)) => {
                 if let Err(e) = background_db_finalize(
                     conn, &bg_state, &bg_app, &bg_vol, current_run_id, entry_count > 0, bg_started,
@@ -434,20 +434,35 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
                     },
                 ) {
                     eprintln!("[win/mft/bg +{}] DB finalize FAILED: {e}", ts());
+                    false
+                } else {
+                    true
                 }
             }
             Err(e) => {
                 eprintln!("[win/mft/bg +{}] DB bulk insert FAILED: {e}", ts());
                 drop(mem_idx);
                 *bg_state.mem_index.write() = None;
+                false
             }
-        }
+        };
 
         bg_state
             .indexing_active
             .store(false, AtomicOrdering::Release);
 
-        eprintln!("[win/mft/bg +{}] background work done", ts());
+        if bg_ok {
+            {
+                let mut status = bg_state.status.lock();
+                status.state = IndexState::Ready;
+            }
+            emit_index_state(&bg_app, "Ready", None);
+        } else {
+            let msg = "Background DB operation failed".to_string();
+            set_state(&bg_state, IndexState::Error, Some(msg.clone()));
+            emit_index_state(&bg_app, "Error", Some(msg));
+        }
+        eprintln!("[win/mft/bg +{}] background work done (ok={})", ts(), bg_ok);
 
         if let Err(e) = super::usn_watcher::start(bg_app.clone(), bg_state.clone(), frn_cache, outside_scan_frns) {
             eprintln!("[win/mft/bg +{}] USN watcher failed ({e}), trying RDCW fallback", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));

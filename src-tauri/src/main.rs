@@ -146,6 +146,7 @@ struct IndexStatusDto {
     scanned: u64,
     indexed: u64,
     current_path: String,
+    background_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3038,6 +3039,7 @@ fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
         scanned: snapshot.scanned,
         indexed: snapshot.indexed,
         current_path: snapshot.current_path,
+        background_active: indexing_active,
     };
     if cfg!(debug_assertions) {
         eprintln!(

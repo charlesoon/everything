@@ -77,7 +77,8 @@
     lastUpdated: null,
     permissionErrors: 0,
     message: null,
-    isCatchup: false
+    isCatchup: false,
+    backgroundActive: false
   };
 
   let indexingStartTime = null;
@@ -135,6 +136,7 @@
   let toastTimer;
   let statusRefreshTimer;
   let elapsedTimer;
+  let bgPollTimer;
   let statusRefreshInFlight = false;
   let resetInFlight = false;
   let lastReadyCount = 0;
@@ -531,7 +533,8 @@
         entriesCount: status.entriesCount,
         lastUpdated: status.lastUpdated,
         permissionErrors: status.permissionErrors ?? 0,
-        message: status.message
+        message: status.message,
+        backgroundActive: status.backgroundActive ?? false
       };
       if (status.state === 'Indexing' && prevState !== 'Indexing') {
         startElapsedTimer();
@@ -1388,6 +1391,7 @@
   function startElapsedTimer() {
     clearInterval(elapsedTimer);
     clearInterval(statusRefreshTimer);
+    clearInterval(bgPollTimer);
     indexingStartTime = Date.now();
     indexingElapsed = '0s';
     indexingFinishedAt = '';
@@ -1404,6 +1408,25 @@
     }
     indexingStartTime = null;
     indexingElapsed = '';
+  }
+
+  function startBackgroundPoll() {
+    clearInterval(bgPollTimer);
+    bgPollTimer = setInterval(async () => {
+      try {
+        const status = await invoke('get_index_status');
+        indexStatus = {
+          ...indexStatus,
+          backgroundActive: status.backgroundActive ?? false,
+          entriesCount: status.entriesCount ?? indexStatus.entriesCount
+        };
+        if (!status.backgroundActive) {
+          clearInterval(bgPollTimer);
+        }
+      } catch (_) {
+        clearInterval(bgPollTimer);
+      }
+    }, 1000);
   }
 
   function displayPath(path) {
@@ -1480,7 +1503,7 @@
         scanned = event.payload.scanned;
         indexed = event.payload.indexed;
         currentPath = event.payload.currentPath;
-        if (indexStatus.state !== 'Indexing') {
+        if (indexStatus.state !== 'Indexing' && indexStatus.state !== 'Ready') {
           indexStatus = {
             ...indexStatus,
             state: 'Indexing'
@@ -1508,9 +1531,13 @@
           startElapsedTimer();
         } else if (event.payload.state !== 'Indexing' && prevState === 'Indexing') {
           stopElapsedTimer();
+          if (event.payload.state === 'Ready') {
+            startBackgroundPoll();
+          }
         }
 
         if (event.payload.state === 'Ready') {
+          void refreshStatus();
           scheduleSearch(true);
         }
       })
@@ -1672,6 +1699,7 @@
     clearTimeout(maximizeStateTimer);
     clearInterval(statusRefreshTimer);
     clearInterval(elapsedTimer);
+    clearInterval(bgPollTimer);
     resizeCleanup?.();
 
     for (const unlisten of unlistenFns) {
@@ -1838,7 +1866,7 @@
   <footer class="status-bar" role="status" aria-live="polite">
     <div class="status-left">
       <span class="status-state">
-        <span class="state-dot {indexStatus.state === 'Indexing' ? 'indexing' : indexStatus.state === 'Error' ? 'error' : 'ready'}"></span>
+        <span class="state-dot {indexStatus.state === 'Indexing' ? 'indexing' : indexStatus.state === 'Error' ? 'error' : 'ready'}" class:pulsing={indexStatus.state === 'Ready' && indexStatus.backgroundActive}></span>
         {#if indexStatus.state === 'Indexing'}
           Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if}
           {#if !indexStatus.isCatchup}
@@ -2592,6 +2620,15 @@
   .state-dot.ready { background: #28C840; }
   .state-dot.indexing { background: #FEBC2E; }
   .state-dot.error { background: #FF5F57; }
+
+  .state-dot.pulsing {
+    animation: pulse-dot 1.4s ease-in-out infinite;
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
 
   .rebuild-btn {
     display: flex;
