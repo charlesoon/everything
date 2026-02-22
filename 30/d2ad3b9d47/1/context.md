@@ -1,0 +1,12 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+system dark theme에서 light theme로 설정한 뒤에 타이틀바 더블클릭(전체화면)으로 동작할 때 배경이 dark theme로 창이 확대되다가 웹 화면이 커지는 이슈가 있어. 어떻게 수정할까?
+
+### Prompt 2
+
+commit
+
