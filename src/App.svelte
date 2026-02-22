@@ -125,6 +125,9 @@
 
   let platform = '';
   let isMaximized = false;
+  let showFdaBanner = false;
+  let fdaSettingsOpened = false;
+  const FDA_DISMISSED_KEY = 'everything-fda-dismissed';
   const appWindow = getCurrentWindow();
   let toast = '';
   let searchTimer;
@@ -1453,6 +1456,12 @@
 
     platform = await step('invoke(get_platform)', () => invoke('get_platform'));
 
+    if (platform === 'macos') {
+      const hasAccess = await invoke('check_full_disk_access').catch(() => true);
+      const dismissed = localStorage.getItem(FDA_DISMISSED_KEY) === '1';
+      showFdaBanner = !hasAccess && !dismissed;
+    }
+
     let unlistenResized = null;
     if (platform === 'windows') {
       try {
@@ -1719,6 +1728,20 @@
       <div class="title-right"></div>
     {/if}
   </div>
+
+  {#if showFdaBanner}
+  <div class="fda-banner" role="alert">
+    {#if fdaSettingsOpened}
+      <span class="fda-banner-text">Full Disk Access granted? Restart the app to apply.</span>
+    {:else}
+      <span class="fda-banner-text">Full Disk Access is required to avoid repeated permission prompts.</span>
+    {/if}
+    <div class="fda-banner-actions">
+      <button class="fda-btn-open" on:click={() => { invoke('open_privacy_settings'); fdaSettingsOpened = true; }}>Open Settings</button>
+      <button class="fda-btn-dismiss" on:click={() => { showFdaBanner = false; localStorage.setItem(FDA_DISMISSED_KEY, '1'); }}>Dismiss</button>
+    </div>
+  </div>
+  {/if}
 
   <header class="search-bar">
     <input
@@ -2212,6 +2235,52 @@
     font-weight: 500;
     color: var(--text-primary);
     letter-spacing: -0.01em;
+  }
+
+  .fda-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 12px;
+    background: #e8a020;
+    flex-shrink: 0;
+    min-width: 0;
+  }
+  :global([data-theme='dark']) .fda-banner {
+    background: #7a4800;
+  }
+  .fda-banner-text {
+    font-size: 11.5px;
+    color: #fff;
+    flex: 1 1 auto;
+    min-width: 0;
+    line-height: 1.4;
+  }
+  .fda-banner-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .fda-btn-open, .fda-btn-dismiss {
+    padding: 3px 10px;
+    border-radius: 5px;
+    font-size: 11.5px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    white-space: nowrap;
+  }
+  .fda-btn-open {
+    background: #fff;
+    color: #a05000;
+  }
+  .fda-btn-dismiss {
+    background: transparent;
+    color: rgba(255,255,255,0.85);
+  }
+  .fda-btn-dismiss:hover {
+    color: #fff;
   }
 
   .search-bar {

@@ -3060,6 +3060,28 @@ fn get_home_dir(state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
+fn check_full_disk_access() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::fs::metadata("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+#[tauri::command]
+fn open_privacy_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+            .spawn();
+    }
+}
+
+#[tauri::command]
 fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     {
@@ -5419,7 +5441,9 @@ pub fn run() {
             show_context_menu,
             set_native_theme,
             frontend_log,
-            mark_frontend_ready
+            mark_frontend_ready,
+            check_full_disk_access,
+            open_privacy_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
