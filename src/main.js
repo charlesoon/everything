@@ -3,6 +3,7 @@ import '@fontsource/inter/500.css';
 import '@fontsource/inter/600.css';
 import '@fontsource/jetbrains-mono/400.css';
 import '@fontsource/jetbrains-mono/500.css';
+import { mount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
 import App from './App.svelte';
 
@@ -26,7 +27,7 @@ function bootLog(message, retry = 0) {
 
 bootLog(`main.js module start (readyState=${document.readyState})`);
 
-const app = new App({
+const app = mount(App, {
   target: document.getElementById('app')
 });
 
