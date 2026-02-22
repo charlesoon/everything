@@ -3,8 +3,10 @@
   "checkpoint_id": "04f3687c225b",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 1,
+  "checkpoints_count": 4,
   "files_touched": [
+    "src-tauri/src/gitignore_filter.rs",
+    "src-tauri/src/main.rs",
     "src/App.svelte"
   ],
   "sessions": [
@@ -14,13 +16,20 @@
       "context": "/04/f3687c225b/0/context.md",
       "content_hash": "/04/f3687c225b/0/content_hash.txt",
       "prompt": "/04/f3687c225b/0/prompt.txt"
+    },
+    {
+      "metadata": "/04/f3687c225b/1/metadata.json",
+      "transcript": "/04/f3687c225b/1/full.jsonl",
+      "context": "/04/f3687c225b/1/context.md",
+      "content_hash": "/04/f3687c225b/1/content_hash.txt",
+      "prompt": "/04/f3687c225b/1/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 268,
-    "cache_creation_tokens": 240490,
-    "cache_read_tokens": 18631563,
-    "output_tokens": 15982,
-    "api_call_count": 204
+    "input_tokens": 426,
+    "cache_creation_tokens": 438040,
+    "cache_read_tokens": 33913104,
+    "output_tokens": 34971,
+    "api_call_count": 334
   }
 }
