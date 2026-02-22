@@ -1601,7 +1601,7 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-<div class="app-shell" data-theme={theme}>
+<div class="app-shell" data-theme={theme} data-platform={platform}>
   <div class="title-bar" role="presentation" data-tauri-drag-region on:mousedown={onTitleBarMouseDown}>
     <div class="title-left" class:win-title-left={platform === 'windows'}></div>
     <div class="title-center">
@@ -1662,7 +1662,7 @@
             class:active={resizingColumn === 'name'}
             on:mousedown={(event) => startColumnResize(event, 'name')}
             aria-label="Resize Name column"
-          />
+          ></button>
         </div>
 
         <div class="col path">
@@ -1675,7 +1675,7 @@
             class:active={resizingColumn === 'path'}
             on:mousedown={(event) => startColumnResize(event, 'path')}
             aria-label="Resize Path column"
-          />
+          ></button>
         </div>
 
         <div class="col size">
@@ -2588,5 +2588,32 @@
 
   :global(.os-scrollbar.os-scrollbar-interacting) {
     background-color: var(--os-track-bg-active);
+  }
+
+  /* ── Windows platform overrides ── */
+  :global([data-platform='windows']) .title-bar {
+    height: 30px;
+  }
+  :global([data-platform='windows']) .title-icon {
+    width: 12px;
+    height: 12px;
+  }
+  :global([data-platform='windows']) .title-text {
+    font-size: 12px;
+  }
+  :global([data-platform='windows']) .search-bar {
+    padding: 0 8px 0;
+  }
+  :global([data-platform='windows']) .search-input {
+    height: 30px;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  :global([data-platform='windows']) .table-header {
+    height: 24px;
+  }
+  :global([data-platform='windows']) .col-resizer::after {
+    top: 4px;
+    bottom: 4px;
   }
 </style>
