@@ -1,0 +1,63 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "011f32bb624f",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 19,
+  "files_touched": [
+    "package-lock.json",
+    "package.json",
+    "src-tauri/Cargo.lock",
+    "src-tauri/Cargo.toml",
+    "src-tauri/capabilities/default.json",
+    "src-tauri/gen/schemas/capabilities.json",
+    "src-tauri/icons/icons.pen",
+    "src-tauri/src/main.rs",
+    "src-tauri/tauri.conf.json",
+    "src/main.js"
+  ],
+  "sessions": [
+    {
+      "metadata": "/01/1f32bb624f/0/metadata.json",
+      "transcript": "/01/1f32bb624f/0/full.jsonl",
+      "context": "/01/1f32bb624f/0/context.md",
+      "content_hash": "/01/1f32bb624f/0/content_hash.txt",
+      "prompt": "/01/1f32bb624f/0/prompt.txt"
+    },
+    {
+      "metadata": "/01/1f32bb624f/1/metadata.json",
+      "transcript": "/01/1f32bb624f/1/full.jsonl",
+      "context": "/01/1f32bb624f/1/context.md",
+      "content_hash": "/01/1f32bb624f/1/content_hash.txt",
+      "prompt": "/01/1f32bb624f/1/prompt.txt"
+    },
+    {
+      "metadata": "/01/1f32bb624f/2/metadata.json",
+      "transcript": "/01/1f32bb624f/2/full.jsonl",
+      "context": "/01/1f32bb624f/2/context.md",
+      "content_hash": "/01/1f32bb624f/2/content_hash.txt",
+      "prompt": "/01/1f32bb624f/2/prompt.txt"
+    },
+    {
+      "metadata": "/01/1f32bb624f/3/metadata.json",
+      "transcript": "/01/1f32bb624f/3/full.jsonl",
+      "context": "/01/1f32bb624f/3/context.md",
+      "content_hash": "/01/1f32bb624f/3/content_hash.txt",
+      "prompt": "/01/1f32bb624f/3/prompt.txt"
+    },
+    {
+      "metadata": "/01/1f32bb624f/4/metadata.json",
+      "transcript": "/01/1f32bb624f/4/full.jsonl",
+      "context": "/01/1f32bb624f/4/context.md",
+      "content_hash": "/01/1f32bb624f/4/content_hash.txt",
+      "prompt": "/01/1f32bb624f/4/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 4235,
+    "cache_creation_tokens": 1419376,
+    "cache_read_tokens": 50112352,
+    "output_tokens": 83386,
+    "api_call_count": 523
+  }
+}

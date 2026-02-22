@@ -1,0 +1,28 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+@src-tauri/icons/icon.png 를 참고해서 맥의 @everything.icon/ 도 바꿔줘
+
+### Prompt 2
+
+[Request interrupted by user]
+
+### Prompt 3
+
+@src-tauri/icons/icon.png 를 참고해서 맥의 @everything.icon/ 도 아이콘 내부 돋보기 색상을 초록색으로 바꿔줘
+
+### Prompt 4
+
+실행해봤는데 안바뀌었는데? 뭔가 캐시되고 있나? npm run tauri dev로 실행했어
+
+### Prompt 5
+
+그래야 하나봐. 여전히 주황색으로 보여
+
+### Prompt 6
+
+여전히 주황색으로 보인다. target 디렉토리를 모두 지운뒤에 실행해보면 어떨까?
+

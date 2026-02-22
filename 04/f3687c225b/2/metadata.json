@@ -1,0 +1,39 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "04f3687c225b",
+  "session_id": "80923829-31f5-4d01-a64b-e92bbdd80054",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-22T11:13:02.223916Z",
+  "branch": "main",
+  "checkpoints_count": 0,
+  "files_touched": [
+    "src/App.svelte",
+    "src-tauri/gen/schemas/macOS-schema.json",
+    "src-tauri/src/gitignore_filter.rs",
+    "src-tauri/src/main.rs",
+    "src-tauri/src/win/mft_indexer.rs",
+    "src-tauri/tauri.conf.json"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "1de08fcab2a1",
+  "transcript_identifier_at_start": "77ef38c0-f0f6-4119-ab9d-19ce0ed23534",
+  "checkpoint_transcript_start": 72,
+  "transcript_lines_at_start": 72,
+  "token_usage": {
+    "input_tokens": 22,
+    "cache_creation_tokens": 28031,
+    "cache_read_tokens": 1267244,
+    "output_tokens": 139,
+    "api_call_count": 16
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-22T11:13:01.619245Z",
+    "agent_lines": 79,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 79,
+    "agent_percentage": 100
+  },
+  "transcript_path": ".claude/projects/-Users-al02402336-everything/80923829-31f5-4d01-a64b-e92bbdd80054.jsonl"
+}

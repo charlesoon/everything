@@ -1,0 +1,34 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "e5c2a735197b",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src-tauri/icons/icon.ico",
+    "src-tauri/icons/icons.pen"
+  ],
+  "sessions": [
+    {
+      "metadata": "/e5/c2a735197b/0/metadata.json",
+      "transcript": "/e5/c2a735197b/0/full.jsonl",
+      "context": "/e5/c2a735197b/0/context.md",
+      "content_hash": "/e5/c2a735197b/0/content_hash.txt",
+      "prompt": "/e5/c2a735197b/0/prompt.txt"
+    },
+    {
+      "metadata": "/e5/c2a735197b/1/metadata.json",
+      "transcript": "/e5/c2a735197b/1/full.jsonl",
+      "context": "/e5/c2a735197b/1/context.md",
+      "content_hash": "/e5/c2a735197b/1/content_hash.txt",
+      "prompt": "/e5/c2a735197b/1/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 208,
+    "cache_creation_tokens": 558832,
+    "cache_read_tokens": 10447676,
+    "output_tokens": 6729,
+    "api_call_count": 102
+  }
+}

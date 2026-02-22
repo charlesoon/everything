@@ -1,0 +1,28 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+터미널에서 claudecc로 실행하면 claude --dangerously-skip-permissions이 실행되도록 명령어 만들어줘
+
+### Prompt 2
+
+@src-tauri/icons/icon.ico 색상이 너무 어두운데 조금 더 밝게 바꿔줘
+
+### Prompt 3
+
+@src-tauri/icons/icon.ico 를 재생성 해줘
+
+### Prompt 4
+
+commit and push
+
+### Prompt 5
+
+@src-tauri/icons/icon.ico 을 디자인처럼 플랫하게 만들어줘. 지금 이미지는 입체적이야
+
+### Prompt 6
+
+@src-tauri/icons/icon.ico 에 다양한 사이즈의 이미지를 만들어뒀어? 윈도우에서는 16x16 뿐만 아니라 더 큰 사이즈도 필요해. 작업 표시줄에 보여주려면
+

@@ -1,0 +1,13 @@
+rename 했을 때 파일 이름 수정(multi line)을 위해 list item 영역이 넓어지는데.. finder 방식처럼 overlay된 이름 변경 tool이 뜨고 list item의 height가 넓어지지 않게 수정해줘
+
+---
+
+따로 뜨는 입력창이 multi line으로 뜨고 list의 height에는 영향을 주지 않게 바꿔줘
+
+---
+
+[Request interrupted by user]
+
+---
+
+따로 뜨는 입력창이 multi line으로 뜨고 list의 height에는 영향을 주지 않게 바꿔줘. 그리고 다른 라인의 텍스트와 수정하려는 텍스트의 align이 맞게 해줘

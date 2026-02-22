@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "011f32bb624f",
+  "session_id": "756f503a-43a0-4c98-a0cc-a38beaa5529b",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-21T14:23:25.213286Z",
+  "branch": "main",
+  "checkpoints_count": 11,
+  "files_touched": [
+    "src-tauri/tauri.conf.json"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "0e241c5720a2",
+  "transcript_identifier_at_start": "4545f18d-499d-4821-93cc-d5bf2ccbfbac",
+  "token_usage": {
+    "input_tokens": 1532,
+    "cache_creation_tokens": 672559,
+    "cache_read_tokens": 30792641,
+    "output_tokens": 47855,
+    "api_call_count": 321
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-21T14:23:17.45145Z",
+    "agent_lines": 0,
+    "human_added": 79,
+    "human_modified": 32,
+    "human_removed": 0,
+    "total_committed": 80,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude/projects/-Users-al02402336-everything/756f503a-43a0-4c98-a0cc-a38beaa5529b.jsonl"
+}

@@ -1,0 +1,31 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "04f3687c225b",
+  "session_id": "8c7c52ff-d14e-4185-a9e9-6c25fcb26ad1",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-22T11:13:04.685153Z",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "src-tauri/src/win/mft_indexer.rs"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "be48f2f799bb",
+  "token_usage": {
+    "input_tokens": 69,
+    "cache_creation_tokens": 116844,
+    "cache_read_tokens": 7002484,
+    "output_tokens": 19453,
+    "api_call_count": 67
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-22T11:13:02.394839Z",
+    "agent_lines": 1,
+    "human_added": 78,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 79,
+    "agent_percentage": 1.2658227848101267
+  },
+  "transcript_path": ".claude/projects/-Users-al02402336-everything/8c7c52ff-d14e-4185-a9e9-6c25fcb26ad1.jsonl"
+}

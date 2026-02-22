@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "6f952db67606",
+  "session_id": "3972c14b-7d5e-4698-bfc4-08734e28b787",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-20T07:36:15.422956Z",
+  "branch": "main",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "everything.icon/Assets/everything-icon-1-classic-orange.svg",
+    "everything.icon/icon.json"
+  ],
+  "agent": "Claude Code",
+  "turn_id": "b2af938b4c36",
+  "transcript_identifier_at_start": "1f559bb5-7950-428d-96fb-25eddb4f0aad",
+  "token_usage": {
+    "input_tokens": 1550,
+    "cache_creation_tokens": 61268,
+    "cache_read_tokens": 822763,
+    "output_tokens": 3965,
+    "api_call_count": 23
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-20T07:36:15.387565Z",
+    "agent_lines": 16,
+    "human_added": 6,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 22,
+    "agent_percentage": 72.72727272727273
+  },
+  "transcript_path": ".claude/projects/-Users-al02402336-everything/3972c14b-7d5e-4698-bfc4-08734e28b787.jsonl"
+}

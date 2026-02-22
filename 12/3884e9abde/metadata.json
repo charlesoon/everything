@@ -1,0 +1,42 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "123884e9abde",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "everything.icon/icon.json",
+    "src-tauri/src/main.rs",
+    "src/App.svelte"
+  ],
+  "sessions": [
+    {
+      "metadata": "/12/3884e9abde/0/metadata.json",
+      "transcript": "/12/3884e9abde/0/full.jsonl",
+      "context": "/12/3884e9abde/0/context.md",
+      "content_hash": "/12/3884e9abde/0/content_hash.txt",
+      "prompt": "/12/3884e9abde/0/prompt.txt"
+    },
+    {
+      "metadata": "/12/3884e9abde/1/metadata.json",
+      "transcript": "/12/3884e9abde/1/full.jsonl",
+      "context": "/12/3884e9abde/1/context.md",
+      "content_hash": "/12/3884e9abde/1/content_hash.txt",
+      "prompt": "/12/3884e9abde/1/prompt.txt"
+    },
+    {
+      "metadata": "/12/3884e9abde/2/metadata.json",
+      "transcript": "/12/3884e9abde/2/full.jsonl",
+      "context": "/12/3884e9abde/2/context.md",
+      "content_hash": "/12/3884e9abde/2/content_hash.txt",
+      "prompt": "/12/3884e9abde/2/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 579,
+    "cache_creation_tokens": 806829,
+    "cache_read_tokens": 14407686,
+    "output_tokens": 10048,
+    "api_call_count": 126
+  }
+}

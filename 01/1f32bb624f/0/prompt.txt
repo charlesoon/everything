@@ -1,0 +1,35 @@
+rename 시도 후에 esc를 누르면 스크롤이 움직이는데 그건 왜그런거야?
+GPT => 원인은 Esc 취소와 blur 처리의 조합 때문입니다.
+
+  - rename input에 on:blur={commitRename}가 걸려 있음 (src/
+    App.svelte:1497)
+  - Esc 누르면 cancelRename()로 input을 제거함 (src/
+    App.svelte:10491052, src/App.svelte:961967)
+  - input이 사라지면서 blur가 발생하고, 이때 포커스가 다른 요소(행/문
+    서)로 이동하면서 브라우저가 “포커스 요소를 보이게” 하려고 스크롤
+    컨테이너를 살짝 움직일 수 있음
+      - 행이 tabindex="0"이라 영향이 더 큼 (src/App.svelte:1484)
+  - 타이밍에 따라 commitRename() 경로가 실행되면 runSearch()에서
+    scrollTop=0이 걸려 더 크게 움직일 수도 있음 (src/App.svelte:504)
+
+  즉, 구조적으로 Esc 취소와 blur 커밋이 충돌하는 패턴입니다.
+  원하면 이걸 기준으로 스크롤 안 움직이게 바로 수정해드릴게요.
+
+
+이거 맞아?
+
+---
+
+그럼 바로 수정해줘
+
+---
+
+입력창에 텍스트 입력한 상태에서  esc를 누르면 어떻게 동작해야 할까?
+
+---
+
+[Request interrupted by user for tool use]
+
+---
+
+지금 수정하고 있는 입력창 수정 빼고 나머지만 커밋해줘

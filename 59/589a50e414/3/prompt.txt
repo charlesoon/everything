@@ -1,0 +1,188 @@
+아이템에 우클릭했을 때 finder에서 우클릭한것처럼 native context menu를 띄울 수 있을까?
+
+---
+
+그럼 option 1으로 구현해줄래?
+
+---
+
+실제 파일을 copy 하는 복사 기능도 menu에 넣어줘
+
+---
+
+Conduct a thorough, line-by-line code review with a critical perspective.
+
+**Usage:**
+```bash
+/ln:codereview           # Review all uncommitted changes (default)
+/ln:codereview all       # Review all uncommitted changes (staged + unstaged)
+/ln:codereview unstaged  # Review only unstaged changes
+```
+
+## Review Scope
+
+**Mode 1: All uncommitted changes (default)**
+- Command: `git diff HEAD` (staged + unstaged)
+- Reviews everything not yet committed
+
+**Mode 2: Unstaged only**
+- Command: `git diff` (working directory changes only)
+- Reviews only files not yet staged
+
+All modes include:
+1. **Critical examination**: Line-by-line inspection with skeptical mindset
+2. **Pattern validation**: Verify adherence to project conventions and guides
+
+## Review Categories
+
+### Code Quality
+- **Clean code**: No TODO comments, no unused code
+- **Naming conventions**: Consistent with project standards
+- **File organization**: Proper separation of concerns
+- **Documentation**: Adequate comments where necessary
+
+### Technical Validation
+- **Build verification**: Zero warnings, all tests pass
+- **Type safety**: No type errors or unsafe operations
+- **Performance**: No memory leaks, efficient algorithms
+- **Security**: No hardcoded secrets or vulnerabilities
+
+### Architecture Review
+- **Design patterns**: Appropriate use of patterns
+- **Dependency management**: Minimal coupling
+- **Error handling**: Comprehensive error coverage
+- **Concurrency**: Thread safety and race conditions
+
+### Design Principles (OCP/SRP)
+
+**OCP (Open-Closed Principle) violations to catch:**
+- Adding `else if` / `switch case` to extend existing behavior
+- Modifying stable code instead of creating new modules
+- Missing extension points (strategy, registry, plugin patterns)
+
+**SRP (Single Responsibility Principle) violations to catch:**
+- One file handling multiple unrelated concerns
+- Functions/classes that change for multiple reasons
+- God objects or utility dumps
+
+**When found, suggest:**
+- Extract new behavior into separate file/class
+- Use strategy/registry pattern for extensibility
+- Split multi-responsibility files into focused modules
+
+## Review Process
+
+### Step 0: Understand Project Context (MANDATORY)
+
+Before reviewing any code, you MUST understand the project environment:
+
+1. **Read CLAUDE.md** - Check project root and user's `~/.claude/CLAUDE.md` for project-specific conventions
+2. **Identify app type** - Read entry points, config files, or main modules to determine:
+   - **Platform**: Desktop (Electron) / Mobile (React Native, Flutter, iOS, Android) / Web server / CLI / Library
+   - **User model**: Single-user vs Multi-user
+   - **Network exposure**: Local-only vs Network-exposed API
+3. **Understand architecture** - Scan key files to grasp the overall structure
+
+**Why this matters:**
+- Security concerns differ drastically between local desktop app and public API server
+- "Memory leak" in a short-lived CLI is irrelevant; in a long-running server it's critical
+- Path traversal in local-only app with file dialog is low-risk; in server accepting arbitrary input it's critical
+
+**DO NOT skip this step.** Reviewing without context leads to false positives and wastes everyone's time.
+
+### Step 1: Analyze Changes
+
+Determine review mode from command argument (default: `all`):
+
+**Mode: all (default)**
+```bash
+git diff HEAD  # All uncommitted changes (staged + unstaged)
+```
+
+**Mode: unstaged**
+```bash
+git diff  # Only unstaged changes
+```
+
+### Step 2: Validate Build
+- TypeScript: `npx tsc --noEmit`
+- Linting: `npm run lint`
+- Testing: `npm run test`
+- Language-specific checks per development guides
+
+### Step 3: Generate Report
+
+I will provide a structured report with:
+
+#### Critical Issues 🚨
+- **ONLY** issues that will cause runtime crashes, data loss, or security breaches
+- Must be reproducible with concrete steps
+- Example: SQL injection, unhandled null causing crash, infinite loop
+
+#### Major Issues ⚠️
+- Issues that cause incorrect behavior users will notice
+- Must demonstrate actual failure scenario
+- Example: Wrong calculation result, UI not updating, API returning wrong data
+
+#### Minor Issues 💡
+- Style violations or optimization opportunities
+- Suggestions for improvement
+- Example: Inconsistent naming, missing error message
+
+**DO NOT mark as Critical/Major:**
+- Theoretical concerns without concrete failure scenario
+- "Could potentially cause..." without proof
+- Design preferences or "I would do it differently"
+
+#### Positive Highlights ✅
+- Well-implemented patterns
+- Good practices observed
+
+## Review Principles
+
+- **No temporary solutions**: Reject workarounds or hacks
+- **Complete implementation**: No partial features with TODOs
+- **Performance first**: Consider memory, CPU, and I/O impact
+- **Build cleanliness**: Zero warnings tolerance
+- **Guide compliance**: Follow all development guides in docs/
+
+## ⛔ Anti-Hallucination Rules
+
+Before reporting ANY issue, you MUST:
+
+1. **READ the actual code** - Don't guess based on patterns. Read the exact lines.
+2. **TRACE the execution flow** - Follow the code path. If you claim race condition, prove it step by step.
+3. **VERIFY the issue exists** - Can you reproduce it? Show concrete scenario.
+4. **CHECK context** - What's the runtime environment? Desktop vs server, single-user vs multi-user?
+5. **CONFIRM it's not intentional** - fire-and-forget, placeholder values updated later, etc. may be by design.
+
+### Issue Validation Checklist
+
+For each issue you want to report, answer:
+1. Did I read the ACTUAL code, not just the diff snippet?
+2. Can I show the EXACT line numbers where this fails?
+3. Is this a REAL bug or theoretical concern that can't happen in practice?
+4. Does the surrounding code already handle this case?
+
+### What NOT to report as issues:
+- Singleton with placeholder that gets updated in init/start method
+- "Memory leak" in single-user desktop app with bounded data
+- "Race condition" when there's already a guard (e.g., `if (this.running) return`)
+- Intentional fire-and-forget patterns with error logging
+- "Missing cleanup" when cleanup exists in useEffect return or stop() method
+
+## Exclusions (Do NOT Review)
+
+- **Git submodule reference changes only**: Skip dirty submodule states, submodule commit hash changes in the main repo. Source code inside submodules CAN and SHOULD be reviewed when requested.
+
+## Output Format
+
+The review will be delivered as a comprehensive report with:
+- Severity-based issue categorization
+- Specific line references for each issue
+- Concrete suggestions for fixes
+- Overall code health assessment
+
+---
+
+모두 수정해줘

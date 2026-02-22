@@ -1,0 +1,67 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "3ad31bb9c195",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "CLAUDE.md",
+    "README.md",
+    "doc/architecture.md",
+    "doc/architecture_KR.md",
+    "doc/spec.md",
+    "doc/spec_KR.md",
+    "doc/windows_plan.md",
+    "index.html",
+    "package-lock.json",
+    "package.json",
+    "src-tauri/src/gitignore_filter.rs",
+    "src-tauri/src/main.rs",
+    "src-tauri/src/mem_search.rs",
+    "src-tauri/src/win/mft_indexer.rs",
+    "src-tauri/src/win/mod.rs",
+    "src-tauri/src/win/nonadmin_indexer.rs",
+    "src-tauri/src/win/rdcw_watcher.rs",
+    "src-tauri/tauri.conf.json",
+    "src/App.svelte",
+    "src/main.js",
+    "vite.config.js"
+  ],
+  "sessions": [
+    {
+      "metadata": "/3a/d31bb9c195/0/metadata.json",
+      "transcript": "/3a/d31bb9c195/0/full.jsonl",
+      "context": "/3a/d31bb9c195/0/context.md",
+      "content_hash": "/3a/d31bb9c195/0/content_hash.txt",
+      "prompt": "/3a/d31bb9c195/0/prompt.txt"
+    },
+    {
+      "metadata": "/3a/d31bb9c195/1/metadata.json",
+      "transcript": "/3a/d31bb9c195/1/full.jsonl",
+      "context": "/3a/d31bb9c195/1/context.md",
+      "content_hash": "/3a/d31bb9c195/1/content_hash.txt",
+      "prompt": "/3a/d31bb9c195/1/prompt.txt"
+    },
+    {
+      "metadata": "/3a/d31bb9c195/2/metadata.json",
+      "transcript": "/3a/d31bb9c195/2/full.jsonl",
+      "context": "/3a/d31bb9c195/2/context.md",
+      "content_hash": "/3a/d31bb9c195/2/content_hash.txt",
+      "prompt": "/3a/d31bb9c195/2/prompt.txt"
+    },
+    {
+      "metadata": "/3a/d31bb9c195/3/metadata.json",
+      "transcript": "/3a/d31bb9c195/3/full.jsonl",
+      "context": "/3a/d31bb9c195/3/context.md",
+      "content_hash": "/3a/d31bb9c195/3/content_hash.txt",
+      "prompt": "/3a/d31bb9c195/3/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 1773,
+    "cache_creation_tokens": 1266670,
+    "cache_read_tokens": 45238292,
+    "output_tokens": 65040,
+    "api_call_count": 458
+  }
+}

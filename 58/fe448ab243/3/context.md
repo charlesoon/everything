@@ -1,0 +1,12 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+아이템에 우클릭했을 때 finder에서 우클릭한것처럼 native context menu를 띄울 수 있을까?
+
+### Prompt 2
+
+그럼 option 1으로 구현해줄래?
+
