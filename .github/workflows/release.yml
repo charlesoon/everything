@@ -46,19 +46,19 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Everything ${{ github.ref_name }}"
           releaseBody: |
-            파일 검색 앱
+            File search app
 
-            ## macOS 설치 방법
-            1. DMG 파일을 다운로드합니다
-            2. DMG를 열고 Everything.app을 Applications 폴더로 드래그합니다
-            3. 최초 실행 시 "확인되지 않은 개발자" 경고가 나타나면:
-               - `시스템 설정 > 개인정보 보호 및 보안` 에서 "확인 없이 열기" 클릭
-               - 또는 터미널에서: `xattr -cr /Applications/Everything.app`
+            ## macOS Installation
+            1. Download the DMG file
+            2. Open the DMG and drag `Everything.app` to the Applications folder
+            3. If you see an "Unidentified Developer" warning on first launch:
+               - Go to `System Settings > Privacy & Security` and click "Open Anyway"
+               - Or run in Terminal: `xattr -cr /Applications/Everything.app`
 
-            ## Windows 설치 방법
-            1. .exe 인스톨러를 다운로드합니다
-            2. 인스톨러를 실행하여 설치합니다
-            3. 시작 메뉴 또는 바탕화면 바로가기로 실행합니다
+            ## Windows Installation
+            1. Download the `.exe` installer
+            2. Run the installer to install the app
+            3. Launch it from the Start menu or desktop shortcut
           releaseDraft: true
           prerelease: false
 
@@ -101,18 +101,18 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "Everything ${{ github.ref_name }}"
           releaseBody: |
-            파일 검색 앱
+            File search app
 
-            ## macOS 설치 방법
-            1. DMG 파일을 다운로드합니다
-            2. DMG를 열고 Everything.app을 Applications 폴더로 드래그합니다
-            3. 최초 실행 시 "확인되지 않은 개발자" 경고가 나타나면:
-               - `시스템 설정 > 개인정보 보호 및 보안` 에서 "확인 없이 열기" 클릭
-               - 또는 터미널에서: `xattr -cr /Applications/Everything.app`
+            ## macOS Installation
+            1. Download the DMG file
+            2. Open the DMG and drag `Everything.app` to the Applications folder
+            3. If you see an "Unidentified Developer" warning on first launch:
+               - Go to `System Settings > Privacy & Security` and click "Open Anyway"
+               - Or run in Terminal: `xattr -cr /Applications/Everything.app`
 
-            ## Windows 설치 방법
-            1. .exe 인스톨러를 다운로드합니다
-            2. 인스톨러를 실행하여 설치합니다
-            3. 시작 메뉴 또는 바탕화면 바로가기로 실행합니다
+            ## Windows Installation
+            1. Download the `.exe` installer
+            2. Run the installer to install the app
+            3. Launch it from the Start menu or desktop shortcut
           releaseDraft: true
           prerelease: false
