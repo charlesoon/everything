@@ -1,0 +1,28 @@
+{
+  "cli_version": "v0.4.3-4-g147bcffe-dirty",
+  "checkpoint_id": "77ff01e337fe",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "src-tauri\\src\\main.rs",
+    "src-tauri\\src\\win\\mft_indexer.rs",
+    "src\\App.svelte"
+  ],
+  "sessions": [
+    {
+      "metadata": "/77/ff01e337fe/0/metadata.json",
+      "transcript": "/77/ff01e337fe/0/full.jsonl",
+      "context": "/77/ff01e337fe/0/context.md",
+      "content_hash": "/77/ff01e337fe/0/content_hash.txt",
+      "prompt": "/77/ff01e337fe/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 101,
+    "cache_creation_tokens": 62620,
+    "cache_read_tokens": 4930783,
+    "output_tokens": 10511,
+    "api_call_count": 88
+  }
+}

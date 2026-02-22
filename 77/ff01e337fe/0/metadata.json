@@ -1,0 +1,33 @@
+{
+  "cli_version": "v0.4.3-4-g147bcffe-dirty",
+  "checkpoint_id": "77ff01e337fe",
+  "session_id": "760e29c4-9faf-4657-a2b1-10dd20155f69",
+  "strategy": "manual-commit",
+  "created_at": "2026-02-22T13:08:46.8314553Z",
+  "branch": "main",
+  "checkpoints_count": 5,
+  "files_touched": [
+    "src-tauri\\src\\main.rs",
+    "src-tauri\\src\\win\\mft_indexer.rs",
+    "src\\App.svelte"
+  ],
+  "agent": "Claude Code",
+  "transcript_identifier_at_start": "c95660f4-cf2f-4fc7-9ab7-cc87b0f58b5a",
+  "token_usage": {
+    "input_tokens": 101,
+    "cache_creation_tokens": 62620,
+    "cache_read_tokens": 4930783,
+    "output_tokens": 10511,
+    "api_call_count": 88
+  },
+  "initial_attribution": {
+    "calculated_at": "2026-02-22T13:08:45.9506398Z",
+    "agent_lines": 0,
+    "human_added": 0,
+    "human_modified": 157359,
+    "human_removed": 9158,
+    "total_committed": 543,
+    "agent_percentage": 0
+  },
+  "transcript_path": ".claude\\projects\\C--Users-USER-workspace-everything\\760e29c4-9faf-4657-a2b1-10dd20155f69.jsonl"
+}
