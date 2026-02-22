@@ -2499,7 +2499,6 @@
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
   }
 
-
   /* macOS Style OverlayScrollbars */
   :global(.os-theme-dark) {
     --os-size: 10px; /* Default width */

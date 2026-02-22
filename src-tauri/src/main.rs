@@ -3385,20 +3385,21 @@ fn execute_search(
                             LIMIT ?3 OFFSET ?4
                             "#,
                         );
-                        let stmt_result = conn.prepare(&prefix_sql_indexed)
-                            .or_else(|_| conn.prepare(&prefix_sql_fallback));
-                        if let Ok(mut stmt) = stmt_result {
-                            if let Ok(rows) = stmt.query_map(
+                        let mut stmt = match conn.prepare(&prefix_sql_indexed) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                eprintln!("[search] idx_entries_name_nocase unavailable, using fallback");
+                                conn.prepare(&prefix_sql_fallback).map_err(|e| e.to_string())?
+                            }
+                        };
+                        let rows = stmt
+                            .query_map(
                                 params![prefix_like, exact_query, remaining, adj_offset],
                                 row_to_entry,
-                            ) {
-                                for row in rows {
-                                    match row {
-                                        Ok(entry) => results.push(entry),
-                                        Err(_) => break,
-                                    }
-                                }
-                            }
+                            )
+                            .map_err(|e| e.to_string())?;
+                        for row in rows {
+                            results.push(row.map_err(|e| e.to_string())?);
                         }
                     }
 

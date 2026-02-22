@@ -401,6 +401,17 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
     });
 }
 
+/// Returns true if the path is a reparse point (junction or symlink).
+/// These cannot be reliably watched by ReadDirectoryChangesW and would
+/// duplicate coverage of their targets.
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        .unwrap_or(false)
+}
+
 /// Expand a directory into its children, excluding the subtree rooted at
 /// `exclude`. Used to avoid re-scanning the home directory when walking
 /// its parent (e.g. C:\Users).
@@ -420,7 +431,7 @@ fn expand_children_excluding(
         if child == exclude || exclude.starts_with(&child) {
             continue;
         }
-        if !child.is_dir() {
+        if !child.is_dir() || is_reparse_point(&child) {
             continue;
         }
         if should_skip_path_ext(
@@ -454,7 +465,7 @@ pub fn compute_watch_roots(state: &AppState) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(&state.scan_root) {
         for e in entries.flatten() {
             let path = e.path();
-            if path == state.home_dir || !path.is_dir() {
+            if path == state.home_dir || !path.is_dir() || is_reparse_point(&path) {
                 continue;
             }
             if should_skip_path_ext(&path, &arc_roots, &arc_patterns, Some(&gi_filter), None) {
