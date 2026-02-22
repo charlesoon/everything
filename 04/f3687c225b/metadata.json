@@ -3,7 +3,7 @@
   "checkpoint_id": "04f3687c225b",
   "strategy": "manual-commit",
   "branch": "main",
-  "checkpoints_count": 4,
+  "checkpoints_count": 5,
   "files_touched": [
     "src-tauri/gen/schemas/macOS-schema.json",
     "src-tauri/src/gitignore_filter.rs",
@@ -33,13 +33,20 @@
       "context": "/04/f3687c225b/2/context.md",
       "content_hash": "/04/f3687c225b/2/content_hash.txt",
       "prompt": "/04/f3687c225b/2/prompt.txt"
+    },
+    {
+      "metadata": "/04/f3687c225b/3/metadata.json",
+      "transcript": "/04/f3687c225b/3/full.jsonl",
+      "context": "/04/f3687c225b/3/context.md",
+      "content_hash": "/04/f3687c225b/3/content_hash.txt",
+      "prompt": "/04/f3687c225b/3/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 448,
-    "cache_creation_tokens": 466071,
-    "cache_read_tokens": 35180348,
-    "output_tokens": 35110,
-    "api_call_count": 350
+    "input_tokens": 517,
+    "cache_creation_tokens": 582915,
+    "cache_read_tokens": 42182832,
+    "output_tokens": 54563,
+    "api_call_count": 417
   }
 }
