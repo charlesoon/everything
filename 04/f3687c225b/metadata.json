@@ -5,8 +5,11 @@
   "branch": "main",
   "checkpoints_count": 4,
   "files_touched": [
+    "src-tauri/gen/schemas/macOS-schema.json",
     "src-tauri/src/gitignore_filter.rs",
     "src-tauri/src/main.rs",
+    "src-tauri/src/win/mft_indexer.rs",
+    "src-tauri/tauri.conf.json",
     "src/App.svelte"
   ],
   "sessions": [
@@ -23,13 +26,20 @@
       "context": "/04/f3687c225b/1/context.md",
       "content_hash": "/04/f3687c225b/1/content_hash.txt",
       "prompt": "/04/f3687c225b/1/prompt.txt"
+    },
+    {
+      "metadata": "/04/f3687c225b/2/metadata.json",
+      "transcript": "/04/f3687c225b/2/full.jsonl",
+      "context": "/04/f3687c225b/2/context.md",
+      "content_hash": "/04/f3687c225b/2/content_hash.txt",
+      "prompt": "/04/f3687c225b/2/prompt.txt"
     }
   ],
   "token_usage": {
-    "input_tokens": 426,
-    "cache_creation_tokens": 438040,
-    "cache_read_tokens": 33913104,
-    "output_tokens": 34971,
-    "api_call_count": 334
+    "input_tokens": 448,
+    "cache_creation_tokens": 466071,
+    "cache_read_tokens": 35180348,
+    "output_tokens": 35110,
+    "api_call_count": 350
   }
 }
