@@ -44,6 +44,15 @@ pub fn glob_to_like(pattern: &str) -> String {
     out
 }
 
+pub fn last_path_separator(s: &str) -> Option<usize> {
+    match (s.rfind('/'), s.rfind('\\')) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 pub fn parse_query(query: &str) -> SearchMode {
     let trimmed = query.trim();
 
@@ -51,17 +60,19 @@ pub fn parse_query(query: &str) -> SearchMode {
         return SearchMode::Empty;
     }
 
-    if trimmed.contains('/') {
-        let last_slash = trimmed.rfind('/').unwrap();
-        let dir_part = trimmed[..last_slash].trim();
-        let name_part = trimmed[last_slash + 1..].trim();
+    if let Some(last_sep) = last_path_separator(trimmed) {
+        let dir_part_raw = trimmed[..last_sep].trim();
+        let name_part = trimmed[last_sep + 1..].trim();
+
+        // Accept both '/' and '\' as path separators from user input.
+        let dir_part = dir_part_raw.replace('\\', "/");
 
         let path_like = if dir_part.is_empty() {
             "%".to_string()
-        } else if has_glob_chars(dir_part) {
-            format!("%{}/%", glob_to_like(dir_part))
+        } else if has_glob_chars(&dir_part) {
+            format!("%{}/%", glob_to_like(&dir_part))
         } else {
-            format!("%{}/%", escape_like(dir_part))
+            format!("%{}/%", escape_like(&dir_part))
         };
 
         let name_like = if name_part.is_empty() {
@@ -87,7 +98,11 @@ pub fn parse_query(query: &str) -> SearchMode {
     }
 
     if let Some(ext_part) = trimmed.strip_prefix("*.") {
-        if !ext_part.is_empty() && !ext_part.contains('/') && !has_glob_chars(ext_part) {
+        if !ext_part.is_empty()
+            && !ext_part.contains('/')
+            && !ext_part.contains('\\')
+            && !has_glob_chars(ext_part)
+        {
             return SearchMode::ExtSearch {
                 ext: ext_part.to_lowercase(),
                 name_like: glob_to_like(trimmed),
@@ -359,6 +374,46 @@ mod tests {
         // dir/*.png should remain PathSearch, not ExtSearch
         assert!(matches!(
             parse_query("dir/*.png"),
+            SearchMode::PathSearch { .. }
+        ));
+    }
+
+    #[test]
+    fn path_search_backslash_dir_only() {
+        match parse_query("desktop\\") {
+            SearchMode::PathSearch {
+                path_like,
+                name_like,
+                dir_hint,
+            } => {
+                assert_eq!(path_like, "%desktop/%");
+                assert_eq!(name_like, "%");
+                assert_eq!(dir_hint, "desktop");
+            }
+            other => panic!("expected PathSearch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn path_search_backslash_dir_and_name() {
+        match parse_query("desktop\\*.png") {
+            SearchMode::PathSearch {
+                path_like,
+                name_like,
+                dir_hint,
+            } => {
+                assert_eq!(path_like, "%desktop/%");
+                assert_eq!(name_like, "%.png");
+                assert_eq!(dir_hint, "desktop");
+            }
+            other => panic!("expected PathSearch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ext_search_not_for_backslash_path() {
+        assert!(matches!(
+            parse_query("dir\\*.png"),
             SearchMode::PathSearch { .. }
         ));
     }

@@ -280,8 +280,14 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     );
 
     // ── Progressive Ready: build partial MemIndex from dirs only ──
-    eprintln!("[win/mft +{}] building partial MemIndex ({} dirs)...", ts(), dir_results.len());
-    let early_entries = dir_results.clone();
+    let early_cap = super::EARLY_MEM_INDEX_LIMIT.min(dir_results.len());
+    eprintln!(
+        "[win/mft +{}] building partial MemIndex ({} of {} dirs)...",
+        ts(),
+        early_cap,
+        dir_results.len()
+    );
+    let early_entries: Vec<CompactEntry> = dir_results.iter().take(early_cap).cloned().collect();
     let early_idx = Arc::new(crate::mem_search::MemIndex::build(early_entries));
     eprintln!("[win/mft +{}] partial MemIndex built", ts());
     *state.mem_index.write() = Some(Arc::clone(&early_idx));

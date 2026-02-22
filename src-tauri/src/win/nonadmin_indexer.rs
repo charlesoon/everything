@@ -113,10 +113,13 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
     let mut all_entries: Vec<CompactEntry> = Vec::with_capacity(2_000_000);
 
     if !shallow.entries.is_empty() {
-        let early_idx =
-            Arc::new(crate::mem_search::MemIndex::build(shallow.entries.clone()));
+        let early_cap = super::EARLY_MEM_INDEX_LIMIT.min(shallow.entries.len());
+        let early_entries: Vec<CompactEntry> =
+            shallow.entries.iter().take(early_cap).cloned().collect();
+        let early_idx = Arc::new(crate::mem_search::MemIndex::build(early_entries));
         *state.mem_index.write() = Some(early_idx);
 
+        let shallow_total = shallow.entries.len();
         all_entries.extend(shallow.entries);
 
         {
@@ -129,9 +132,10 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
         emit_index_progress(&app, scanned, indexed, String::new());
 
         eprintln!(
-            "[nonadmin +{}] Phase 1 MemIndex built ({} entries searchable)",
+            "[nonadmin +{}] Phase 1 MemIndex built ({} of {} entries searchable)",
             ts(),
-            indexed
+            early_cap,
+            shallow_total
         );
     }
 

@@ -9,6 +9,8 @@ pub mod context_menu;
 pub mod search_catchup;
 pub mod icon;
 
+pub const EARLY_MEM_INDEX_LIMIT: usize = 200_000;
+
 use tauri::AppHandle;
 
 use std::sync::atomic::Ordering as AtomicOrdering;

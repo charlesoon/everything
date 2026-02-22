@@ -41,6 +41,11 @@ notify = "7"
 rayon = "1"
 png = "0.17"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

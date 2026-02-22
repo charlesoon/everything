@@ -55,10 +55,9 @@ enum NameMatch {
 fn parse_live_query(query: &str) -> QueryMode {
     let trimmed = query.trim();
 
-    if trimmed.contains('/') {
-        let last_slash = trimmed.rfind('/').unwrap();
-        let dir_part = trimmed[..last_slash].trim().to_lowercase();
-        let name_part = trimmed[last_slash + 1..].trim();
+    if let Some(last_sep) = crate::query::last_path_separator(trimmed) {
+        let dir_part_raw = trimmed[..last_sep].trim();
+        let name_part = trimmed[last_sep + 1..].trim();
 
         let name_mode = if name_part.is_empty() {
             NameMatch::Any
@@ -74,10 +73,11 @@ fn parse_live_query(query: &str) -> QueryMode {
             )
         };
 
+        let dir_part = dir_part_raw.replace('\\', "/").to_lowercase();
         let dir_lower = if dir_part.is_empty() {
             Vec::new()
         } else {
-            format!("/{}/", dir_part).into_bytes()
+            format!("/{}/", dir_part.trim_matches('/')).into_bytes()
         };
 
         return QueryMode::PathSearch {
@@ -129,13 +129,42 @@ fn ascii_icontains(haystack: &[u8], needle: &[u8]) -> bool {
     h.contains(n.as_ref())
 }
 
-fn ascii_iends_with(haystack: &[u8], needle: &[u8]) -> bool {
+fn ascii_path_fold(byte: u8) -> u8 {
+    if byte == b'\\' {
+        b'/'
+    } else {
+        byte.to_ascii_lowercase()
+    }
+}
+
+fn ascii_path_icontains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
     if needle.len() > haystack.len() {
         return false;
     }
+
+    let end = haystack.len() - needle.len();
+    'outer: for i in 0..=end {
+        for j in 0..needle.len() {
+            if ascii_path_fold(haystack[i + j]) != ascii_path_fold(needle[j]) {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+fn ascii_path_iends_with(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
     let start = haystack.len() - needle.len();
     for i in 0..needle.len() {
-        if haystack[start + i].to_ascii_lowercase() != needle[i] {
+        if ascii_path_fold(haystack[start + i]) != ascii_path_fold(needle[i]) {
             return false;
         }
     }
@@ -160,7 +189,9 @@ fn matches_query_fast(mode: &QueryMode, name: &[u8], dir: Option<&[u8]>) -> bool
             if !dir_lower.is_empty() {
                 let d = dir.unwrap_or(&[]);
                 let without_trailing = &dir_lower[..dir_lower.len() - 1];
-                if !ascii_icontains(d, dir_lower) && !ascii_iends_with(d, without_trailing) {
+                if !ascii_path_icontains(d, dir_lower)
+                    && !ascii_path_iends_with(d, without_trailing)
+                {
                     return false;
                 }
             }
@@ -213,8 +244,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 // Simplified relevance ranking (0-3) for live filesystem search results.
 // Differs from the main.rs version (0-5) which includes path-aware ranking
 // for DB/indexed results (e.g., directory depth, path component matches).
-fn relevance_rank(entry: &EntryDto, query_lower: &str) -> u8 {
-    let name_lower = entry.name.to_lowercase();
+fn relevance_rank(name_lower: &str, query_lower: &str) -> u8 {
     if name_lower == query_lower {
         return 0;
     }
@@ -381,41 +411,60 @@ pub fn run_fd_search(
     LiveSearchResult { entries, timed_out }
 }
 
-fn sort_by_relevance(entries: &mut [EntryDto], query_lower: &str, sort_by: &str, sort_dir: &str) {
-    entries.sort_by(|a, b| {
-        let rank_cmp = relevance_rank(a, query_lower).cmp(&relevance_rank(b, query_lower));
+fn sort_by_relevance(entries: &mut Vec<EntryDto>, query_lower: &str, sort_by: &str, sort_dir: &str) {
+    if entries.len() <= 1 {
+        return;
+    }
+
+    let sort_desc = sort_dir == "desc";
+    let mut decorated: Vec<(EntryDto, String, String, String, u8)> = std::mem::take(entries)
+        .into_iter()
+        .map(|entry| {
+            let name_lower = entry.name.to_lowercase();
+            let dir_lower = entry.dir.to_lowercase();
+            let path_lower = entry.path.to_lowercase();
+            let rank = relevance_rank(&name_lower, query_lower);
+            (entry, name_lower, dir_lower, path_lower, rank)
+        })
+        .collect();
+
+    decorated.sort_unstable_by(|a, b| {
+        let rank_cmp = a.4.cmp(&b.4);
         if rank_cmp != Ordering::Equal {
             return rank_cmp;
         }
+
         match sort_by {
             "mtime" => {
-                let lhs = a.mtime.unwrap_or(0);
-                let rhs = b.mtime.unwrap_or(0);
-                let primary = if sort_dir == "desc" {
-                    rhs.cmp(&lhs)
-                } else {
-                    lhs.cmp(&rhs)
-                };
-                primary.then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                let lhs = a.0.mtime.unwrap_or(0);
+                let rhs = b.0.mtime.unwrap_or(0);
+                let primary = if sort_desc { rhs.cmp(&lhs) } else { lhs.cmp(&rhs) };
+                primary
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.3.cmp(&b.3))
             }
             "dir" => {
-                let primary = if sort_dir == "desc" {
-                    b.dir.to_lowercase().cmp(&a.dir.to_lowercase())
+                let primary = if sort_desc {
+                    b.2.cmp(&a.2)
                 } else {
-                    a.dir.to_lowercase().cmp(&b.dir.to_lowercase())
+                    a.2.cmp(&b.2)
                 };
-                primary.then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                primary
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.3.cmp(&b.3))
             }
             _ => {
-                let primary = if sort_dir == "desc" {
-                    b.name.to_lowercase().cmp(&a.name.to_lowercase())
+                let primary = if sort_desc {
+                    b.1.cmp(&a.1)
                 } else {
-                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                    a.1.cmp(&b.1)
                 };
-                primary.then(a.path.to_lowercase().cmp(&b.path.to_lowercase()))
+                primary.then_with(|| a.3.cmp(&b.3))
             }
         }
     });
+
+    entries.extend(decorated.into_iter().map(|(entry, _, _, _, _)| entry));
 }
 
 #[cfg(test)]
@@ -554,6 +603,27 @@ mod tests {
             &mode,
             b"main.rs",
             Some(b"/home/user/docs")
+        ));
+    }
+
+
+    #[test]
+    fn query_mode_path_search_backslash_bytes() {
+        let mode = parse_live_query("desktop\\*.png");
+        assert!(matches_query_fast(
+            &mode,
+            b"photo.png",
+            Some(b"/users/al/desktop")
+        ));
+        assert!(matches_query_fast(
+            &mode,
+            b"photo.png",
+            Some(b"\\Users\\al\\desktop")
+        ));
+        assert!(!matches_query_fast(
+            &mode,
+            b"photo.png",
+            Some(b"\\Users\\al\\documents")
         ));
     }
 }

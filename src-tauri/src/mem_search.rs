@@ -73,14 +73,14 @@ impl MemIndex {
             .collect();
         let t1 = t0.elapsed().as_millis();
 
-        // Phase 2: sorted_idx — parallel sort
+        // Phase 2: sorted_idx -- parallel sort
         let mut sorted_idx: Vec<u32> = (0..n as u32).collect();
         sorted_idx.par_sort_unstable_by(|&a, &b| {
             names_lower[a as usize].cmp(&names_lower[b as usize])
         });
         let t2 = t0.elapsed().as_millis();
 
-        // Phase 3: ext_map + dir_map (sequential — HashMap building is inherently serial)
+        // Phase 3: ext_map + dir_map (sequential -- HashMap building is inherently serial)
         let mut ext_map: HashMap<String, Vec<u32>> = HashMap::new();
         let mut dir_map: HashMap<String, Vec<u32>> = HashMap::new();
         for (i, e) in entries.iter().enumerate() {
@@ -178,7 +178,7 @@ pub fn search_mem_index(
                     .map(|&i| mem_index.entries[i as usize].to_entry_dto())
                     .collect()
             } else {
-                // Default: name sorted — use sorted_idx directly
+                // Default: name sorted -- use sorted_idx directly
                 let iter = if sort_dir == "desc" {
                     // Reverse iteration
                     let rstart = mem_index.sorted_idx.len().saturating_sub(start + effective_limit as usize);
@@ -208,7 +208,7 @@ pub fn search_mem_index(
         return page;
     }
 
-    // ExtSearch: values are pre-sorted by name_lower — skip sort, paginate directly
+    // ExtSearch: values are pre-sorted by name_lower -- skip sort, paginate directly
     if let SearchMode::ExtSearch { ext, .. } = &mode {
         let ext_lower = ext.to_lowercase();
         let page = match mem_index.ext_map.get(&ext_lower) {
@@ -226,31 +226,34 @@ pub fn search_mem_index(
                             mem_index.entries[idx as usize].mtime
                         }
                     };
-                    let n = lim.min(sorted.len());
-                    if n < sorted.len() {
-                        sorted.select_nth_unstable_by(n, |&a, &b| {
+                    let need = start.saturating_add(lim).min(sorted.len());
+                    if need == 0 || start >= sorted.len() {
+                        Vec::new()
+                    } else {
+                        if need < sorted.len() {
+                            // Keep only the needed candidates before final sort.
+                            let nth = need - 1;
+                            sorted.select_nth_unstable_by(nth, |&a, &b| {
+                                cmp_opt_none_last(opt_val(a), opt_val(b), desc)
+                            });
+                            sorted.truncate(need);
+                        }
+                        sorted.sort_unstable_by(|&a, &b| {
                             cmp_opt_none_last(opt_val(a), opt_val(b), desc)
                         });
-                        sorted.truncate(n);
-                    }
-                    sorted.sort_unstable_by(|&a, &b| {
-                        cmp_opt_none_last(opt_val(a), opt_val(b), desc)
-                    });
-                    let end = (start + lim).min(sorted.len());
-                    if start < sorted.len() {
-                        sorted[start..end].iter()
-                            .map(|&i| mem_index.entries[i as usize].to_entry_dto()).collect()
-                    } else {
-                        Vec::new()
+                        sorted[start..need]
+                            .iter()
+                            .map(|&i| mem_index.entries[i as usize].to_entry_dto())
+                            .collect()
                     }
                 } else if sort_dir == "desc" {
-                    // Pre-sorted by name asc, need desc — reverse iterate
+                    // Pre-sorted by name asc, need desc -- reverse iterate
                     let rstart = idxs.len().saturating_sub(start + lim);
                     let rend = idxs.len().saturating_sub(start);
                     idxs[rstart..rend].iter().rev()
                         .map(|&i| mem_index.entries[i as usize].to_entry_dto()).collect()
                 } else {
-                    // Pre-sorted by name asc — direct slice
+                    // Pre-sorted by name asc -- direct slice
                     let end = (start + lim).min(idxs.len());
                     if start < idxs.len() {
                         idxs[start..end].iter()

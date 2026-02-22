@@ -29,7 +29,7 @@ const POLL_BUSY: Duration = Duration::from_millis(100);
 // Debounce for flushing accumulated USN changes to DB.
 // Higher than macOS FSEvent debounce (300ms) because USN records accumulate
 // many noisy system changes, and we want fewer DB round-trips.
-const USN_CHANGE_DEBOUNCE: Duration = Duration::from_secs(30);
+const USN_CHANGE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 const FALLBACK_CACHE_CLEAR_INTERVAL: Duration = Duration::from_secs(120);
 

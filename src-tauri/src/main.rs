@@ -52,7 +52,11 @@ const DEFERRED_DIR_NAMES: &[&str] = &[
     "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs",
 ];
 const SHALLOW_SCAN_DEPTH: usize = 6;
-const JWALK_NUM_THREADS: usize = 8;
+fn jwalk_num_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(4).min(16))
+        .unwrap_or(8)
+}
 
 pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".git",
@@ -167,8 +171,9 @@ struct SearchResultDto {
     entries: Vec<EntryDto>,
     mode_label: String,
     /// Total number of results matching the query (ignoring LIMIT/OFFSET).
-    /// 0 means unknown — frontend should fall back to entries.length.
     total_count: u32,
+    /// True when total_count is exact. False means frontend should treat it as unknown.
+    total_known: bool,
 }
 
 #[allow(dead_code)]
@@ -302,7 +307,7 @@ pub(crate) struct AppState {
     pub(crate) recent_ops: Arc<Mutex<Vec<RecentOp>>>,
     pub(crate) icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub(crate) fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>,
-    pub(crate) negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>,
+    pub(crate) negative_name_cache: Arc<Mutex<HashMap<String, NegativeNameEntry>>>,
     pub(crate) ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,
     pub(crate) gitignore: Arc<gitignore_filter::LazyGitignoreFilter>,
     /// In-memory index for instant search while DB upsert runs in background.
@@ -318,7 +323,6 @@ pub(crate) struct AppState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct NegativeNameEntry {
-    query_lower: String,
     created_at: Instant,
     fallback_checked: bool,
 }
@@ -395,7 +399,7 @@ pub(crate) fn db_connection(db_path: &Path) -> AppResult<Connection> {
 }
 
 fn db_connection_for_search(db_path: &Path) -> AppResult<Connection> {
-    let conn = db_connection_with_timeout(db_path, 200)?;
+    let conn = db_connection_with_timeout(db_path, 500)?;
     conn.execute_batch(
         "PRAGMA cache_size = -32768;
          PRAGMA mmap_size = 268435456;",
@@ -410,7 +414,7 @@ pub(crate) fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
         PRAGMA synchronous = NORMAL;
         PRAGMA cache_size = -65536;
         PRAGMA mmap_size = 268435456;
-        PRAGMA wal_autocheckpoint = 0;
+        PRAGMA wal_autocheckpoint = 10000;
         "#,
     )
     .map_err(|e| e.to_string())
@@ -421,7 +425,7 @@ pub(crate) fn restore_normal_pragmas(conn: &Connection) -> AppResult<()> {
         r#"
         PRAGMA synchronous = NORMAL;
         PRAGMA cache_size = -16384;
-        PRAGMA mmap_size = 0;
+        PRAGMA mmap_size = 268435456;
         PRAGMA wal_autocheckpoint = 1000;
         "#,
     )
@@ -548,9 +552,9 @@ pub(crate) fn invalidate_search_caches(state: &AppState) {
     state.negative_name_cache.lock().clear();
 }
 
-fn prune_negative_name_cache(cache: &mut Vec<NegativeNameEntry>) {
+fn prune_negative_name_cache(cache: &mut HashMap<String, NegativeNameEntry>) {
     let now = Instant::now();
-    cache.retain(|entry| now.duration_since(entry.created_at) <= NEGATIVE_CACHE_TTL);
+    cache.retain(|_, entry| now.duration_since(entry.created_at) <= NEGATIVE_CACHE_TTL);
 }
 
 fn negative_name_cache_lookup(state: &AppState, query: &str) -> Option<NegativeCacheHit> {
@@ -563,9 +567,10 @@ fn negative_name_cache_lookup(state: &AppState, query: &str) -> Option<NegativeC
     prune_negative_name_cache(&mut cache);
     cache
         .iter()
-        .find(|entry| q.contains(&entry.query_lower))
-        .map(|entry| NegativeCacheHit {
-            query_lower: entry.query_lower.clone(),
+        .filter(|(key, _)| q.contains(key.as_str()))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(key, entry)| NegativeCacheHit {
+            query_lower: key.clone(),
             age: now.duration_since(entry.created_at),
             fallback_checked: entry.fallback_checked,
         })
@@ -579,22 +584,26 @@ fn remember_negative_name_query(state: &AppState, query: &str) {
     let mut cache = state.negative_name_cache.lock();
     prune_negative_name_cache(&mut cache);
 
-    if cache
-        .iter()
-        .any(|existing| existing.query_lower == normalized)
-    {
+    if cache.contains_key(&normalized) {
         return;
     }
 
-    cache.push(NegativeNameEntry {
-        query_lower: normalized,
-        created_at: Instant::now(),
-        fallback_checked: false,
-    });
+    cache.insert(
+        normalized,
+        NegativeNameEntry {
+            created_at: Instant::now(),
+            fallback_checked: false,
+        },
+    );
     const MAX_NEGATIVE_CACHE: usize = 512;
     if cache.len() > MAX_NEGATIVE_CACHE {
+        let mut entries: Vec<_> =
+            cache.iter().map(|(k, v)| (k.clone(), v.created_at)).collect();
+        entries.sort_by_key(|(_, t)| *t);
         let drop_count = cache.len() - MAX_NEGATIVE_CACHE;
-        cache.drain(0..drop_count);
+        for (key, _) in entries.into_iter().take(drop_count) {
+            cache.remove(&key);
+        }
     }
 }
 
@@ -603,16 +612,12 @@ fn remove_negative_name_query(state: &AppState, query: &str) {
         return;
     }
     let normalized = query.to_lowercase();
-    let mut cache = state.negative_name_cache.lock();
-    cache.retain(|entry| entry.query_lower != normalized);
+    state.negative_name_cache.lock().remove(&normalized);
 }
 
 fn mark_negative_name_fallback_checked(state: &AppState, query_lower: &str) {
     let mut cache = state.negative_name_cache.lock();
-    if let Some(entry) = cache
-        .iter_mut()
-        .find(|entry| entry.query_lower == query_lower)
-    {
+    if let Some(entry) = cache.get_mut(query_lower) {
         entry.fallback_checked = true;
     }
 }
@@ -1464,28 +1469,27 @@ fn entry_cmp(a: &EntryDto, b: &EntryDto, sort_by: &str, sort_dir: &str) -> Order
     }
 }
 
-fn relevance_rank(entry: &EntryDto, query: &str) -> u8 {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
+fn relevance_rank(entry: &EntryDto, query_lower: &str, path_suffix: &str) -> u8 {
+    if query_lower.is_empty() {
         return 255;
     }
 
     let name = entry.name.to_lowercase();
     let path = entry.path.to_lowercase();
 
-    if name == q {
+    if name == query_lower {
         return 0;
     }
-    if name.starts_with(&q) {
+    if name.starts_with(query_lower) {
         return 1;
     }
-    if name.contains(&q) {
+    if name.contains(query_lower) {
         return 2;
     }
-    if path.ends_with(&format!("/{q}")) {
+    if path.ends_with(path_suffix) {
         return 3;
     }
-    if path.contains(&q) {
+    if path.contains(query_lower) {
         return 4;
     }
 
@@ -1506,14 +1510,16 @@ fn sort_entries_with_relevance(
     sort_by: &str,
     sort_dir: &str,
 ) {
-    if query.trim().is_empty() {
+    let query_lower = query.trim().to_lowercase();
+    if query_lower.is_empty() {
         sort_entries(entries, sort_by, sort_dir);
         return;
     }
+    let path_suffix = format!("/{query_lower}");
 
     entries.sort_by(|a, b| {
-        let ra = relevance_rank(a, query);
-        let rb = relevance_rank(b, query);
+        let ra = relevance_rank(a, &query_lower, &path_suffix);
+        let rb = relevance_rank(b, &query_lower, &path_suffix);
         if ra != rb {
             return ra.cmp(&rb);
         }
@@ -1897,7 +1903,7 @@ fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) 
         return Ok(());
     }
 
-    // Mark index as incomplete — cleared when run_incremental_index succeeds
+    // Mark index as incomplete -- cleared when run_incremental_index succeeds
     if let Ok(c) = db_connection(&state.db_path) {
         let _ = set_meta(&c, "index_complete", "0");
     }
@@ -2150,7 +2156,7 @@ fn run_incremental_index_inner(
 
 
     for pass in 0..2u8 {
-        // Fresh index: single unlimited-depth pass — avoids double filesystem traversal
+        // Fresh index: single unlimited-depth pass -- avoids double filesystem traversal
         if pass == 1 && is_fresh {
             break;
         }
@@ -2181,8 +2187,8 @@ fn run_incremental_index_inner(
             let mut builder = jwalk::WalkDir::new(root)
                 .follow_links(false)
                 .skip_hidden(false)
-                .parallelism(jwalk::Parallelism::RayonNewPool(JWALK_NUM_THREADS));
-            // Fresh index: no depth limit — walk everything in one pass
+                .parallelism(jwalk::Parallelism::RayonNewPool(jwalk_num_threads()));
+            // Fresh index: no depth limit -- walk everything in one pass
             if pass == 0 && !is_fresh {
                 builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
             }
@@ -3016,16 +3022,23 @@ fn search_log_enabled() -> bool {
 }
 
 /// Returns the total number of entries matching `query` without LIMIT/OFFSET.
-/// Returns 0 when the total is unknown or not worth computing (PathSearch with
-/// complex WHERE, non-zero offset, or non-SQL paths).
-fn compute_total_count(db_path: &Path, home_dir: &Path, execution: &SearchExecution) -> u32 {
+/// Returns `None` when the total is unknown or intentionally skipped.
+fn compute_total_count(
+    db_path: &Path,
+    home_dir: &Path,
+    execution: &SearchExecution,
+) -> Option<u32> {
     // When fewer results than the limit were returned the total is exact.
     if (execution.results.len() as u32) < execution.effective_limit {
-        return execution.offset.saturating_add(execution.results.len() as u32);
+        return Some(
+            execution
+                .offset
+                .saturating_add(execution.results.len() as u32),
+        );
     }
     // For paginated pages after the first we leave total tracking to the frontend.
     if execution.offset > 0 {
-        return 0;
+        return None;
     }
     // Non-SQL fast paths already return all matching entries.
     if execution.mode_label.starts_with("mem_")
@@ -3034,13 +3047,13 @@ fn compute_total_count(db_path: &Path, home_dir: &Path, execution: &SearchExecut
         || execution.mode_label == "find_fallback"
         || execution.mode_label == "name_neg_cache"
     {
-        return execution.results.len() as u32;
+        return Some(execution.results.len() as u32);
     }
     let Ok(conn) = db_connection_for_search(db_path) else {
-        return 0;
+        return None;
     };
     let mode = parse_query(&execution.query);
-    match mode {
+    let total = match mode {
         SearchMode::Empty => conn
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap_or(0),
@@ -3080,7 +3093,11 @@ fn compute_total_count(db_path: &Path, home_dir: &Path, execution: &SearchExecut
                 |r| r.get(0),
             )
             .unwrap_or(0),
-        SearchMode::PathSearch { name_like, dir_hint, .. } => {
+        SearchMode::PathSearch {
+            name_like,
+            dir_hint,
+            ..
+        } => {
             let resolved_dirs = resolve_dir_hint(home_dir, &dir_hint)
                 .map(|p| vec![p.to_string_lossy().to_string()])
                 .unwrap_or_default();
@@ -3123,9 +3140,8 @@ fn compute_total_count(db_path: &Path, home_dir: &Path, execution: &SearchExecut
                         format!(" AND e.name LIKE ?{} ESCAPE '\\'", i + 1)
                     }
                 };
-                let sql = format!(
-                    "SELECT COUNT(*) FROM entries e WHERE ({dir_where}){name_filter}"
-                );
+                let sql =
+                    format!("SELECT COUNT(*) FROM entries e WHERE ({dir_where}){name_filter}");
                 conn.query_row(&sql, params_from_iter(sql_params.iter()), |r| r.get(0))
                     .unwrap_or(0)
             } else {
@@ -3160,7 +3176,9 @@ fn compute_total_count(db_path: &Path, home_dir: &Path, execution: &SearchExecut
                 }
             }
         }
-    }
+    };
+
+    Some(total)
 }
 
 fn execute_search(
@@ -3811,6 +3829,7 @@ async fn search(
     offset: Option<u32>,
     sort_by: Option<String>,
     sort_dir: Option<String>,
+    include_total: Option<bool>,
     state: State<'_, AppState>,
 ) -> AppResult<SearchResultDto> {
     let state = state.inner().clone();
@@ -3848,18 +3867,32 @@ async fn search(
             ));
         }
 
+        let include_total = include_total.unwrap_or(true);
         let count_started = Instant::now();
-        let total_count = compute_total_count(&state.db_path, &state.home_dir, &execution);
-        let count_elapsed_ms = count_started.elapsed().as_secs_f64() * 1000.0;
+        let (total_count, total_known) = if include_total {
+            match compute_total_count(&state.db_path, &state.home_dir, &execution) {
+                Some(v) => (v, true),
+                None => (0, false),
+            }
+        } else {
+            (0, false)
+        };
+        let count_elapsed_ms = if include_total {
+            count_started.elapsed().as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+
         let rpc_elapsed_ms = rpc_started.elapsed().as_secs_f64() * 1000.0;
         if cfg!(debug_assertions) {
             let db_ready = state.db_ready.load(AtomicOrdering::Acquire);
             let indexing_active = state.indexing_active.load(AtomicOrdering::Acquire);
             eprintln!(
-                "[rpc/search] total={:.3}ms execute={:.3}ms total_count={:.3}ms query={:?} mode={} sort={}/{} limit={} offset={} results={} total_count={} db_ready={} indexing_active={}",
+                "[rpc/search] total={:.3}ms execute={:.3}ms total_count={:.3}ms include_total={} query={:?} mode={} sort={}/{} limit={} offset={} results={} total_count={} total_known={} db_ready={} indexing_active={}",
                 rpc_elapsed_ms,
                 execute_elapsed_ms,
                 count_elapsed_ms,
+                include_total,
                 execution.query,
                 execution.mode_label,
                 execution.sort_by,
@@ -3868,6 +3901,7 @@ async fn search(
                 execution.offset,
                 execution.results.len(),
                 total_count,
+                total_known,
                 db_ready,
                 indexing_active,
             );
@@ -3876,6 +3910,7 @@ async fn search(
             entries: execution.results,
             mode_label: execution.mode_label,
             total_count,
+            total_known,
         })
     })
     .await
@@ -4308,31 +4343,48 @@ async fn fd_search(
             });
         }
 
-        let mut cache = state.fd_search_cache.lock();
+        {
+            let cache = state.fd_search_cache.lock();
+            if let Some(cached) = cache.as_ref() {
+                let cache_hit = cached.query == query
+                    && cached.sort_by == sort_by
+                    && cached.sort_dir == sort_dir
+                    && cached.ignore_fingerprint == ignore_fingerprint;
+                if cache_hit {
+                    let total = cached.entries.len() as u64;
+                    let end = (offset + limit).min(cached.entries.len());
+                    let page = if offset < cached.entries.len() {
+                        cached.entries[offset..end].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(FdSearchResultDto {
+                        entries: page,
+                        total,
+                        timed_out: false,
+                    });
+                }
+            }
+        }
 
-        let cache_hit = cache
-            .as_ref()
-            .map(|c| {
-                c.query == query
-                    && c.sort_by == sort_by
-                    && c.sort_dir == sort_dir
-                    && c.ignore_fingerprint == ignore_fingerprint
-            })
-            .unwrap_or(false);
+        let result = fd_search::run_fd_search(
+            &state.scan_root,
+            &runtime_ignored_roots,
+            &runtime_ignored_patterns,
+            &query,
+            &sort_by,
+            &sort_dir,
+        );
+        let total = result.entries.len() as u64;
+        let end = (offset + limit).min(result.entries.len());
+        let page = if offset < result.entries.len() {
+            result.entries[offset..end].to_vec()
+        } else {
+            Vec::new()
+        };
 
-        let mut timed_out = false;
-
-        if !cache_hit {
-            let result = fd_search::run_fd_search(
-                &state.scan_root,
-                &runtime_ignored_roots,
-                &runtime_ignored_patterns,
-                &query,
-                &sort_by,
-                &sort_dir,
-            );
-            timed_out = result.timed_out;
-
+        {
+            let mut cache = state.fd_search_cache.lock();
             *cache = Some(FdSearchCache {
                 query: query.clone(),
                 sort_by: sort_by.clone(),
@@ -4342,19 +4394,10 @@ async fn fd_search(
             });
         }
 
-        let cached = cache.as_ref().unwrap();
-        let total = cached.entries.len() as u64;
-        let end = (offset + limit).min(cached.entries.len());
-        let page = if offset < cached.entries.len() {
-            cached.entries[offset..end].to_vec()
-        } else {
-            Vec::new()
-        };
-
         Ok(FdSearchResultDto {
             entries: page,
             total,
-            timed_out,
+            timed_out: result.timed_out,
         })
     })
     .await
@@ -4980,7 +5023,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         recent_ops: Arc::new(Mutex::new(Vec::new())),
         icon_cache: Arc::new(Mutex::new(HashMap::new())),
         fd_search_cache: Arc::new(Mutex::new(None)),
-        negative_name_cache: Arc::new(Mutex::new(Vec::new())),
+        negative_name_cache: Arc::new(Mutex::new(HashMap::new())),
         ignore_cache: Arc::new(Mutex::new(None)),
         gitignore,
         mem_index: Arc::new(RwLock::new(None)),
@@ -5036,9 +5079,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         eprintln!("[startup/thread] +{}ms init_db done", thread_started.elapsed().as_millis());
 
         state.db_ready.store(true, AtomicOrdering::Release);
-        eprintln!("[startup/thread] +{}ms db_ready=true — launching indexing immediately", thread_started.elapsed().as_millis());
+        eprintln!("[startup/thread] +{}ms db_ready=true -- launching indexing immediately", thread_started.elapsed().as_millis());
 
-        // Deferred housekeeping — purge + status counts run in background
+        // Deferred housekeeping -- purge + status counts run in background
         {
             let hk_app = app_handle.clone();
             let hk_state = state.clone();
@@ -5110,7 +5153,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                     );
                 } else {
                     if !index_complete {
-                        eprintln!("[mac] index incomplete — starting full index");
+                        eprintln!("[mac] index incomplete; starting full index");
                     }
                     let _ = start_full_index_worker(app_handle.clone(), state.clone());
                     start_fsevent_watcher_worker(app_handle.clone(), state.clone(), None, false);
@@ -5286,7 +5329,7 @@ mod tests {
             recent_ops: Arc::new(Mutex::new(Vec::new())),
             icon_cache: Arc::new(Mutex::new(HashMap::new())),
             fd_search_cache: Arc::new(Mutex::new(None)),
-            negative_name_cache: Arc::new(Mutex::new(Vec::new())),
+            negative_name_cache: Arc::new(Mutex::new(HashMap::new())),
             ignore_cache: Arc::new(Mutex::new(None)),
             gitignore: Arc::new(gitignore_filter::LazyGitignoreFilter::new(home_dir.clone())),
             mem_index: Arc::new(RwLock::new(None)),
@@ -5589,7 +5632,7 @@ mod tests {
 
         let state = test_state_for(db_path, root.clone(), root.clone());
 
-        // Query: "jp.naver.line/log/" — dir listing, name_like = "%"
+        // Query: "jp.naver.line/log/" - dir listing, name_like = "%"
         let result = execute_search(
             &state,
             "jp.naver.line/log/".to_string(),
@@ -5626,7 +5669,7 @@ mod tests {
             "glob * should also list all files"
         );
 
-        // Query with trailing dot: "jp.naver.line/log/ *." — name_like becomes "%."
+        // Query with trailing dot: "jp.naver.line/log/ *." - name_like becomes "%."
         let result3 = execute_search(
             &state,
             "jp.naver.line/log/ *.".to_string(),
@@ -5637,7 +5680,7 @@ mod tests {
         )
         .unwrap();
 
-        // "*." matches files ending with "." — none of our test files end with "."
+        // "*." matches files ending with "." - none of our test files end with "."
         // so this correctly returns 0 (this is expected, NOT a bug)
         assert_eq!(
             result3.results.len(),

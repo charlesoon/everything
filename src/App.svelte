@@ -6,7 +6,12 @@
   import { startDrag } from '@crabnebula/tauri-plugin-drag';
   import 'overlayscrollbars/overlayscrollbars.css';
   import { OverlayScrollbars } from 'overlayscrollbars';
-
+  import {
+    SEARCH_DEBOUNCE_MS,
+    computeSearchFetchLimit,
+    extractLeafQuery,
+    shouldApplyPreserveResults
+  } from './search-utils';
   let osInstance = null;
   let osViewport = null;
   let scrollCleanup = null;
@@ -17,19 +22,19 @@
   const rowHeight = 26;
   const PAGE_SIZE = 500;
   let homePrefix = '';
-  const COL_WIDTHS_KEY = 'everything-col-widths-v2';
+  const COL_WIDTHS_KEY = 'everything-col-widths-v3';
   const THEME_KEY = 'everything-theme';
   const columnKeys = ['name', 'path', 'size', 'modified'];
   const minColumnWidth = {
     name: 180,
     path: 240,
-    size: 75,
+    size: 62,
     modified: 150
   };
   const defaultColumnRatios = {
-    name: 0.3,
-    path: 0.45,
-    size: 0.1
+    name: 0.32,
+    path: 0.48,
+    size: 0.05
   };
   const DEBUG_STARTUP = false;
 
@@ -106,7 +111,7 @@
   let colWidths = {
     name: 250,
     path: 350,
-    size: 75,
+    size: 62,
     modified: 150
   };
 
@@ -128,10 +133,11 @@
   let statusRefreshInFlight = false;
   let resetInFlight = false;
   let lastReadyCount = 0;
-
+  const ICON_CACHE_MAX = 500;
   const iconCache = new Map();
   const iconLoading = new Set();
 
+  const HIGHLIGHT_CACHE_MAX = 300;
   let highlightCache = new Map();
   let highlightCacheQuery = '';
 
@@ -197,11 +203,15 @@
       highlightCacheQuery = q;
     }
 
-    // Check cache
+    // Check cache (LRU: re-insert on access to keep recently used at end)
     const cached = highlightCache.get(name);
-    if (cached) return cached;
+    if (cached) {
+      highlightCache.delete(name);
+      highlightCache.set(name, cached);
+      return cached;
+    }
 
-    if (q.includes('/')) q = q.slice(q.lastIndexOf('/') + 1);
+    q = extractLeafQuery(q);
     q = q.replace(/[*?]/g, '');
     const terms = q.split(/\s+/).filter(Boolean);
     if (terms.length === 0) return [{ text: name, hl: false }];
@@ -228,6 +238,10 @@
     }
 
     highlightCache.set(name, segs);
+    if (highlightCache.size > HIGHLIGHT_CACHE_MAX) {
+      const oldest = highlightCache.keys().next().value;
+      highlightCache.delete(oldest);
+    }
     return segs;
   }
 
@@ -241,7 +255,22 @@
   }
 
   function iconFor(entry) {
-    return iconCache.get(iconKey(entry)) || (entry.isDir ? folderFallbackIcon : fileFallbackIcon);
+    const key = iconKey(entry);
+    const cached = iconCache.get(key);
+    if (cached) {
+      iconCache.delete(key);
+      iconCache.set(key, cached);
+      return cached;
+    }
+    return entry.isDir ? folderFallbackIcon : fileFallbackIcon;
+  }
+
+  function setIconCache(key, value) {
+    iconCache.set(key, value);
+    if (iconCache.size > ICON_CACHE_MAX) {
+      const oldest = iconCache.keys().next().value;
+      iconCache.delete(oldest);
+    }
   }
 
   async function ensureIcon(entry) {
@@ -258,12 +287,12 @@
       });
       if (Array.isArray(bytes) && bytes.length > 0) {
         const image = `data:image/png;base64,${bytesToBase64(Uint8Array.from(bytes))}`;
-        iconCache.set(key, image);
+        setIconCache(key, image);
       } else {
-        iconCache.set(key, entry.isDir ? folderFallbackIcon : fileFallbackIcon);
+        setIconCache(key, entry.isDir ? folderFallbackIcon : fileFallbackIcon);
       }
     } catch {
-      iconCache.set(key, entry.isDir ? folderFallbackIcon : fileFallbackIcon);
+      setIconCache(key, entry.isDir ? folderFallbackIcon : fileFallbackIcon);
     } finally {
       iconLoading.delete(key);
     }
@@ -271,7 +300,41 @@
 
   function syncColumnWidthsToContainer() {
     const width = tableContainer ? getScrollEl().clientWidth : tableAreaEl?.clientWidth;
-    if (!width || lastTableWidth !== 0) {
+    if (!width) {
+      return;
+    }
+    if (Math.abs(width - lastTableWidth) <= 1) {
+      return;
+    }
+
+    if (lastTableWidth > 0) {
+      const fixedModified = colWidths.modified;
+      const currentFlexible = colWidths.name + colWidths.path + colWidths.size;
+      const nextFlexible = Math.max(
+        minColumnWidth.name + minColumnWidth.path + minColumnWidth.size,
+        width - fixedModified
+      );
+      const scale = nextFlexible / Math.max(1, currentFlexible);
+      let scaledName = Math.max(minColumnWidth.name, Math.round(colWidths.name * scale));
+      let scaledSize = Math.max(minColumnWidth.size, Math.round(colWidths.size * scale));
+      let scaledPath = nextFlexible - scaledName - scaledSize;
+      if (scaledPath < minColumnWidth.path) {
+        const shortfall = minColumnWidth.path - scaledPath;
+        const nameReduction = Math.min(shortfall, scaledName - minColumnWidth.name);
+        scaledName -= nameReduction;
+        const remaining = shortfall - nameReduction;
+        if (remaining > 0) {
+          scaledSize -= Math.min(remaining, scaledSize - minColumnWidth.size);
+        }
+        scaledPath = nextFlexible - scaledName - scaledSize;
+      }
+      colWidths = {
+        ...colWidths,
+        name: scaledName,
+        path: Math.max(minColumnWidth.path, scaledPath),
+        size: scaledSize
+      };
+      lastTableWidth = width;
       return;
     }
 
@@ -500,23 +563,37 @@
     clearTimeout(searchTimer);
 
     const now = performance.now();
-    if (now - lastSearchFiredAt >= 200) {
-      // Leading edge: fire immediately if enough time has passed
+    if (now - lastSearchFiredAt >= SEARCH_DEBOUNCE_MS) {
+      // Leading edge: return results quickly while user is typing.
       lastSearchFiredAt = now;
-      void runSearch(preserveScroll);
-    } else {
-      // Trailing edge: debounce
-      searchTimer = setTimeout(() => {
-        if (scheduledGen !== scheduleGeneration) {
-          return;
-        }
-        lastSearchFiredAt = performance.now();
-        void runSearch(preserveScroll);
-      }, 200);
+      void runSearch(preserveScroll, false);
     }
+
+    // Trailing edge: once input settles, run again with total-count enabled.
+    searchTimer = setTimeout(() => {
+      if (scheduledGen !== scheduleGeneration) {
+        return;
+      }
+      lastSearchFiredAt = performance.now();
+      void runSearch(preserveScroll, true);
+    }, SEARCH_DEBOUNCE_MS);
   }
 
-  async function runSearch(preserveScroll = false) {
+  async function runSearch(preserveScroll = false, includeTotal = true) {
+    const viewportStart = startIndex;
+    const viewportRows = visibleCount;
+    const fetchLimit = computeSearchFetchLimit({
+      preserveScroll,
+      pageSize: PAGE_SIZE,
+      loadedCount: results.length,
+      viewportStart,
+      viewportRows
+    });
+    if (preserveScroll && fetchLimit === null) {
+      void runSearch(false, true);
+      return;
+    }
+
     searchGeneration += 1;
     const gen = searchGeneration;
     searchPending = true;
@@ -524,11 +601,6 @@
     const searchSortBy = sortBy;
     const searchSortDir = sortDir;
     const startedAt = performance.now();
-    // When preserving scroll, reload at least as many results as currently
-    // loaded so totalHeight stays stable and scrollTop isn't clamped.
-    const fetchLimit = preserveScroll
-      ? Math.max(PAGE_SIZE, results.length)
-      : PAGE_SIZE;
     try {
       const keepPaths = new Set(selectedPaths());
       const next = await invoke('search', {
@@ -536,7 +608,8 @@
         limit: fetchLimit,
         offset: 0,
         sortBy: searchSortBy,
-        sortDir: searchSortDir
+        sortDir: searchSortDir,
+        includeTotal
       });
 
       if (gen !== searchGeneration) return;
@@ -546,15 +619,11 @@
       const entries = Array.isArray(next.entries) ? next.entries : [];
       searchModeLabel = next.modeLabel || '';
 
-      // During the await, loadMore may have grown results beyond fetchLimit.
-      // Replacing a larger result set with a smaller one would shrink
-      // totalHeight and cause the browser to clamp scrollTop → scroll jump.
-      // Skip this update; the existing results are still valid (same query/sort).
-      if (preserveScroll && entries.length < results.length) return;
+      if (preserveScroll && !shouldApplyPreserveResults(entries.length, viewportStart, viewportRows)) return;
 
       if (preserveScroll && tableContainer) scrollTop = getScrollEl().scrollTop;
       results = entries;
-      if (next.totalCount > 0) {
+      if (next.totalKnown) {
         totalResults = next.totalCount;
         totalResultsKnown = true;
       } else {
@@ -591,7 +660,8 @@
         limit: PAGE_SIZE,
         offset: results.length,
         sortBy: sortBy,
-        sortDir: sortDir
+        sortDir: sortDir,
+        includeTotal: false
       });
       if (gen !== searchGeneration) return;
       const arr = Array.isArray(batch.entries) ? batch.entries : [];
@@ -638,7 +708,7 @@
       sortDir = 'asc';
     }
     if (tableContainer) getScrollEl().scrollTop = 0;
-    void runSearch();
+    void runSearch(false, true);
   }
 
   function handleRowClick(event, index) {
@@ -1312,14 +1382,17 @@
 
   function startElapsedTimer() {
     clearInterval(elapsedTimer);
+    clearInterval(statusRefreshTimer);
     indexingStartTime = Date.now();
     indexingElapsed = '0s';
     indexingFinishedAt = '';
     elapsedTimer = setInterval(updateElapsed, 1000);
+    statusRefreshTimer = setInterval(() => { void refreshStatus(); }, 1000);
   }
 
   function stopElapsedTimer() {
     clearInterval(elapsedTimer);
+    clearInterval(statusRefreshTimer);
     if (indexingStartTime) {
       const elapsed = Date.now() - indexingStartTime;
       indexingFinishedAt = `${formatElapsed(elapsed)}`;
@@ -1562,11 +1635,6 @@
 
     await step('runSearch()', () => runSearch());
 
-    statusRefreshTimer = setInterval(() => {
-      if (indexStatus.state === 'Indexing') {
-        void refreshStatus();
-      }
-    }, 1000);
     startupLog(`[startup/fe] +${ms()}ms onMount complete`);
     if (DEBUG_STARTUP) console.log(`[startup/fe] +${ms()}ms onMount complete`);
   });
@@ -1644,13 +1712,14 @@
       on:input={() => scheduleSearch()}
       on:focus={clearSelection}
       placeholder="Search file/folder names"
+      aria-label="Search file and folder names"
       autocomplete="off"
       spellcheck="false"
     />
   </header>
 
-  <section class="table-area" bind:this={tableAreaEl} style={tableGridStyle}>
-    <div class="table-header">
+  <section class="table-area" bind:this={tableAreaEl} style={tableGridStyle} role="table" aria-label="Search results">
+    <div class="table-header" role="rowgroup">
       <div class="table-header-track">
         <div class="col name">
           <button type="button" class="col-button" on:click={() => handleHeaderSort('name')}>
@@ -1695,6 +1764,7 @@
     <div
       class="table-body"
       bind:this={tableContainer}
+      role="rowgroup"
     >
       <div class="spacer" style={`height:${totalHeight}px`}>
         <div class="rows" style={`transform: translateY(${translateY}px);`}>
@@ -1708,6 +1778,7 @@
               on:dblclick={() => handleRowDoubleClick(index)}
               on:contextmenu={(event) => handleRowContextMenu(event, index)}
               role="row"
+              aria-selected={selectedIndices.has(index)}
               tabindex="0"
             >
               <div class="cell name">
@@ -1724,7 +1795,7 @@
     </div>
   </section>
 
-  <footer class="status-bar">
+  <footer class="status-bar" role="status" aria-live="polite">
     <div class="status-left">
       <span class="status-state">
         <span class="state-dot {indexStatus.state === 'Indexing' ? 'indexing' : indexStatus.state === 'Error' ? 'error' : 'ready'}"></span>
@@ -1755,7 +1826,13 @@
     </div>
     <div class="status-right">
       <button class="status-btn" on:click={cycleTheme} title="Switch theme">
-        {theme === 'dark' ? '☀ Light' : '◑ Dark'}
+        {#if theme === 'dark'}
+          <svg class="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="3.5"/><line x1="8" y1="1.5" x2="8" y2="3"/><line x1="8" y1="13" x2="8" y2="14.5"/><line x1="1.5" y1="8" x2="3" y2="8"/><line x1="13" y1="8" x2="14.5" y2="8"/><line x1="3.4" y1="3.4" x2="4.5" y2="4.5"/><line x1="11.5" y1="11.5" x2="12.6" y2="12.6"/><line x1="3.4" y1="12.6" x2="4.5" y2="11.5"/><line x1="11.5" y1="4.5" x2="12.6" y2="3.4"/></svg>
+          Light
+        {:else}
+          <svg class="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5 5.5 5.5 0 1 0 13.5 9.2z"/></svg>
+          Dark
+        {/if}
       </button>
       <button
         class="status-btn rebuild-btn"
@@ -1867,7 +1944,7 @@
     }
   }
 
-  /* ── Theme: Dark ──────────────────────────────────────────────── */
+  /* Theme: Dark */
   :global([data-theme="dark"]) {
     color-scheme: dark;
     --bg-app: #1E1E21;
@@ -1898,7 +1975,7 @@
     --toast-text: #f2f2f6;
   }
 
-  /* ── Theme: Light ─────────────────────────────────────────────── */
+  /* Theme: Light */
   :global([data-theme="light"]) {
     color-scheme: light;
     --bg-app: #F5F5F7;
@@ -1929,7 +2006,7 @@
     --toast-text: #1C1C1E;
   }
 
-  /* ── Themed element overrides ─────────────────────────────────── */
+  /* Themed element overrides */
   :global([data-theme]) {
     background: var(--bg-app);
   }
@@ -1978,6 +2055,7 @@
 
   :global([data-theme]) .cell.path {
     font-size: 11px;
+    padding-right: 4px;
   }
 
   :global([data-theme]) .cell.size {
@@ -2214,6 +2292,10 @@
     cursor: pointer;
   }
 
+  .col.size .col-button {
+    justify-content: flex-end;
+  }
+
   :global(.sort-icon) {
     width: 10px;
     height: 10px;
@@ -2299,7 +2381,9 @@
   }
 
   .cell.size {
-    text-align: right;
+    padding: 0;
+    justify-content: flex-end;
+    white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
 
@@ -2381,6 +2465,9 @@
   }
 
   .status-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
     border: 1px solid var(--button-border);
     border-radius: 5px;
     background: var(--button-bg);
@@ -2435,6 +2522,12 @@
 
   .rebuild-btn:disabled {
     opacity: 0.5;
+  }
+
+  .theme-icon {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
   }
 
   .rebuild-icon {
@@ -2590,7 +2683,7 @@
     background-color: var(--os-track-bg-active);
   }
 
-  /* ── Windows platform overrides ── */
+  /* Windows platform overrides */
   :global([data-platform='windows']) .title-bar {
     height: 30px;
   }
