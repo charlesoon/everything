@@ -144,7 +144,7 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
 
     // Build enhanced skip names: BUILTIN_SKIP_NAMES + AnySegment patterns from pathignore
     let extra_segment_names: Vec<String> = ignored_patterns.iter().filter_map(|p| {
-        if let IgnorePattern::AnySegment(name) = p { Some(name.clone()) } else { None }
+        if let IgnorePattern::AnySegment { segment, .. } = p { Some(segment.clone()) } else { None }
     }).collect();
     let mut all_skip_names: Vec<&str> = BUILTIN_SKIP_NAMES.to_vec();
     for name in &extra_segment_names {

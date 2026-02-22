@@ -94,6 +94,8 @@
   let searchPending = false;
 
   let scanned = 0;
+  let indexed = 0;
+  let currentPath = '';
 
   let searchInputEl;
   let renameInputEl;
@@ -1093,7 +1095,7 @@
       const rightEdge = pathCell ? pathCell.getBoundingClientRect().right : nameCell.getBoundingClientRect().right;
       renameOverlay = {
         top: rowRect.top,
-        left: spanRect.left - 5,
+        left: spanRect.left - 9,
         maxWidth: rightEdge - spanRect.left + 5 - 8
       };
     }
@@ -1442,6 +1444,7 @@
     };
 
     startupLog('[startup/fe] onMount entered');
+    try {
 
     updateViewportHeight();
     startupLog(`[startup/fe] +${ms()}ms updateViewportHeight done`);
@@ -1452,10 +1455,14 @@
 
     let unlistenResized = null;
     if (platform === 'windows') {
-      isMaximized = await appWindow.isMaximized().catch(() => false);
-      unlistenResized = await appWindow.onResized(() => {
-        refreshMaximizedStateSoon();
-      });
+      try {
+        isMaximized = await appWindow.isMaximized().catch(() => false);
+        unlistenResized = await appWindow.onResized(() => {
+          refreshMaximizedStateSoon();
+        });
+      } catch (err) {
+        console.warn('[startup/fe] windows resize hooks unavailable', err);
+      }
     }
 
     const unlistenProgress = await step(
@@ -1503,6 +1510,10 @@
     const unlistenUpdated = await step(
       'listen(index_updated)',
       () => listen('index_updated', (event) => {
+        const changed =
+          event.payload.entriesCount !== indexStatus.entriesCount ||
+          event.payload.lastUpdated !== indexStatus.lastUpdated;
+
         indexStatus = {
           ...indexStatus,
           entriesCount: event.payload.entriesCount,
@@ -1510,7 +1521,7 @@
           permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
         };
 
-        scheduleSearch(true);
+        if (changed) scheduleSearch(true);
       })
     );
 
@@ -1637,6 +1648,12 @@
 
     startupLog(`[startup/fe] +${ms()}ms onMount complete`);
     if (DEBUG_STARTUP) console.log(`[startup/fe] +${ms()}ms onMount complete`);
+    } catch (err) {
+      console.error('[startup/fe] onMount failed', err);
+      await tick().catch(() => {});
+      document.getElementById('skeleton')?.remove();
+      showToast(`Startup failed: ${String(err)}`);
+    }
   });
 
   onDestroy(async () => {
@@ -1709,7 +1726,7 @@
       class="search-input"
       type="text"
       bind:value={query}
-      on:input={() => scheduleSearch()}
+      on:input={() => { indexingFinishedAt = ''; scheduleSearch(); }}
       on:focus={clearSelection}
       placeholder="Search file/folder names"
       aria-label="Search file and folder names"
@@ -2133,7 +2150,8 @@
   .title-center {
     position: absolute;
     left: 50%;
-    transform: translateX(-50%);
+    top: 50%;
+    transform: translate(-50%, -50%);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2190,6 +2208,7 @@
   .title-text {
     font-family: Inter, 'SF Pro Text', sans-serif;
     font-size: 13px;
+    line-height: 1;
     font-weight: 500;
     color: var(--text-primary);
     letter-spacing: -0.01em;
@@ -2683,16 +2702,22 @@
     background-color: var(--os-track-bg-active);
   }
 
-  /* Windows platform overrides */
-  :global([data-platform='windows']) .title-bar {
+  /* Compact titlebar design (Windows + macOS overlay) */
+  :global([data-platform='windows']) .title-bar,
+  :global([data-platform='macos']) .title-bar {
     height: 30px;
   }
-  :global([data-platform='windows']) .title-icon {
+  :global([data-platform='windows']) .title-icon,
+  :global([data-platform='macos']) .title-icon {
     width: 12px;
     height: 12px;
   }
-  :global([data-platform='windows']) .title-text {
+  :global([data-platform='windows']) .title-text,
+  :global([data-platform='macos']) .title-text {
     font-size: 12px;
+  }
+  :global([data-platform='macos']) .title-left {
+    width: 72px;
   }
   :global([data-platform='windows']) .search-bar {
     padding: 0 8px 0;

@@ -21,7 +21,7 @@
         "titleBarStyle": "Overlay",
         "trafficLightPosition": {
           "x": 12,
-          "y": 24
+          "y": 12
         },
         "visible": false,
         "minWidth": 400,
@@ -57,7 +57,10 @@
     "windows": {
       "nsis": {
         "displayLanguageSelector": false,
-        "languages": ["Korean", "English"],
+        "languages": [
+          "Korean",
+          "English"
+        ],
         "installerIcon": "icons/icon.ico"
       }
     }

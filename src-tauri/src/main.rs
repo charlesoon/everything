@@ -2095,6 +2095,17 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
     match &result {
         Ok(_) => {
             let _ = set_meta(&conn, "index_complete", "1");
+            // Ensure any new indexes exist after indexing completes. Runs here (not at
+            // db_ready) to avoid DDL contention with the bulk insert / fresh-index
+            // DROP+CREATE INDEX cycle above.
+            {
+                let idx_db_path = state.db_path.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = ensure_db_indexes(&idx_db_path) {
+                        eprintln!("[init_db] ensure_db_indexes error: {e}");
+                    }
+                });
+            }
             let snapshot = state.status.lock().clone();
             perf_log(format!(
                 "index_run_done elapsed_ms={} scanned={} indexed={} entries={} permission_errors={} message={:?}",
@@ -2672,7 +2683,7 @@ fn process_watcher_paths(
             }
         }
         Err(err) => {
-            let is_busy = err.contains("locked") || err.contains("busy");
+            let is_busy = err.contains("locked") || err.contains("busy") || err.contains("unable to open");
             if is_busy {
                 eprintln!(
                     "[watcher] DB busy, will retry in {}s: {} | batch_size={}",
@@ -2748,6 +2759,8 @@ fn start_fsevent_watcher_worker(
                 }
             };
 
+        state.watcher_active.store(true, AtomicOrdering::Release);
+
         if conditional {
             perf_log("conditional_startup: watcher started, awaiting history replay");
             set_state(&state, IndexState::Ready, None);
@@ -2765,6 +2778,10 @@ fn start_fsevent_watcher_worker(
         let mut full_scan_triggered = false;
 
         loop {
+            if state.watcher_stop.load(AtomicOrdering::Acquire) {
+                break;
+            }
+
             let wait = match deadline {
                 Some(due) => {
                     let now = Instant::now();
@@ -2774,7 +2791,7 @@ fn start_fsevent_watcher_worker(
                         due - now
                     }
                 }
-                None => Duration::from_secs(10),
+                None => Duration::from_secs(1),
             };
             match rx.recv_timeout(wait) {
                 Ok(mac::fsevent_watcher::FsEvent::Paths(paths)) => {
@@ -2891,6 +2908,8 @@ fn start_fsevent_watcher_worker(
         let eid = watcher.last_event_id();
         let _ = persist_event_id(&state.db_path, eid);
         watcher.stop();
+        state.watcher_active.store(false, AtomicOrdering::Release);
+        eprintln!("[watcher] fsevent watcher stopped");
     });
 }
 
@@ -3098,7 +3117,9 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         }
         #[cfg(not(target_os = "windows"))]
         {
-            start_full_index_worker(app, state)
+            start_full_index_worker(app.clone(), state.clone())?;
+            start_fsevent_watcher_worker(app, state, None, false);
+            Ok(())
         }
     })
     .await
@@ -5202,16 +5223,6 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
         state.db_ready.store(true, AtomicOrdering::Release);
         eprintln!("[startup/thread] +{}ms db_ready=true -- launching indexing immediately", thread_started.elapsed().as_millis());
-
-        // Ensure indexes in background -- may be slow if new indexes were added to an existing DB.
-        {
-            let idx_db_path = state.db_path.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = ensure_db_indexes(&idx_db_path) {
-                    eprintln!("[init_db] ensure_db_indexes error: {e}");
-                }
-            });
-        }
 
         // Deferred housekeeping -- purge + status counts run in background
         {
