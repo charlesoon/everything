@@ -20,6 +20,7 @@ impl GitignoreFilter {
         Self { matchers }
     }
 
+    #[allow(dead_code)]
     pub fn root_paths(&self) -> Vec<&Path> {
         self.matchers.iter().map(|gi| gi.path()).collect()
     }

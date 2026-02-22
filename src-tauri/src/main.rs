@@ -1881,6 +1881,7 @@ fn emit_status_counts(app: &AppHandle, state: &AppState) {
     );
 }
 
+#[allow(dead_code)]
 pub(crate) fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
     let conn = db_connection(&state.db_path)?;
     let (entries_count, last_updated) = update_counts(&conn)?;
