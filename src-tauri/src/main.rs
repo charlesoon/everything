@@ -1881,6 +1881,17 @@ fn emit_status_counts(app: &AppHandle, state: &AppState) {
     );
 }
 
+pub(crate) fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
+    let conn = db_connection(&state.db_path)?;
+    let (entries_count, last_updated) = update_counts(&conn)?;
+    {
+        let mut status = state.status.lock();
+        status.entries_count = entries_count;
+        status.last_updated = last_updated;
+    }
+    Ok((entries_count, last_updated))
+}
+
 pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
     let conn = db_connection(&state.db_path)?;
     let (entries_count, last_updated) = update_counts(&conn)?;
