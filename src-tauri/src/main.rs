@@ -44,7 +44,7 @@ const RECENT_OP_TTL: Duration = Duration::from_secs(2);
 pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 const NEGATIVE_CACHE_FALLBACK_WINDOW: Duration = Duration::from_millis(550);
-const DB_VERSION: i32 = 4;
+const DB_VERSION: i32 = 5;
 const DEFERRED_DIR_NAMES: &[&str] = &[
     "Library", ".Trash", ".Trashes",
     // Windows system directories (deferred when scan_root is C:\)
@@ -55,6 +55,12 @@ const SHALLOW_SCAN_DEPTH: usize = 6;
 fn jwalk_num_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| (n.get() / 2).max(4).min(16))
+        .unwrap_or(8)
+}
+
+fn jwalk_num_threads_fresh() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().max(4).min(16))
         .unwrap_or(8)
 }
 
@@ -93,6 +99,18 @@ pub(crate) const BUILTIN_SKIP_PATHS: &[&str] = &[
 ];
 
 type AppResult<T> = Result<T, String>;
+
+// Pre-computed infix/suffix strings for BUILTIN_SKIP_PATHS to avoid hot-path allocations.
+static BUILTIN_SKIP_PATH_CHECKS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+fn builtin_skip_path_checks() -> &'static [(String, String)] {
+    BUILTIN_SKIP_PATH_CHECKS.get_or_init(|| {
+        BUILTIN_SKIP_PATHS
+            .iter()
+            .map(|pat| (format!("/{pat}/"), format!("/{pat}")))
+            .collect()
+    })
+}
+
 static SEARCH_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static PERF_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static BENCH_MODE_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -281,8 +299,25 @@ pub(crate) struct RecentOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IgnorePattern {
-    AnySegment(String),
+    /// Matches any path segment equal to `segment`.
+    /// `suffix` = `"/{segment}"`, `infix` = `"/{segment}/"` — pre-computed to avoid
+    /// per-call format! allocations in the hot path.
+    AnySegment {
+        segment: String,
+        suffix: String,
+        infix: String,
+    },
     Glob(String),
+}
+
+impl IgnorePattern {
+    pub(crate) fn any_segment(segment: &str) -> Self {
+        IgnorePattern::AnySegment {
+            suffix: format!("/{segment}"),
+            infix: format!("/{segment}/"),
+            segment: segment.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -411,10 +446,10 @@ fn db_connection_for_search(db_path: &Path) -> AppResult<Connection> {
 pub(crate) fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         r#"
-        PRAGMA synchronous = NORMAL;
-        PRAGMA cache_size = -65536;
-        PRAGMA mmap_size = 268435456;
-        PRAGMA wal_autocheckpoint = 10000;
+        PRAGMA synchronous = OFF;
+        PRAGMA cache_size = -131072;
+        PRAGMA mmap_size = 536870912;
+        PRAGMA wal_autocheckpoint = 0;
         "#,
     )
     .map_err(|e| e.to_string())
@@ -430,12 +465,16 @@ pub(crate) fn restore_normal_pragmas(conn: &Connection) -> AppResult<()> {
         "#,
     )
     .map_err(|e| e.to_string())?;
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    // PASSIVE checkpoint: does not block readers/writers; checkpoints as many
+    // WAL frames as possible without waiting. The WAL will be fully checkpointed
+    // when the next auto-checkpoint threshold is hit.
+    conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn init_db(db_path: &Path) -> AppResult<()> {
+/// Phase 1: creates tables only. Fast even on large DBs.
+fn init_db_tables(db_path: &Path) -> AppResult<()> {
     let t = Instant::now();
     let conn = db_connection(db_path)?;
     eprintln!("[init_db] +{}ms db_connection opened", t.elapsed().as_millis());
@@ -474,11 +513,6 @@ fn init_db(db_path: &Path) -> AppResult<()> {
           run_id INTEGER NOT NULL DEFAULT 0
         );
 
-        CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
-        CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);
-
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
@@ -486,18 +520,39 @@ fn init_db(db_path: &Path) -> AppResult<()> {
         "#,
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[init_db] +{}ms schema ensured", t.elapsed().as_millis());
+    eprintln!("[init_db] +{}ms tables ensured", t.elapsed().as_millis());
 
-    let legacy_index_migration_key = "migration_drop_idx_entries_dir_name_nocase_v1";
-    let migrated = get_meta(&conn, legacy_index_migration_key)
+    Ok(())
+}
+
+/// Phase 2: creates indexes and runs legacy migrations. May be slow on large DBs
+/// when new indexes are added; runs after db_ready so it does not block startup.
+fn ensure_db_indexes(db_path: &Path) -> AppResult<()> {
+    let t = Instant::now();
+    let conn = db_connection(db_path)?;
+
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
+        CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_entries_indexed_at ON entries(indexed_at);
+        "#,
+    )
+    .map_err(|e| e.to_string())?;
+    eprintln!("[init_db] +{}ms indexes ensured", t.elapsed().as_millis());
+
+    let legacy_key = "migration_drop_idx_entries_dir_name_nocase_v1";
+    let migrated = get_meta(&conn, legacy_key)
         .map(|v| v == "1")
         .unwrap_or(false);
     if !migrated {
         conn.execute_batch("DROP INDEX IF EXISTS idx_entries_dir_name_nocase;")
             .map_err(|e| e.to_string())?;
-        set_meta(&conn, legacy_index_migration_key, "1")?;
+        set_meta(&conn, legacy_key, "1")?;
     }
-    eprintln!("[init_db] +{}ms total", t.elapsed().as_millis());
+    eprintln!("[init_db] +{}ms total (indexes + migration)", t.elapsed().as_millis());
 
     Ok(())
 }
@@ -520,9 +575,7 @@ pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<(
     Ok(())
 }
 
-fn update_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
-    let conn = db_connection(&state.db_path)?;
-
+fn update_counts(conn: &Connection) -> AppResult<(u64, Option<i64>)> {
     let entries_count = conn
         .query_row("SELECT COUNT(*) FROM entries", [], |row| {
             row.get::<_, i64>(0)
@@ -536,14 +589,6 @@ fn update_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
         })
         .map_err(|e| e.to_string())?;
 
-    Ok((entries_count, last_updated))
-}
-
-pub(crate) fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i64>)> {
-    let (entries_count, last_updated) = update_counts(state)?;
-    let mut status = state.status.lock();
-    status.entries_count = entries_count;
-    status.last_updated = last_updated;
     Ok((entries_count, last_updated))
 }
 
@@ -745,7 +790,7 @@ fn resolve_dirs_from_db(conn: &Connection, dir_hint: &str) -> Vec<String> {
 }
 
 fn normalize_slashes(s: String) -> String {
-    s.replace('\\', "/")
+    if s.contains('\\') { s.replace('\\', "/") } else { s }
 }
 
 fn resolve_ignore_path(raw: &str, base_dir: &Path, home_dir: &Path) -> Option<PathBuf> {
@@ -791,7 +836,7 @@ fn parse_ignore_pattern(raw: &str, base_dir: &Path, home_dir: &Path) -> Option<I
 
     if let Some(segment) = trimmed.strip_prefix("**/") {
         if !segment.is_empty() && !segment.contains('/') && !contains_glob_meta(segment) {
-            return Some(IgnorePattern::AnySegment(segment.to_string()));
+            return Some(IgnorePattern::any_segment(segment));
         }
     }
 
@@ -802,7 +847,7 @@ fn parse_ignore_pattern(raw: &str, base_dir: &Path, home_dir: &Path) -> Option<I
 
 fn ignore_pattern_key(pattern: &IgnorePattern) -> String {
     match pattern {
-        IgnorePattern::AnySegment(segment) => format!("seg:{segment}"),
+        IgnorePattern::AnySegment { segment, .. } => format!("seg:{segment}"),
         IgnorePattern::Glob(glob) => format!("glob:{glob}"),
     }
 }
@@ -1144,10 +1189,15 @@ fn purge_ignored_entries(db_path: &Path, ignored_roots: &[PathBuf]) -> AppResult
         }
 
         let prefix = root_str.trim_end_matches('/');
-        let descendant_like = format!("{}%", escape_like(&format!("{prefix}/")));
+        // Use range condition instead of LIKE+ESCAPE: SQLite disables the index
+        // range-scan optimization when an ESCAPE clause is present, causing a full
+        // table scan even though `path` has a UNIQUE (implicit) index.
+        // "\u{10FFFF}" is the maximum Unicode code point; any valid path sorts below it.
+        let lo = format!("{prefix}/");
+        let hi = format!("{prefix}/\u{10FFFF}");
         conn.execute(
-            "DELETE FROM entries WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-            params![prefix, descendant_like],
+            "DELETE FROM entries WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+            params![prefix, lo, hi],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -1208,10 +1258,8 @@ fn glob_match_path(pattern: &str, text: &str) -> bool {
 
 pub(crate) fn matches_ignore_pattern(path: &str, pattern: &IgnorePattern) -> bool {
     match pattern {
-        IgnorePattern::AnySegment(segment) => {
-            let suffix = format!("/{segment}");
-            let infix = format!("/{segment}/");
-            path.ends_with(&suffix) || path.contains(&infix)
+        IgnorePattern::AnySegment { suffix, infix, .. } => {
+            path.ends_with(suffix.as_str()) || path.contains(infix.as_str())
         }
         IgnorePattern::Glob(glob) => {
             let mut cur = path;
@@ -1261,11 +1309,10 @@ pub(crate) fn should_skip_path_ext(
     }
 
     // Multi-component builtin paths
-    if BUILTIN_SKIP_PATHS.iter().any(|pat| {
-        let infix = format!("/{pat}/");
-        let suffix = format!("/{pat}");
-        s.contains(&infix) || s.ends_with(&suffix)
-    }) {
+    if builtin_skip_path_checks()
+        .iter()
+        .any(|(infix, suffix)| s.contains(infix.as_str()) || s.ends_with(suffix.as_str()))
+    {
         return true;
     }
 
@@ -1354,10 +1401,6 @@ fn index_row_from_walkdir_entry(entry: &walkdir::DirEntry) -> Option<IndexRow> {
     index_row_from_path_and_metadata(entry.path(), &metadata)
 }
 
-fn index_row_from_jwalk_entry(entry: &jwalk::DirEntry<((), ())>) -> Option<IndexRow> {
-    let metadata = entry.metadata().ok()?;
-    index_row_from_path_and_metadata(&entry.path(), &metadata)
-}
 
 fn collect_rows_recursive(
     root: &Path,
@@ -1839,13 +1882,17 @@ fn emit_status_counts(app: &AppHandle, state: &AppState) {
 }
 
 pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
-    let (entries_count, last_updated) = update_status_counts(state)?;
+    let conn = db_connection(&state.db_path)?;
+    let (entries_count, last_updated) = update_counts(&conn)?;
+    {
+        let mut status = state.status.lock();
+        status.entries_count = entries_count;
+        status.last_updated = last_updated;
+    }
     // Persist cached counts so next startup can read them instantly
-    if let Ok(conn) = db_connection(&state.db_path) {
-        let _ = set_meta(&conn, "cached_entries_count", &entries_count.to_string());
-        if let Some(lu) = last_updated {
-            let _ = set_meta(&conn, "cached_last_updated", &lu.to_string());
-        }
+    let _ = set_meta(&conn, "cached_entries_count", &entries_count.to_string());
+    if let Some(lu) = last_updated {
+        let _ = set_meta(&conn, "cached_last_updated", &lu.to_string());
     }
     emit_status_counts(app, state);
     Ok(())
@@ -2009,10 +2056,41 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
     let mut conn = db_connection(&state.db_path)?;
     set_indexing_pragmas(&conn)?;
 
+    // For fresh index (empty DB), drop secondary indexes before bulk insert and
+    // recreate them after. This avoids per-row BTREE maintenance on every insert,
+    // which can be 3-5x faster when loading hundreds of thousands of rows.
+    let is_fresh_run: bool = get_meta(&conn, "last_run_id")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        == 0;
+    if is_fresh_run {
+        let _ = conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_entries_dir_ext_name_nocase;
+             DROP INDEX IF EXISTS idx_entries_mtime;
+             DROP INDEX IF EXISTS idx_entries_name_nocase;
+             DROP INDEX IF EXISTS idx_entries_ext_name;",
+        );
+    }
+
     let result = run_incremental_index_inner(app, state, &mut conn);
 
+    if is_fresh_run {
+        let t_idx = Instant::now();
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
+             CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
+             CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
+             CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);",
+        );
+        eprintln!("[timing] create_indexes {}ms", t_idx.elapsed().as_millis());
+    }
+
+    let t_analyze = Instant::now();
     let _ = conn.execute_batch("ANALYZE");
+    eprintln!("[timing] analyze {}ms", t_analyze.elapsed().as_millis());
+    let t_checkpoint = Instant::now();
     let _ = restore_normal_pragmas(&conn);
+    eprintln!("[timing] checkpoint {}ms", t_checkpoint.elapsed().as_millis());
 
     match &result {
         Ok(_) => {
@@ -2061,12 +2139,16 @@ fn run_incremental_index_inner(
     // Fresh index: DB was empty, skip preload/stamp, single unlimited-depth pass
     let is_fresh = last_run_id == 0;
 
+    // Fresh index has no secondary indexes to maintain, so we can use larger
+    // batches to reduce transaction overhead (fewer commits = faster).
+    let flush_batch_size = if is_fresh { BATCH_SIZE * 5 } else { BATCH_SIZE };
+
     let mut scanned: u64 = 0;
     let mut indexed: u64 = 0;
     let mut permission_errors: u64 = 0;
     let mut current_path = String::new();
-    let mut batch: Vec<IndexRow> = Vec::with_capacity(BATCH_SIZE);
-    let mut stamp_batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<IndexRow> = Vec::with_capacity(flush_batch_size);
+    let mut stamp_batch: Vec<String> = Vec::with_capacity(flush_batch_size);
     let mut last_emit = Instant::now();
     let mut last_perf_emit = Instant::now();
 
@@ -2135,7 +2217,7 @@ fn run_incremental_index_inner(
 
 
     // Flush home-level stamp batch
-    if stamp_batch.len() >= BATCH_SIZE {
+    if stamp_batch.len() >= flush_batch_size {
         stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
         stamp_batch.clear();
     }
@@ -2184,43 +2266,59 @@ fn run_incremental_index_inner(
             let skip_roots = arc_ignored_roots.clone();
             let skip_patterns = arc_ignored_patterns.clone();
 
-            let mut builder = jwalk::WalkDir::new(root)
+            // Use more threads for fresh index: stat() calls are the bottleneck,
+            // more rayon threads = more parallel stat() calls.
+            let num_threads = if is_fresh { jwalk_num_threads_fresh() } else { jwalk_num_threads() };
+            let current_pass = pass;
+            let mut builder = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
                 .follow_links(false)
                 .skip_hidden(false)
-                .parallelism(jwalk::Parallelism::RayonNewPool(jwalk_num_threads()));
+                .parallelism(jwalk::Parallelism::RayonNewPool(num_threads));
             // Fresh index: no depth limit -- walk everything in one pass
             if pass == 0 && !is_fresh {
                 builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
             }
             let walker = builder.process_read_dir(move |_depth, path, _state, children| {
-                children.retain(|entry_result| {
-                    entry_result
-                        .as_ref()
-                        .map(|entry| {
+                // Combined filter + metadata pre-fetch in one pass using retain_mut.
+                // Running stat() here parallelizes it across rayon threads (one per directory).
+                children.retain_mut(|entry_result| {
+                    match entry_result {
+                        Ok(entry) => {
                             let full_path = path.join(&entry.file_name);
                             let is_dir = Some(entry.file_type.is_dir());
-                            !should_skip_path_ext(
+                            if should_skip_path_ext(
                                 &full_path,
                                 &skip_roots,
                                 &skip_patterns,
                                 Some(&gi_ref),
                                 is_dir,
-                            )
-                        })
-                        .unwrap_or(false)
+                            ) {
+                                return false;
+                            }
+                            // Pre-fetch metadata in rayon thread (avoids serial stat() on
+                            // main thread). Skip for pass-1 shallow entries that will be
+                            // discarded in the main loop anyway.
+                            if current_pass != 1 || entry.depth > SHALLOW_SCAN_DEPTH {
+                                entry.client_state = fs::symlink_metadata(&full_path).ok();
+                            }
+                            true
+                        }
+                        Err(_) => false,
+                    }
                 });
             });
 
             for result in walker {
                 match result {
                     Ok(entry) => {
+                        let entry_depth = entry.depth;
                         let path = entry.path();
                         if path == root.as_path() {
                             continue;
                         }
 
                         // Pass 1 (incremental only): skip shallow entries already indexed in pass 0
-                        if pass == 1 && entry.depth <= SHALLOW_SCAN_DEPTH {
+                        if pass == 1 && entry_depth <= SHALLOW_SCAN_DEPTH {
                             continue;
                         }
 
@@ -2228,7 +2326,18 @@ fn run_incremental_index_inner(
                         root_scanned += 1;
                         current_path = path.to_string_lossy().to_string();
 
-                        if let Some(mut row) = index_row_from_jwalk_entry(&entry) {
+                        // Use metadata pre-fetched in rayon thread; fall back to stat on failure.
+                        let metadata = match entry.client_state {
+                            Some(m) => m,
+                            None => {
+                                // pre-fetch failed (permission error or race condition)
+                                permission_errors += 1;
+                                root_permission_errors += 1;
+                                continue;
+                            }
+                        };
+
+                        if let Some(mut row) = index_row_from_path_and_metadata(&path, &metadata) {
                             row.run_id = current_run_id;
                             if is_fresh {
                                 // Fresh index: all entries are new, skip existing check
@@ -2250,12 +2359,12 @@ fn run_incremental_index_inner(
                             }
                         }
 
-                        if batch.len() >= BATCH_SIZE {
+                        if batch.len() >= flush_batch_size {
                             upsert_rows(conn, &batch)?;
                             batch.clear();
                         }
 
-                        if stamp_batch.len() >= BATCH_SIZE {
+                        if stamp_batch.len() >= flush_batch_size {
                             stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
                             stamp_batch.clear();
                         }
@@ -2373,7 +2482,12 @@ fn run_incremental_index_inner(
         invalidate_search_caches(state);
     }
 
-    let (entries_count, last_updated) = update_status_counts(state)?;
+    let (entries_count, last_updated) = update_counts(conn)?;
+    {
+        let mut status = state.status.lock();
+        status.entries_count = entries_count;
+        status.last_updated = last_updated;
+    }
     // Persist cached counts for instant startup next time
     let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
     if let Some(lu) = last_updated {
@@ -2645,7 +2759,7 @@ fn start_fsevent_watcher_worker(
         let mut last_flush = Instant::now();
         let mut last_status_emit = Instant::now();
         let mut pending_status_emit = false;
-        let mut last_count_refresh = Instant::now();
+
         let mut must_scan_count: usize = 0;
         let mut replay_phase = conditional;
         let mut full_scan_triggered = false;
@@ -2660,7 +2774,7 @@ fn start_fsevent_watcher_worker(
                         due - now
                     }
                 }
-                None => Duration::from_secs(1),
+                None => Duration::from_secs(10),
             };
             match rx.recv_timeout(wait) {
                 Ok(mac::fsevent_watcher::FsEvent::Paths(paths)) => {
@@ -2771,11 +2885,6 @@ fn start_fsevent_watcher_worker(
                 last_flush = Instant::now();
             }
 
-            // Periodic count refresh to keep in-memory counts accurate
-            if last_count_refresh.elapsed() >= EVENT_ID_FLUSH_INTERVAL {
-                let _ = update_status_counts(&state);
-                last_count_refresh = Instant::now();
-            }
         }
 
         // Final flush on shutdown
@@ -2953,6 +3062,10 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         }
 
         let conn = db_connection(&state.db_path)?;
+        // Use synchronous=OFF + large cache to make the bulk DELETE fast
+        let _ = conn.execute_batch(
+            "PRAGMA synchronous=OFF; PRAGMA cache_size=-131072;",
+        );
         conn.execute("DELETE FROM entries", [])
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM meta", [])
@@ -4555,12 +4668,21 @@ async fn set_native_theme(theme: String, app: AppHandle) -> AppResult<()> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main window not found".to_string())?;
-    let t = if theme == "light" {
+    let is_light = theme == "light";
+    let t = if is_light {
         tauri::Theme::Light
     } else {
         tauri::Theme::Dark
     };
-    window.set_theme(Some(t)).map_err(|e| e.to_string())
+    window.set_theme(Some(t)).map_err(|e| e.to_string())?;
+    use tauri::window::Color;
+    let bg = if is_light {
+        Color(0xF5, 0xF5, 0xF7, 0xFF)
+    } else {
+        Color(0x1E, 0x1E, 0x21, 0xFF)
+    };
+    let _ = window.set_background_color(Some(bg));
+    Ok(())
 }
 
 #[tauri::command]
@@ -4948,9 +5070,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             .map(|t| t == tauri::Theme::Dark)
             .unwrap_or(false);
         let bg = if is_dark {
-            Color(0x1f, 0x1f, 0x1f, 0xff)
+            Color(0x1E, 0x1E, 0x21, 0xFF)
         } else {
-            Color(0xf4, 0xf5, 0xf7, 0xff)
+            Color(0xF5, 0xF5, 0xF7, 0xFF)
         };
         let _ = window.set_background_color(Some(bg));
         let _ = window.show();
@@ -4962,9 +5084,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         use tauri::window::Color;
         let is_dark = window.theme().map(|t| t == tauri::Theme::Dark).unwrap_or(false);
         let bg = if is_dark {
-            Color(0x1f, 0x1f, 0x1f, 0xff)
+            Color(0x1E, 0x1E, 0x21, 0xFF)
         } else {
-            Color(0xf4, 0xf5, 0xf7, 0xff)
+            Color(0xF5, 0xF5, 0xF7, 0xFF)
         };
         let _ = window.set_background_color(Some(bg));
         if let Err(e) = window.set_decorations(false) {
@@ -5070,16 +5192,26 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         let thread_started = std::time::Instant::now();
         eprintln!("[startup/thread] init thread started");
 
-        eprintln!("[startup/thread] +{}ms calling init_db...", thread_started.elapsed().as_millis());
-        if let Err(err) = init_db(&state.db_path) {
+        eprintln!("[startup/thread] +{}ms calling init_db_tables...", thread_started.elapsed().as_millis());
+        if let Err(err) = init_db_tables(&state.db_path) {
             set_state(&state, IndexState::Error, Some(err.clone()));
             emit_index_state(&app_handle, "Error", Some(err));
             return;
         }
-        eprintln!("[startup/thread] +{}ms init_db done", thread_started.elapsed().as_millis());
+        eprintln!("[startup/thread] +{}ms init_db_tables done", thread_started.elapsed().as_millis());
 
         state.db_ready.store(true, AtomicOrdering::Release);
         eprintln!("[startup/thread] +{}ms db_ready=true -- launching indexing immediately", thread_started.elapsed().as_millis());
+
+        // Ensure indexes in background -- may be slow if new indexes were added to an existing DB.
+        {
+            let idx_db_path = state.db_path.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = ensure_db_indexes(&idx_db_path) {
+                    eprintln!("[init_db] ensure_db_indexes error: {e}");
+                }
+            });
+        }
 
         // Deferred housekeeping -- purge + status counts run in background
         {
@@ -5372,7 +5504,7 @@ mod tests {
 
     #[test]
     fn should_skip_path_for_glob_any_segment_target() {
-        let patterns = vec![IgnorePattern::AnySegment("target".to_string())];
+        let patterns = vec![IgnorePattern::any_segment("target")];
 
         assert!(should_skip_path(
             Path::new("/Users/al02402336/work/rust/target"),
@@ -5436,7 +5568,8 @@ mod tests {
         fs::create_dir_all(&dir_b).unwrap();
 
         let db_path = root.join("index.db");
-        init_db(&db_path).unwrap();
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
         let mut conn = db_connection(&db_path).unwrap();
         let now = now_epoch();
 
@@ -5478,7 +5611,8 @@ mod tests {
         fs::create_dir_all(&archived_src).unwrap();
 
         let db_path = root.join("index.db");
-        init_db(&db_path).unwrap();
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
         let conn = db_connection(&db_path).unwrap();
         let now = now_epoch();
 
@@ -5606,7 +5740,8 @@ mod tests {
         fs::create_dir_all(&sub_dir).unwrap();
 
         let db_path = root.join("index.db");
-        init_db(&db_path).unwrap();
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
         let conn = db_connection(&db_path).unwrap();
         let now = now_epoch();
 
@@ -5715,7 +5850,8 @@ mod tests {
         fs::create_dir_all(&proj_dir).unwrap();
 
         let db_path = root.join("index.db");
-        init_db(&db_path).unwrap();
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
         let conn = db_connection(&db_path).unwrap();
         let now = now_epoch();
 
