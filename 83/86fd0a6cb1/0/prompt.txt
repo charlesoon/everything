@@ -1,0 +1,440 @@
+@doc\ 의 문서와 @README.md 를 현재 구현으로 최신화해줘
+
+---
+
+Please analyze this codebase and create a CLAUDE.md file, which will be given to future instances of Claude Code to operate in this repository.
+
+What to add:
+1. Commands that will be commonly used, such as how to build, lint, and run tests. Include the necessary commands to develop in this codebase, such as how to run a single test.
+2. High-level code architecture and structure so that future instances can be productive more quickly. Focus on the "big picture" architecture that requires reading multiple files to understand.
+
+Usage notes:
+- If there's already a CLAUDE.md, suggest improvements to it.
+- When you make the initial CLAUDE.md, do not repeat yourself and do not include obvious instructions like "Provide helpful error messages to users", "Write unit tests for all new utilities", "Never include sensitive information (API keys, tokens) in code or commits".
+- Avoid listing every component or file structure that can be easily discovered.
+- Don't include generic development practices.
+- If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (in .github/copilot-instructions.md), make sure to include the important parts.
+- If there is a README.md, make sure to include the important parts.
+- Do not make up information such as "Common Development Tasks", "Tips for Development", "Support and Documentation" unless this is expressly included in other files that you read.
+- Be sure to prefix the file with the following text:
+
+```
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+```
+
+---
+
+overlay scrollbar 적용한게 롤백됐어. 확인해줘
+
+---
+
+윈도우 release build에서 기본 스크롤바가 보였어
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **First user request**: "doc/ 의 문서와 README.md 를 현재 구현으로 최신화해줘" - Update documentation in doc/ and README.md to match current implementation.
+
+2. **My approach**: I read all existing documentation files (architecture.md, architecture_KR.md, spec.md, spec_KR.md, README.md), then launched an Explore agent to thoroughly examine the current codebase. I compared the documentation against the actual code and identified numerous differences.
+
+3. **Key differences found between docs and code**:
+   - Svelte 4 → Svelte 5, Vite 5 → Vite 7
+   - DB_VERSION 4 → 5
+   - rowHeight 28px → 26px
+   - USN debounce 30s → 5s
+   - New module: win/nonadmin_indexer.rs
+   - New file: search-utils.js
+   - New IPC commands: copy_files, quick_look, check_full_disk_access, open_privacy_settings, set_native_theme, mark_frontend_ready, frontend_log
+   - New event: context_menu_action
+   - AppState changes: mem_index, watcher_stop, watcher_active, frontend_ready, LazyGitignoreFilter
+   - Keyboard shortcuts changed: Enter→Open(Windows)/Rename(macOS), Space→QuickLook, Cmd+F→Focus search
+   - Column Kind → Size, size sorting added
+   - New features: FDA banner, Quick Look, theme toggle, OverlayScrollbars, MemIndex
+   - Index changes: idx_entries_run_id → idx_entries_indexed_at
+   - BUILTIN_SKIP_NAMES: DerivedData added, BUILTIN_SKIP_SUFFIXES new
+   - New plugins: tauri-plugin-drag, tauri-plugin-window-state, tauri-plugin-decorum
+   - JWALK_NUM_THREADS: fixed 4 → dynamic
+   - negative_name_cache: Vec → HashMap
+   - meta keys: usn_next → win_last_usn, usn_journal_id → win_journal_id
+
+4. **Files updated**: I wrote complete new versions of all 5 files:
+   - doc/architecture.md
+   - doc/architecture_KR.md
+   - doc/spec.md
+   - doc/spec_KR.md
+   - README.md
+
+5. **Second user request**: `/init` - Create/update CLAUDE.md file. I read the existing CLAUDE.md and updated it with all the current implementation details.
+
+6. **Third user request**: User attempted `/install-github-app` which failed (not a skill I can execute).
+
+7. **Fourth user request**: "overlay scrollbar 적용한게 롤백됐어. 확인해줘" - The overlay scrollbar was rolled back, check it.
+
+8. **My investigation**: I searched for OverlayScrollbars references in App.svelte and found it's still present (imports, initialization, CSS). Checked git status - no changes to App.svelte. Checked node_modules - package installed. Confirmed the code is intact.
+
+9. **Fifth user request**: "윈도우 release build에서 기본 스크롤바가 보였어" - Native scrollbar was visible in Windows release build.
+
+10. **My investigation for Windows release build issue**:
+    - Read the OverlayScrollbars initialization code in onMount (lines 1628-1638)
+    - Read the CSS styling (lines 2720-2810)
+    - Checked the Tauri config for CSP settings
+    - Checked vite.config.js build target (chrome105 for Windows)
+    - Ran `npm run build` to verify the production build succeeds
+    - Verified OverlayScrollbars JS and CSS are included in the built bundle
+    - Dumped the full CSS to analyze the scrollbar hiding rules
+    - Checked the installed OverlayScrollbars version (2.14.0)
+    
+    I was still investigating the root cause when the summary was requested. The investigation was not complete - I hadn't yet identified the specific cause or provided a fix.
+
+Key files examined for the scrollbar issue:
+- src/App.svelte lines 1628-1638 (initialization)
+- src/App.svelte lines 2720-2810 (CSS)
+- src-tauri/tauri.conf.json (CSP: style-src 'self' 'unsafe-inline')
+- vite.config.js (build target: chrome105 for Windows)
+- dist/assets/index-Doo0HG3g.css (built CSS bundle)
+- dist/assets/index-D_jHDh2H.js (built JS bundle)
+
+Summary:
+1. Primary Request and Intent:
+   - **Request 1 (Completed)**: Update all documentation files (`doc/architecture.md`, `doc/architecture_KR.md`, `doc/spec.md`, `doc/spec_KR.md`, and `README.md`) to match the current codebase implementation. The user's exact message: "@doc\ 의 문서와 @README.md 를 현재 구현으로 최신화해줘"
+   - **Request 2 (Completed)**: Create/update CLAUDE.md via `/init` command. Updated the existing CLAUDE.md with current implementation details.
+   - **Request 3 (In Progress)**: Investigate why OverlayScrollbars shows native scrollbar in Windows release build. User initially said "overlay scrollbar 적용한게 롤백됐어" then clarified "윈도우 release build에서 기본 스크롤바가 보였어"
+
+2. Key Technical Concepts:
+   - Tauri v2 + Rust backend + Svelte 5 frontend + SQLite architecture
+   - OverlayScrollbars v2.14.0 integration for custom scrollbar styling
+   - WebView2 (Chromium-based) on Windows for rendering
+   - Vite 7 production build with target `chrome105` for Windows
+   - CSP configuration: `style-src 'self' 'unsafe-inline'`
+   - `scrollbar-width: none` and `::-webkit-scrollbar` CSS for hiding native scrollbars
+   - OverlayScrollbars uses `data-overlayscrollbars-initialize` and `data-overlayscrollbars-viewport` attributes
+   - DB_VERSION = 5, PRAGMA user_version
+   - MemIndex (in-memory search during MFT→DB upsert on Windows)
+   - Platform-specific keyboard shortcuts (Enter=Open on Windows, Enter=Rename on macOS)
+   - Non-admin WalkDir fallback indexer for Windows
+   - LazyGitignoreFilter, BUILTIN_SKIP_NAMES/SUFFIXES/PATHS
+
+3. Files and Code Sections:
+   - **doc/architecture.md** - Completely rewritten with current implementation (Svelte 5, DB v5, new modules, new IPC commands, MemIndex, nonadmin_indexer, updated constants)
+   - **doc/architecture_KR.md** - Korean translation, completely rewritten to match architecture.md
+   - **doc/spec.md** - Completely rewritten with current features (Quick Look, Copy Files, FDA banner, theme toggle, platform-specific Enter key, Size column, MemIndex)
+   - **doc/spec_KR.md** - Korean translation, completely rewritten to match spec.md
+   - **README.md** - Updated with current features, tech stack (Svelte 5), project structure (nonadmin_indexer.rs, search-utils.js), keyboard shortcuts, architecture
+   - **CLAUDE.md** - Updated with current implementation details
+   - **src/App.svelte** - Examined extensively for OverlayScrollbars issue:
+     - Lines 7-8: CSS and JS imports for OverlayScrollbars
+     - Line 15: `let osInstance = null;`
+     - Line 22: `const rowHeight = 26;`
+     - Lines 1628-1638: OverlayScrollbars initialization in onMount:
+       ```javascript
+       if (tableContainer) {
+         tableContainer.setAttribute('data-overlayscrollbars-initialize', '');
+         osInstance = OverlayScrollbars(tableContainer, {
+           scrollbars: {
+             theme: 'os-theme-dark',
+             autoHide: 'scroll',
+             autoHideDelay: 500,
+             clickScroll: true
+           }
+         });
+         osViewport = osInstance.elements().viewport;
+       ```
+     - Lines 2453-2459: `.table-body { overflow: auto; overflow-anchor: none; ... }`
+     - Lines 2720-2810: macOS Style OverlayScrollbars CSS (`:global(.os-theme-dark)` with custom properties, hover expansion to 15px, fade transitions, single-axis visibility)
+   - **src-tauri/tauri.conf.json** - CSP includes `'unsafe-inline'` for styles, build target chrome105 for Windows
+   - **vite.config.js** - Build target `chrome105` for Windows, `safari13` for macOS, esbuild minification in production
+   - **src/search-utils.js** - Search debounce (200ms), viewport-preserve logic
+   - **src-tauri/src/main.rs** - Verified AppState struct (lines 333-358), DB_VERSION=5 (line 47), schema/indexes (lines 504-541), BUILTIN_SKIP_NAMES/SUFFIXES/PATHS (lines 67-99), all tauri commands
+
+4. Errors and fixes:
+   - No code errors encountered during documentation updates
+   - `/install-github-app` skill invocation failed with "Skill install-github-app is not a prompt-based skill" - this is a built-in CLI command, not something I can execute
+   - OverlayScrollbars Windows release build issue - still under investigation, no fix applied yet
+
+5. Problem Solving:
+   - **Documentation sync (Solved)**: Thoroughly compared all documentation against current codebase using Explore agent + direct file reads. Identified 20+ differences and rewrote all 6 documentation files.
+   - **OverlayScrollbars on Windows release build (In Progress)**: Verified code is present and intact in source. Verified CSS and JS are included in production bundle. Verified CSP allows inline styles. Checked build target compatibility. The investigation was interrupted before identifying root cause or applying a fix. Potential causes being explored:
+     - WebView2 version compatibility with `scrollbar-width: none` (supported since Chrome 121, but build target is chrome105)
+     - Possible initialization failure without try-catch protection
+     - No explicit native scrollbar hiding CSS on the `.table-body` or viewport elements as fallback
+
+6. All user messages:
+   - "@doc\ 의 문서와 @README.md 를 현재 구현으로 최신화해줘" (Update docs to current implementation)
+   - `/init` command (Create/update CLAUDE.md)
+   - `/install-github-app` (Failed - built-in CLI command)
+   - "overlay scrollbar 적용한게 롤백됐어. 확인해줘" (Overlay scrollbar was rolled back, check it)
+   - "윈도우 release build에서 기본 스크롤바가 보였어" (Native scrollbar visible in Windows release build)
+
+7. Pending Tasks:
+   - Diagnose and fix why OverlayScrollbars shows native scrollbar in Windows release build
+   
+8. Current Work:
+   Investigating why OverlayScrollbars displays native scrollbar in Windows release build. The user said "윈도우 release build에서 기본 스크롤바가 보였어". I confirmed:
+   - OverlayScrollbars code is intact in App.svelte (imports, init, CSS)
+   - Package is installed (v2.14.0)
+   - Production build includes both JS and CSS in bundles
+   - CSP allows inline styles (`'unsafe-inline'`)
+   - Built CSS contains all OverlayScrollbars rules including `scrollbar-width: none` and `::-webkit-scrollbar { display: none }`
+   - Build target is `chrome105` for Windows
+   
+   I was about to formulate a diagnosis/fix but was interrupted by the summary request. The `.table-body` has `overflow: auto` which shows native scrollbar when OverlayScrollbars fails to initialize or override. No try-catch wraps the initialization. The OverlayScrollbars CSS relies on `scrollbar-width: none` (Chrome 121+) and `::-webkit-scrollbar` selectors with `data-overlayscrollbars-*` attribute selectors.
+
+9. Optional Next Step:
+   Continue investigating and fix the Windows release build OverlayScrollbars issue. The user's exact request was "윈도우 release build에서 기본 스크롤바가 보였어". Likely fixes to explore:
+   - Add explicit CSS fallback to hide native scrollbars on `.table-body` and its OverlayScrollbars viewport child
+   - Wrap OverlayScrollbars initialization in try-catch for robustness
+   - Investigate if `scrollbar-width: none` works in the WebView2 version matching chrome105 build target (it requires Chrome 121+, which may be the root cause)
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\USER\.claude\projects\C--Users-USER-workspace-everything\64e85545-ff2f-4869-86ff-e31fe7c9940a.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+[Request interrupted by user]
+
+---
+
+csp 때문일지 모르니까 일단 빼고 nsis 빌드 걸어볼까?
+
+---
+
+[Request interrupted by user]
+
+---
+
+csp 때문일지 모르니까 일단 빼고 release 빌드 걸어볼까?
+
+---
+
+오버레이 스크롤로 잘보여
+
+---
+
+그럼 scripts\build-windows.ps1 다시 돌려줘
+
+---
+
+[Request interrupted by user]
+
+---
+
+commit
+
+---
+
+admin으로 했을 때랑 nonadmin으로 했을 때 indexing되는 목록이 달라. %LOCALAPPDATA%에 있는 데이터가 nonadmin에서는 검색이 안돼
+
+---
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Context from previous session**: The user had previously asked to update documentation, create CLAUDE.md, and investigate an OverlayScrollbars issue on Windows release build. The overlay scrollbar was showing native scrollbars in Windows release builds.
+
+2. **CSP fix for OverlayScrollbars**: I read the relevant code in App.svelte (OverlayScrollbars initialization, CSS), tauri.conf.json (CSP settings), and the OverlayScrollbars library CSS. The CSP was `"default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"`. I removed the CSP entirely from tauri.conf.json, built a release build, and the user confirmed overlay scrollbars worked correctly.
+
+3. **User asked to commit**: The user said "commit". I found many uncommitted changes across multiple files. Asked user scope preference - they chose "전체 변경사항" (all changes, split into separate commits). I created 5 commits:
+   - `46a0662` Sync Cargo.lock with version 0.3.1
+   - `dfd7fba` Update ignore patterns for test directories
+   - `ca40469` Update documentation to match current implementation
+   - `3fe4985` Improve Windows build script and release workflow
+   - `e7d38dd` Remove CSP to fix OverlayScrollbars on Windows release build
+   
+   Note: Per user's CLAUDE.md rules, NO Co-Authored-By or AI attribution was added.
+
+4. **User asked about build script**: "그럼 scripts\build-windows.ps1 다시 돌려줘" - but then interrupted.
+
+5. **User asked to commit again**: Was interrupted and just said "commit" - I proceeded with committing.
+
+6. **Nonadmin indexing issue**: User reported "admin으로 했을 때랑 nonadmin으로 했을 때 indexing되는 목록이 달라. %LOCALAPPDATA%에 있는 데이터가 nonadmin에서는 검색이 안돼"
+
+7. **Investigation of nonadmin vs MFT indexer**: I thoroughly investigated:
+   - `src-tauri/src/win/nonadmin_indexer.rs` - WalkDir/jwalk-based indexer
+   - `src-tauri/src/win/mft_indexer.rs` - NTFS MFT direct scan
+   - `src-tauri/src/main.rs` - shared skip logic (BUILTIN_SKIP_NAMES, BUILTIN_SKIP_PATHS, windows_noisy_roots, effective_ignore_rules, should_skip_path_ext)
+   - `src-tauri/src/win/mod.rs` - indexer selection logic
+   - `src-tauri/src/win/search_catchup.rs` - catchup mechanism
+   - `src-tauri/src/gitignore_filter.rs` - gitignore discovery and matching
+
+8. **User provided specific file**: "C:\Users\USER\AppData\Local\LINE\Data\mcp_config.json 이게 검색이 안돼"
+
+9. **Empirical testing**: 
+   - Killed app, deleted DB completely, ran fresh nonadmin index
+   - Nonadmin indexer ran successfully: 1,339,865 entries total
+   - Used Python + sqlite3 to query the DB
+   - Found `LINE\Data` directory IS indexed (17 entries in DB vs 19 on disk)
+   - **Missing files**: `mcp_config.json` and `qci_3.bin` - both have Windows Hidden attribute
+   - Then discovered `bin` and `log` directories also missing globally (0 in entire DB)
+
+10. **Root cause investigation - gitignore scope leaking**:
+    - `vcpkg\.gitignore` has `[Bb]in/` and `[Ll]og/` patterns
+    - `WindowsAppSDK-Samples\.gitignore` has `[Bb]in/`, `[Ll]og/`, `[Ll]ogs/`
+    - Multiple gitignore files have `build`, `dist`, `logs`, `coverage`, etc.
+    - The `ignore` crate's `Gitignore::matched()` appears to be applying patterns OUTSIDE the git repo's root directory scope
+    - This causes gitignore patterns from workspace git repos to filter out files throughout the entire filesystem
+
+11. **Two separate issues discovered**:
+    - **Issue 1**: Windows Hidden attribute files (like `mcp_config.json`) are not indexed - but this might also be related to the gitignore issue
+    - **Issue 2**: Gitignore patterns leak outside their repo scope, causing `bin`, `log`, `build`, `dist` etc. directories to be filtered globally
+
+The investigation was still in progress when the summary was requested. I had identified the discovered gitignore files and their broad patterns but hadn't yet confirmed the exact mechanism of the `ignore` crate's scope leaking or proposed a fix.
+
+Summary:
+1. Primary Request and Intent:
+   - **Request 1 (Completed)**: Fix OverlayScrollbars showing native scrollbar in Windows release build. User said "윈도우 release build에서 기본 스크롤바가 보였어", then "csp 때문일지 모르니까 일단 빼고 release 빌드 걸어볼까?" - Remove CSP and test.
+   - **Request 2 (Completed)**: Commit all uncommitted changes split into logical commits. User said "commit" and chose "전체 변경사항" (all changes, split into separate commits).
+   - **Request 3 (In Progress)**: Investigate why nonadmin indexer doesn't index `%LOCALAPPDATA%` files. User said "admin으로 했을 때랑 nonadmin으로 했을 때 indexing되는 목록이 달라. %LOCALAPPDATA%에 있는 데이터가 nonadmin에서는 검색이 안돼" and then specifically "C:\Users\USER\AppData\Local\LINE\Data\mcp_config.json 이게 검색이 안돼"
+
+2. Key Technical Concepts:
+   - Tauri v2 CSP (Content Security Policy) blocking OverlayScrollbars dynamic style injection
+   - NTFS MFT indexer (admin, reads raw metadata bypassing ACLs) vs nonadmin jwalk/WalkDir indexer
+   - jwalk 0.8.1 `skip_hidden` only checks dot-prefix (`is_hidden` checks `file_name.starts_with('.')`) — does NOT check Windows Hidden file attribute
+   - `ignore` crate's `Gitignore::matched()` — appears to match paths OUTSIDE the gitignore's root directory scope, causing global filtering
+   - `discover_gitignores()` walks home_dir children to depth 3, finds `.git` dirs, loads their `.gitignore` files
+   - `GitignoreFilter::is_ignored()` iterates ALL discovered gitignore matchers against a given path
+   - Windows file attributes: `FILE_ATTRIBUTE_HIDDEN (0x2)` — separate from Unix dot-prefix convention
+   - Nonadmin indexer phases: Phase 1 (shallow home scan depth≤6), Phase 2 (deep home + C:\ roots in parallel), Phase 3 (background DB persist)
+
+3. Files and Code Sections:
+   - **`src-tauri/tauri.conf.json`**
+     - CSP was removed to fix OverlayScrollbars on Windows release build
+     - Changed from `"csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"` to empty `"security": {}`
+   
+   - **`src-tauri/src/win/nonadmin_indexer.rs`** (full file read)
+     - Non-admin fast indexer using jwalk with `skip_hidden(false)` and `follow_links(false)`
+     - Phase 1: `scan_dir_jwalk(&state.home_dir, ..., Some(SHALLOW_DEPTH=6), 0, None)`
+     - Phase 2: Deep home scan + C:\ root children scanned in parallel
+     - Phase 3: Background DB insert via `background_db_insert()`
+     - `process_read_dir` callback calls `should_skip_path_ext()` to filter entries
+     - Line 337: `status.permission_errors = 0; // expected in non-admin mode, don't surface`
+   
+   - **`src-tauri/src/main.rs`** (multiple sections read)
+     - Lines 67-99: `BUILTIN_SKIP_NAMES` (`.git`, `node_modules`, `.cache`, etc.), `BUILTIN_SKIP_SUFFIXES` (`.build`), `BUILTIN_SKIP_PATHS` (`AppData/Local/Temp`, `AppData/Local/Microsoft`, `AppData/Local/Google`, `AppData/Local/Packages`)
+     - Lines 1047-1062: `windows_noisy_roots()` adds 4 AppData\Local subdirs + system dirs to ignore
+     - Lines 1069-1094: `effective_ignore_rules()` chains pathignore, gitignore roots, macos_tcc, windows_noisy_roots
+     - Lines 1295-1339: `should_skip_path_ext()` — normalizes slashes, checks BUILTIN_SKIP_NAMES per segment, BUILTIN_SKIP_PATHS infix/suffix, ignored_roots, ignored_patterns, gitignore
+     - Lines 5167-5176: `home_dir` from `HOME`/`USERPROFILE`, `scan_root` always `C:\` on Windows
+   
+   - **`src-tauri/src/win/mod.rs`** (full file read)
+     - `start_windows_indexing()`: tries USN resume → MFT scan → fallback paths
+     - MFT fail + DB empty → `nonadmin_indexer::run_nonadmin_index`
+     - MFT fail + `index_complete=true` → Ready + background catchup
+     - MFT fail + DB has entries → Ready + `start_full_index_worker_silent`
+   
+   - **`src-tauri/src/win/mft_indexer.rs`** (multiple sections read)
+     - Uses `should_skip_dir_in_pruned_subtree()` and `should_skip_file_in_pruned_subtree()` — different from nonadmin's `should_skip_path_ext()`
+     - MFT reads raw NTFS metadata, bypasses all ACLs and file attributes
+   
+   - **`src-tauri/src/gitignore_filter.rs`** (full file read)
+     - `discover_gitignores()`: walks home_dir children (skips dot-dirs and "Library"), recurses to depth 3
+     - `collect_gitignores_recursive()`: looks for `.git` dir, loads `.gitignore`, stops recursing into git repos
+     - `GitignoreFilter::is_ignored()`: iterates ALL matchers, returns true on first `Ignore` match
+     - **KEY BUG**: The `ignore` crate's `Gitignore::matched()` appears to match paths outside the gitignore's root scope
+   
+   - **`C:\Users\USER\.cargo\registry\src\...\jwalk-0.8.1\src\lib.rs`**
+     - Lines 549-554: `fn is_hidden(file_name: &OsStr) -> bool { file_name.to_str().map(|s| s.starts_with('.')).unwrap_or(false) }` — ONLY checks dot-prefix, NOT Windows Hidden attribute
+
+4. Errors and fixes:
+   - **CSP blocking OverlayScrollbars**: Removed CSP entirely from `tauri.conf.json`. User confirmed "오버레이 스크롤로 잘보여" (overlay scrollbar works well).
+   - **DB not deleted properly**: First attempt to delete DB failed because app was still running. Fixed by using `taskkill //F //IM everything.exe` before deleting DB files (index.db, index.db-shm, index.db-wal).
+   - **Python sqlite3 unicode escape errors**: Raw strings with backslashes caused `SyntaxError: (unicode error)`. Fixed by using raw triple-quoted strings `r"""..."""`.
+   - **Commit style**: Per user's CLAUDE.md rules, NO "Co-Authored-By", emojis, or AI attribution in commits.
+
+5. Problem Solving:
+   - **Solved**: CSP was blocking OverlayScrollbars dynamic style injection in Windows release builds. Removing CSP fixed it.
+   - **Solved**: Identified two root causes for nonadmin indexer missing `%LOCALAPPDATA%` files:
+     1. **Gitignore scope leak** (MAJOR): The `ignore` crate's `Gitignore::matched()` applies patterns globally, not just within the git repo's root. Gitignore patterns like `[Bb]in/`, `[Ll]og/`, `build`, `dist`, `logs` from repos under `~/workspace/` are filtering files throughout the entire filesystem. Evidence: ZERO `bin` or `log` directories exist in the 1.3M entry DB.
+     2. **Windows Hidden attribute files** (confirmed): Files with Windows Hidden attribute like `mcp_config.json` are missing from DB. Need to verify if this is also caused by gitignore scope leak or a separate issue.
+   - **Key evidence**: 
+     - `C:\Users\USER\workspace\vcpkg\.gitignore` has `[Bb]in/` and `[Ll]og/`
+     - `C:\Users\USER\workspace\windowsai_image\WindowsAppSDK-Samples\.gitignore` has `[Bb]in/`, `[Ll]og/`, `[Ll]ogs/`
+     - Multiple repos have `build`, `dist`, `logs`, `coverage` patterns
+     - 20 gitignore files are discovered and applied globally
+
+6. All user messages:
+   - "csp 때문일지 모르니까 일단 빼고 release 빌드 걸어볼까?" (interrupted, then repeated)
+   - "오버레이 스크롤로 잘보여" (confirmation that overlay scrollbar works after CSP removal)
+   - "그럼 scripts\build-windows.ps1 다시 돌려줘" (interrupted)
+   - "commit" (interrupted, then repeated)
+   - "admin으로 했을 때랑 nonadmin으로 했을 때 indexing되는 목록이 달라. %LOCALAPPDATA%에 있는 데이터가 nonadmin에서는 검색이 안돼"
+   - "C:\Users\USER\AppData\Local\LINE\Data\mcp_config.json 이게 검색이 안돼"
+
+7. Pending Tasks:
+   - Fix the gitignore scope leak bug in `gitignore_filter.rs` — the `ignore` crate's `Gitignore::matched()` is applying patterns outside git repo scopes, filtering `bin`, `log`, `build`, `dist` directories globally
+   - Investigate if Windows Hidden attribute files (`mcp_config.json`) are also affected by the gitignore leak or need separate handling
+   - The MFT indexer uses different filter functions (`should_skip_dir_in_pruned_subtree`, `should_skip_file_in_pruned_subtree`) which may also be affected
+
+8. Current Work:
+   I was investigating why `C:\Users\USER\AppData\Local\LINE\Data\mcp_config.json` is not indexed by the nonadmin indexer. Through empirical testing (fresh DB, nonadmin index run, Python SQLite queries), I discovered:
+   - The file has Windows Hidden attribute (`Hidden, Archive`)
+   - Zero `bin` or `log` directories exist in the entire 1.3M entry DB
+   - 20 `.gitignore` files from git repos under home directory are discovered and applied globally
+   - Key offending gitignores include `vcpkg\.gitignore` (`[Bb]in/`, `[Ll]og/`), `WindowsAppSDK-Samples\.gitignore` (`[Bb]in/`, `[Ll]og/`), and many repos with `build`, `dist`, `logs` patterns
+   
+   I had just finished enumerating all broad patterns from all 20 discovered gitignore files when the summary was requested.
+
+9. Optional Next Step:
+   Fix the gitignore scope leak in `src-tauri/src/gitignore_filter.rs`. The `GitignoreFilter::is_ignored()` method calls `gi.matched(path, is_dir)` for ALL discovered gitignore matchers. The `ignore` crate's `Gitignore::matched()` should theoretically scope to its root, but it appears to match globally. The fix should either:
+   - Pre-check if the path is under the gitignore's root before calling `matched()` (e.g., `if !path.starts_with(gi.path()) { continue; }`)
+   - Or restructure the discovery to avoid collecting broad-pattern gitignores
+   
+   Also need to investigate whether the Windows Hidden attribute issue is a separate bug or just a symptom of gitignore patterns like `*.json` or `*.bin` matching hidden files.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\USER\.claude\projects\C--Users-USER-workspace-everything\64e85545-ff2f-4869-86ff-e31fe7c9940a.jsonl
+Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.
+
+---
+
+<task-notification>
+<task-id>b5fcda1</task-id>
+<tool-use-id>toolu_01TK7mE5a73fwsHsmbuUNSub</tool-use-id>
+<output-file>C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\b5fcda1.output</output-file>
+<status>completed</status>
+<summary>Background command "Run Rust tests" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\b5fcda1.output
+
+---
+
+<task-notification>
+<task-id>b153332</task-id>
+<tool-use-id>toolu_0116nzi3NPrf948VwSSSKwRP</tool-use-id>
+<output-file>C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\b153332.output</output-file>
+<status>completed</status>
+<summary>Background command "Start app for fresh index test" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\b153332.output
+
+---
+
+<task-notification>
+<task-id>b0618e9</task-id>
+<tool-use-id>toolu_01KQmHSqKYyxvdxGYB5ZvmUQ</tool-use-id>
+<output-file>C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\b0618e9.output</output-file>
+<status>completed</status>
+<summary>Background command "Start Tauri dev and wait for indexing" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\b0618e9.output
+
+---
+
+<task-notification>
+<task-id>bdd7dde</task-id>
+<tool-use-id>REDACTED</tool-use-id>
+<output-file>C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\bdd7dde.output</output-file>
+<status>completed</status>
+<summary>Background command "Start Tauri dev with fresh DB" completed (exit code 0)</summary>
+</task-notification>
+Read the output file to retrieve the result: C:\Users\USER\AppData\Local\Temp\claude\C--Users-USER-workspace-everything\tasks\bdd7dde.output
+
+---
+
+commit
