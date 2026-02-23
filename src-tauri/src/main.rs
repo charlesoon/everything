@@ -44,7 +44,7 @@ const RECENT_OP_TTL: Duration = Duration::from_secs(2);
 pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 const NEGATIVE_CACHE_FALLBACK_WINDOW: Duration = Duration::from_millis(550);
-const DB_VERSION: i32 = 5;
+const DB_VERSION: i32 = 6;
 const DEFERRED_DIR_NAMES: &[&str] = &[
     "Library", ".Trash", ".Trashes",
     // Windows system directories (deferred when scan_root is C:\)

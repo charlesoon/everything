@@ -27,6 +27,13 @@ impl GitignoreFilter {
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         for gi in &self.matchers {
+            // Only apply a gitignore to paths that are under its root directory.
+            // An unanchored pattern like `target/` in /proj-a/.gitignore must not
+            // match /proj-b/src/target — the ignore crate resolves it as `**/target`
+            // and would otherwise match across unrelated projects.
+            if !path.starts_with(gi.path()) {
+                continue;
+            }
             match gi.matched(path, is_dir) {
                 ignore::Match::Ignore(_) => return true,
                 ignore::Match::Whitelist(_) => return false,
@@ -107,6 +114,43 @@ fn collect_gitignores_recursive(
         }
 
         collect_gitignores_recursive(&path, depth + 1, max_depth, result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_gitignore(dir: &Path, contents: &str) {
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::write(dir.join(".gitignore"), contents).unwrap();
+    }
+
+    #[test]
+    fn cross_project_unanchored_pattern_does_not_bleed() {
+        let tmp = std::env::temp_dir().join(format!("gi_test_{}", std::process::id()));
+        let proj_a = tmp.join("proj-a");
+        let proj_b = tmp.join("proj-b");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+
+        // proj-a has `target/` — an unanchored pattern that the ignore crate resolves to `**/target`
+        write_gitignore(&proj_a, "target/\n");
+        // proj-b has a `target/` directory that must NOT be ignored
+        let target_in_b = proj_b.join("target");
+        fs::create_dir_all(&target_in_b).unwrap();
+        write_gitignore(&proj_b, "dist/\n");
+
+        let filter = GitignoreFilter::build(&tmp);
+        // proj-b/target must not be ignored just because proj-a has `target/`
+        assert!(!filter.is_ignored(&target_in_b, true), "cross-project gitignore bleed: target in proj-b was ignored by proj-a's .gitignore");
+        // proj-a/target MUST be ignored (its own rule)
+        let target_in_a = proj_a.join("target");
+        fs::create_dir_all(&target_in_a).unwrap();
+        assert!(filter.is_ignored(&target_in_a, true), "proj-a/target should be ignored by its own .gitignore");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
 
