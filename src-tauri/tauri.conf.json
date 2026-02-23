@@ -30,8 +30,7 @@
         "fullscreen": false
       }
     ],
-    "security": {
-    }
+    "security": {}
   },
   "bundle": {
     "active": true,

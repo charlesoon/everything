@@ -1,12 +1,11 @@
 node_modules
-src-tauri/target
 src-tauri/target-test
 src-tauri/tmp-test-dirs
+target/debug
 dist
 .DS_Store
 certificates
 .claude
 .entire
-build
 src-tauri/target-test-review/
 src-tauri/target-test-review2/
