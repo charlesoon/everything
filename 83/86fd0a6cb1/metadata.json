@@ -1,0 +1,33 @@
+{
+  "cli_version": "v0.4.3-4-g147bcffe-dirty",
+  "checkpoint_id": "8386fd0a6cb1",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 4,
+  "files_touched": [
+    "CLAUDE.md",
+    "README.md",
+    "doc\\architecture.md",
+    "doc\\architecture_KR.md",
+    "doc\\spec.md",
+    "doc\\spec_KR.md",
+    "src-tauri\\src\\gitignore_filter.rs",
+    "src-tauri\\tauri.conf.json"
+  ],
+  "sessions": [
+    {
+      "metadata": "/83/86fd0a6cb1/0/metadata.json",
+      "transcript": "/83/86fd0a6cb1/0/full.jsonl",
+      "context": "/83/86fd0a6cb1/0/context.md",
+      "content_hash": "/83/86fd0a6cb1/0/content_hash.txt",
+      "prompt": "/83/86fd0a6cb1/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 226,
+    "cache_creation_tokens": 533339,
+    "cache_read_tokens": 18812916,
+    "output_tokens": 64622,
+    "api_call_count": 194
+  }
+}
