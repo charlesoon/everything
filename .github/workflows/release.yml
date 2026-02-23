@@ -56,9 +56,10 @@ jobs:
                - Or run in Terminal: `xattr -cr /Applications/Everything.app`
 
             ## Windows Installation
-            1. Download the `.exe` installer
+            1. Download the Windows installer file (`*-setup.exe`)
             2. Run the installer to install the app
-            3. Launch it from the Start menu or desktop shortcut
+            3. Do not use other Windows `.exe` assets (portable/runtime files) for installation
+            4. Launch it from the Start menu or desktop shortcut
           releaseDraft: true
           prerelease: false
 
@@ -111,8 +112,11 @@ jobs:
                - Or run in Terminal: `xattr -cr /Applications/Everything.app`
 
             ## Windows Installation
-            1. Download the `.exe` installer
+            1. Download the Windows installer file (`*-setup.exe`)
             2. Run the installer to install the app
-            3. Launch it from the Start menu or desktop shortcut
+            3. Do not use other Windows `.exe` assets (portable/runtime files) for installation
+            4. Launch it from the Start menu or desktop shortcut
+          args: --bundles nsis
           releaseDraft: true
           prerelease: false
+
