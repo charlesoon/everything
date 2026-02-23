@@ -1,4 +1,4 @@
-This document is the final implementation-ready design/spec for development with Tauri (v2) + Svelte. (Quick Look excluded, "search speed" is top priority, Enter=Rename, Double click=Open)
+This document is the final implementation-ready design/spec for development with Tauri (v2) + Svelte. (Quick Look excluded, "search speed" is top priority, Enter=Rename on macOS / Enter=Open on Windows, Double click=Open)
 
 ---
 
@@ -6,7 +6,7 @@ This document is the final implementation-ready design/spec for development with
 
 - **Product name (tentative):** Everything
 - **Platform:** macOS, Windows
-- **Tech stack:** Tauri v2 + Rust + Svelte
+- **Tech stack:** Tauri v2 + Rust + Svelte 5
 - **Goal:** Ultrafast file/folder "name-based" search on par with Everything (Windows)
 - **UI direction:** Everything (Windows) clone style — simple, dense interface centered on a search bar + result table
 - **Window behavior:** Standard app window + instant activation via global shortcut (Cmd+Shift+Space on macOS)
@@ -27,13 +27,14 @@ This document is the final implementation-ready design/spec for development with
   - Open With... (MVP: Reveal in Finder/Explorer fallback)
   - Reveal in Finder / Explorer
   - Copy Path
+  - Copy Files (macOS: NSPasteboard clipboard)
   - Move to Trash / Recycle Bin
-  - Rename (Enter)
+  - Rename (Enter on macOS, F2 cross-platform)
+  - Quick Look (macOS: Space key)
 
 ### 1.2 Non-Goals (not in this version)
 
 - Full-text content search
-- Quick Look
 - Network/remote drive indexing
 - Full App Store sandbox compliance (future task)
 - Search filters (file/folder/extension filters) — MVP searches everything without filters
@@ -45,28 +46,33 @@ This document is the final implementation-ready design/spec for development with
 
 ### 2.1 Main Screen Layout
 
-- **Top:** Search input (auto-focused on app launch)
+- **Top:** Title bar (drag region) + theme toggle
+- **Below title bar:** Search input (auto-focused on app launch)
 - **Center:** Result table (virtual scroll)
   - Name (file icon + name)
   - Path (Directory)
-  - Kind (extension/file/folder)
+  - Size
   - Modified
 - **Bottom status bar:**
   - Index status: Ready | Indexing | Error
   - Indexed entries count
   - Last updated timestamp
+  - Permission errors count
+- **macOS:** Full Disk Access banner (dismissible)
 
 ### 2.2 Input/Interaction Rules (finalized)
 
 - **Double click:** Open
-- **Enter (selected, not editing):** Rename (start inline edit)
+- **Enter (macOS, selected, not editing):** Rename (start inline edit)
+- **Enter (Windows, selected, not editing):** Open
 - **Enter (while editing):** Confirm rename
 - **Esc (while editing):** Cancel rename
+- **Space:** Quick Look (macOS)
 
 Multi-select:
 - **Shift+Click:** Range select
 - **Cmd+Click (macOS) / Ctrl+Click (Windows):** Toggle select
-- Available actions with multi-select: Open, Reveal in Finder/Explorer, Copy Path, Move to Trash
+- Available actions with multi-select: Open, Reveal in Finder/Explorer, Copy Path, Copy Files, Move to Trash
 - Rename is only available in single-select mode (disabled during multi-select)
 
 ### 2.3 Keyboard Shortcuts (required)
@@ -78,18 +84,21 @@ Multi-select:
 - `Cmd+O` / `Ctrl+O` — Open
 - `Cmd+Enter` / `Ctrl+Enter` — Reveal in Finder/Explorer
 - `Cmd+C` / `Ctrl+C` — Copy Path
-- `Del` or `Cmd+Backspace` — Move to Trash (default: confirmation dialog ON)
-- `F2` — Rename (secondary, same as Enter)
+- `Cmd+F` / `Ctrl+F` — Focus search input
+- `Del` or `Cmd+Backspace` — Move to Trash
+- `F2` — Rename
+- `Space` — Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` — Select all
-
-Since Enter triggers Rename, `Cmd+O` / `Ctrl+O` is the primary "open" shortcut.
+- `Enter` — Open (Windows) / Rename (macOS)
 
 ### 2.4 Right-Click Context Menu (required)
 
 **macOS (custom menu):**
 - Open
-- Open With... -> Reveal in Finder (MVP)
+- Quick Look
+- Open With...
 - Reveal in Finder
+- Copy Files
 - Copy Path
 - Move to Trash
 - Rename (shown only in single-select)
@@ -97,6 +106,7 @@ Since Enter triggers Rename, `Cmd+O` / `Ctrl+O` is the primary "open" shortcut.
 **Windows (native Explorer context menu):**
 - Open, Reveal in Explorer, Copy Path (built-in items)
 - Shell context menu items (Open with, Send to, etc.)
+- Actions returned via `context_menu_action` event
 
 ---
 
@@ -113,6 +123,7 @@ Since Enter triggers Rename, `Cmd+O` / `Ctrl+O` is the primary "open" shortcut.
 - Initial indexing runs in background, no UI freezes
 - DB writes use batch transactions
 - Change detection (watcher) uses debounce + partial rescan for stability
+- In-memory index (MemIndex) provides instant search while DB upsert runs
 
 ---
 
@@ -120,13 +131,14 @@ Since Enter triggers Rename, `Cmd+O` / `Ctrl+O` is the primary "open" shortcut.
 
 ### 4.1 Components
 
-- **Frontend (Svelte):** UI, input events, virtual scroll, context menu
+- **Frontend (Svelte 5):** UI, input events, virtual scroll, context menu, OverlayScrollbars
 - **Backend (Rust):**
   - Indexer (scan + DB upsert)
     - macOS: jwalk incremental 2-pass scan
-    - Windows: NTFS MFT scan (rayon parallel)
-  - Search engine (LIKE-based with multi-index optimization)
-  - Action execution (open/reveal/trash/rename)
+    - Windows: NTFS MFT scan (rayon parallel) → WalkDir non-admin fallback
+  - In-memory search engine (MemIndex for instant results during indexing)
+  - DB search engine (LIKE-based with multi-index optimization)
+  - Action execution (open/reveal/trash/rename/quick_look)
   - Watcher for incremental updates
     - macOS: FSEvents (direct fsevent-sys binding)
     - Windows: USN Change Journal → ReadDirectoryChangesW fallback
@@ -138,8 +150,8 @@ Since Enter triggers Rename, `Cmd+O` / `Ctrl+O` is the primary "open" shortcut.
 
 1. App launch → scan filesystem → populate entries table
    - macOS: jwalk scan of `$HOME`
-   - Windows: MFT enumeration of `C:\`
-2. User searches → Rust runs LIKE-based query → returns top N results
+   - Windows: MFT enumeration of `C:\` (with MemIndex for immediate search)
+2. User searches → Rust checks MemIndex first, then queries SQLite (LIKE-based, multi-mode) → returns top N results
 3. Svelte renders list
 4. File changes occur → watcher queue → path-level upsert/delete
    - macOS: FSEvents
@@ -163,22 +175,20 @@ Since Enter triggers Rename, `Cmd+O` / `Ctrl+O` is the primary "open" shortcut.
 - `is_dir` INTEGER NOT NULL (0/1)
 - `ext` TEXT (lowercase extension, NULL for directories)
 - `mtime` INTEGER (unix epoch seconds, optional)
-- `size` INTEGER (optional, can store or omit in initial MVP)
+- `size` INTEGER (optional)
 - `indexed_at` INTEGER NOT NULL
 - `run_id` INTEGER NOT NULL DEFAULT 0
 
 **Indexes:**
 - `idx_entries_name_nocase` — `name COLLATE NOCASE` (prefix/contains search)
-- `idx_entries_dir` — `dir` (PathSearch directory scope)
 - `idx_entries_dir_ext_name_nocase` — `(dir, ext, name)` (PathSearch + ext shortcut)
-- `idx_entries_ext` — `ext` (ExtSearch)
 - `idx_entries_ext_name` — `(ext, name)` (ExtSearch + sorting)
 - `idx_entries_mtime` — `mtime` (modified date sorting)
-- `idx_entries_run_id` — `run_id` (stale row deletion during incremental indexing)
+- `idx_entries_indexed_at` — `indexed_at` (stale row management)
 
 **meta table:**
 - `key TEXT PRIMARY KEY, value TEXT NOT NULL`
-- Stores: `last_run_id`, `last_event_id` (macOS), `usn_next` / `usn_journal_id` / `index_complete` (Windows)
+- Stores: `last_run_id`, `last_event_id` (macOS), `win_last_usn` / `win_journal_id` / `index_complete` (Windows)
 
 ---
 
@@ -200,6 +210,8 @@ Search results use pure column sorting, not relevance-based.
 Supported sort modes:
 - Name ASC (default)
 - Name DESC
+- Size ASC
+- Size DESC
 - Modified ASC (oldest first)
 - Modified DESC (newest first)
 
@@ -239,7 +251,8 @@ No root selection UI — always indexes the platform default.
 - Direct NTFS Master File Table enumeration via `FSCTL_ENUM_USN_DATA`
 - Two-pass: enumerate MFT → resolve paths (rayon parallel)
 - Batch transaction per 50,000 rows
-- Fallback: jwalk-based scan if MFT unavailable
+- Builds MemIndex during scan for instant search before DB is ready
+- Fallback: WalkDir non-admin indexer if MFT access denied
 
 Progress events:
 - Send scanned_count, indexed_count, current_path to UI every 200ms
@@ -257,7 +270,7 @@ Progress events:
 - Zero-syscall path resolution using FRN cache from MFT scan
 - Filters: CREATE, DELETE, RENAME_OLD/NEW, CLOSE (skips metadata-only)
 - Rename pairing: OLD_NAME + NEW_NAME with 500ms timeout
-- Debounce: 30s (longer due to noisy system changes)
+- Debounce: 5s
 
 **Windows — ReadDirectoryChangesW (fallback):**
 - Uses notify crate when USN unavailable
@@ -271,7 +284,10 @@ Progress events:
 ### 7.4 Exclusion Rules (defaults + options)
 
 Default exclusions:
-- `.git/`, `node_modules/`, `.Trash`, `.npm`, `.cache`, `__pycache__`, `.gradle`
+- `.git/`, `node_modules/`, `.Trash`, `.Trashes`, `.npm`, `.cache`, `__pycache__`, `.gradle`, `DerivedData`
+
+Suffix exclusions:
+- `.build` (Xcode intermediate build directories)
 
 Platform-specific exclusions:
 - macOS: `Library/Caches/`, `Library/Developer/CoreSimulator`, `Library/Logs`, TCC roots (~40 paths)
@@ -297,34 +313,44 @@ Options:
 - Windows: native context menu includes "Open with" via Shell API
 - Future: recommended app list popover via macOS LaunchServices (Phase 2)
 
-### 8.3 Reveal in Finder / Explorer
+### 8.3 Quick Look (macOS only)
+
+- Space key triggers Quick Look preview
+- Uses macOS native Quick Look API
+
+### 8.4 Reveal in Finder / Explorer
 
 - Open file manager with the item selected
 - Multi-select: open each item's parent folder
 - macOS: `open -R`, Windows: `explorer /select,`, Linux: `xdg-open` parent
 
-### 8.4 Copy Path (finalized: multi-select support)
+### 8.5 Copy Path (finalized: multi-select support)
 
 - Copy path to clipboard
 - Single select: one path line
 - Multi-select: paths separated by newline (LF, `\n`)
 - macOS: `pbcopy`, Windows: `cmd /C clip`, Linux: `wl-copy` / `xclip` / `xsel`
 
-### 8.5 Move to Trash
+### 8.6 Copy Files (macOS only)
+
+- Copy files to clipboard via NSPasteboard
+- Supports multi-select
+
+### 8.7 Move to Trash
 
 - Move to Trash / Recycle Bin (uses `trash` crate for cross-platform support)
 - Default: confirmation dialog ON
 - Multi-select: "Move N items to Trash?" confirmation
 - (Shift to skip confirmation is a future option)
 
-### 8.6 Rename (Enter)
+### 8.8 Rename
 
-Rename only works in single-select mode. Enter/F2 is ignored during multi-select.
+Rename only works in single-select mode. F2 starts rename on both platforms. Enter starts rename on macOS only.
 
 Rename includes filesystem change + DB update + watcher duplicate suppression.
 
 Behavior definition:
-- Enter -> inline edit
+- F2 / Enter (macOS) -> inline edit
 - Enter while editing -> confirm
 - On confirm:
   1. Validate new name (no empty string, no path separators)
@@ -362,23 +388,33 @@ Without this, "flickering" or "duplicate delete/upsert" frequently occurs after 
 
 - `get_index_status() -> IndexStatusDTO`
 - `get_platform() -> String` ("windows", "macos", or other)
+- `get_home_dir() -> String`
 - `start_full_index()`
 - `reset_index()`
-- `search(query: String, limit: u32, sort_by: String, sort_dir: String) -> SearchResultDTO`
+- `search(query: String, limit: u32, sort_by: String, sort_dir: String, include_total: bool) -> SearchResultDTO`
+- `fd_search(query, ...) -> FdSearchResultDTO`
 - `open(paths: Vec<String>)`
 - `open_with(path: String)` (MVP: calls reveal_in_finder)
 - `reveal_in_finder(paths: Vec<String>)`
 - `copy_paths(paths: Vec<String>) -> String` (newline-separated paths)
+- `copy_files(paths: Vec<String>)` (macOS only — NSPasteboard clipboard)
 - `move_to_trash(paths: Vec<String>) -> Result`
 - `rename(path: String, new_name: String) -> Result<EntryDTO>`
 - `get_file_icon(ext: String, path: Option<String>) -> Option<Vec<u8>>` (system icon per extension/path)
-- `show_context_menu(paths: Vec<String>, x: f64, y: f64)` (Windows only — native Explorer context menu)
+- `show_context_menu(paths: Vec<String>, x: f64, y: f64)` (native context menu)
+- `quick_look(path: String)` (macOS only)
+- `check_full_disk_access() -> bool` (macOS only)
+- `open_privacy_settings()` (macOS only)
+- `set_native_theme(theme: String)` (dark/light)
+- `mark_frontend_ready()` (signals frontend initialization complete)
+- `frontend_log(msg: String)` (debug logging)
 
 ### 10.2 Events (Backend -> Frontend)
 
 - `index_progress { scanned, indexed, current_path }`
-- `index_state { state: Ready|Indexing|Error, message? }`
+- `index_state { state: Ready|Indexing|Error, message?, isCatchup? }`
 - `index_updated { entries_count, last_updated, permission_errors }`
+- `context_menu_action` (Windows: native context menu action result)
 - `focus_search` (macOS global shortcut)
 
 DTO minimum fields (performance):
@@ -386,33 +422,37 @@ DTO minimum fields (performance):
 
 ---
 
-## 11. Frontend (Svelte) Implementation Spec
+## 11. Frontend (Svelte 5) Implementation Spec
 
 ### 11.1 State Model
 
 - `query: string`
 - `results: EntryDTO[]`
+- `totalResults: number`, `totalResultsKnown: boolean`
 - `selectedIndices: Set<number>` (multi-select support)
 - `lastSelectedIndex: number` (Shift selection anchor)
-- `editing: { active: boolean, path: string, draftName: string }`
-- `indexStatus: IndexStatusDTO`
-- `sortBy: 'name' | 'mtime'` (default: `'name'`)
+- `editing: { active: boolean, path: string, index: number, draftName: string }`
+- `indexStatus: IndexStatusDTO` (includes `isCatchup`, `backgroundActive`)
+- `sortBy: 'name' | 'mtime' | 'size'` (default: `'name'`)
 - `sortDir: 'asc' | 'desc'` (default: `'asc'`)
 - `platform: string` ("windows", "macos", or other)
+- `theme: string` ("dark", "light")
+- `showFdaBanner: boolean` (macOS Full Disk Access)
 
 ### 11.2 Input Event Handling (state machine)
 
 - Search input onInput:
-  - Debounce 0–30ms (0 recommended by default)
-  - `invoke('search', { query, limit, sort_by, sort_dir })`
+  - Debounce 200ms (leading + trailing edge)
+  - `invoke('search', { query, limit, sort_by, sort_dir, include_total })`
 - List keydown:
-  - Enter:
-    - If editing: confirm rename
-    - If single-select: startRename()
-    - If multi-select: ignore
+  - Enter (macOS): startRename() / Enter (Windows): openSelected()
+  - Enter while editing: confirm rename
+  - F2: startRename()
+  - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder
   - Cmd+C / Ctrl+C: copy_paths
+  - Cmd+F / Ctrl+F: focus search input
   - Esc: cancel edit
   - Double click row: open(path)
   - Click: single select
@@ -425,8 +465,10 @@ DTO minimum fields (performance):
 ### 11.3 Virtual Scroll (required)
 
 - Smooth performance even with hundreds of results
-- Fixed row height (for performance)
-- Icon/Kind computation cache
+- Fixed row height: 26px
+- Icon cache (max 500 entries)
+- Highlight cache (max 300 entries)
+- OverlayScrollbars for styled scrollbar
 
 ### 11.4 Inline Rename UI (required)
 
@@ -444,7 +486,7 @@ DTO minimum fields (performance):
 
 **Windows:**
 - Per-file icons for executables: exe, lnk, ico, url, scr, appx
-  - Loaded via IShellItemImageFactory (32x32 PNG, requires real file path)
+  - Loaded via IShellItemImageFactory (16x16 PNG, requires real file path)
 - Extension-based fallback via SHGetFileInfo
 - No prewarming (loaded on demand)
 
@@ -452,13 +494,22 @@ Common:
 - Cache key: extension string (e.g., "pdf", "txt", "app")
 - Folders: cache a single folder icon
 - Files without extension: use default document icon
-- Frontend maintains icon cache as `Map<string, dataURL>`
+- Frontend maintains icon cache as `Map<string, dataURL>` (max 500)
 
 ### 11.6 Column Header Sort UI
 
-- Clicking Name or Modified column header toggles sort direction
+- Clicking Name, Size, or Modified column header toggles sort direction
 - Current sort column shows direction indicator: ▲ (ASC) / ▼ (DESC)
-- Path and Kind columns do not support sorting
+- Path column does not support sorting
+
+### 11.7 Result Columns
+
+| Column | Content |
+|--------|---------|
+| Name | File icon + file/folder name (with highlight) |
+| Path | Parent directory path |
+| Size | File size (human-readable) |
+| Modified | Last modified date/time |
 
 ---
 
@@ -471,7 +522,9 @@ Common:
 - **Rename/trash failure:**
   - Show error message to user (permissions/not found/conflict)
 - **MFT scan failure (Windows):**
-  - Fallback to USN-only or RDCW watcher mode
+  - Fallback to non-admin WalkDir indexer, then RDCW watcher mode
+- **Full Disk Access missing (macOS):**
+  - Show dismissible banner with link to Privacy settings
 
 ---
 
@@ -481,6 +534,7 @@ Common:
 - Include hidden files
 - Edit exclusion patterns (`.pathignore`)
 - Trash confirmation dialog on/off
+- Theme toggle (dark/light)
 
 ---
 
@@ -488,17 +542,17 @@ Common:
 
 **Phase 0: Search MVP (first priority)**
 1. SQLite init + entries schema + indexes
-2. Full scan indexer (macOS: jwalk, Windows: MFT)
+2. Full scan indexer (macOS: jwalk, Windows: MFT + WalkDir fallback)
 3. Search command (LIKE-based multi-mode + limit + ORDER BY)
 4. Svelte UI (search bar + results + virtual scroll + file icons)
 5. Double click open
 6. Status bar index status
-7. Column header sort (Name/Modified)
+7. Column header sort (Name/Size/Modified)
 
 **Phase 1: Actions + Multi-select + Rename UX**
 8. Multi-select UI (Shift/Cmd+Click, Ctrl+Click on Windows)
 9. Reveal/Copy/Trash implementation (multi-select, cross-platform)
-10. Enter=Rename (inline edit, single-select only) + rename command + DB sync
+10. Rename (inline edit, single-select only) + rename command + DB sync
 11. recent_ops cache for watcher duplicate prevention
 12. Global shortcut (Cmd+Shift+Space) registration (macOS)
 
@@ -508,7 +562,13 @@ Common:
 15. Debounce + path upsert/delete
 16. Bulk change stress test
 
-**Phase 3: Windows Native Features**
+**Phase 3: Platform Native Features**
 17. Windows native context menu (Shell API)
 18. Per-file icon loading (exe, lnk, etc.)
 19. Offline catchup (Windows Search service / mtime scan)
+20. Quick Look (macOS)
+21. Full Disk Access banner (macOS)
+22. Copy Files (macOS NSPasteboard)
+23. In-memory MemIndex (Windows, instant search during DB upsert)
+24. Non-admin WalkDir fallback (Windows)
+25. Theme toggle + native theme sync

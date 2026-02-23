@@ -1,4 +1,4 @@
-아래 문서는 Tauri(v2) + Svelte로 바로 개발에 들어갈 수 있도록 정리한 최종 설계/스펙(implementation-ready) 입니다. (Quick Look 제외, "검색 속도" 최우선, Enter=Rename, Double click=Open 반영)
+아래 문서는 Tauri(v2) + Svelte로 바로 개발에 들어갈 수 있도록 정리한 최종 설계/스펙(implementation-ready) 입니다. (Quick Look 포함, "검색 속도" 최우선, macOS: Enter=Rename / Windows: Enter=Open, Double click=Open 반영)
 
 ---
 
@@ -6,7 +6,7 @@
 
 - **제품명(가칭):** Everything
 - **플랫폼:** macOS, Windows
-- **기술 스택:** Tauri v2 + Rust + Svelte
+- **기술 스택:** Tauri v2 + Rust + Svelte 5
 - **목표:** Everything급(체감) 초고속 파일/폴더 "이름 기반" 검색
 - **UI 방향:** Everything(Windows) 클론 스타일 — 검색창 + 결과 테이블 중심의 단순하고 밀도 높은 인터페이스
 - **윈도우 동작:** 일반 앱 윈도우 + 글로벌 단축키(macOS: Cmd+Shift+Space)로 즉시 활성화
@@ -27,13 +27,14 @@
   - Open With… (MVP: Reveal in Finder/Explorer fallback)
   - Reveal in Finder / Explorer
   - Copy Path
+  - Copy Files (macOS: NSPasteboard 클립보드)
   - Move to Trash / 휴지통
-  - Rename(Enter)
+  - Rename (macOS: Enter, 공통: F2)
+  - Quick Look (macOS: Space 키)
 
 ### 1.2 비목표(이번 버전에서 하지 않음)
 
 - 내용 검색(全文)
-- Quick Look
 - 네트워크/원격 드라이브 인덱싱
 - App Store 샌드박스 완전 대응(추후 과제)
 - 검색 필터(파일/폴더/확장자 필터) — MVP에서는 필터 없이 전체 검색만
@@ -45,28 +46,33 @@
 
 ### 2.1 메인 화면 구성
 
-- **상단:** 검색 입력창(앱 시작 시 자동 포커스)
+- **상단:** 타이틀 바 (드래그 영역) + 테마 토글
+- **타이틀 바 아래:** 검색 입력창(앱 시작 시 자동 포커스)
 - **중앙:** 결과 테이블(가상 스크롤)
   - Name (파일 아이콘 + 이름)
   - Path(Directory)
-  - Kind(확장자/파일/폴더)
+  - Size
   - Modified
 - **하단 상태바:**
   - Index status: Ready | Indexing | Error
   - Indexed entries count
   - Last updated timestamp
+  - 권한 오류 수
+- **macOS:** Full Disk Access 배너 (해제 가능)
 
 ### 2.2 입력/조작 규칙(확정)
 
 - **Double click:** Open
-- **Enter(선택 상태, 편집 아님):** Rename(인라인 편집 시작)
+- **Enter(macOS, 선택 상태, 편집 아님):** Rename(인라인 편집 시작)
+- **Enter(Windows, 선택 상태, 편집 아님):** Open
 - **Enter(편집 중):** Rename 확정
 - **Esc(편집 중):** Rename 취소
+- **Space:** Quick Look (macOS)
 
 다중 선택:
 - **Shift+클릭:** 범위 선택
 - **Cmd+클릭 (macOS) / Ctrl+클릭 (Windows):** 개별 토글 선택
-- 다중 선택 시 가능한 액션: Open, Reveal in Finder/Explorer, Copy Path, Move to Trash
+- 다중 선택 시 가능한 액션: Open, Reveal in Finder/Explorer, Copy Path, Copy Files, Move to Trash
 - Rename은 단일 선택 상태에서만 가능 (다중 선택 시 Rename 비활성화)
 
 ### 2.3 키보드 단축키(필수)
@@ -78,18 +84,21 @@
 - `Cmd+O` / `Ctrl+O` : Open
 - `Cmd+Enter` / `Ctrl+Enter` : Reveal in Finder/Explorer
 - `Cmd+C` / `Ctrl+C` : Copy Path
-- `Del` 또는 `Cmd+Backspace` : Move to Trash (기본: 확인 다이얼로그 ON)
-- `F2` : Rename(보조, Enter와 동일)
+- `Cmd+F` / `Ctrl+F` : 검색 입력 포커스
+- `Del` 또는 `Cmd+Backspace` : Move to Trash
+- `F2` : Rename
+- `Space` : Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` : 전체 선택
-
-Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강제합니다.
+- `Enter` : Open (Windows) / Rename (macOS)
 
 ### 2.4 우클릭 메뉴(필수)
 
 **macOS (커스텀 메뉴):**
 - Open
-- Open With… → Reveal in Finder (MVP)
+- Quick Look
+- Open With…
 - Reveal in Finder
+- Copy Files
 - Copy Path
 - Move to Trash
 - Rename (단일 선택 시에만 표시)
@@ -97,6 +106,7 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 **Windows (네이티브 Explorer 컨텍스트 메뉴):**
 - Open, Reveal in Explorer, Copy Path (기본 항목)
 - Shell 컨텍스트 메뉴 항목 (연결 프로그램, 보내기 등)
+- `context_menu_action` 이벤트로 액션 반환
 
 ---
 
@@ -113,6 +123,7 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 - 초기 인덱싱은 백그라운드 수행, UI 프리즈 금지
 - DB 쓰기는 batch transaction으로 처리
 - 변경 감지(watcher)는 debounce + 부분 재스캔으로 안정성 우선
+- 인메모리 인덱스(MemIndex)로 DB upsert 중에도 즉시 검색 제공
 
 ---
 
@@ -120,13 +131,14 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 
 ### 4.1 구성 요소
 
-- **Frontend(Svelte):** UI, 입력 이벤트, 가상 스크롤, 컨텍스트 메뉴
+- **Frontend(Svelte 5):** UI, 입력 이벤트, 가상 스크롤, 컨텍스트 메뉴, OverlayScrollbars
 - **Backend(Rust):**
   - 인덱서(스캔 + DB upsert)
     - macOS: jwalk 증분 2-pass 스캔
-    - Windows: NTFS MFT 스캔 (rayon 병렬)
-  - 검색 엔진(LIKE 기반 다중 인덱스 최적화)
-  - 액션 수행(open/reveal/trash/rename)
+    - Windows: NTFS MFT 스캔 (rayon 병렬) → WalkDir non-admin fallback
+  - 인메모리 검색 엔진(MemIndex, 인덱싱 중 즉시 검색)
+  - DB 검색 엔진(LIKE 기반 다중 인덱스 최적화)
+  - 액션 수행(open/reveal/trash/rename/quick_look)
   - 증분 업데이트용 watcher
     - macOS: FSEvents (fsevent-sys 직접 바인딩)
     - Windows: USN Change Journal → ReadDirectoryChangesW fallback
@@ -138,8 +150,8 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 
 1. 앱 시작 → 파일 시스템 스캔 → entries 테이블 채움
    - macOS: `$HOME` jwalk 스캔
-   - Windows: `C:\` MFT 열거
-2. 사용자가 검색 → Rust가 LIKE 기반 다중 모드 쿼리 → 상위 N개 반환
+   - Windows: `C:\` MFT 열거 (MemIndex로 즉시 검색 가능)
+2. 사용자가 검색 → Rust가 MemIndex 먼저 확인, 그 다음 SQLite LIKE 기반 다중 모드 쿼리 → 상위 N개 반환
 3. Svelte가 리스트 렌더
 4. 파일 변경 발생 → watcher 큐 → (경로 단위) upsert/delete 반영
    - macOS: FSEvents
@@ -163,22 +175,20 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 - `is_dir` INTEGER NOT NULL (0/1)
 - `ext` TEXT (lowercase extension, dir이면 NULL)
 - `mtime` INTEGER (unix epoch seconds, optional)
-- `size` INTEGER (optional, initial MVP에서는 저장해도 되고 생략 가능)
+- `size` INTEGER (optional)
 - `indexed_at` INTEGER NOT NULL
 - `run_id` INTEGER NOT NULL DEFAULT 0
 
 **Indexes:**
 - `idx_entries_name_nocase` — `name COLLATE NOCASE` (prefix/contains 검색)
-- `idx_entries_dir` — `dir` (PathSearch 디렉토리 범위)
 - `idx_entries_dir_ext_name_nocase` — `(dir, ext, name)` (PathSearch + ext shortcut)
-- `idx_entries_ext` — `ext` (ExtSearch)
 - `idx_entries_ext_name` — `(ext, name)` (ExtSearch + 정렬)
 - `idx_entries_mtime` — `mtime` (수정일 정렬)
-- `idx_entries_run_id` — `run_id` (증분 인덱싱 stale row 삭제)
+- `idx_entries_indexed_at` — `indexed_at` (stale row 관리)
 
 **meta 테이블:**
 - `key TEXT PRIMARY KEY, value TEXT NOT NULL`
-- 저장 항목: `last_run_id`, `last_event_id` (macOS), `usn_next` / `usn_journal_id` / `index_complete` (Windows)
+- 저장 항목: `last_run_id`, `last_event_id` (macOS), `win_last_usn` / `win_journal_id` / `index_complete` (Windows)
 
 ---
 
@@ -200,6 +210,8 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 지원하는 정렬 모드:
 - Name ASC (기본값)
 - Name DESC
+- Size ASC
+- Size DESC
 - Modified ASC (오래된 순)
 - Modified DESC (최신 순)
 
@@ -239,7 +251,8 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 - `FSCTL_ENUM_USN_DATA`로 NTFS Master File Table 직접 열거
 - 2-pass: MFT 열거 → 경로 해석 (rayon 병렬)
 - 50,000행 단위 batch transaction
-- Fallback: MFT 사용 불가 시 jwalk 기반 스캔
+- 스캔 중 MemIndex 빌드 (DB 준비 전 즉시 검색용)
+- Fallback: MFT 접근 불가 시 WalkDir non-admin 인덱서
 
 진행 이벤트:
 - 200ms마다 UI로 scanned_count, indexed_count, current_path 송신
@@ -257,7 +270,7 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 - MFT 스캔의 FRN 캐시로 syscall 없이 경로 해석
 - 필터: CREATE, DELETE, RENAME_OLD/NEW, CLOSE (메타데이터 변경만 스킵)
 - rename 페어링: OLD_NAME + NEW_NAME 500ms 타임아웃
-- 디바운스: 30초 (시스템 노이즈가 많아 더 긴 주기)
+- 디바운스: 5초
 
 **Windows — ReadDirectoryChangesW (fallback):**
 - USN 사용 불가 시 notify 크레이트 사용
@@ -271,7 +284,10 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 ### 7.4 제외 규칙(기본값 + 옵션)
 
 기본 제외(초기값):
-- `.git/`, `node_modules/`, `.Trash`, `.npm`, `.cache`, `__pycache__`, `.gradle`
+- `.git/`, `node_modules/`, `.Trash`, `.Trashes`, `.npm`, `.cache`, `__pycache__`, `.gradle`, `DerivedData`
+
+접미사 제외:
+- `.build` (Xcode 중간 빌드 디렉토리)
 
 플랫폼별 제외:
 - macOS: `Library/Caches/`, `Library/Developer/CoreSimulator`, `Library/Logs`, TCC roots (~40개)
@@ -297,34 +313,44 @@ Enter가 Rename이므로 `Cmd+O` / `Ctrl+O`를 "열기 기본 단축키"로 강�
 - Windows: 네이티브 컨텍스트 메뉴에 Shell API를 통한 "연결 프로그램" 포함
 - 향후: macOS LaunchServices로 추천 앱 목록 팝오버(Phase 2)
 
-### 8.3 Reveal in Finder / Explorer
+### 8.3 Quick Look (macOS 전용)
+
+- Space 키로 Quick Look 미리보기 트리거
+- macOS 네이티브 Quick Look API 사용
+
+### 8.4 Reveal in Finder / Explorer
 
 - 파일 관리자에서 해당 항목을 선택 상태로 열기
 - 다중 선택 시: 각 항목의 부모 폴더를 열기
 - macOS: `open -R`, Windows: `explorer /select,`, Linux: `xdg-open` 부모
 
-### 8.4 Copy Path(확정: 다중 선택 지원)
+### 8.5 Copy Path(확정: 다중 선택 지원)
 
 - 경로를 클립보드에 복사
 - 단일 선택: 해당 경로 1줄
 - 다중 선택: 각 경로를 개행(LF, `\n`)으로 구분하여 복사
 - macOS: `pbcopy`, Windows: `cmd /C clip`, Linux: `wl-copy` / `xclip` / `xsel`
 
-### 8.5 Move to Trash
+### 8.6 Copy Files (macOS 전용)
+
+- NSPasteboard를 통한 파일 클립보드 복사
+- 다중 선택 지원
+
+### 8.7 Move to Trash
 
 - 휴지통으로 이동 (`trash` 크레이트로 크로스 플랫폼 지원)
 - 기본: 확인 다이얼로그 ON
 - 다중 선택 시: "N개 항목을 휴지통으로 이동하시겠습니까?" 확인
 - (Shift 누르면 확인 없이 삭제 같은 UX는 추후 옵션)
 
-### 8.6 Rename (Enter)
+### 8.8 Rename
 
-Rename은 단일 선택 상태에서만 동작한다. 다중 선택 시 Enter/F2 무시.
+Rename은 단일 선택 상태에서만 동작한다. F2는 양 플랫폼 공통. Enter는 macOS에서만 Rename 시작.
 
 Rename은 파일 시스템 변경 + DB 갱신 + watcher 중복 억제까지 포함합니다.
 
 동작 정의:
-- Enter → 인라인 편집
+- F2 / Enter (macOS) → 인라인 편집
 - 편집 중 Enter → 확정
 - 확정 시:
   1. 새 이름 정합성 검사(빈 문자열 금지, 경로 구분자 금지)
@@ -362,23 +388,33 @@ Rename/Trash/Open 등 앱이 직접 수행한 작업은 watcher 이벤트로도 
 
 - `get_index_status() -> IndexStatusDTO`
 - `get_platform() -> String` ("windows", "macos" 등)
+- `get_home_dir() -> String`
 - `start_full_index()`
 - `reset_index()`
-- `search(query: String, limit: u32, sort_by: String, sort_dir: String) -> SearchResultDTO`
+- `search(query: String, limit: u32, sort_by: String, sort_dir: String, include_total: bool) -> SearchResultDTO`
+- `fd_search(query, ...) -> FdSearchResultDTO`
 - `open(paths: Vec<String>)`
 - `open_with(path: String)` (MVP: reveal_in_finder 호출)
 - `reveal_in_finder(paths: Vec<String>)`
 - `copy_paths(paths: Vec<String>) -> String` (개행 구분 경로)
+- `copy_files(paths: Vec<String>)` (macOS 전용 — NSPasteboard 클립보드)
 - `move_to_trash(paths: Vec<String>) -> Result`
 - `rename(path: String, new_name: String) -> Result<EntryDTO>`
 - `get_file_icon(ext: String, path: Option<String>) -> Option<Vec<u8>>` (확장자/경로별 시스템 아이콘)
-- `show_context_menu(paths: Vec<String>, x: f64, y: f64)` (Windows 전용 — 네이티브 Explorer 컨텍스트 메뉴)
+- `show_context_menu(paths: Vec<String>, x: f64, y: f64)` (네이티브 컨텍스트 메뉴)
+- `quick_look(path: String)` (macOS 전용)
+- `check_full_disk_access() -> bool` (macOS 전용)
+- `open_privacy_settings()` (macOS 전용)
+- `set_native_theme(theme: String)` (dark/light)
+- `mark_frontend_ready()` (프론트엔드 초기화 완료 신호)
+- `frontend_log(msg: String)` (디버그 로깅)
 
 ### 10.2 Events(Backend → Frontend)
 
 - `index_progress { scanned, indexed, current_path }`
-- `index_state { state: Ready|Indexing|Error, message? }`
+- `index_state { state: Ready|Indexing|Error, message?, isCatchup? }`
 - `index_updated { entries_count, last_updated, permission_errors }`
+- `context_menu_action` (Windows: 네이티브 컨텍스트 메뉴 액션 결과)
 - `focus_search` (macOS 글로벌 단축키)
 
 DTO 최소 필드(성능):
@@ -386,33 +422,37 @@ DTO 최소 필드(성능):
 
 ---
 
-## 11. 프론트엔드(Svelte) 구현 스펙
+## 11. 프론트엔드(Svelte 5) 구현 스펙
 
 ### 11.1 상태 모델
 
 - `query: string`
 - `results: EntryDTO[]`
+- `totalResults: number`, `totalResultsKnown: boolean`
 - `selectedIndices: Set<number>` (다중 선택 지원)
 - `lastSelectedIndex: number` (Shift 선택 앵커)
-- `editing: { active: boolean, path: string, draftName: string }`
-- `indexStatus: IndexStatusDTO`
-- `sortBy: 'name' | 'mtime'` (기본값: `'name'`)
+- `editing: { active: boolean, path: string, index: number, draftName: string }`
+- `indexStatus: IndexStatusDTO` (`isCatchup`, `backgroundActive` 포함)
+- `sortBy: 'name' | 'mtime' | 'size'` (기본값: `'name'`)
 - `sortDir: 'asc' | 'desc'` (기본값: `'asc'`)
 - `platform: string` ("windows", "macos" 등)
+- `theme: string` ("dark", "light")
+- `showFdaBanner: boolean` (macOS Full Disk Access)
 
 ### 11.2 입력 이벤트 처리(상태 머신)
 
 - 검색창 onInput:
-  - debounce 0~30ms(기본 0 권장)
-  - `invoke('search', { query, limit, sort_by, sort_dir })`
+  - debounce 200ms (leading + trailing edge)
+  - `invoke('search', { query, limit, sort_by, sort_dir, include_total })`
 - 리스트 키다운:
-  - Enter:
-    - 편집 중이면 rename 확정
-    - 단일 선택이면 startRename()
-    - 다중 선택이면 무시
+  - Enter (macOS): startRename() / Enter (Windows): openSelected()
+  - 편집 중 Enter: rename 확정
+  - F2: startRename()
+  - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder
   - Cmd+C / Ctrl+C: copy_paths
+  - Cmd+F / Ctrl+F: 검색 입력 포커스
   - Esc: 편집 취소
   - Double click row: open(path)
   - 클릭: 단일 선택
@@ -425,8 +465,10 @@ DTO 최소 필드(성능):
 ### 11.3 가상 스크롤(필수)
 
 - 결과가 수백 개여도 부드럽게
-- row 높이 고정(성능 위해)
-- 아이콘/Kind 계산 캐시
+- row 높이 고정: 26px
+- 아이콘 캐시 (최대 500개)
+- 하이라이트 캐시 (최대 300개)
+- OverlayScrollbars로 스타일 스크롤바
 
 ### 11.4 인라인 Rename UI(필수)
 
@@ -444,7 +486,7 @@ DTO 최소 필드(성능):
 
 **Windows:**
 - 실행 파일 전용 아이콘: exe, lnk, ico, url, scr, appx
-  - IShellItemImageFactory (32x32 PNG, 실제 파일 경로 필요)
+  - IShellItemImageFactory (16x16 PNG, 실제 파일 경로 필요)
 - 확장자 기반 fallback: SHGetFileInfo
 - 프리워밍 없음 (온디맨드 로딩)
 
@@ -452,13 +494,22 @@ DTO 최소 필드(성능):
 - 캐시 키: 확장자 문자열 (예: "pdf", "txt", "app")
 - 폴더: 별도 폴더 아이콘 1개 캐시
 - 확장자 없는 파일: 기본 문서 아이콘 사용
-- 프론트엔드에서 `Map<string, dataURL>` 형태로 아이콘 캐시 유지
+- 프론트엔드에서 `Map<string, dataURL>` 형태로 아이콘 캐시 유지 (최대 500개)
 
 ### 11.6 컬럼 헤더 정렬 UI
 
-- Name, Modified 컬럼 헤더 클릭 시 정렬 전환
+- Name, Size, Modified 컬럼 헤더 클릭 시 정렬 전환
 - 현재 정렬 컬럼에 방향 표시: ▲(ASC) / ▼(DESC)
-- Path, Kind 컬럼은 정렬 미지원
+- Path 컬럼은 정렬 미지원
+
+### 11.7 결과 컬럼
+
+| 컬럼 | 내용 |
+|------|------|
+| Name | 파일 아이콘 + 파일/폴더 이름 (하이라이트) |
+| Path | 부모 디렉토리 경로 |
+| Size | 파일 크기 (사람이 읽기 쉬운 형식) |
+| Modified | 최종 수정 일시 |
 
 ---
 
@@ -471,7 +522,9 @@ DTO 최소 필드(성능):
 - **rename/trash 실패:**
   - 사용자에게 오류 메시지(권한/존재하지 않음/충돌)
 - **MFT 스캔 실패 (Windows):**
-  - USN 전용 또는 RDCW watcher 모드로 fallback
+  - Non-admin WalkDir 인덱서로 fallback, 그 다음 RDCW watcher 모드
+- **Full Disk Access 미부여 (macOS):**
+  - 개인정보 설정 링크 포함 해제 가능 배너 표시
 
 ---
 
@@ -481,6 +534,7 @@ DTO 최소 필드(성능):
 - 숨김 파일 포함
 - 제외 패턴 편집 (`.pathignore`)
 - Trash 확인 다이얼로그 on/off
+- 테마 토글 (dark/light)
 
 ---
 
@@ -488,17 +542,17 @@ DTO 최소 필드(성능):
 
 **Phase 0: 검색 MVP(가장 먼저)**
 1. SQLite 초기화 + entries 스키마 + 인덱스
-2. full scan 인덱서 (macOS: jwalk, Windows: MFT)
+2. full scan 인덱서 (macOS: jwalk, Windows: MFT + WalkDir fallback)
 3. search command (LIKE 기반 다중 모드 + limit + ORDER BY)
 4. Svelte UI(검색창+결과+가상스크롤+파일아이콘)
 5. Double click open
 6. 상태바 index status
-7. 컬럼 헤더 정렬(Name/Modified)
+7. 컬럼 헤더 정렬(Name/Size/Modified)
 
 **Phase 1: 액션 + 다중 선택 + Rename UX**
 8. 다중 선택 UI (Shift/Cmd+클릭, Windows에서 Ctrl+클릭)
 9. Reveal/Copy/Trash 구현 (다중 선택, 크로스 플랫폼 대응)
-10. Enter=Rename(인라인 편집, 단일 선택만) + rename command + DB 갱신
+10. Rename(인라인 편집, 단일 선택만) + rename command + DB 갱신
 11. recent_ops 캐시로 watcher 중복 대비
 12. 글로벌 단축키(Cmd+Shift+Space) 등록 (macOS)
 
@@ -508,7 +562,13 @@ DTO 최소 필드(성능):
 15. debounce + path upsert/delete
 16. 대량 변경 스트레스 테스트
 
-**Phase 3: Windows 네이티브 기능**
+**Phase 3: 플랫폼 네이티브 기능**
 17. Windows 네이티브 컨텍스트 메뉴 (Shell API)
 18. 파일별 아이콘 로딩 (exe, lnk 등)
 19. 오프라인 catchup (Windows Search 서비스 / mtime 스캔)
+20. Quick Look (macOS)
+21. Full Disk Access 배너 (macOS)
+22. Copy Files (macOS NSPasteboard)
+23. 인메모리 MemIndex (Windows, DB upsert 중 즉시 검색)
+24. Non-admin WalkDir fallback (Windows)
+25. 테마 토글 + 네이티브 테마 동기화

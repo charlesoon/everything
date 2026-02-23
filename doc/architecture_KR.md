@@ -8,12 +8,13 @@ Everything — 파일 시스템 전체를 SQLite에 인덱싱하여 sub-50ms 파
 |-------|-----------|
 | App framework | Tauri v2 |
 | Backend | Rust (rusqlite, jwalk, ignore) |
-| Frontend | Svelte 4 (단일 컴포넌트) |
+| Frontend | Svelte 5 (단일 컴포넌트) |
 | DB | SQLite WAL mode, LIKE 기반 검색 |
-| Build | Vite 5, Cargo |
+| Build | Vite 7, Cargo |
 | macOS watcher | fsevent-sys (FSEvents 직접 바인딩) |
-| Windows 인덱서 | MFT 스캔 (Win32 FSCTL), USN 저널, ReadDirectoryChangesW fallback |
+| Windows 인덱서 | MFT 스캔 (Win32 FSCTL), USN 저널, ReadDirectoryChangesW fallback, WalkDir non-admin fallback |
 | Windows 추가 | windows 0.58, notify, rayon, png |
+| Plugins | tauri-plugin-global-shortcut, tauri-plugin-drag, tauri-plugin-window-state, tauri-plugin-decorum |
 
 ---
 
@@ -24,8 +25,8 @@ src-tauri/src/
 ├── main.rs              # 앱 상태, DB, 인덱싱, 검색, 파일 액션, IPC 핸들러
 ├── query.rs             # 검색 쿼리 파서 (SearchMode 분류)
 ├── fd_search.rs         # jwalk 기반 라이브 파일시스템 검색
-├── mem_search.rs        # 인메모리 컴팩트 엔트리 검색
-├── gitignore_filter.rs  # .gitignore 재귀 탐색 및 매칭
+├── mem_search.rs        # 인메모리 컴팩트 엔트리 검색 (MemIndex)
+├── gitignore_filter.rs  # 지연 .gitignore 탐색 및 매칭
 │
 ├── mac/                 # macOS 전용 모듈
 │   ├── mod.rs
@@ -35,6 +36,7 @@ src-tauri/src/
 └── win/                 # Windows 전용 모듈
     ├── mod.rs               # Windows 인덱싱 오케스트레이션 (MFT → USN → RDCW fallback)
     ├── mft_indexer.rs       # NTFS Master File Table 스캔 (rayon 병렬)
+    ├── nonadmin_indexer.rs  # WalkDir fallback (MFT 접근 불가 시)
     ├── usn_watcher.rs       # USN Change Journal 모니터
     ├── rdcw_watcher.rs      # ReadDirectoryChangesW fallback (notify 크레이트)
     ├── search_catchup.rs    # 오프라인 동기화 (Windows Search 서비스 / mtime 스캔)
@@ -46,7 +48,8 @@ src-tauri/src/
 
 src/
 ├── main.js              # Svelte 마운트 포인트
-└── App.svelte           # 전체 UI (단일 컴포넌트)
+├── App.svelte           # 전체 UI (단일 컴포넌트)
+└── search-utils.js      # 검색 디바운스 & 뷰포트 보존 유틸리티
 ```
 
 ### 모듈 의존성
@@ -67,8 +70,9 @@ gitignore_filter.rs   독립 (ignore 크레이트만 사용)
 mac/fsevent_watcher.rs    독립 (fsevent-sys만 사용)
 mac/spotlight_search.rs ──→ main.rs (EntryDto)
 
-win/mod.rs         ──→ mft_indexer, usn_watcher, rdcw_watcher, search_catchup
-win/mft_indexer.rs ──→ path_resolver, volume, com_guard
+win/mod.rs         ──→ mft_indexer, nonadmin_indexer, usn_watcher, rdcw_watcher, search_catchup
+win/mft_indexer.rs ──→ path_resolver, volume, com_guard, mem_search
+win/nonadmin_indexer.rs ──→ mem_search, rdcw_watcher
 win/usn_watcher.rs ──→ path_resolver, volume, com_guard
 win/rdcw_watcher.rs   독립 (notify 크레이트만 사용)
 win/icon.rs        ──→ com_guard
@@ -90,15 +94,19 @@ struct AppState {
     cwd: PathBuf,                         // 현재 작업 디렉토리
     db_ready: Arc<AtomicBool>,            // DB 초기화 완료 여부
     indexing_active: Arc<AtomicBool>,     // 인덱싱 진행 중 플래그
-    status: Arc<Mutex<IndexStatus>>,      // 인덱싱 상태 (state, counts)
+    status: Arc<Mutex<IndexStatus>>,      // 인덱싱 상태 (state, counts, backgroundActive)
     path_ignores: Arc<Vec<PathBuf>>,      // 무시 경로 목록
     path_ignore_patterns: Arc<Vec<IgnorePattern>>,  // 무시 패턴 (glob)
-    gitignore: SharedGitignoreFilter,     // Arc<GitignoreFilter>
+    gitignore: Arc<LazyGitignoreFilter>,  // 지연 .gitignore 필터
     recent_ops: Arc<Mutex<Vec<RecentOp>>>,          // rename/trash 2초 TTL 캐시
     icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,   // 확장자→PNG 아이콘
     fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>, // 라이브 검색 캐시
-    negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>, // 0건 검색어 60초 캐시
+    negative_name_cache: Arc<Mutex<HashMap<String, NegativeNameEntry>>>, // 0건 검색어 60초 캐시
     ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,      // 무시 규칙 mtime 캐시
+    mem_index: Arc<RwLock<Option<Arc<MemIndex>>>>,  // 인메모리 인덱스 (Windows: MFT→DB upsert 중)
+    watcher_stop: Arc<AtomicBool>,        // 파일 워처 중지 신호
+    watcher_active: Arc<AtomicBool>,      // 파일 워처 이벤트 루프 실행 중
+    frontend_ready: Arc<AtomicBool>,      // 프론트엔드 onMount 완료
 }
 ```
 
@@ -108,7 +116,7 @@ struct AppState {
 
 ## DB Schema
 
-**위치**: `<app_data_dir>/index.db` | **버전**: `PRAGMA user_version = 4`
+**위치**: `<app_data_dir>/index.db` | **버전**: `PRAGMA user_version = 5`
 
 ### entries 테이블
 
@@ -132,12 +140,10 @@ CREATE TABLE entries (
 | 인덱스 | 용도 |
 |--------|------|
 | `idx_entries_name_nocase` | `name COLLATE NOCASE` — NameSearch prefix/contains |
-| `idx_entries_dir` | `dir` — PathSearch 디렉토리 범위 |
 | `idx_entries_dir_ext_name_nocase` | `(dir, ext, name)` — PathSearch + ext shortcut |
-| `idx_entries_ext` | `ext` — ExtSearch |
 | `idx_entries_ext_name` | `(ext, name)` — ExtSearch + 정렬 |
 | `idx_entries_mtime` | `mtime` — 수정일 정렬 |
-| `idx_entries_run_id` | `run_id` — 증분 인덱싱 stale row 삭제 |
+| `idx_entries_indexed_at` | `indexed_at` — stale row 관리 |
 
 ### meta 테이블
 
@@ -149,8 +155,8 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 |-----|------|
 | `last_run_id` | 마지막 인덱싱 run ID (증분 비교 기준) |
 | `last_event_id` | FSEvents event ID — 재시작 시 replay 시작점 (macOS) |
-| `usn_next` | 다음 USN 오프셋 — 저널 이어읽기 (Windows) |
-| `usn_journal_id` | USN 저널 ID — 저널 리셋 감지 (Windows) |
+| `win_last_usn` | 다음 USN 오프셋 — 저널 이어읽기 (Windows) |
+| `win_journal_id` | USN 저널 ID — 저널 리셋 감지 (Windows) |
 | `index_complete` | 이전 인덱싱 정상 완료 플래그 (Windows) |
 | `rdcw_last_active_ts` | RDCW 오프라인 catchup용 마지막 활성 타임스탬프 (Windows) |
 
@@ -176,7 +182,7 @@ journal_mode=WAL  synchronous=NORMAL  temp_store=MEMORY  busy_timeout=3000
   ├─ 무시 규칙 로드: .pathignore + .gitignore roots
   │    macOS:   + TCC roots (~40개 보호된 Library 경로)
   │
-  ├─ GitignoreFilter 빌드: scan_root 하위 비숨김 디렉토리 depth 3까지 탐색
+  ├─ LazyGitignoreFilter 빌드: scan_root 하위 비숨김 디렉토리 depth 3까지 탐색
   ├─ AppState 구성 및 등록
   │
   ├─ 글로벌 단축키 등록 (macOS만):
@@ -188,9 +194,10 @@ journal_mode=WAL  synchronous=NORMAL  temp_store=MEMORY  busy_timeout=3000
   │
   └─ 백그라운드 스레드 시작
        │
-       ├─ init_db(): 테이블/인덱스 생성, 버전 체크 (불일치 시 전체 재생성)
+       ├─ init_db(): 테이블 생성, 버전 체크 (불일치 시 전체 재생성)
        ├─ purge_ignored_entries(): 무시 대상 기존 DB 엔트리 삭제
        ├─ db_ready = true (검색 가능)
+       ├─ ensure_db_indexes(): 인덱스 생성 (비차단, 지연)
        ├─ emit_status_counts → 프론트엔드에 현재 엔트리 수 전달
        │
        ├─ [macOS] 조건부 시작: last_event_id 존재 AND DB에 엔트리 있음?
@@ -256,12 +263,34 @@ MFT 스캔 (NTFS Master File Table)
   ├─ Pass 2: 경로 해석 + upsert (rayon 병렬)
   │    ├─ 각 파일 FRN → PathResolver로 전체 경로 해석
   │    ├─ 필터: scan_root 외부 경로 스킵, 무시 규칙 적용
+  │    ├─ MemIndex 빌드 (DB upsert 중 즉시 검색용)
   │    ├─ 백그라운드 DB upsert 파이프라인 (배치 50,000건)
   │    └─ 200ms마다 index_progress emit
   │
   ├─ stale 엔트리 정리 + ANALYZE
-  ├─ usn_next, usn_journal_id, index_complete을 meta에 저장
+  ├─ win_last_usn, win_journal_id, index_complete을 meta에 저장
   └─ FRN 캐시 + next_usn을 USN watcher에 전달
+```
+
+### Windows: Non-Admin 인덱서 (`win::nonadmin_indexer`)
+
+```
+WalkDir fallback (MFT 접근 불가 시)
+  │
+  ├─ Phase 1 (shallow): 우선순위 루트 depth 제한 스캔
+  │    ├─ 조기 MemIndex 빌드 (즉시 검색용)
+  │    └─ 스캔 중 index_progress emit
+  │
+  ├─ Phase 2 (deep): 나머지 루트 병렬 스캔
+  │    ├─ rayon으로 루트별 병렬 스캔
+  │    └─ 전체 MemIndex 빌드
+  │
+  ├─ 백그라운드 DB 저장 (벌크 인서트)
+  │    ├─ 인덱스 삭제/재생성으로 빠른 upsert
+  │    ├─ stale 엔트리 정리 + ANALYZE
+  │    └─ DB 완료 후 MemIndex 해제
+  │
+  └─ RDCW watcher 시작 (증분 업데이트용)
 ```
 
 ### Windows 인덱싱 fallback 체인
@@ -280,6 +309,9 @@ start_windows_indexing()
   ├─ USN watcher만 시도 (MFT 캐시 없이)
   │    └─ 실패 ↓
   │
+  ├─ Non-admin WalkDir 인덱서 시도 (nonadmin_indexer)
+  │    └─ 실패 ↓
+  │
   └─ RDCW watcher fallback (ReadDirectoryChangesW via notify 크레이트)
 ```
 
@@ -288,25 +320,30 @@ start_windows_indexing()
 ```
 should_skip_path(path)
   │
-  ├─ BUILTIN_SKIP_NAMES: .git, node_modules, .Trash, .npm, .cache,
-  │                       CMakeFiles, .qtc_clangd, __pycache__, .gradle
+  ├─ BUILTIN_SKIP_NAMES: .git, node_modules, .Trash, .Trashes, .npm, .cache,
+  │                       CMakeFiles, .qtc_clangd, __pycache__, .gradle, DerivedData
+  │
+  ├─ BUILTIN_SKIP_SUFFIXES: .build (Xcode 중간 빌드 디렉토리)
   │
   ├─ BUILTIN_SKIP_PATHS (macOS):
-  │    Library/Caches, Library/Developer/CoreSimulator, Library/Logs, .vscode/extensions
+  │    Library/Caches, Library/Developer/CoreSimulator, Library/Logs
   │
-  ├─ BUILTIN_SKIP_PATHS (Windows — deferred roots):
-  │    Windows, Program Files, Program Files (x86), $Recycle.Bin,
-  │    System Volume Information, Recovery, PerfLogs
+  ├─ BUILTIN_SKIP_PATHS (크로스 플랫폼):
+  │    .vscode/extensions
   │
-  ├─ Windows noisy 디렉토리 제외 (USN watcher):
+  ├─ BUILTIN_SKIP_PATHS (Windows — AppData 노이즈):
   │    AppData/Local/Temp, AppData/Local/Microsoft,
   │    AppData/Local/Google, AppData/Local/Packages
+  │
+  ├─ DEFERRED_DIR_NAMES (Windows — 시스템 디렉토리):
+  │    Windows, Program Files, Program Files (x86), $Recycle.Bin,
+  │    System Volume Information, Recovery, PerfLogs
   │
   ├─ .pathignore: 프로젝트 루트 및 home_dir에서 로드
   ├─ macOS TCC roots: ~/Library/Mail, Safari, Messages 등 ~40개
   ├─ IgnorePattern::AnySegment: **/target 등 어느 depth에서든 매칭
   ├─ IgnorePattern::Glob: 와일드카드 패턴 매칭
-  └─ gitignore_filter: .gitignore 규칙 (ignore 크레이트)
+  └─ LazyGitignoreFilter: .gitignore 규칙 (ignore 크레이트, depth 3)
 ```
 
 ---
@@ -335,6 +372,9 @@ should_skip_path(path)
   ├─ [NameSearch] negative cache 확인
   │    ├─ 캐시 hit (300-550ms 이내, 미확인) → find 명령 1회 fallback
   │    └─ 캐시 hit (그 외) → 빈 결과 즉시 반환
+  │
+  ├─ MemIndex 확인 (Windows, MFT→DB upsert 중)
+  │    └─ MemIndex 존재 → 인메모리 검색, 결과 반환
   │
   ├─ DB 검색 (모드별)
   │    │
@@ -370,7 +410,24 @@ should_skip_path(path)
   │    │    동일 rank 내 얕은 경로 우선
   │    └─ NameSearch 0건 → negative cache 저장 (60초 TTL)
   │
-  └─ SearchResultDto { entries, modeLabel } 반환
+  └─ SearchResultDto { entries, modeLabel, totalCount, totalKnown } 반환
+```
+
+### 인메모리 검색 (`mem_search.rs`)
+
+```
+MemIndex (MFT/WalkDir 스캔 중 즉시 검색용으로 빌드)
+  │
+  ├─ CompactEntry: 최소 구조체 (EntryDto 대비 ~104바이트 절감)
+  ├─ sorted_idx: 이름 정렬 인덱스 (이진 검색용)
+  ├─ ext_map: 확장자 → 엔트리 인덱스
+  ├─ dir_map: 디렉토리 → 엔트리 인덱스
+  │
+  ├─ 검색 단계:
+  │    Phase 1: 정확 + 접두사 (이진 검색)
+  │    Phase 2: 포함 매칭 (30ms 시간 제한)
+  │
+  └─ 정렬: 관련성 (0-9) → mtime/size/name
 ```
 
 ### Spotlight Fallback (macOS 전용 — `mac/spotlight_search.rs`)
@@ -442,7 +499,7 @@ USN watcher (주요 — MFT 스캔 이후)
   ├─ rename 페어링: RENAME_OLD_NAME + RENAME_NEW_NAME을 500ms 타임아웃으로 매칭
   │    불완전 페어 → create 또는 delete로 처리
   │
-  ├─ 디바운스: 30초 (시스템 노이즈가 많아 macOS보다 긴 주기)
+  ├─ 디바운스: 5초
   ├─ 배치 처리 → 해당 경로 upsert/delete
   ├─ 이중 캐싱: positive 캐시 (새 디렉토리) + negative 캐시 (scan_root 외부)
   │
@@ -476,24 +533,32 @@ RDCW watcher (fallback — USN 사용 불가 시)
 | `get_platform` | FE→BE | `"windows"`, `"macos"` 등 반환 |
 | `start_full_index` | FE→BE | 전체 재인덱싱 트리거 |
 | `reset_index` | FE→BE | DB 초기화 후 재인덱싱 |
-| `search` | FE→BE | DB 검색 → `SearchResultDto { entries, modeLabel }` |
+| `search` | FE→BE | DB 검색 → `SearchResultDto { entries, modeLabel, totalCount, totalKnown }` |
 | `fd_search` | FE→BE | jwalk 라이브 검색 → `FdSearchResultDto { entries, total, timedOut }` |
 | `open` | FE→BE | 파일 열기 (macOS: `open`, Windows: `cmd /C start`, Linux: `xdg-open`) |
 | `open_with` | FE→BE | 파일 관리자에서 보기 |
 | `reveal_in_finder` | FE→BE | macOS: `open -R`, Windows: `explorer /select,`, Linux: `xdg-open` 부모 |
 | `copy_paths` | FE→BE | 경로 클립보드 복사 (macOS: `pbcopy`, Windows: `clip`) |
+| `copy_files` | FE→BE | 파일 클립보드 복사 (macOS 전용, NSPasteboard) |
 | `move_to_trash` | FE→BE | 휴지통 이동 + DB 삭제 |
 | `rename` | FE→BE | 이름 변경 + DB 갱신 → 새 EntryDto 반환 |
 | `get_file_icon` | FE→BE | 확장자/경로별 시스템 아이콘 PNG 반환 |
-| `show_context_menu` | FE→BE | 네이티브 Explorer 컨텍스트 메뉴 (Windows 전용) |
+| `show_context_menu` | FE→BE | 네이티브 컨텍스트 메뉴 (Windows: Explorer Shell API, macOS: 커스텀) |
+| `quick_look` | FE→BE | Quick Look 미리보기 (macOS 전용) |
+| `check_full_disk_access` | FE→BE | 전체 디스크 접근 권한 확인 (macOS 전용) |
+| `open_privacy_settings` | FE→BE | 개인 정보 설정 열기 (macOS 전용) |
+| `set_native_theme` | FE→BE | 네이티브 윈도우 테마 설정 (dark/light) |
+| `mark_frontend_ready` | FE→BE | 프론트엔드 초기화 완료 신호 |
+| `frontend_log` | FE→BE | 프론트엔드 디버그 로깅 |
 
 ## Backend Events
 
 | Event | Payload | 시점 |
 |-------|---------|------|
 | `index_progress` | `{ scanned, indexed, currentPath }` | 인덱싱 중 200ms 간격 |
-| `index_state` | `{ state, message }` | Indexing/Ready/Error 전환 시 |
+| `index_state` | `{ state, message, isCatchup }` | Indexing/Ready/Error 전환 시 |
 | `index_updated` | `{ entriesCount, lastUpdated, permissionErrors }` | 인덱싱 완료, watcher 업데이트, 파일 액션 후 |
+| `context_menu_action` | 액션 페이로드 | Windows: 네이티브 컨텍스트 메뉴 액션 결과 |
 | `focus_search` | (없음) | Cmd+Shift+Space 글로벌 단축키 (macOS) |
 
 ---
@@ -502,7 +567,7 @@ RDCW watcher (fallback — USN 사용 불가 시)
 
 ### 단일 컴포넌트 (`App.svelte`)
 
-검색 입력, 가상 스크롤 테이블, 인라인 이름 변경, 컨텍스트 메뉴, 키보드 단축키, 아이콘 캐시, 상태 바를 포함하는 단일 컴포넌트.
+검색 입력, 가상 스크롤 테이블, 인라인 이름 변경, 컨텍스트 메뉴, 키보드 단축키, 아이콘 캐시, 상태 바, 테마 토글, Full Disk Access 배너(macOS)를 포함하는 단일 컴포넌트.
 
 ### 플랫폼 감지
 
@@ -510,16 +575,17 @@ RDCW watcher (fallback — USN 사용 불가 시)
 
 ### 상태 관리
 
-Svelte 리액티브 변수 사용 (store 미사용).
+Svelte 5 리액티브 변수 사용 (store 미사용).
 
 | 카테고리 | 주요 변수 |
 |---------|----------|
-| 검색 | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir` |
+| 검색 | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir`, `totalResults`, `totalResultsKnown` |
 | 선택 | `selectedIndices` (Set), `selectionAnchor`, `lastSelectedIndex` |
 | 편집 | `editing { active, path, index, draftName }` |
-| 인덱싱 | `indexStatus`, `scanned`, `indexed`, `currentPath`, `lastReadyCount` |
+| 인덱싱 | `indexStatus { state, entriesCount, lastUpdated, permissionErrors, isCatchup, backgroundActive }`, `scanned`, `indexed`, `currentPath` |
 | 가상 스크롤 | `scrollTop`, `viewportHeight`, `colWidths` |
-| 캐시 | `iconCache` (Map), `highlightCache` (Map) |
+| 캐시 | `iconCache` (Map, 최대 500), `highlightCache` (Map, 최대 300) |
+| UI | `platform`, `isMaximized`, `showFdaBanner`, `theme`, `contextMenu`, `toast` |
 
 ### 검색 입력 → 결과 시퀀스
 
@@ -532,10 +598,11 @@ Svelte 리액티브 변수 사용 (store 미사용).
   │
   ├─ runSearch()
   │    ├─ searchGeneration++ (stale 응답 방지)
-  │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir })
-  │    ├─ 응답: { entries, modeLabel }
+  │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir, include_total: false })
+  │    ├─ 응답: { entries, modeLabel, totalCount, totalKnown }
   │    ├─ results = entries
   │    ├─ searchModeLabel = modeLabel
+  │    ├─ 뷰포트 보존 로직 (스크롤 위치)
   │    └─ 선택 경로 기반 복원
   │
   └─ 무한 스크롤
@@ -547,14 +614,15 @@ Svelte 리액티브 변수 사용 (store 미사용).
 ### 가상 스크롤
 
 ```
-고정 행 높이: 28px
+고정 행 높이: 26px
 버퍼: 상하 10행 (총 overscan ~20행)
+OverlayScrollbars로 커스텀 스크롤바 스타일링
 
 scrollTop
-  → startIndex = max(0, floor(scrollTop / 28) - 10)
+  → startIndex = max(0, floor(scrollTop / 26) - 10)
   → endIndex = min(results.length, startIndex + visibleCount)
   → visibleRows = results.slice(startIndex, endIndex)
-  → translateY = startIndex * 28
+  → translateY = startIndex * 26
 
 DOM:
   <div class="table-body">          ← 스크롤 컨테이너
@@ -570,30 +638,32 @@ DOM:
 
 | 키 | 동작 |
 |----|------|
-| `Escape` | 선택 해제, 검색 입력 포커스 |
+| `Escape` | 선택 해제, 검색 입력 포커스 / 이름 변경 취소 |
 | `↑` / `↓` | 선택 이동 (Shift: 범위 선택) |
 | `PageUp` / `PageDown` | 페이지 단위 이동 |
-| `Enter` | 인라인 이름 변경 시작 |
+| `Enter` | 열기 (Windows) / 인라인 이름 변경 시작 (macOS) |
 | `F2` | 인라인 이름 변경 시작 |
+| `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | 선택 항목 열기 |
 | `Cmd+Enter` / `Ctrl+Enter` | Finder/Explorer에서 보기 |
 | `Cmd+C` / `Ctrl+C` | 경로 복사 |
 | `Cmd+A` / `Ctrl+A` | 전체 선택 |
+| `Cmd+F` / `Ctrl+F` | 검색 입력 포커스 |
 | `Delete` / `Cmd+⌫` | 휴지통 이동 |
 
 ### 컨텍스트 메뉴
 
 | 플랫폼 | 구현 |
 |--------|------|
-| Windows | 네이티브 Explorer 컨텍스트 메뉴 (Shell API, `show_context_menu` 커맨드) |
-| macOS | 커스텀 메뉴: Open, Open With, Reveal in Finder, Copy Path, Move to Trash, Rename (단일 선택 시) |
+| Windows | 네이티브 Explorer 컨텍스트 메뉴 (Shell API, `show_context_menu` 커맨드), `context_menu_action` 이벤트로 액션 수신 |
+| macOS | 커스텀 메뉴: Open, Quick Look, Open With, Reveal in Finder, Copy Files, Copy Path, Move to Trash, Rename (단일 선택 시) |
 
 ### 아이콘 시스템
 
 ```
 visibleRows 변경
   → ensureIcon(entry) 호출
-  → iconCache에 있으면 즉시 반환
+  → iconCache에 있으면 즉시 반환 (최대 500개)
   → 없으면 invoke('get_file_icon', { ext, path })
 
 macOS:
@@ -602,14 +672,14 @@ macOS:
 
 Windows:
   → 실행 파일 전용 아이콘: exe, lnk, ico, url, scr, appx
-      IShellItemImageFactory (32x32 PNG, 실제 파일 경로 필요)
+      IShellItemImageFactory (16x16 PNG, 실제 파일 경로 필요)
   → 확장자 기반 fallback: SHGetFileInfo
   → 프리워밍 없음 (온디맨드 로딩)
 ```
 
 ### 테마
 
-시스템 설정 연동 (`prefers-color-scheme: dark`). CSS 커스텀 프로퍼티 기반.
+시스템 설정 연동 (`prefers-color-scheme: dark`). 테마 버튼으로 토글. CSS 커스텀 프로퍼티 및 `data-theme` 속성 기반. localStorage에 저장.
 
 ```css
 :root {
@@ -622,11 +692,15 @@ Windows:
 
 | 상태 | 표시 내용 |
 |------|----------|
-| 인덱싱 중 (엔트리 있음) | `● 검색 가능` + 진행률% + 경과 시간 + 엔트리 수 |
+| 인덱싱 중 (엔트리 있음) | 펄싱 `●` + 진행률% + 경과 시간 + 엔트리 수 |
 | 인덱싱 중 (엔트리 없음) | `인덱싱 시작 중...` |
-| Ready | `Index: Ready` + 엔트리 수 + 인덱싱 소요 시간 |
-| Spotlight fallback (macOS) | 주황색 `Spotlight 임시 검색` |
+| Ready | 녹색 `●` + 엔트리 수 + 인덱싱 소요 시간 |
+| Ready (백그라운드 활성) | 펄싱 녹색 `●` |
 | 검색 완료 | `"query" Xms · N results` |
+
+### Full Disk Access 배너 (macOS)
+
+macOS에서 시작 시 `check_full_disk_access()` 확인. 미부여 시 개인정보 설정 링크가 포함된 해제 가능한 배너 표시.
 
 ---
 
@@ -635,15 +709,18 @@ Windows:
 | 기능 | macOS | Windows |
 |------|-------|---------|
 | 스캔 범위 | `$HOME` | `C:\` (전체 드라이브) |
-| 인덱싱 | jwalk 증분 (2-pass depth) | MFT 스캔 (NTFS 메타데이터, rayon 병렬) |
+| 인덱싱 | jwalk 증분 (2-pass depth) | MFT 스캔 (NTFS 메타데이터, rayon 병렬) → WalkDir fallback |
 | 파일 워처 | FSEvents (fsevent-sys 직접 바인딩) | USN 저널 → RDCW fallback |
 | 재시작 시 이어하기 | FSEvent replay (저장된 event_id) | USN resume (저장된 next_usn) |
 | 검색 fallback | Spotlight (mdfind) | N/A |
+| 인메모리 인덱스 | N/A | MemIndex (MFT→DB upsert 중) |
 | 아이콘 로딩 | NSWorkspace (확장자 기반, 프리워밍) | IShellItemImageFactory (exe/lnk 파일별) + SHGetFileInfo |
 | 컨텍스트 메뉴 | 커스텀 (프론트엔드) | 네이티브 Explorer 컨텍스트 메뉴 (Shell API) |
 | 글로벌 단축키 | Cmd+Shift+Space (tauri-plugin-global-shortcut) | 미등록 |
 | 윈도우 효과 | Vibrancy (NSVisualEffectMaterial) | 테마별 배경색 |
-| 클립보드 | `pbcopy` | `cmd /C clip` |
+| Quick Look | 지원 (Space 키) | N/A |
+| Full Disk Access | FDA 배너 확인 | N/A |
+| 클립보드 | `pbcopy` (경로), NSPasteboard (파일) | `cmd /C clip` |
 | 파일 열기 | `open` 명령 | `cmd /C start ""` |
 | 파일 위치 표시 | `open -R` | `explorer /select,` |
 
@@ -659,9 +736,9 @@ Windows:
 | `BATCH_SIZE` | 10,000 | DB 배치 쓰기 단위 (macOS 인덱싱) |
 | `MFT_BATCH_SIZE` | 50,000 | DB 배치 쓰기 단위 (Windows MFT) |
 | `SHALLOW_SCAN_DEPTH` | 6 | Pass 0 최대 depth (macOS) |
-| `JWALK_NUM_THREADS` | 4 | 병렬 워커 수 |
+| `jwalk_num_threads()` | available/2 (4–16) | 동적 병렬 워커 수 |
 | `WATCH_DEBOUNCE` | 300ms | 파일 변경 디바운스 (macOS FSEvents, Windows RDCW) |
-| `USN_DEBOUNCE` | 30s | USN watcher 디바운스 (Windows) |
+| `USN_CHANGE_DEBOUNCE` | 5s | USN watcher 디바운스 (Windows) |
 | `RENAME_PAIR_TIMEOUT` | 500ms | rename 이벤트 페어링 타임아웃 (Windows USN/RDCW) |
 | `RECENT_OP_TTL` | 2s | rename/trash 중복 방지 |
 | `NEGATIVE_CACHE_TTL` | 60s | 0건 검색어 캐시 |
@@ -670,5 +747,10 @@ Windows:
 | `WSEARCH_TIMEOUT` | 10s | Windows Search 서비스 타임아웃 |
 | `MUST_SCAN_THRESHOLD` | 10 | replay 중 full scan 트리거 (macOS) |
 | `EVENT_ID_FLUSH_INTERVAL` | 30s | event_id / usn_next DB 저장 주기 |
+| `STATUS_EMIT_MIN_INTERVAL` | 2s | 상태 업데이트 스로틀 |
+| `DB_BUSY_RETRY_DELAY` | 3s | DB busy 시 재시도 지연 |
+| `SEARCH_DEBOUNCE_MS` (FE) | 200ms | 프론트엔드 검색 디바운스 |
 | `PAGE_SIZE` (FE) | 500 | 프론트엔드 페이지 크기 |
-| `rowHeight` (FE) | 28px | 가상 스크롤 행 높이 |
+| `rowHeight` (FE) | 26px | 가상 스크롤 행 높이 |
+| `ICON_CACHE_MAX` (FE) | 500 | 프론트엔드 아이콘 캐시 제한 |
+| `HIGHLIGHT_CACHE_MAX` (FE) | 300 | 프론트엔드 하이라이트 캐시 제한 |

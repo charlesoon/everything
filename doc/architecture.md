@@ -8,12 +8,13 @@ Everything — a Tauri v2 desktop app that indexes the filesystem into SQLite fo
 |-------|-----------|
 | App framework | Tauri v2 |
 | Backend | Rust (rusqlite, jwalk, ignore) |
-| Frontend | Svelte 4 (single component) |
+| Frontend | Svelte 5 (single component) |
 | DB | SQLite WAL mode, LIKE-based search |
-| Build | Vite 5, Cargo |
+| Build | Vite 7, Cargo |
 | macOS watcher | fsevent-sys (direct FSEvents binding) |
-| Windows indexer | MFT scan (Win32 FSCTL), USN journal, ReadDirectoryChangesW fallback |
+| Windows indexer | MFT scan (Win32 FSCTL), USN journal, ReadDirectoryChangesW fallback, WalkDir non-admin fallback |
 | Windows extras | windows 0.58, notify, rayon, png |
+| Plugins | tauri-plugin-global-shortcut, tauri-plugin-drag, tauri-plugin-window-state, tauri-plugin-decorum |
 
 ---
 
@@ -24,8 +25,8 @@ src-tauri/src/
 ├── main.rs              # App state, DB, indexing, search, file actions, IPC handlers
 ├── query.rs             # Search query parser (SearchMode classification)
 ├── fd_search.rs         # jwalk-based live filesystem search
-├── mem_search.rs        # In-memory compact entry search
-├── gitignore_filter.rs  # Recursive .gitignore discovery and matching
+├── mem_search.rs        # In-memory compact entry search (MemIndex)
+├── gitignore_filter.rs  # Lazy .gitignore discovery and matching
 │
 ├── mac/                 # macOS-specific modules
 │   ├── mod.rs
@@ -35,6 +36,7 @@ src-tauri/src/
 └── win/                 # Windows-specific modules
     ├── mod.rs               # Windows indexing orchestration (MFT → USN → RDCW fallback)
     ├── mft_indexer.rs       # NTFS Master File Table scan (rayon parallel)
+    ├── nonadmin_indexer.rs  # WalkDir fallback (when MFT access denied)
     ├── usn_watcher.rs       # USN Change Journal monitor
     ├── rdcw_watcher.rs      # ReadDirectoryChangesW fallback (notify crate)
     ├── search_catchup.rs    # Offline sync (Windows Search service / mtime scan)
@@ -46,7 +48,8 @@ src-tauri/src/
 
 src/
 ├── main.js              # Svelte mount point
-└── App.svelte           # Entire UI (single component)
+├── App.svelte           # Entire UI (single component)
+└── search-utils.js      # Search debounce & viewport-preserve utilities
 ```
 
 ### Module Dependencies
@@ -67,8 +70,9 @@ gitignore_filter.rs   standalone (only ignore crate)
 mac/fsevent_watcher.rs    standalone (only fsevent-sys)
 mac/spotlight_search.rs ──→ main.rs (EntryDto)
 
-win/mod.rs         ──→ mft_indexer, usn_watcher, rdcw_watcher, search_catchup
-win/mft_indexer.rs ──→ path_resolver, volume, com_guard
+win/mod.rs         ──→ mft_indexer, nonadmin_indexer, usn_watcher, rdcw_watcher, search_catchup
+win/mft_indexer.rs ──→ path_resolver, volume, com_guard, mem_search
+win/nonadmin_indexer.rs ──→ mem_search, rdcw_watcher
 win/usn_watcher.rs ──→ path_resolver, volume, com_guard
 win/rdcw_watcher.rs   standalone (only notify crate)
 win/icon.rs        ──→ com_guard
@@ -90,15 +94,19 @@ struct AppState {
     cwd: PathBuf,                         // current working directory
     db_ready: Arc<AtomicBool>,            // DB initialization complete flag
     indexing_active: Arc<AtomicBool>,     // indexing in-progress flag
-    status: Arc<Mutex<IndexStatus>>,      // indexing state (state, counts)
+    status: Arc<Mutex<IndexStatus>>,      // indexing state (state, counts, backgroundActive)
     path_ignores: Arc<Vec<PathBuf>>,      // ignored path list
     path_ignore_patterns: Arc<Vec<IgnorePattern>>,  // ignore patterns (glob)
-    gitignore: SharedGitignoreFilter,     // Arc<GitignoreFilter>
+    gitignore: Arc<LazyGitignoreFilter>,  // lazy .gitignore filter
     recent_ops: Arc<Mutex<Vec<RecentOp>>>,          // rename/trash 2-second TTL cache
     icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,   // extension→PNG icon
     fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>, // live search cache
-    negative_name_cache: Arc<Mutex<Vec<NegativeNameEntry>>>, // zero-result query 60s cache
+    negative_name_cache: Arc<Mutex<HashMap<String, NegativeNameEntry>>>, // zero-result query 60s cache
     ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,      // ignore rules mtime cache
+    mem_index: Arc<RwLock<Option<Arc<MemIndex>>>>,  // in-memory index (Windows: during MFT→DB upsert)
+    watcher_stop: Arc<AtomicBool>,        // signal to stop file watcher
+    watcher_active: Arc<AtomicBool>,      // file watcher event loop running
+    frontend_ready: Arc<AtomicBool>,      // frontend onMount complete
 }
 ```
 
@@ -108,7 +116,7 @@ All fields are wrapped in `Arc` for `Clone` support. Injected into IPC handlers 
 
 ## DB Schema
 
-**Location**: `<app_data_dir>/index.db` | **Version**: `PRAGMA user_version = 4`
+**Location**: `<app_data_dir>/index.db` | **Version**: `PRAGMA user_version = 5`
 
 ### entries table
 
@@ -132,12 +140,10 @@ CREATE TABLE entries (
 | Index | Purpose |
 |-------|---------|
 | `idx_entries_name_nocase` | `name COLLATE NOCASE` — NameSearch prefix/contains |
-| `idx_entries_dir` | `dir` — PathSearch directory scope |
 | `idx_entries_dir_ext_name_nocase` | `(dir, ext, name)` — PathSearch + ext shortcut |
-| `idx_entries_ext` | `ext` — ExtSearch |
 | `idx_entries_ext_name` | `(ext, name)` — ExtSearch + sorting |
 | `idx_entries_mtime` | `mtime` — modified date sorting |
-| `idx_entries_run_id` | `run_id` — stale row deletion during incremental indexing |
+| `idx_entries_indexed_at` | `indexed_at` — stale row management |
 
 ### meta table
 
@@ -149,8 +155,8 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 |-----|---------|
 | `last_run_id` | Last indexing run ID (baseline for incremental comparison) |
 | `last_event_id` | FSEvents event ID — replay starting point on restart (macOS) |
-| `usn_next` | Next USN offset for journal resume (Windows) |
-| `usn_journal_id` | USN journal ID for detecting journal resets (Windows) |
+| `win_last_usn` | Next USN offset for journal resume (Windows) |
+| `win_journal_id` | USN journal ID for detecting journal resets (Windows) |
 | `index_complete` | Flag indicating prior indexing finished successfully (Windows) |
 | `rdcw_last_active_ts` | Last active timestamp for RDCW offline catchup (Windows) |
 
@@ -176,7 +182,7 @@ App launch
   ├─ Load ignore rules: .pathignore + .gitignore roots
   │    macOS:   + TCC roots (~40 protected Library paths)
   │
-  ├─ Build GitignoreFilter: scan non-hidden dirs under scan_root up to depth 3
+  ├─ Build LazyGitignoreFilter: scan non-hidden dirs under scan_root up to depth 3
   ├─ Construct and register AppState
   │
   ├─ Register global shortcut (macOS only):
@@ -188,9 +194,10 @@ App launch
   │
   └─ Start background thread
        │
-       ├─ init_db(): create tables/indexes, version check (recreate on mismatch)
+       ├─ init_db(): create tables, version check (recreate on mismatch)
        ├─ purge_ignored_entries(): delete existing DB entries for ignored paths
        ├─ db_ready = true (search now available)
+       ├─ ensure_db_indexes(): create indexes (deferred, non-blocking)
        ├─ emit_status_counts → send current entry count to frontend
        │
        ├─ [macOS] Conditional start: last_event_id exists AND DB has entries?
@@ -256,12 +263,34 @@ MFT scan (NTFS Master File Table)
   ├─ Pass 2: Resolve paths + upsert (rayon parallel)
   │    ├─ Resolve each file FRN → full path via PathResolver
   │    ├─ Filter: skip paths outside scan_root, apply ignore rules
+  │    ├─ Build MemIndex for instant search during DB upsert
   │    ├─ Background DB upsert pipeline (batch size: 50,000)
   │    └─ Emit index_progress every 200ms
   │
   ├─ Cleanup stale entries + ANALYZE
-  ├─ Save usn_next, usn_journal_id, index_complete to meta
+  ├─ Save win_last_usn, win_journal_id, index_complete to meta
   └─ Hand off FRN cache + next_usn to USN watcher
+```
+
+### Windows: Non-Admin Indexer (`win::nonadmin_indexer`)
+
+```
+WalkDir fallback (when MFT access is denied)
+  │
+  ├─ Phase 1 (shallow): depth-limited scan of priority roots
+  │    ├─ Build MemIndex early for instant search
+  │    └─ Emit index_progress during scan
+  │
+  ├─ Phase 2 (deep): parallel scan of remaining roots
+  │    ├─ Parallel root scanning via rayon
+  │    └─ Build full MemIndex
+  │
+  ├─ Background DB persist (bulk insert)
+  │    ├─ Drop/recreate indexes for fast upsert
+  │    ├─ Cleanup stale entries + ANALYZE
+  │    └─ Free MemIndex after DB is ready
+  │
+  └─ Start RDCW watcher for incremental updates
 ```
 
 ### Windows Indexing Fallback Chain
@@ -280,6 +309,9 @@ start_windows_indexing()
   ├─ Try USN watcher only (no MFT cache)
   │    └─ Failure ↓
   │
+  ├─ Try non-admin WalkDir indexer (nonadmin_indexer)
+  │    └─ Failure ↓
+  │
   └─ RDCW watcher fallback (ReadDirectoryChangesW via notify crate)
 ```
 
@@ -288,25 +320,30 @@ start_windows_indexing()
 ```
 should_skip_path(path)
   │
-  ├─ BUILTIN_SKIP_NAMES: .git, node_modules, .Trash, .npm, .cache,
-  │                       CMakeFiles, .qtc_clangd, __pycache__, .gradle
+  ├─ BUILTIN_SKIP_NAMES: .git, node_modules, .Trash, .Trashes, .npm, .cache,
+  │                       CMakeFiles, .qtc_clangd, __pycache__, .gradle, DerivedData
+  │
+  ├─ BUILTIN_SKIP_SUFFIXES: .build (Xcode intermediate dirs)
   │
   ├─ BUILTIN_SKIP_PATHS (macOS):
-  │    Library/Caches, Library/Developer/CoreSimulator, Library/Logs, .vscode/extensions
+  │    Library/Caches, Library/Developer/CoreSimulator, Library/Logs
   │
-  ├─ BUILTIN_SKIP_PATHS (Windows — deferred roots):
-  │    Windows, Program Files, Program Files (x86), $Recycle.Bin,
-  │    System Volume Information, Recovery, PerfLogs
+  ├─ BUILTIN_SKIP_PATHS (cross-platform):
+  │    .vscode/extensions
   │
-  ├─ Windows noisy directory exclusions (USN watcher):
+  ├─ BUILTIN_SKIP_PATHS (Windows — AppData noise):
   │    AppData/Local/Temp, AppData/Local/Microsoft,
   │    AppData/Local/Google, AppData/Local/Packages
+  │
+  ├─ DEFERRED_DIR_NAMES (Windows — system directories):
+  │    Windows, Program Files, Program Files (x86), $Recycle.Bin,
+  │    System Volume Information, Recovery, PerfLogs
   │
   ├─ .pathignore: loaded from project root and home_dir
   ├─ macOS TCC roots: ~/Library/Mail, Safari, Messages, etc. (~40 paths)
   ├─ IgnorePattern::AnySegment: **/target etc., matches at any depth
   ├─ IgnorePattern::Glob: wildcard pattern matching
-  └─ gitignore_filter: .gitignore rules (ignore crate)
+  └─ LazyGitignoreFilter: .gitignore rules (ignore crate, depth 3)
 ```
 
 ---
@@ -335,6 +372,9 @@ User input
   ├─ [NameSearch] Check negative cache
   │    ├─ Cache hit (within 300-550ms, unconfirmed) → find command single fallback
   │    └─ Cache hit (otherwise) → return empty result immediately
+  │
+  ├─ Check MemIndex (Windows, during MFT→DB upsert)
+  │    └─ MemIndex exists → search in-memory, return results
   │
   ├─ DB search (by mode)
   │    │
@@ -370,7 +410,24 @@ User input
   │    │    shallower paths preferred within same rank
   │    └─ NameSearch zero results → save to negative cache (60s TTL)
   │
-  └─ Return SearchResultDto { entries, modeLabel }
+  └─ Return SearchResultDto { entries, modeLabel, totalCount, totalKnown }
+```
+
+### In-Memory Search (`mem_search.rs`)
+
+```
+MemIndex (built during MFT/WalkDir scan for instant results)
+  │
+  ├─ CompactEntry: minimal struct (~104 bytes saved vs EntryDto)
+  ├─ sorted_idx: name-sorted index for binary search
+  ├─ ext_map: extension → entry indices
+  ├─ dir_map: directory → entry indices
+  │
+  ├─ Search phases:
+  │    Phase 1: exact + prefix via binary search
+  │    Phase 2: contains matches (30ms time budget)
+  │
+  └─ Sorting: relevance (0-9) → mtime/size/name
 ```
 
 ### Spotlight Fallback (macOS only — `mac/spotlight_search.rs`)
@@ -442,7 +499,7 @@ USN watcher (primary — after MFT scan)
   ├─ Rename pairing: RENAME_OLD_NAME + RENAME_NEW_NAME with 500ms timeout
   │    Incomplete pairs → treated as create or delete
   │
-  ├─ Debounce: 30s (longer than macOS due to noisy system changes)
+  ├─ Debounce: 5s
   ├─ Batch process → upsert/delete affected paths
   ├─ Dual caching: positive cache (new dirs) + negative cache (outside scan_root)
   │
@@ -476,24 +533,32 @@ RDCW watcher (fallback — when USN unavailable)
 | `get_platform` | FE→BE | Returns `"windows"`, `"macos"`, or other |
 | `start_full_index` | FE→BE | Trigger full re-indexing |
 | `reset_index` | FE→BE | Reset DB and re-index |
-| `search` | FE→BE | DB search → `SearchResultDto { entries, modeLabel }` |
+| `search` | FE→BE | DB search → `SearchResultDto { entries, modeLabel, totalCount, totalKnown }` |
 | `fd_search` | FE→BE | jwalk live search → `FdSearchResultDto { entries, total, timedOut }` |
 | `open` | FE→BE | Open file (macOS: `open`, Windows: `cmd /C start`, Linux: `xdg-open`) |
 | `open_with` | FE→BE | Reveal in file manager |
 | `reveal_in_finder` | FE→BE | macOS: `open -R`, Windows: `explorer /select,`, Linux: `xdg-open` parent |
 | `copy_paths` | FE→BE | Copy paths to clipboard (macOS: `pbcopy`, Windows: `clip`) |
+| `copy_files` | FE→BE | Copy files to clipboard (macOS only, NSPasteboard) |
 | `move_to_trash` | FE→BE | Move to trash + delete from DB |
 | `rename` | FE→BE | Rename + DB update → return new EntryDto |
 | `get_file_icon` | FE→BE | Return system icon PNG per extension/path |
-| `show_context_menu` | FE→BE | Native Explorer context menu (Windows only) |
+| `show_context_menu` | FE→BE | Native context menu (Windows: Explorer Shell API, macOS: custom) |
+| `quick_look` | FE→BE | Quick Look preview (macOS only) |
+| `check_full_disk_access` | FE→BE | Check Full Disk Access permission (macOS only) |
+| `open_privacy_settings` | FE→BE | Open Privacy settings (macOS only) |
+| `set_native_theme` | FE→BE | Set native window theme (dark/light) |
+| `mark_frontend_ready` | FE→BE | Signal frontend initialization complete |
+| `frontend_log` | FE→BE | Debug logging from frontend |
 
 ## Backend Events
 
 | Event | Payload | Timing |
 |-------|---------|--------|
 | `index_progress` | `{ scanned, indexed, currentPath }` | Every 200ms during indexing |
-| `index_state` | `{ state, message }` | On Indexing/Ready/Error transitions |
+| `index_state` | `{ state, message, isCatchup }` | On Indexing/Ready/Error transitions |
 | `index_updated` | `{ entriesCount, lastUpdated, permissionErrors }` | After indexing complete, watcher updates, file actions |
+| `context_menu_action` | action payload | Windows: native context menu action result |
 | `focus_search` | (none) | Cmd+Shift+Space global shortcut (macOS) |
 
 ---
@@ -502,7 +567,7 @@ RDCW watcher (fallback — when USN unavailable)
 
 ### Single Component (`App.svelte`)
 
-Single component containing search input, virtual-scrolled table, inline rename, context menu, keyboard shortcuts, icon cache, and status bar.
+Single component containing search input, virtual-scrolled table, inline rename, context menu, keyboard shortcuts, icon cache, status bar, theme toggle, and Full Disk Access banner (macOS).
 
 ### Platform Detection
 
@@ -510,16 +575,17 @@ Calls `get_platform()` at startup. Stores result in `platform` variable for cond
 
 ### State Management
 
-Uses Svelte reactive variables (no stores).
+Uses Svelte 5 reactive variables (no stores).
 
 | Category | Key Variables |
 |----------|--------------|
-| Search | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir` |
+| Search | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir`, `totalResults`, `totalResultsKnown` |
 | Selection | `selectedIndices` (Set), `selectionAnchor`, `lastSelectedIndex` |
 | Editing | `editing { active, path, index, draftName }` |
-| Indexing | `indexStatus`, `scanned`, `indexed`, `currentPath`, `lastReadyCount` |
+| Indexing | `indexStatus { state, entriesCount, lastUpdated, permissionErrors, isCatchup, backgroundActive }`, `scanned`, `indexed`, `currentPath` |
 | Virtual scroll | `scrollTop`, `viewportHeight`, `colWidths` |
-| Cache | `iconCache` (Map), `highlightCache` (Map) |
+| Cache | `iconCache` (Map, max 500), `highlightCache` (Map, max 300) |
+| UI | `platform`, `isMaximized`, `showFdaBanner`, `theme`, `contextMenu`, `toast` |
 
 ### Search Input → Result Sequence
 
@@ -532,10 +598,11 @@ User typing
   │
   ├─ runSearch()
   │    ├─ searchGeneration++ (prevent stale responses)
-  │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir })
-  │    ├─ Response: { entries, modeLabel }
+  │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir, include_total: false })
+  │    ├─ Response: { entries, modeLabel, totalCount, totalKnown }
   │    ├─ results = entries
   │    ├─ searchModeLabel = modeLabel
+  │    ├─ Viewport-preserve logic for scroll position
   │    └─ Selection restoration based on path
   │
   └─ Infinite scroll
@@ -547,14 +614,15 @@ User typing
 ### Virtual Scroll
 
 ```
-Fixed row height: 28px
+Fixed row height: 26px
 Buffer: 10 rows above and below (total overscan ~20 rows)
+OverlayScrollbars for custom scrollbar styling
 
 scrollTop
-  → startIndex = max(0, floor(scrollTop / 28) - 10)
+  → startIndex = max(0, floor(scrollTop / 26) - 10)
   → endIndex = min(results.length, startIndex + visibleCount)
   → visibleRows = results.slice(startIndex, endIndex)
-  → translateY = startIndex * 28
+  → translateY = startIndex * 26
 
 DOM:
   <div class="table-body">          ← scroll container
@@ -570,30 +638,32 @@ DOM:
 
 | Key | Action |
 |-----|--------|
-| `Escape` | Deselect, focus search input |
+| `Escape` | Deselect, focus search input / cancel rename |
 | `Up` / `Down` | Move selection (Shift: range select) |
 | `PageUp` / `PageDown` | Page-level navigation |
-| `Enter` | Start inline rename |
+| `Enter` | Open (Windows) / Start inline rename (macOS) |
 | `F2` | Start inline rename |
+| `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | Open selected items |
 | `Cmd+Enter` / `Ctrl+Enter` | Reveal in Finder/Explorer |
 | `Cmd+C` / `Ctrl+C` | Copy paths |
 | `Cmd+A` / `Ctrl+A` | Select all |
+| `Cmd+F` / `Ctrl+F` | Focus search input |
 | `Delete` / `Cmd+Backspace` | Move to trash |
 
 ### Context Menu
 
 | Platform | Implementation |
 |----------|---------------|
-| Windows | Native Explorer context menu via Shell API (`show_context_menu` command) |
-| macOS | Custom menu: Open, Open With, Reveal in Finder, Copy Path, Move to Trash, Rename (single-select only) |
+| Windows | Native Explorer context menu via Shell API (`show_context_menu` command), actions via `context_menu_action` event |
+| macOS | Custom menu: Open, Quick Look, Open With, Reveal in Finder, Copy Files, Copy Path, Move to Trash, Rename (single-select only) |
 
 ### Icon System
 
 ```
 visibleRows change
   → call ensureIcon(entry)
-  → if in iconCache, return immediately
+  → if in iconCache, return immediately (max 500 entries)
   → if not, invoke('get_file_icon', { ext, path })
 
 macOS:
@@ -602,14 +672,14 @@ macOS:
 
 Windows:
   → Per-file icons for: exe, lnk, ico, url, scr, appx
-      via IShellItemImageFactory (32x32 PNG, requires real file path)
+      via IShellItemImageFactory (16x16 PNG, requires real file path)
   → Extension-based fallback via SHGetFileInfo
   → No prewarming (loaded on demand)
 ```
 
 ### Theme
 
-Syncs with system settings (`prefers-color-scheme: dark`). Based on CSS custom properties.
+Syncs with system settings (`prefers-color-scheme: dark`). Toggle via theme button. Based on CSS custom properties and `data-theme` attribute. Persisted to localStorage.
 
 ```css
 :root {
@@ -622,11 +692,15 @@ Syncs with system settings (`prefers-color-scheme: dark`). Based on CSS custom p
 
 | State | Display |
 |-------|---------|
-| Indexing (has entries) | `● Searchable` + progress % + elapsed time + entry count |
+| Indexing (has entries) | Pulsing `●` + progress % + elapsed time + entry count |
 | Indexing (no entries) | `Starting indexing...` |
-| Ready | `Index: Ready` + entry count + indexing duration |
-| Spotlight fallback (macOS) | Orange `Spotlight temporary search` |
+| Ready | Green `●` + entry count + indexing duration |
+| Ready (background active) | Pulsing green `●` |
 | Search complete | `"query" Xms · N results` |
+
+### Full Disk Access Banner (macOS)
+
+On macOS, checks `check_full_disk_access()` at startup. If not granted, shows a dismissible banner with a link to Privacy settings.
 
 ---
 
@@ -635,15 +709,18 @@ Syncs with system settings (`prefers-color-scheme: dark`). Based on CSS custom p
 | Feature | macOS | Windows |
 |---------|-------|---------|
 | Scan root | `$HOME` | `C:\` (entire drive) |
-| Indexing | jwalk incremental (2-pass depth) | MFT scan (NTFS metadata, rayon parallel) |
+| Indexing | jwalk incremental (2-pass depth) | MFT scan (NTFS metadata, rayon parallel) → WalkDir fallback |
 | File watcher | FSEvents (direct fsevent-sys binding) | USN journal → RDCW fallback |
 | Resume on restart | FSEvent replay from stored event_id | USN resume from stored next_usn |
 | Search fallback | Spotlight (mdfind) | N/A |
+| In-memory index | N/A | MemIndex during MFT→DB upsert |
 | Icon loading | NSWorkspace (extension-based, prewarmed) | IShellItemImageFactory (per-file for exe/lnk) + SHGetFileInfo |
 | Context menu | Custom (frontend) | Native Explorer context menu (Shell API) |
 | Global shortcut | Cmd+Shift+Space (tauri-plugin-global-shortcut) | Not registered |
 | Window effect | Vibrancy (NSVisualEffectMaterial) | Background color per theme |
-| Clipboard | `pbcopy` | `cmd /C clip` |
+| Quick Look | Supported (Space key) | N/A |
+| Full Disk Access | FDA banner check | N/A |
+| Clipboard | `pbcopy` (paths), NSPasteboard (files) | `cmd /C clip` |
 | Open file | `open` command | `cmd /C start ""` |
 | Reveal file | `open -R` | `explorer /select,` |
 
@@ -659,9 +736,9 @@ Syncs with system settings (`prefers-color-scheme: dark`). Based on CSS custom p
 | `BATCH_SIZE` | 10,000 | DB batch write unit (macOS indexing) |
 | `MFT_BATCH_SIZE` | 50,000 | DB batch write unit (Windows MFT) |
 | `SHALLOW_SCAN_DEPTH` | 6 | Pass 0 max depth (macOS) |
-| `JWALK_NUM_THREADS` | 4 | Parallel worker count |
+| `jwalk_num_threads()` | available/2 (4–16) | Dynamic parallel worker count |
 | `WATCH_DEBOUNCE` | 300ms | File change debounce (macOS FSEvents, Windows RDCW) |
-| `USN_DEBOUNCE` | 30s | USN watcher debounce (Windows) |
+| `USN_CHANGE_DEBOUNCE` | 5s | USN watcher debounce (Windows) |
 | `RENAME_PAIR_TIMEOUT` | 500ms | Rename event pairing timeout (Windows USN/RDCW) |
 | `RECENT_OP_TTL` | 2s | Rename/trash duplicate prevention |
 | `NEGATIVE_CACHE_TTL` | 60s | Zero-result query cache |
@@ -670,5 +747,10 @@ Syncs with system settings (`prefers-color-scheme: dark`). Based on CSS custom p
 | `WSEARCH_TIMEOUT` | 10s | Windows Search service timeout |
 | `MUST_SCAN_THRESHOLD` | 10 | Full scan trigger during replay (macOS) |
 | `EVENT_ID_FLUSH_INTERVAL` | 30s | event_id / usn_next DB save interval |
+| `STATUS_EMIT_MIN_INTERVAL` | 2s | Status update throttle |
+| `DB_BUSY_RETRY_DELAY` | 3s | Retry delay on DB busy |
+| `SEARCH_DEBOUNCE_MS` (FE) | 200ms | Frontend search debounce |
 | `PAGE_SIZE` (FE) | 500 | Frontend page size |
-| `rowHeight` (FE) | 28px | Virtual scroll row height |
+| `rowHeight` (FE) | 26px | Virtual scroll row height |
+| `ICON_CACHE_MAX` (FE) | 500 | Frontend icon cache limit |
+| `HIGHLIGHT_CACHE_MAX` (FE) | 300 | Frontend highlight cache limit |
