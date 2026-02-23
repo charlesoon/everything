@@ -27,6 +27,9 @@ impl GitignoreFilter {
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         for gi in &self.matchers {
+            if !path.starts_with(gi.path()) {
+                continue;
+            }
             match gi.matched(path, is_dir) {
                 ignore::Match::Ignore(_) => return true,
                 ignore::Match::Whitelist(_) => return false,
