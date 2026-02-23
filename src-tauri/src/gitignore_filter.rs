@@ -144,11 +144,17 @@ mod tests {
 
         let filter = GitignoreFilter::build(&tmp);
         // proj-b/target must not be ignored just because proj-a has `target/`
-        assert!(!filter.is_ignored(&target_in_b, true), "cross-project gitignore bleed: target in proj-b was ignored by proj-a's .gitignore");
+        assert!(
+            !filter.is_ignored(&target_in_b, true),
+            "cross-project gitignore bleed: target in proj-b was ignored by proj-a's .gitignore"
+        );
         // proj-a/target MUST be ignored (its own rule)
         let target_in_a = proj_a.join("target");
         fs::create_dir_all(&target_in_a).unwrap();
-        assert!(filter.is_ignored(&target_in_a, true), "proj-a/target should be ignored by its own .gitignore");
+        assert!(
+            filter.is_ignored(&target_in_a, true),
+            "proj-a/target should be ignored by its own .gitignore"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -188,7 +194,10 @@ impl LazyGitignoreFilter {
                 eprintln!("[gitignore] building filter (lazy init)...");
                 let started = std::time::Instant::now();
                 let filter = build_shared_filter(&self.home_dir);
-                eprintln!("[gitignore] filter built in {}ms", started.elapsed().as_millis());
+                eprintln!(
+                    "[gitignore] filter built in {}ms",
+                    started.elapsed().as_millis()
+                );
                 filter
             })
             .clone()
