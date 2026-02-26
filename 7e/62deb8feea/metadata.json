@@ -1,0 +1,36 @@
+{
+  "cli_version": "0.4.5",
+  "checkpoint_id": "7e62deb8feea",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "package.json",
+    "src-tauri/Cargo.lock",
+    "src-tauri/Cargo.toml",
+    "src-tauri/src/gitignore_filter.rs",
+    "src-tauri/src/main.rs",
+    "src-tauri/src/win/mft_indexer.rs",
+    "src-tauri/src/win/nonadmin_indexer.rs",
+    "src-tauri/src/win/rdcw_watcher.rs",
+    "src-tauri/src/win/usn_watcher.rs",
+    "src-tauri/tauri.conf.json",
+    "src/App.svelte"
+  ],
+  "sessions": [
+    {
+      "metadata": "/7e/62deb8feea/0/metadata.json",
+      "transcript": "/7e/62deb8feea/0/full.jsonl",
+      "context": "/7e/62deb8feea/0/context.md",
+      "content_hash": "/7e/62deb8feea/0/content_hash.txt",
+      "prompt": "/7e/62deb8feea/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 268,
+    "cache_creation_tokens": 240490,
+    "cache_read_tokens": 18631563,
+    "output_tokens": 15982,
+    "api_call_count": 204
+  }
+}
