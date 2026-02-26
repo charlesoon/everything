@@ -4,15 +4,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 use crate::{
     db_connection, delete_paths, invalidate_search_caches,
     index_row_from_path_and_metadata, is_recently_touched,
-    now_epoch, refresh_and_emit_status_counts, set_meta,
-    should_skip_path, update_status_counts, upsert_rows,
+    now_epoch, pathignore_active_entries, refresh_and_emit_status_counts,
+    set_meta, should_skip_path, update_status_counts, upsert_rows,
     AppState, WATCH_DEBOUNCE,
 };
 
@@ -82,6 +82,11 @@ fn event_loop(
     let mut last_status_emit = Instant::now();
     let mut last_ts_persist = Instant::now();
 
+    // Track config file changes to emit pathignore_changed when rules change
+    let mut last_config_entries = pathignore_active_entries(
+        &std::fs::read_to_string(&state.config_file_path).unwrap_or_default(),
+    );
+
     // Fixed poll: sleep, then drain all accumulated events at once.
     // ~1 wake/sec keeps CPU near 0% even with hundreds of events/sec.
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,6 +105,16 @@ fn event_loop(
         while let Ok(result) = rx.try_recv() {
             drained = true;
             if let Ok(ev) = result {
+                // Check for config file change before classifying
+                if ev.paths.iter().any(|p| *p == state.config_file_path) {
+                    let new_entries = pathignore_active_entries(
+                        &std::fs::read_to_string(&state.config_file_path).unwrap_or_default(),
+                    );
+                    if new_entries != last_config_entries {
+                        last_config_entries = new_entries;
+                        app.emit("pathignore_changed", ()).ok();
+                    }
+                }
                 classify_event(ev, &mut pending_changes, &mut pending_renames);
             }
         }

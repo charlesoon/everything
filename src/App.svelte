@@ -127,6 +127,7 @@
   let platform = '';
   let isMaximized = false;
   let showFdaBanner = false;
+  let showPathignoreBanner = false;
   let fdaSettingsOpened = false;
   const FDA_DISMISSED_KEY = 'everything-fda-dismissed';
   const appWindow = getCurrentWindow();
@@ -1531,15 +1532,14 @@
           startElapsedTimer();
         } else if (event.payload.state !== 'Indexing' && prevState === 'Indexing') {
           stopElapsedTimer();
-          if (event.payload.state === 'Ready') {
-            startBackgroundPoll();
-          }
+          if (event.payload.state === 'Ready') startBackgroundPoll();
         }
 
         if (event.payload.state === 'Ready') {
           void refreshStatus();
           scheduleSearch(true);
         }
+
       })
     );
 
@@ -1549,14 +1549,12 @@
         const changed =
           event.payload.entriesCount !== indexStatus.entriesCount ||
           event.payload.lastUpdated !== indexStatus.lastUpdated;
-
         indexStatus = {
           ...indexStatus,
           entriesCount: event.payload.entriesCount,
           lastUpdated: event.payload.lastUpdated,
           permissionErrors: event.payload.permissionErrors ?? indexStatus.permissionErrors
         };
-
         if (changed) scheduleSearch(true);
       })
     );
@@ -1585,7 +1583,14 @@
       })
     );
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction, unlistenResized].filter(Boolean);
+    const unlistenPathignore = await step(
+      'listen(pathignore_changed)',
+      () => listen('pathignore_changed', () => {
+        showPathignoreBanner = true;
+      })
+    );
+
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction, unlistenPathignore, unlistenResized].filter(Boolean);
     startupLog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
@@ -1771,6 +1776,16 @@
   </div>
   {/if}
 
+  {#if showPathignoreBanner}
+  <div class="fda-banner" role="alert">
+    <span class="fda-banner-text">설정 파일(.pathignore)이 변경되었습니다. 재시작 후 적용됩니다.</span>
+    <div class="fda-banner-actions">
+      <button class="fda-btn-open" on:click={() => invoke('restart_app')}>재시작</button>
+      <button class="fda-btn-dismiss" on:click={() => showPathignoreBanner = false}>닫기</button>
+    </div>
+  </div>
+  {/if}
+
   <header class="search-bar">
     <input
       bind:this={searchInputEl}
@@ -1901,6 +1916,9 @@
           <svg class="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5 5.5 5.5 0 1 0 13.5 9.2z"/></svg>
           Dark
         {/if}
+      </button>
+      <button class="status-btn" on:click={() => invoke('open_pathignore')} title="설정 파일(.pathignore) 열기">
+        Ignore
       </button>
       <button
         class="status-btn rebuild-btn"
@@ -2618,7 +2636,7 @@
   }
 
   .state-dot.ready { background: #28C840; }
-  .state-dot.indexing { background: #FEBC2E; }
+  .state-dot.indexing { background: #FEBC2E; animation: pulse-dot 1.4s ease-in-out infinite; }
   .state-dot.error { background: #FF5F57; }
 
   .state-dot.pulsing {

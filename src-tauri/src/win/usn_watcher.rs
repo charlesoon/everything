@@ -4,13 +4,14 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use super::volume;
 use crate::{
     db_connection, delete_paths, invalidate_search_caches,
     index_row_from_path_and_metadata, is_recently_touched,
-    now_epoch, perf_log, refresh_and_emit_status_counts, set_meta,
+    now_epoch, pathignore_active_entries, perf_log,
+    refresh_and_emit_status_counts, set_meta,
     should_skip_path, update_status_counts, upsert_rows,
     AppState,
 };
@@ -193,6 +194,11 @@ fn poll_loop(
     let mut diag_process_us: u64 = 0;
     let mut diag_apply_us: u64 = 0;
 
+    // Track config file changes to emit pathignore_changed when rules change
+    let mut last_config_entries = pathignore_active_entries(
+        &std::fs::read_to_string(&state.config_file_path).unwrap_or_default(),
+    );
+
     loop {
         if state.watcher_stop.load(AtomicOrdering::Acquire) {
             eprintln!("[win/usn] stop signal received, exiting");
@@ -246,6 +252,18 @@ fn poll_loop(
                 Some(ref _p) => { diag_home_matches += 1; _p.join(&record.name) }
                 None => continue,
             };
+
+            // Detect config file changes before skip check (config is under ignored app_data_dir)
+            if full_path == state.config_file_path {
+                let new_entries = pathignore_active_entries(
+                    &std::fs::read_to_string(&state.config_file_path).unwrap_or_default(),
+                );
+                if new_entries != last_config_entries {
+                    last_config_entries = new_entries;
+                    app.emit("pathignore_changed", ()).ok();
+                }
+                continue;
+            }
 
             // Early path filter: skip paths in ignored directories BEFORE
             // creating FileChange events (avoids expensive stat + DB ops)

@@ -26,7 +26,6 @@ use std::os::windows::process::CommandExt;
 use walkdir::WalkDir;
 
 mod fd_search;
-mod gitignore_filter;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mem_search;
@@ -44,7 +43,40 @@ const RECENT_OP_TTL: Duration = Duration::from_secs(2);
 pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 const NEGATIVE_CACHE_FALLBACK_WINDOW: Duration = Duration::from_millis(550);
-const DB_VERSION: i32 = 6;
+const DB_VERSION: i32 = 7;
+
+const CREATE_ENTRIES_TABLE_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS entries (
+    id         INTEGER PRIMARY KEY,
+    path       TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
+    dir        TEXT NOT NULL,
+    is_dir     INTEGER NOT NULL,
+    ext        TEXT,
+    mtime      INTEGER,
+    size       INTEGER,
+    indexed_at INTEGER NOT NULL,
+    run_id     INTEGER NOT NULL DEFAULT 0
+);";
+
+const DROP_FTS_TRIGGERS_SQL: &str = "\
+DROP TRIGGER IF EXISTS entries_ai;
+DROP TRIGGER IF EXISTS entries_ad;
+DROP TRIGGER IF EXISTS entries_au;";
+
+const CREATE_FTS_TRIGGERS_SQL: &str = "\
+CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+    INSERT INTO entries_fts(rowid, name) VALUES (new.id, new.name);
+END;
+CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, name) VALUES ('delete', old.id, old.name);
+END;
+CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE OF name ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, name) VALUES ('delete', old.id, old.name);
+    INSERT INTO entries_fts(rowid, name) VALUES (new.id, new.name);
+END;";
+
+const REBUILD_FTS_SQL: &str = "INSERT INTO entries_fts(entries_fts) VALUES('rebuild');";
 const DEFERRED_DIR_NAMES: &[&str] = &[
     "Library", ".Trash", ".Trashes",
     // Windows system directories (deferred when scan_root is C:\)
@@ -58,11 +90,6 @@ fn jwalk_num_threads() -> usize {
         .unwrap_or(8)
 }
 
-fn jwalk_num_threads_fresh() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().max(4).min(16))
-        .unwrap_or(8)
-}
 
 pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".git",
@@ -326,7 +353,7 @@ pub(crate) struct IgnoreRulesCache {
     roots: Vec<PathBuf>,
     patterns: Vec<IgnorePattern>,
     pathignore_mtime: Option<SystemTime>,
-    gitignore_mtime: Option<SystemTime>,
+    config_file_mtime: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +362,7 @@ pub(crate) struct AppState {
     pub(crate) home_dir: PathBuf,
     pub(crate) scan_root: PathBuf,
     pub(crate) cwd: PathBuf,
+    pub(crate) config_file_path: PathBuf,
     pub(crate) path_ignores: Arc<Vec<PathBuf>>,
     pub(crate) path_ignore_patterns: Arc<Vec<IgnorePattern>>,
     pub(crate) db_ready: Arc<AtomicBool>,
@@ -345,7 +373,10 @@ pub(crate) struct AppState {
     pub(crate) fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>,
     pub(crate) negative_name_cache: Arc<Mutex<HashMap<String, NegativeNameEntry>>>,
     pub(crate) ignore_cache: Arc<Mutex<Option<IgnoreRulesCache>>>,
-    pub(crate) gitignore: Arc<gitignore_filter::LazyGitignoreFilter>,
+    /// FTS index is in sync with entries table. Set to false during fresh index
+    /// (triggers dropped for bulk insert), set to true after FTS rebuild completes.
+    /// When false, search falls back to LIKE-based queries instead of FTS.
+    pub(crate) fts_ready: Arc<AtomicBool>,
     /// In-memory index for instant search while DB upsert runs in background.
     /// Set by MFT scan, cleared after background DB upsert completes.
     pub(crate) mem_index: Arc<RwLock<Option<Arc<mem_search::MemIndex>>>>,
@@ -483,44 +514,92 @@ fn init_db_tables(db_path: &Path) -> AppResult<()> {
     let current_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap_or(0);
+
     if current_version != DB_VERSION {
-        conn.execute_batch(
-            r#"
-            DROP TRIGGER IF EXISTS entries_ai;
-            DROP TRIGGER IF EXISTS entries_ad;
-            DROP TRIGGER IF EXISTS entries_au;
-            DROP TABLE IF EXISTS entries_fts;
-            DROP TABLE IF EXISTS entries;
-            "#,
-        )
-        .map_err(|e| e.to_string())?;
+        // Fast schema migration: rename entries → entries_gc_{old_version} (instant),
+        // create new empty entries, rebuild FTS from empty content table (instant),
+        // reset relevant meta keys. Background thread drops the renamed old table.
+        // This avoids the 20-30s synchronous DROP TABLE entries_fts on large DBs.
+        let old_table = format!("entries_gc_{}", current_version);
+
+        let entries_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+
+        if entries_exists {
+            // Drop triggers before rename: SQLite keeps trigger names when a table is renamed,
+            // so CREATE TRIGGER with the same names would fail after rename.
+            let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
+
+            // Also handle re-entrant case: if entries_gc_{old_version} already exists
+            // (e.g., previous run crashed after rename but before user_version update),
+            // drop it first so the rename can succeed.
+            let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {old_table};"));
+
+            // Rename entries (fast, no data movement)
+            conn.execute_batch(&format!("ALTER TABLE entries RENAME TO {old_table};"))
+                .map_err(|e| e.to_string())?;
+
+            // Create new empty entries (FTS triggers + rebuild deferred to after unconditional block below)
+            conn.execute_batch(CREATE_ENTRIES_TABLE_SQL).map_err(|e| e.to_string())?;
+
+            // Reset meta keys so startup triggers a full index scan
+            let meta_exists: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='meta'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
+            if meta_exists {
+                let _ = conn.execute_batch(
+                    "DELETE FROM meta WHERE key IN \
+                     ('index_complete','last_run_id','last_event_id');",
+                );
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('entries_pending_drop',?1)",
+                    params![old_table],
+                );
+            }
+
+            // Old table will be dropped by the GC cleanup in the finalizing
+            // thread after indexing completes — avoids WAL lock contention with
+            // the indexer that starts shortly after init_db returns.
+            eprintln!(
+                "[init_db] +{}ms schema migrated v={} -> v={}: {} deferred for gc",
+                t.elapsed().as_millis(),
+                current_version,
+                DB_VERSION,
+                old_table
+            );
+        }
+
         conn.execute_batch(&format!("PRAGMA user_version = {};", DB_VERSION))
             .map_err(|e| e.to_string())?;
     }
     eprintln!("[init_db] +{}ms version check done (v={})", t.elapsed().as_millis(), current_version);
 
+    conn.execute_batch(CREATE_ENTRIES_TABLE_SQL).map_err(|e| e.to_string())?;
     conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS entries (
-          id INTEGER PRIMARY KEY,
-          path TEXT NOT NULL UNIQUE,
-          name TEXT NOT NULL,
-          dir TEXT NOT NULL,
-          is_dir INTEGER NOT NULL,
-          ext TEXT,
-          mtime INTEGER,
-          size INTEGER,
-          indexed_at INTEGER NOT NULL,
-          run_id INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS meta (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-        "#,
+        "CREATE TABLE IF NOT EXISTS meta (
+           key TEXT PRIMARY KEY,
+           value TEXT NOT NULL
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+           name,
+           content='entries',
+           content_rowid='id',
+           tokenize='trigram'
+         );",
     )
     .map_err(|e| e.to_string())?;
+    conn.execute_batch(CREATE_FTS_TRIGGERS_SQL).map_err(|e| e.to_string())?;
     eprintln!("[init_db] +{}ms tables ensured", t.elapsed().as_millis());
 
     Ok(())
@@ -573,6 +652,39 @@ pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<(
         params![key, value],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn cleanup_entries_gc_tables(conn: &Connection) -> AppResult<()> {
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'entries_gc_%'",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        let mut tables = Vec::new();
+        for row in rows {
+            tables.push(row.map_err(|e| e.to_string())?);
+        }
+        tables
+    };
+
+    for table in tables {
+        if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            eprintln!("[gc] skipping invalid table name: {table}");
+            continue;
+        }
+        eprintln!("[gc] dropping orphaned table {table}");
+        let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"));
+        let _ = conn.execute(
+            "DELETE FROM meta WHERE key='entries_pending_drop' AND value=?1",
+            rusqlite::params![table],
+        );
+    }
+
     Ok(())
 }
 
@@ -865,6 +977,7 @@ fn find_file_upward(start: &Path, file_name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
 fn find_git_root(start: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(dir) = current {
@@ -877,12 +990,67 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn load_pathignore_rules(home_dir: &Path, cwd: &Path) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
+const DEFAULT_PATHIGNORE_CONTENTS: &str = "\
+# Everything - index exclusion rules
+# **/name  : exclude directories with this name anywhere
+# /abs/path : exclude a specific absolute path
+
+# Build artifacts
+**/dist
+**/build
+**/out
+**/.next
+**/.nuxt
+**/.svelte-kit
+**/coverage
+**/.parcel-cache
+**/.turbo
+
+# Home directory exclusions
+~/.cursor/
+~/.gemini
+~/.cargo
+";
+
+/// Extracts the effective rule lines from a .pathignore file's contents:
+/// trims whitespace, drops empty lines, comments (#), and negation lines (!).
+/// Used to detect meaningful changes while ignoring formatting edits.
+pub(crate) fn pathignore_active_entries(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn ensure_pathignore_exists(path: &Path) -> AppResult<()> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        fs::write(path, DEFAULT_PATHIGNORE_CONTENTS).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn load_pathignore_rules(config_file: &Path, home_dir: &Path, cwd: &Path) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
+    let _ = ensure_pathignore_exists(config_file);
+
     let mut files = Vec::new();
+    // App-data config file takes priority.
+    files.push(config_file.to_path_buf());
+
+    // Legacy: cwd/.pathignore or ~/ .pathignore for backward compatibility.
     if let Some(file) = find_file_upward(cwd, ".pathignore") {
-        files.push(file);
+        if file != config_file {
+            files.push(file);
+        }
     } else {
-        files.push(cwd.join(".pathignore"));
+        let cwd_file = cwd.join(".pathignore");
+        if cwd_file != config_file {
+            files.push(cwd_file);
+        }
     }
     let home_file = home_dir.join(".pathignore");
     if !files.iter().any(|p| p == &home_file) {
@@ -930,48 +1098,6 @@ fn load_pathignore_rules(home_dir: &Path, cwd: &Path) -> (Vec<PathBuf>, Vec<Igno
     (roots, patterns)
 }
 
-fn load_gitignore_roots(home_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let gitignore = if let Some(root) = find_git_root(cwd) {
-        root.join(".gitignore")
-    } else if let Some(file) = find_file_upward(&cwd, ".gitignore") {
-        file
-    } else {
-        return Vec::new();
-    };
-    let contents = match fs::read_to_string(&gitignore) {
-        Ok(contents) => contents,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('!') {
-            continue;
-        }
-        if contains_glob_meta(trimmed) || trimmed.contains('[') {
-            continue;
-        }
-
-        let normalized = trimmed.trim_start_matches('/').trim_end_matches('/');
-        if normalized.is_empty() {
-            continue;
-        }
-
-        let Some(path) = resolve_ignore_path(normalized, &cwd, home_dir) else {
-            continue;
-        };
-
-        let key = path.to_string_lossy().to_string();
-        if seen.insert(key) {
-            roots.push(path);
-        }
-    }
-
-    roots
-}
 
 #[cfg(target_os = "macos")]
 fn macos_tcc_ignore_roots(home_dir: &Path) -> Vec<PathBuf> {
@@ -1067,6 +1193,7 @@ fn windows_noisy_roots(_home_dir: &Path) -> Vec<PathBuf> {
 }
 
 pub(crate) fn effective_ignore_rules(
+    config_file: &Path,
     home_dir: &Path,
     cwd: &Path,
     base_roots: &[PathBuf],
@@ -1080,10 +1207,9 @@ pub(crate) fn effective_ignore_rules(
         .collect();
     let mut seen_patterns: HashSet<String> = patterns.iter().map(ignore_pattern_key).collect();
 
-    let (pathignore_roots, pathignore_patterns) = load_pathignore_rules(home_dir, cwd);
+    let (pathignore_roots, pathignore_patterns) = load_pathignore_rules(config_file, home_dir, cwd);
     for root in pathignore_roots
         .into_iter()
-        .chain(load_gitignore_roots(home_dir, cwd).into_iter())
         .chain(macos_tcc_ignore_roots(home_dir).into_iter())
         .chain(windows_noisy_roots(home_dir).into_iter())
     {
@@ -1123,27 +1249,29 @@ fn builtin_ignore_patterns(home_dir: &Path) -> Vec<IgnorePattern> {
 pub(crate) fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
     let home_dir = &state.home_dir;
     let cwd = &state.cwd;
+    let config_file = &state.config_file_path;
 
-    let pathignore_mtime = find_file_upward(cwd, ".pathignore")
-        .or_else(|| Some(home_dir.join(".pathignore")))
-        .and_then(|p| fs::metadata(&p).ok())
+    // Check mtime of config file (app_data_dir/.pathignore) first, then legacy locations.
+    let config_file_mtime = fs::metadata(config_file)
+        .ok()
         .and_then(|m| m.modified().ok());
 
-    let gitignore_mtime = find_git_root(cwd)
-        .map(|root| root.join(".gitignore"))
-        .or_else(|| find_file_upward(cwd, ".gitignore"))
+    let pathignore_mtime = find_file_upward(cwd, ".pathignore")
+        .filter(|p| p != config_file)
+        .or_else(|| Some(home_dir.join(".pathignore")))
         .and_then(|p| fs::metadata(&p).ok())
         .and_then(|m| m.modified().ok());
 
     let mut cache = state.ignore_cache.lock();
     if let Some(ref cached) = *cache {
-        if cached.pathignore_mtime == pathignore_mtime && cached.gitignore_mtime == gitignore_mtime
+        if cached.config_file_mtime == config_file_mtime && cached.pathignore_mtime == pathignore_mtime
         {
             return (cached.roots.clone(), cached.patterns.clone());
         }
     }
 
     let (roots, patterns) = effective_ignore_rules(
+        config_file,
         home_dir,
         cwd,
         state.path_ignores.as_ref(),
@@ -1154,7 +1282,7 @@ pub(crate) fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, 
         roots: roots.clone(),
         patterns: patterns.clone(),
         pathignore_mtime,
-        gitignore_mtime,
+        config_file_mtime,
     });
 
     (roots, patterns)
@@ -1289,16 +1417,6 @@ pub(crate) fn should_skip_path(
     ignored_roots: &[PathBuf],
     ignored_patterns: &[IgnorePattern],
 ) -> bool {
-    should_skip_path_ext(path, ignored_roots, ignored_patterns, None, None)
-}
-
-pub(crate) fn should_skip_path_ext(
-    path: &Path,
-    ignored_roots: &[PathBuf],
-    ignored_patterns: &[IgnorePattern],
-    gitignore: Option<&gitignore_filter::GitignoreFilter>,
-    is_dir_hint: Option<bool>,
-) -> bool {
     let s = normalize_slashes(path.to_string_lossy().to_string());
 
     // Single-component builtin names: check path segments
@@ -1329,14 +1447,9 @@ pub(crate) fn should_skip_path_ext(
     {
         return true;
     }
-    if let Some(gi) = gitignore {
-        let is_dir = is_dir_hint.unwrap_or_else(|| path.is_dir());
-        if gi.is_ignored(path, is_dir) {
-            return true;
-        }
-    }
     false
 }
+
 
 fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
     if is_dir {
@@ -1993,8 +2106,11 @@ fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) 
                 emit_index_state(&app, "Error", Some(err.clone()));
             }
             // Silent mode: keep Ready state, just log the error
+            // On error: release indexing_active here (finalizing thread was not spawned)
+            state.indexing_active.store(false, AtomicOrdering::Release);
         }
-        state.indexing_active.store(false, AtomicOrdering::Release);
+        // On success: indexing_active is released by the finalizing bg thread
+        // (spawned inside run_incremental_index) after Ready is emitted.
     });
 
     Ok(())
@@ -2108,15 +2224,42 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
     match &result {
         Ok(_) => {
             let _ = set_meta(&conn, "index_complete", "1");
-            // Ensure any new indexes exist after indexing completes. Runs here (not at
-            // db_ready) to avoid DDL contention with the bulk insert / fresh-index
-            // DROP+CREATE INDEX cycle above.
+            // Run ensure_db_indexes + GC cleanup sequentially in one background thread,
+            // then transition to Ready and release indexing_active.
             {
-                let idx_db_path = state.db_path.clone();
+                let fin_app = app.clone();
+                let fin_state = state.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = ensure_db_indexes(&idx_db_path) {
-                        eprintln!("[init_db] ensure_db_indexes error: {e}");
+                    // Guard: ensure indexing_active is released even on panic.
+                    struct IndexingGuard(Arc<AtomicBool>);
+                    impl Drop for IndexingGuard {
+                        fn drop(&mut self) {
+                            self.0.store(false, AtomicOrdering::Release);
+                        }
                     }
+                    let _guard = IndexingGuard(Arc::clone(&fin_state.indexing_active));
+
+                    // 1. Ensure any new indexes exist (DDL, may take a few seconds on large DB)
+                    if let Err(e) = ensure_db_indexes(&fin_state.db_path) {
+                        eprintln!("[finalizing] ensure_db_indexes error: {e}");
+                    }
+                    // 2. Drop any orphaned entries_gc_* tables from crashed sessions
+                    if let Ok(c) = db_connection(&fin_state.db_path) {
+                        if let Err(e) = cleanup_entries_gc_tables(&c) {
+                            eprintln!("[gc] cleanup error: {e}");
+                        }
+                    }
+                    // 3. Transition to Ready: update state and emit event
+                    // (index_updated already emitted by run_incremental_index_inner;
+                    //  only Ready state transition + index_state event needed here)
+                    let message = fin_state.status.lock().message.clone();
+                    {
+                        let mut status = fin_state.status.lock();
+                        status.state = IndexState::Ready;
+                    }
+                    emit_index_state(&fin_app, "Ready", message);
+                    // indexing_active released by _guard Drop
+                    perf_log("index_state=Ready (finalizing complete)");
                 });
             }
             let snapshot = state.status.lock().clone();
@@ -2149,12 +2292,12 @@ fn run_incremental_index_inner(
 ) -> AppResult<()> {
 
     let (runtime_ignored_roots, runtime_ignored_patterns) = effective_ignore_rules(
+        &state.config_file_path,
         &state.home_dir,
         &state.cwd,
         state.path_ignores.as_ref(),
         state.path_ignore_patterns.as_ref(),
     );
-    let gi_filter = state.gitignore.get();
 
     let last_run_id: i64 = get_meta(conn, "last_run_id")
         .and_then(|v| v.parse().ok())
@@ -2167,12 +2310,21 @@ fn run_incremental_index_inner(
     // batches to reduce transaction overhead (fewer commits = faster).
     let flush_batch_size = if is_fresh { BATCH_SIZE * 5 } else { BATCH_SIZE };
 
+    // Fresh index: drop FTS triggers to avoid per-row FTS overhead during bulk insert.
+    // A single FTS rebuild runs after all rows are written (much faster than 3.6M trigger fires).
+    // Mark FTS as not ready so search falls back to LIKE queries during bulk insert.
+    if is_fresh {
+        state.fts_ready.store(false, AtomicOrdering::Release);
+        let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
+    }
+
     let mut scanned: u64 = 0;
     let mut indexed: u64 = 0;
     let mut permission_errors: u64 = 0;
     let mut current_path = String::new();
     let mut batch: Vec<IndexRow> = Vec::with_capacity(flush_batch_size);
-    let mut stamp_batch: Vec<String> = Vec::with_capacity(flush_batch_size);
+    // Fresh index: DB was empty, stamp_batch is never used; avoid large pre-allocation.
+    let mut stamp_batch: Vec<String> = Vec::with_capacity(if is_fresh { 0 } else { flush_batch_size });
     let mut last_emit = Instant::now();
     let mut last_perf_emit = Instant::now();
 
@@ -2203,12 +2355,10 @@ fn run_incremental_index_inner(
         for dir_entry in entries.flatten() {
             let child_path = dir_entry.path();
 
-            if should_skip_path_ext(
+            if should_skip_path(
                 &child_path,
                 &runtime_ignored_roots,
                 &runtime_ignored_patterns,
-                Some(&gi_filter),
-                None,
             ) {
                 continue;
             }
@@ -2261,211 +2411,394 @@ fn run_incremental_index_inner(
     let arc_ignored_patterns = Arc::new(runtime_ignored_patterns.clone());
 
 
-    for pass in 0..2u8 {
-        // Fresh index: single unlimited-depth pass -- avoids double filesystem traversal
-        if pass == 1 && is_fresh {
-            break;
+    if is_fresh {
+        // FRESH INDEX: parallel root scan.
+        // All roots are scanned concurrently by N worker threads; the main thread
+        // receives row batches via channel and writes them to SQLite.
+        // FTS triggers were dropped above; FTS is rebuilt in one pass after all rows
+        // are written (avoids ~3.6M individual B-tree trigger inserts).
+
+        // Flush scan_root + direct-children batch before parallel workers start.
+        if !batch.is_empty() {
+            upsert_rows(conn, &batch)?;
+            batch.clear();
         }
-        let pass_label = if pass == 0 { "shallow" } else { "deep" };
-        let pass_started = Instant::now();
-        let mut pass_scanned = 0u64;
-        let mut pass_indexed = 0u64;
 
-        for root in &roots {
-            let root_started = Instant::now();
-            let mut root_scanned = 0u64;
-            let mut root_indexed = 0u64;
-            let mut root_permission_errors = 0u64;
-            let root_str = root.to_string_lossy().to_string();
+        // Shared rayon pool: all workers share one pool sized for maximum I/O throughput.
+        // Filesystem scanning is I/O-bound (stat() calls block on disk), so we use more
+        // threads than CPU cores to keep the I/O pipeline saturated.
+        let n_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let pool_threads = (n_cpus * 2).max(8);
+        let shared_pool = Arc::new(
+            jwalk::rayon::ThreadPoolBuilder::new()
+                .num_threads(pool_threads)
+                .build()
+                .expect("failed to build rayon pool for fresh index"),
+        );
+        let n_workers = n_cpus.min(roots.len().max(1));
+        eprintln!(
+            "[index] fresh parallel scan: {} workers, {} pool threads, {} roots",
+            n_workers,
+            pool_threads,
+            roots.len()
+        );
 
-            // Fresh index: DB is empty, preload is unnecessary
-            let existing = if is_fresh {
-                HashMap::new()
-            } else {
-                let e = preload_existing_entries(conn, &root_str);
-                e
-            };
+        type ScanMsg = (Vec<IndexRow>, u64, u64, u64, String);
+        let (row_tx, row_rx) = std::sync::mpsc::channel::<ScanMsg>();
+        let roots_arc: Arc<Vec<PathBuf>> = Arc::new(roots);
+        let par_started = Instant::now();
 
-            let gi_ref = gi_filter.clone();
-            let skip_roots = arc_ignored_roots.clone();
-            let skip_patterns = arc_ignored_patterns.clone();
+        std::thread::scope(|scope| -> AppResult<()> {
+            for worker_idx in 0..n_workers {
+                let tx = row_tx.clone();
+                let skip_roots = arc_ignored_roots.clone();
+                let skip_patterns = arc_ignored_patterns.clone();
+                let roots_ref = roots_arc.clone();
+                let run_id = current_run_id;
+                let n_w = n_workers;
+                let pool = shared_pool.clone();
+                // Use BATCH_SIZE (not flush_batch_size) so workers send batches every
+                // 10k rows instead of 50k → progress updates reach the main thread sooner.
+                let flush_size = BATCH_SIZE;
 
-            // Use more threads for fresh index: stat() calls are the bottleneck,
-            // more rayon threads = more parallel stat() calls.
-            let num_threads = if is_fresh { jwalk_num_threads_fresh() } else { jwalk_num_threads() };
-            let current_pass = pass;
-            let mut builder = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
-                .follow_links(false)
-                .skip_hidden(false)
-                .parallelism(jwalk::Parallelism::RayonNewPool(num_threads));
-            // Fresh index: no depth limit -- walk everything in one pass
-            if pass == 0 && !is_fresh {
-                builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
-            }
-            let walker = builder.process_read_dir(move |_depth, path, _state, children| {
-                // Combined filter + metadata pre-fetch in one pass using retain_mut.
-                // Running stat() here parallelizes it across rayon threads (one per directory).
-                children.retain_mut(|entry_result| {
-                    match entry_result {
-                        Ok(entry) => {
-                            let full_path = path.join(&entry.file_name);
-                            let is_dir = Some(entry.file_type.is_dir());
-                            if should_skip_path_ext(
-                                &full_path,
-                                &skip_roots,
-                                &skip_patterns,
-                                Some(&gi_ref),
-                                is_dir,
-                            ) {
-                                return false;
+                scope.spawn(move || {
+                    let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
+                    let mut local_scanned = 0u64;
+                    let mut local_indexed = 0u64;
+                    let mut local_perm_errors = 0u64;
+                    let mut local_path = String::new();
+
+                    // Interleaved distribution: worker 0 handles roots[0, n_w, 2*n_w, …]
+                    for i in (worker_idx..roots_ref.len()).step_by(n_w) {
+                        let root = &roots_ref[i];
+                        let root_started = Instant::now();
+                        let mut root_scanned = 0u64;
+                        let mut root_indexed = 0u64;
+                        let mut root_perm_errors = 0u64;
+                        let root_str = root.to_string_lossy().to_string();
+
+                        let s_roots = skip_roots.clone();
+                        let s_patterns = skip_patterns.clone();
+                        let walker =
+                            jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
+                                .follow_links(false)
+                                .skip_hidden(false)
+                                .parallelism(jwalk::Parallelism::RayonExistingPool {
+                                    pool: pool.clone(),
+                                    busy_timeout: None,
+                                })
+                                .process_read_dir(move |_depth, path, _state, children| {
+                                    children.retain_mut(|entry_result| match entry_result {
+                                        Ok(entry) => {
+                                            let full_path = path.join(&entry.file_name);
+                                            if should_skip_path(
+                                                &full_path,
+                                                &s_roots,
+                                                &s_patterns,
+                                            ) {
+                                                return false;
+                                            }
+                                            entry.client_state =
+                                                fs::symlink_metadata(&full_path).ok();
+                                            true
+                                        }
+                                        Err(_) => false,
+                                    });
+                                });
+
+                        for result in walker {
+                            match result {
+                                Ok(entry) => {
+                                    let path = entry.path();
+                                    if path == root.as_path() {
+                                        continue;
+                                    }
+                                    local_scanned += 1;
+                                    root_scanned += 1;
+                                    local_path = path.to_string_lossy().to_string();
+
+                                    let metadata = match entry.client_state {
+                                        Some(m) => m,
+                                        None => {
+                                            local_perm_errors += 1;
+                                            root_perm_errors += 1;
+                                            continue;
+                                        }
+                                    };
+
+                                    if let Some(mut row) =
+                                        index_row_from_path_and_metadata(&path, &metadata)
+                                    {
+                                        row.run_id = run_id;
+                                        local_indexed += 1;
+                                        root_indexed += 1;
+                                        local_batch.push(row);
+                                    }
+
+                                    if local_batch.len() >= flush_size {
+                                        let _ = tx.send((
+                                            std::mem::replace(&mut local_batch, Vec::with_capacity(flush_size)),
+                                            local_scanned,
+                                            local_indexed,
+                                            local_perm_errors,
+                                            local_path.clone(),
+                                        ));
+                                        local_scanned = 0;
+                                        local_indexed = 0;
+                                        local_perm_errors = 0;
+                                    }
+                                }
+                                Err(err) => {
+                                    local_scanned += 1;
+                                    root_scanned += 1;
+                                    local_perm_errors += 1;
+                                    root_perm_errors += 1;
+                                    if local_perm_errors <= 20 || perf_log_enabled() {
+                                        eprintln!("[index] permission error: {}", err);
+                                    }
+                                }
                             }
-                            // Pre-fetch metadata in rayon thread (avoids serial stat() on
-                            // main thread). Skip for pass-1 shallow entries that will be
-                            // discarded in the main loop anyway.
-                            if current_pass != 1 || entry.depth > SHALLOW_SCAN_DEPTH {
-                                entry.client_state = fs::symlink_metadata(&full_path).ok();
-                            }
-                            true
                         }
-                        Err(_) => false,
+
+                        eprintln!(
+                            "[timing]   walk_fresh_par {} {}ms scanned={} indexed={} err={}",
+                            root_str,
+                            root_started.elapsed().as_millis(),
+                            root_scanned,
+                            root_indexed,
+                            root_perm_errors,
+                        );
+                    }
+
+                    // Flush partial batch remaining after all roots processed.
+                    if !local_batch.is_empty() || local_scanned > 0 || local_perm_errors > 0 {
+                        let _ = tx.send((
+                            local_batch,
+                            local_scanned,
+                            local_indexed,
+                            local_perm_errors,
+                            local_path,
+                        ));
                     }
                 });
-            });
+            }
 
-            for result in walker {
-                match result {
-                    Ok(entry) => {
-                        let entry_depth = entry.depth;
-                        let path = entry.path();
-                        if path == root.as_path() {
-                            continue;
+            // Drop original sender: channel exhausts when all worker clones drop.
+            drop(row_tx);
+
+            // Main thread: receive row batches from workers and write to SQLite.
+            for (worker_batch, s, i, pe, path) in row_rx {
+                scanned += s;
+                indexed += i;
+                permission_errors += pe;
+                if !path.is_empty() {
+                    current_path = path;
+                }
+                if !worker_batch.is_empty() {
+                    upsert_rows(conn, &worker_batch)?;
+                }
+                if last_emit.elapsed() >= Duration::from_millis(200) {
+                    set_progress(state, scanned, indexed, &current_path);
+                    emit_index_progress(app, scanned, indexed, current_path.clone());
+                    last_emit = Instant::now();
+                }
+            }
+            Ok(())
+        })?;
+
+        perf_log(format!(
+            "index_pass_done pass=fresh_par elapsed_ms={} scanned={} indexed={}",
+            par_started.elapsed().as_millis(),
+            scanned,
+            indexed,
+        ));
+    } else {
+        // INCREMENTAL INDEX: 2-pass sequential scan (shallow first, then deep).
+        for pass in 0..2u8 {
+            let pass_label = if pass == 0 { "shallow" } else { "deep" };
+            let pass_started = Instant::now();
+            let mut pass_scanned = 0u64;
+            let mut pass_indexed = 0u64;
+
+            for root in &roots {
+                let root_started = Instant::now();
+                let mut root_scanned = 0u64;
+                let mut root_indexed = 0u64;
+                let mut root_permission_errors = 0u64;
+                let root_str = root.to_string_lossy().to_string();
+
+                let existing = preload_existing_entries(conn, &root_str);
+
+                let skip_roots = arc_ignored_roots.clone();
+                let skip_patterns = arc_ignored_patterns.clone();
+
+                let num_threads = jwalk_num_threads();
+                let current_pass = pass;
+                let mut builder = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
+                    .follow_links(false)
+                    .skip_hidden(false)
+                    .parallelism(jwalk::Parallelism::RayonNewPool(num_threads));
+                if pass == 0 {
+                    builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
+                }
+                let walker = builder.process_read_dir(move |_depth, path, _state, children| {
+                    children.retain_mut(|entry_result| {
+                        match entry_result {
+                            Ok(entry) => {
+                                let full_path = path.join(&entry.file_name);
+                                if should_skip_path(&full_path, &skip_roots, &skip_patterns) {
+                                    return false;
+                                }
+                                // Skip metadata pre-fetch for pass-1 shallow entries
+                                // (they'll be skipped in the main loop anyway).
+                                if current_pass != 1 || entry.depth > SHALLOW_SCAN_DEPTH {
+                                    entry.client_state = fs::symlink_metadata(&full_path).ok();
+                                }
+                                true
+                            }
+                            Err(_) => false,
                         }
+                    });
+                });
 
-                        // Pass 1 (incremental only): skip shallow entries already indexed in pass 0
-                        if pass == 1 && entry_depth <= SHALLOW_SCAN_DEPTH {
-                            continue;
-                        }
-
-                        scanned += 1;
-                        root_scanned += 1;
-                        current_path = path.to_string_lossy().to_string();
-
-                        // Use metadata pre-fetched in rayon thread; fall back to stat on failure.
-                        let metadata = match entry.client_state {
-                            Some(m) => m,
-                            None => {
-                                // pre-fetch failed (permission error or race condition)
-                                permission_errors += 1;
-                                root_permission_errors += 1;
+                for result in walker {
+                    match result {
+                        Ok(entry) => {
+                            let entry_depth = entry.depth;
+                            let path = entry.path();
+                            if path == root.as_path() {
                                 continue;
                             }
-                        };
 
-                        if let Some(mut row) = index_row_from_path_and_metadata(&path, &metadata) {
-                            row.run_id = current_run_id;
-                            if is_fresh {
-                                // Fresh index: all entries are new, skip existing check
-                                indexed += 1;
-                                root_indexed += 1;
-                                batch.push(row);
-                            } else if let Some((old_mtime, old_size)) = existing.get(&row.path) {
-                                if *old_mtime == row.mtime && *old_size == row.size {
-                                    stamp_batch.push(row.path);
+                            // Pass 1: skip shallow entries already indexed in pass 0.
+                            if pass == 1 && entry_depth <= SHALLOW_SCAN_DEPTH {
+                                continue;
+                            }
+
+                            scanned += 1;
+                            root_scanned += 1;
+                            current_path = path.to_string_lossy().to_string();
+
+                            let metadata = match entry.client_state {
+                                Some(m) => m,
+                                None => {
+                                    permission_errors += 1;
+                                    root_permission_errors += 1;
+                                    continue;
+                                }
+                            };
+
+                            if let Some(mut row) =
+                                index_row_from_path_and_metadata(&path, &metadata)
+                            {
+                                row.run_id = current_run_id;
+                                if let Some((old_mtime, old_size)) = existing.get(&row.path) {
+                                    if *old_mtime == row.mtime && *old_size == row.size {
+                                        stamp_batch.push(row.path);
+                                    } else {
+                                        indexed += 1;
+                                        root_indexed += 1;
+                                        batch.push(row);
+                                    }
                                 } else {
                                     indexed += 1;
                                     root_indexed += 1;
                                     batch.push(row);
                                 }
-                            } else {
-                                indexed += 1;
-                                root_indexed += 1;
-                                batch.push(row);
+                            }
+
+                            if batch.len() >= flush_batch_size {
+                                upsert_rows(conn, &batch)?;
+                                batch.clear();
+                            }
+
+                            if stamp_batch.len() >= flush_batch_size {
+                                stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
+                                stamp_batch.clear();
+                            }
+
+                            if last_emit.elapsed() >= Duration::from_millis(200) {
+                                set_progress(state, scanned, indexed, &current_path);
+                                emit_index_progress(app, scanned, indexed, current_path.clone());
+                                last_emit = Instant::now();
+                            }
+                            if perf_log_enabled()
+                                && last_perf_emit.elapsed() >= Duration::from_secs(1)
+                            {
+                                perf_log(format!(
+                                    "index_progress pass={} scanned={} indexed={} current_path={}",
+                                    pass_label, scanned, indexed, current_path
+                                ));
+                                last_perf_emit = Instant::now();
                             }
                         }
-
-                        if batch.len() >= flush_batch_size {
-                            upsert_rows(conn, &batch)?;
-                            batch.clear();
-                        }
-
-                        if stamp_batch.len() >= flush_batch_size {
-                            stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-                            stamp_batch.clear();
-                        }
-
-                        if last_emit.elapsed() >= Duration::from_millis(200) {
-                            set_progress(state, scanned, indexed, &current_path);
-                            emit_index_progress(app, scanned, indexed, current_path.clone());
-                            last_emit = Instant::now();
-                        }
-                        if perf_log_enabled() && last_perf_emit.elapsed() >= Duration::from_secs(1)
-                        {
-                            perf_log(format!(
-                                "index_progress pass={} scanned={} indexed={} current_path={}",
-                                pass_label, scanned, indexed, current_path
-                            ));
-                            last_perf_emit = Instant::now();
-                        }
-                    }
-                    Err(err) => {
-                        scanned += 1;
-                        root_scanned += 1;
-                        permission_errors += 1;
-                        root_permission_errors += 1;
-                        if permission_errors <= 20 || perf_log_enabled() {
-                            eprintln!("[index] permission error: {}", err);
+                        Err(err) => {
+                            scanned += 1;
+                            root_scanned += 1;
+                            permission_errors += 1;
+                            root_permission_errors += 1;
+                            if permission_errors <= 20 || perf_log_enabled() {
+                                eprintln!("[index] permission error: {}", err);
+                            }
                         }
                     }
                 }
+
+                pass_scanned += root_scanned;
+                pass_indexed += root_indexed;
+
+                eprintln!(
+                    "[timing]   walk_{} {} {}ms scanned={} indexed={} err={}",
+                    pass_label,
+                    root_str,
+                    root_started.elapsed().as_millis(),
+                    root_scanned,
+                    root_indexed,
+                    root_permission_errors
+                );
+                perf_log(format!(
+                    "index_root_done pass={} root={} elapsed_ms={} scanned={} indexed={} permission_errors={}",
+                    pass_label,
+                    root.to_string_lossy(),
+                    root_started.elapsed().as_millis(),
+                    root_scanned,
+                    root_indexed,
+                    root_permission_errors,
+                ));
             }
 
-            pass_scanned += root_scanned;
-            pass_indexed += root_indexed;
+            // Flush between passes.
+            if !batch.is_empty() {
+                upsert_rows(conn, &batch)?;
+                batch.clear();
+            }
+            if !stamp_batch.is_empty() {
+                stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
+                stamp_batch.clear();
+            }
 
-            eprintln!("[timing]   walk_{} {} {}ms scanned={} indexed={} err={}",
-                pass_label, root_str, root_started.elapsed().as_millis(),
-                root_scanned, root_indexed, root_permission_errors);
             perf_log(format!(
-                "index_root_done pass={} root={} elapsed_ms={} scanned={} indexed={} permission_errors={}",
+                "index_pass_done pass={} elapsed_ms={} scanned={} indexed={}",
                 pass_label,
-                root.to_string_lossy(),
-                root_started.elapsed().as_millis(),
-                root_scanned,
-                root_indexed,
-                root_permission_errors,
+                pass_started.elapsed().as_millis(),
+                pass_scanned,
+                pass_indexed,
             ));
-        }
 
-        // Flush between passes
-        if !batch.is_empty() {
-            upsert_rows(conn, &batch)?;
-            batch.clear();
-        }
-        if !stamp_batch.is_empty() {
-            stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-            stamp_batch.clear();
-        }
-
-        perf_log(format!(
-            "index_pass_done pass={} elapsed_ms={} scanned={} indexed={}",
-            pass_label,
-            pass_started.elapsed().as_millis(),
-            pass_scanned,
-            pass_indexed,
-        ));
-
-        // After shallow pass (incremental only), emit progress so UI shows searchable state early
-        // Fresh index uses per-root emit above instead.
-        if pass == 0 && !is_fresh {
-            let _ = refresh_and_emit_status_counts(app, state);
-            let _ = app.emit(
-                "index_updated",
-                IndexUpdatedEvent {
-                    entries_count: state.status.lock().entries_count,
-                    last_updated: now_epoch(),
-                    permission_errors,
-                },
-            );
+            // After shallow pass emit progress so UI shows searchable state early.
+            if pass == 0 {
+                let _ = refresh_and_emit_status_counts(app, state);
+                let _ = app.emit(
+                    "index_updated",
+                    IndexUpdatedEvent {
+                        entries_count: state.status.lock().entries_count,
+                        last_updated: now_epoch(),
+                        permission_errors,
+                    },
+                );
+            }
         }
     }
 
@@ -2475,6 +2808,16 @@ fn run_incremental_index_inner(
 
     if !stamp_batch.is_empty() {
         stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
+    }
+
+    // Fresh index: rebuild FTS from all inserted rows (single bulk op),
+    // then recreate FTS triggers for future incremental updates.
+    if is_fresh {
+        let fts_t = Instant::now();
+        let _ = conn.execute_batch(REBUILD_FTS_SQL);
+        let _ = conn.execute_batch(CREATE_FTS_TRIGGERS_SQL);
+        state.fts_ready.store(true, AtomicOrdering::Release);
+        eprintln!("[index] fts_rebuild {}ms", fts_t.elapsed().as_millis());
     }
 
     set_progress(state, scanned, indexed, &current_path);
@@ -2521,7 +2864,6 @@ fn run_incremental_index_inner(
 
     {
         let mut status = state.status.lock();
-        status.state = IndexState::Ready;
         status.permission_errors = permission_errors;
         status.scanned = scanned;
         status.indexed = indexed;
@@ -2537,17 +2879,8 @@ fn run_incremental_index_inner(
     }
     emit_index_progress(app, scanned, indexed, current_path);
     emit_index_updated(app, entries_count, updated_at, permission_errors);
-    emit_index_state(
-        app,
-        "Ready",
-        if permission_errors > 0 {
-            Some(format!("{} permission/access error(s)", permission_errors))
-        } else {
-            None
-        },
-    );
     perf_log(format!(
-        "index_state=Ready scanned={} indexed={} deleted={} entries={} permission_errors={}",
+        "index_scan_done scanned={} indexed={} deleted={} entries={} permission_errors={}",
         scanned, indexed, deleted_count, entries_count, permission_errors
     ));
 
@@ -2790,6 +3123,11 @@ fn start_fsevent_watcher_worker(
         let mut replay_phase = conditional;
         let mut full_scan_triggered = false;
 
+        // Snapshot config file entries at watcher start so we only emit
+        // pathignore_changed when actual rule entries change (ignores whitespace/comments).
+        let mut last_config_entries =
+            pathignore_active_entries(&fs::read_to_string(&state.config_file_path).unwrap_or_default());
+
         loop {
             if state.watcher_stop.load(AtomicOrdering::Acquire) {
                 break;
@@ -2811,6 +3149,16 @@ fn start_fsevent_watcher_worker(
                     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
                     let prev_len = pending_paths.len();
                     for path in paths {
+                        if path == state.config_file_path {
+                            let new_entries = pathignore_active_entries(
+                                &fs::read_to_string(&state.config_file_path).unwrap_or_default(),
+                            );
+                            if new_entries != last_config_entries {
+                                last_config_entries = new_entries;
+                                app.emit("pathignore_changed", ()).ok();
+                            }
+                            continue;
+                        }
                         if !should_skip_path(&path, &ignored_roots, &ignored_patterns) {
                             pending_paths.insert(path);
                         }
@@ -3085,6 +3433,27 @@ fn open_privacy_settings() {
 }
 
 #[tauri::command]
+fn open_pathignore(state: State<'_, AppState>) -> AppResult<()> {
+    let path = &state.config_file_path;
+    ensure_pathignore_exists(path)?;
+    #[cfg(target_os = "macos")]
+    Command::new("open").arg(path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    Command::new("cmd")
+        .args(["/C", "start", "", &path.to_string_lossy().to_string()])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = path;
+    Ok(())
+}
+
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    app.restart();
+}
+
+#[tauri::command]
 fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     {
@@ -3117,12 +3486,22 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         }
 
         let conn = db_connection(&state.db_path)?;
-        // Use synchronous=OFF + large cache to make the bulk DELETE fast
-        let _ = conn.execute_batch(
-            "PRAGMA synchronous=OFF; PRAGMA cache_size=-131072;",
-        );
-        conn.execute("DELETE FROM entries", [])
+
+        // Fast reset: rename entries (O(1), no data movement) → create new empty table
+        // → FTS rebuild from empty content table (instant) → background DROP old table.
+        // This avoids per-row WAL writes that make DELETE FROM entries slow at scale.
+        let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS entries_gc_reset;");
+        conn.execute_batch("ALTER TABLE entries RENAME TO entries_gc_reset;")
             .map_err(|e| e.to_string())?;
+        conn.execute_batch(CREATE_ENTRIES_TABLE_SQL).map_err(|e| e.to_string())?;
+        conn.execute_batch(CREATE_FTS_TRIGGERS_SQL).map_err(|e| e.to_string())?;
+        let _ = conn.execute_batch(REBUILD_FTS_SQL);
+
+        // entries_gc_reset will be dropped by the GC cleanup in the finalizing thread
+        // after indexing completes — avoids a race between DROP TABLE and the new indexer
+        // both competing for the SQLite WAL write lock.
+
         conn.execute("DELETE FROM meta", [])
             .map_err(|e| e.to_string())?;
 
@@ -3197,6 +3576,7 @@ fn compute_total_count(
     db_path: &Path,
     home_dir: &Path,
     execution: &SearchExecution,
+    fts_ready: bool,
 ) -> Option<u32> {
     // When fewer results than the limit were returned the total is exact.
     if (execution.results.len() as u32) < execution.effective_limit {
@@ -3228,25 +3608,38 @@ fn compute_total_count(
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap_or(0),
         SearchMode::NameSearch { name_like } => {
-            let escaped = escape_like(&execution.query);
-            let prefix_like = format!("{}%", escaped);
-            let prefix_count: u32 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
-                    params![prefix_like],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if prefix_count > 0 {
-                prefix_count
-            } else {
-                // Phase-2 contains fallback was used.
+            if execution.sort_by != "name" && execution.query.chars().count() >= 3 && fts_ready {
+                let fts_match = format!("\"{}\"", execution.query.replace('"', "\"\""));
                 conn.query_row(
-                    "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
-                    params![name_like],
+                    "SELECT COUNT(*) \
+                     FROM entries_fts f \
+                     JOIN entries e ON e.id = f.rowid \
+                     WHERE entries_fts MATCH ?1",
+                    params![fts_match],
                     |r| r.get(0),
                 )
                 .unwrap_or(0)
+            } else {
+                let escaped = escape_like(&execution.query);
+                let prefix_like = format!("{}%", escaped);
+                let prefix_count: u32 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
+                        params![prefix_like],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if prefix_count > 0 {
+                    prefix_count
+                } else {
+                    // Phase-2 contains fallback was used.
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
+                        params![name_like],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+                }
             }
         }
         SearchMode::GlobName { name_like } => conn
@@ -3400,6 +3793,7 @@ fn execute_search(
     }
 
     let is_indexing = matches!(state.status.lock().state, IndexState::Indexing);
+    let fts_ready = state.fts_ready.load(AtomicOrdering::Acquire);
     let order_by = sort_clause(&sort_by, &sort_dir, "e.");
 
     let mut results = Vec::with_capacity(effective_limit as usize);
@@ -3518,6 +3912,32 @@ fn execute_search(
                 }
 
                 SearchMode::NameSearch { name_like } => {
+                    if sort_by != "name" && query.chars().count() >= 3 && fts_ready {
+                        // Non-name sort: use FTS5 trigram for globally correct ordering.
+                        // The 3-phase approach only returns prefix matches for non-empty
+                        // prefix results, causing contains matches to be silently excluded
+                        // (e.g. a large file "myapp_foo.zip" missing from size-desc results).
+                        // FTS5 trigram index covers all substring matches in one indexed pass.
+                        let fts_match = format!("\"{}\"", query.replace('"', "\"\""));
+                        let sql = format!(
+                            r#"
+                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                            FROM entries_fts f
+                            JOIN entries e ON e.id = f.rowid
+                            WHERE entries_fts MATCH ?1
+                            ORDER BY {order_by}
+                            LIMIT ?2 OFFSET ?3
+                            "#,
+                        );
+                        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                        let rows = stmt
+                            .query_map(params![fts_match, effective_limit, offset], row_to_entry)
+                            .map_err(|e| e.to_string())?;
+                        for row in rows {
+                            results.push(row.map_err(|e| e.to_string())?);
+                        }
+                    } else {
+
                     let escaped_query = escape_like(&query);
                     let exact_query = query.clone();
                     let prefix_like = format!("{}%", escaped_query);
@@ -3630,6 +4050,8 @@ fn execute_search(
 
                         conn.progress_handler(0, None::<fn() -> bool>);
                     }
+
+                    } // end sort_by == "name" branch
                 }
 
                 SearchMode::GlobName { name_like } => {
@@ -4040,7 +4462,8 @@ async fn search(
         let include_total = include_total.unwrap_or(true);
         let count_started = Instant::now();
         let (total_count, total_known) = if include_total {
-            match compute_total_count(&state.db_path, &state.home_dir, &execution) {
+            let fts_ok = state.fts_ready.load(AtomicOrdering::Acquire);
+            match compute_total_count(&state.db_path, &state.home_dir, &execution, fts_ok) {
                 Some(v) => (v, true),
                 None => (0, false),
             }
@@ -5175,25 +5598,20 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         home_dir.clone()
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
+    let config_file_path = app_data_dir.join(".pathignore");
     eprintln!("[startup] +{}ms loading pathignore rules...", setup_started.elapsed().as_millis());
-    let (mut path_ignores, path_ignore_patterns) = load_pathignore_rules(&home_dir, &cwd);
+    let (mut path_ignores, path_ignore_patterns) = load_pathignore_rules(&config_file_path, &home_dir, &cwd);
     if !path_ignores.iter().any(|r| r == &app_data_dir) {
         path_ignores.push(app_data_dir.clone());
     }
-    for root in load_gitignore_roots(&home_dir, &cwd) {
-        if !path_ignores.iter().any(|r| r == &root) {
-            path_ignores.push(root);
-        }
-    }
     eprintln!("[startup] +{}ms pathignore done", setup_started.elapsed().as_millis());
-
-    let gitignore = Arc::new(gitignore_filter::LazyGitignoreFilter::new(home_dir.clone()));
 
     let state = AppState {
         db_path,
         home_dir,
         scan_root,
         cwd,
+        config_file_path,
         path_ignores: Arc::new(path_ignores),
         path_ignore_patterns: Arc::new(path_ignore_patterns),
         db_ready: Arc::new(AtomicBool::new(false)),
@@ -5204,7 +5622,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         fd_search_cache: Arc::new(Mutex::new(None)),
         negative_name_cache: Arc::new(Mutex::new(HashMap::new())),
         ignore_cache: Arc::new(Mutex::new(None)),
-        gitignore,
+        fts_ready: Arc::new(AtomicBool::new(true)),
         mem_index: Arc::new(RwLock::new(None)),
         watcher_stop: Arc::new(AtomicBool::new(false)),
         watcher_active: Arc::new(AtomicBool::new(false)),
@@ -5322,7 +5740,17 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                     })
                     .unwrap_or((None, false));
 
-                if stored_event_id.is_some() && index_complete {
+                let entries_empty = db_connection(&state.db_path)
+                    .ok()
+                    .map(|c| {
+                        c.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
+                            .unwrap_or(0) == 0
+                    })
+                    .unwrap_or(true);
+
+                let effective_complete = index_complete && !entries_empty;
+
+                if stored_event_id.is_some() && effective_complete {
                     // Conditional startup: try watcher replay first, skip full scan if OK
                     start_fsevent_watcher_worker(
                         app_handle.clone(),
@@ -5331,8 +5759,8 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         true,
                     );
                 } else {
-                    if !index_complete {
-                        eprintln!("[mac] index incomplete; starting full index");
+                    if !effective_complete {
+                        eprintln!("[mac] index incomplete or entries empty; starting full index");
                     }
                     let _ = start_full_index_worker(app_handle.clone(), state.clone());
                     start_fsevent_watcher_worker(app_handle.clone(), state.clone(), None, false);
@@ -5446,7 +5874,9 @@ pub fn run() {
             frontend_log,
             mark_frontend_ready,
             check_full_disk_access,
-            open_privacy_settings
+            open_privacy_settings,
+            open_pathignore,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -5498,6 +5928,7 @@ mod tests {
 
     fn test_state_for(db_path: PathBuf, home_dir: PathBuf, cwd: PathBuf) -> AppState {
         AppState {
+            config_file_path: home_dir.join(".pathignore"),
             db_path,
             home_dir: home_dir.clone(),
             scan_root: home_dir.clone(),
@@ -5512,7 +5943,7 @@ mod tests {
             fd_search_cache: Arc::new(Mutex::new(None)),
             negative_name_cache: Arc::new(Mutex::new(HashMap::new())),
             ignore_cache: Arc::new(Mutex::new(None)),
-            gitignore: Arc::new(gitignore_filter::LazyGitignoreFilter::new(home_dir.clone())),
+            fts_ready: Arc::new(AtomicBool::new(true)),
             mem_index: Arc::new(RwLock::new(None)),
             watcher_stop: Arc::new(AtomicBool::new(false)),
             watcher_active: Arc::new(AtomicBool::new(false)),

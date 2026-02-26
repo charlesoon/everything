@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::mem;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +13,8 @@ use super::path_resolver::PathResolver;
 use super::volume;
 use crate::{
     cached_effective_ignore_rules,
-    db_connection, emit_index_progress, emit_index_state, emit_index_updated,
-    get_meta, gitignore_filter, invalidate_search_caches, matches_ignore_pattern, now_epoch,
+    cleanup_entries_gc_tables, db_connection, emit_index_progress, emit_index_state, emit_index_updated,
+    get_meta, invalidate_search_caches, matches_ignore_pattern, now_epoch,
     mem_search::CompactEntry,
     refresh_and_emit_status_counts,
     restore_normal_pragmas, set_indexing_pragmas, set_meta, set_progress, set_state,
@@ -91,10 +90,6 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     }
     emit_index_state(app, "Indexing", None);
 
-    // Pre-trigger gitignore filter build in background (overlaps with MFT enum)
-    let gi_arc = Arc::clone(&state.gitignore);
-    let gi_thread = std::thread::spawn(move || { gi_arc.get(); });
-
     // ── Pass 1: Enumerate MFT — dirs into resolver, files into Vec ──
     let pass1_started = Instant::now();
     let mut resolver = PathResolver::with_capacity("C:", 300_000);
@@ -137,10 +132,6 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     // ── Pass 1.5: Compute effective ignore rules + collect home subtree dirs ──
     let subtree_started = Instant::now();
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
-
-    // Wait for gitignore filter (built in parallel with pass1, should already be done)
-    let _ = gi_thread.join();
-    let gi_filter = state.gitignore.get();
 
     // Build enhanced skip names: BUILTIN_SKIP_NAMES + AnySegment patterns from pathignore
     let extra_segment_names: Vec<String> = ignored_patterns.iter().filter_map(|p| {
@@ -206,26 +197,6 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     // Get path_cache early — all subtree dirs pre-resolved in pass 1.5
     let path_cache = resolver.path_cache();
 
-    // Pre-compute which dirs are under any gitignore root scope.
-    // Dirs/files outside all gitignore roots skip is_ignored() entirely.
-    let gi_roots: Vec<String> = gi_filter.root_paths().iter()
-        .map(|p| p.to_string_lossy().replace('/', "\\"))
-        .collect();
-    let dirs_under_gi: HashSet<u64> = if gi_roots.is_empty() {
-        HashSet::new()
-    } else {
-        path_cache.iter()
-            .filter(|(_, dir_path)| {
-                gi_roots.iter().any(|root| dir_path.starts_with(root.as_str()))
-            })
-            .map(|(&frn, _)| frn)
-            .collect()
-    };
-    eprintln!(
-        "[win/mft +{}] gitignore scope: {} roots, {}/{} dirs under gitignore",
-        ts(), gi_roots.len(), dirs_under_gi.len(), path_cache.len()
-    );
-
     // Pre-extract Glob patterns for pruned-subtree skip checks
     let glob_patterns: Vec<&IgnorePattern> = ignored_patterns
         .iter()
@@ -246,11 +217,9 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         .filter(|(frn, _)| dir_subtree.contains(frn))
         .filter_map(|(frn, timestamp)| {
             let full_path = path_cache.get(frn)?;
-            let in_gi_scope = dirs_under_gi.contains(frn);
             if should_skip_dir_in_pruned_subtree(
-                full_path, &gi_filter, &glob_patterns,
+                full_path, &glob_patterns,
                 &skip_path_infixes, &skip_path_suffixes,
-                in_gi_scope,
             ) {
                 return None;
             }
@@ -320,11 +289,8 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         .filter(|entry| dir_subtree.contains(&entry.parent_frn))
         .filter_map(|entry| {
             let parent_path = path_cache.get(&entry.parent_frn)?;
-            let in_gi_scope = dirs_under_gi.contains(&entry.parent_frn);
-
             if should_skip_file_in_pruned_subtree(
-                parent_path, &entry.name, &gi_filter, &glob_patterns,
-                in_gi_scope,
+                parent_path, &entry.name, &glob_patterns,
             ) {
                 return None;
             }
@@ -684,6 +650,9 @@ fn background_db_finalize(
     eprintln!("[win/mft/bg +{}] remaining indexes in {}ms", ts(), idx2_started.elapsed().as_millis());
 
     let _ = restore_normal_pragmas(&conn);
+    if let Err(e) = cleanup_entries_gc_tables(&conn) {
+        eprintln!("[win/mft/bg] gc cleanup error: {e}");
+    }
 
     // Save USN journal position for future resume
     if let Ok(journal) = volume::query_usn_journal(vol) {
@@ -714,14 +683,12 @@ fn background_db_finalize(
 /// Lightweight skip check for directories already in the pruned subtree.
 /// Subtree pruning already handles BUILTIN_SKIP_NAMES, ignored_roots, and
 /// AnySegment patterns. This only checks BUILTIN_SKIP_PATHS (multi-segment),
-/// BUILTIN_SKIP_SUFFIXES, gitignore, and Glob patterns — with zero heap allocations.
+/// BUILTIN_SKIP_SUFFIXES, and Glob patterns — with zero heap allocations.
 fn should_skip_dir_in_pruned_subtree(
     full_path: &str,
-    gi_filter: &gitignore_filter::GitignoreFilter,
     glob_patterns: &[&IgnorePattern],
     skip_path_infixes: &[String],
     skip_path_suffixes: &[String],
-    in_gi_scope: bool,
 ) -> bool {
     // BUILTIN_SKIP_PATHS: pre-computed backslash patterns (no allocation)
     if skip_path_infixes.iter().any(|infix| full_path.contains(infix.as_str()))
@@ -735,11 +702,6 @@ fn should_skip_dir_in_pruned_subtree(
         if crate::BUILTIN_SKIP_SUFFIXES.iter().any(|suf| last_seg.ends_with(suf)) {
             return true;
         }
-    }
-
-    // Gitignore check — only if this dir is under a gitignore root
-    if in_gi_scope && gi_filter.is_ignored(Path::new(full_path), true) {
-        return true;
     }
 
     // Glob patterns (need forward-slash normalization)
@@ -763,14 +725,16 @@ fn should_skip_dir_in_pruned_subtree(
 /// Lightweight skip check for files whose parent directory is already in the
 /// pruned subtree. Since subtree pruning already eliminates BUILTIN_SKIP_NAMES,
 /// BUILTIN_SKIP_PATHS, ignored_roots, and AnySegment patterns, this only needs
-/// to check gitignore rules and Glob patterns.
+/// to check Glob patterns.
 fn should_skip_file_in_pruned_subtree(
     parent_path: &str,
     file_name: &str,
-    gi_filter: &gitignore_filter::GitignoreFilter,
     glob_patterns: &[&IgnorePattern],
-    in_gi_scope: bool,
 ) -> bool {
+    if glob_patterns.is_empty() {
+        return false;
+    }
+
     thread_local! {
         static BUF: RefCell<String> = RefCell::new(String::with_capacity(512));
     }
@@ -782,19 +746,12 @@ fn should_skip_file_in_pruned_subtree(
         buf.push('\\');
         buf.push_str(file_name);
 
-        // Check gitignore — only if parent dir is under a gitignore root
-        if in_gi_scope && gi_filter.is_ignored(Path::new(buf.as_str()), false) {
-            return true;
-        }
-
         // Check Glob patterns only (AnySegment handled by subtree pruning)
-        if !glob_patterns.is_empty() {
-            // SAFETY: replacing ASCII '\' (0x5C) with '/' (0x2F) preserves UTF-8 validity.
-            unsafe { buf.as_bytes_mut().iter_mut().for_each(|b| if *b == b'\\' { *b = b'/'; }); }
-            for pat in glob_patterns {
-                if matches_ignore_pattern(&buf, pat) {
-                    return true;
-                }
+        // SAFETY: replacing ASCII '\' (0x5C) with '/' (0x2F) preserves UTF-8 validity.
+        unsafe { buf.as_bytes_mut().iter_mut().for_each(|b| if *b == b'\\' { *b = b'/'; }); }
+        for pat in glob_patterns {
+            if matches_ignore_pattern(&buf, pat) {
+                return true;
             }
         }
 

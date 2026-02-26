@@ -6,13 +6,12 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rusqlite::params;
 use tauri::AppHandle;
 
-use crate::gitignore_filter::SharedGitignoreFilter;
 use crate::mem_search::CompactEntry;
 use crate::{
-    db_connection, effective_ignore_rules, emit_index_progress, emit_index_state,
+    cleanup_entries_gc_tables, db_connection, effective_ignore_rules, emit_index_progress, emit_index_state,
     emit_index_updated, get_meta, invalidate_search_caches, now_epoch,
     refresh_and_emit_status_counts, restore_normal_pragmas, set_indexing_pragmas,
-    set_meta, set_progress, should_skip_path_ext, update_status_counts, upsert_rows,
+    set_meta, set_progress, should_skip_path, update_status_counts, upsert_rows,
     AppState, IgnorePattern, IndexRow, IndexState,
 };
 
@@ -62,14 +61,14 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
     }
     emit_index_state(&app, "Indexing", None);
 
-    // Build ignore rules + gitignore (may trigger lazy init)
+    // Build ignore rules
     let (ignored_roots, ignored_patterns) = effective_ignore_rules(
+        &state.config_file_path,
         &state.home_dir,
         &state.cwd,
         state.path_ignores.as_ref(),
         state.path_ignore_patterns.as_ref(),
     );
-    let gi_filter = state.gitignore.get();
 
     let arc_roots = Arc::new(ignored_roots);
     let arc_patterns = Arc::new(ignored_patterns);
@@ -92,7 +91,6 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
         &app,
         &arc_roots,
         &arc_patterns,
-        &gi_filter,
         Some(SHALLOW_DEPTH),
         0,
         None,
@@ -159,12 +157,10 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
                 continue;
             }
 
-            if should_skip_path_ext(
+            if should_skip_path(
                 &path,
                 &arc_roots,
                 &arc_patterns,
-                Some(&gi_filter),
-                None,
             ) {
                 continue;
             }
@@ -191,7 +187,6 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
                     &state.home_dir,
                     &arc_roots,
                     &arc_patterns,
-                    &gi_filter,
                     &mut other_roots,
                 );
                 continue;
@@ -232,7 +227,6 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
     let deep_app = app.clone();
     let deep_roots = arc_roots.clone();
     let deep_patterns = arc_patterns.clone();
-    let deep_gi = gi_filter.clone();
     let deep_home = state.home_dir.clone();
     let deep_sp = Arc::clone(&shared_progress);
 
@@ -244,7 +238,6 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
             &deep_app,
             &deep_roots,
             &deep_patterns,
-            &deep_gi,
             None,          // no max_depth
             SHALLOW_DEPTH, // skip shallow entries already in Phase 1
             Some(&sp),
@@ -267,7 +260,6 @@ pub fn run_nonadmin_index(app: AppHandle, state: AppState) {
             &app,
             &arc_roots,
             &arc_patterns,
-            &gi_filter,
             None,
             0,
             Some(&shared_progress),
@@ -424,7 +416,6 @@ fn expand_children_excluding(
     exclude: &Path,
     ignored_roots: &Arc<Vec<PathBuf>>,
     ignored_patterns: &Arc<Vec<IgnorePattern>>,
-    gi_filter: &SharedGitignoreFilter,
     out: &mut Vec<PathBuf>,
 ) {
     let Ok(entries) = std::fs::read_dir(parent) else {
@@ -438,12 +429,10 @@ fn expand_children_excluding(
         if !child.is_dir() || is_reparse_point(&child) {
             continue;
         }
-        if should_skip_path_ext(
+        if should_skip_path(
             &child,
             ignored_roots,
             ignored_patterns,
-            Some(gi_filter),
-            Some(true),
         ) {
             continue;
         }
@@ -455,12 +444,12 @@ fn expand_children_excluding(
 /// Returns home_dir + top-level dirs under scan_root (expanding ancestors of home_dir).
 pub fn compute_watch_roots(state: &AppState) -> Vec<PathBuf> {
     let (ignored_roots, ignored_patterns) = effective_ignore_rules(
+        &state.config_file_path,
         &state.home_dir,
         &state.cwd,
         state.path_ignores.as_ref(),
         state.path_ignore_patterns.as_ref(),
     );
-    let gi_filter = state.gitignore.get();
     let arc_roots = Arc::new(ignored_roots);
     let arc_patterns = Arc::new(ignored_patterns);
 
@@ -472,7 +461,7 @@ pub fn compute_watch_roots(state: &AppState) -> Vec<PathBuf> {
             if path == state.home_dir || !path.is_dir() || is_reparse_point(&path) {
                 continue;
             }
-            if should_skip_path_ext(&path, &arc_roots, &arc_patterns, Some(&gi_filter), None) {
+            if should_skip_path(&path, &arc_roots, &arc_patterns) {
                 continue;
             }
             if state.home_dir.starts_with(&path) {
@@ -482,7 +471,6 @@ pub fn compute_watch_roots(state: &AppState) -> Vec<PathBuf> {
                     &state.home_dir,
                     &arc_roots,
                     &arc_patterns,
-                    &gi_filter,
                     &mut roots,
                 );
             } else {
@@ -510,7 +498,6 @@ fn scan_dir_jwalk(
     app: &AppHandle,
     ignored_roots: &Arc<Vec<PathBuf>>,
     ignored_patterns: &Arc<Vec<IgnorePattern>>,
-    gi_filter: &SharedGitignoreFilter,
     max_depth: Option<usize>,
     skip_depth: usize,
     shared: Option<&SharedProgress>,
@@ -523,7 +510,6 @@ fn scan_dir_jwalk(
 
     let skip_roots = Arc::clone(ignored_roots);
     let skip_patterns = Arc::clone(ignored_patterns);
-    let gi_ref = gi_filter.clone();
 
     let mut builder = jwalk::WalkDir::new(root)
         .follow_links(false)
@@ -539,13 +525,10 @@ fn scan_dir_jwalk(
                     .as_ref()
                     .map(|entry| {
                         let full_path = path.join(&entry.file_name);
-                        let is_dir = Some(entry.file_type.is_dir());
-                        !should_skip_path_ext(
+                        !should_skip_path(
                             &full_path,
                             &skip_roots,
                             &skip_patterns,
-                            Some(&gi_ref),
-                            is_dir,
                         )
                     })
                     .unwrap_or(false)
@@ -806,6 +789,9 @@ fn background_db_finalize(
 
     let _ = conn.execute_batch("ANALYZE");
     let _ = restore_normal_pragmas(&conn);
+    if let Err(e) = cleanup_entries_gc_tables(&conn) {
+        eprintln!("[nonadmin/bg] gc cleanup error: {e}");
+    }
 
     let _ = set_meta(&conn, "index_complete", "1");
     let _ = set_meta(&conn, "win_last_active_ts", &now_epoch().to_string());
