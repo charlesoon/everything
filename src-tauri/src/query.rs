@@ -83,12 +83,19 @@ pub fn parse_query(query: &str) -> SearchMode {
             format!("%{}%", escape_like(name_part))
         };
 
-        let dir_hint = dir_part
-            .split('/')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("/");
+        let dir_hint = {
+            let joined = dir_part
+                .split('/')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            if dir_part.starts_with('/') {
+                format!("/{joined}")
+            } else {
+                joined
+            }
+        };
 
         return SearchMode::PathSearch {
             path_like,

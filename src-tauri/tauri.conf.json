@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Everything",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "identifier": "com.everything.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -47,7 +47,7 @@
       "../everything.icon": "everything.icon"
     },
     "macOS": {
-      "signingIdentity": null,
+      "signingIdentity": "Developer ID Application: EUNHYUCK KIM (C2B2W43278)",
       "entitlements": "Entitlements.plist",
       "minimumSystemVersion": "11.0",
       "infoPlist": "Info.plist"

@@ -29,6 +29,7 @@ mod fd_search;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mem_search;
+mod pathindexing;
 mod query;
 #[cfg(target_os = "windows")]
 mod win;
@@ -363,6 +364,8 @@ pub(crate) struct AppState {
     pub(crate) scan_root: PathBuf,
     pub(crate) cwd: PathBuf,
     pub(crate) config_file_path: PathBuf,
+    pub(crate) pathindexing_file_path: PathBuf,
+    pub(crate) extra_roots: Arc<Mutex<Vec<PathBuf>>>,
     pub(crate) path_ignores: Arc<Vec<PathBuf>>,
     pub(crate) path_ignore_patterns: Arc<Vec<IgnorePattern>>,
     pub(crate) db_ready: Arc<AtomicBool>,
@@ -386,6 +389,8 @@ pub(crate) struct AppState {
     pub(crate) watcher_active: Arc<AtomicBool>,
     /// Set to true once frontend onMount has completed enough to accept user input.
     pub(crate) frontend_ready: Arc<AtomicBool>,
+    /// Guards against concurrent pathindexing background threads.
+    pub(crate) pathindexing_active: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -2224,6 +2229,9 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
     match &result {
         Ok(_) => {
             let _ = set_meta(&conn, "index_complete", "1");
+            let extra_roots = state.extra_roots.lock().clone();
+            let roots_str: Vec<String> = extra_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+            let _ = set_meta(&conn, "indexed_extra_roots", &roots_str.join("\n"));
             // Run ensure_db_indexes + GC cleanup sequentially in one background thread,
             // then transition to Ready and release indexing_active.
             {
@@ -2399,9 +2407,14 @@ fn run_incremental_index_inner(
     priority_roots.sort();
     deferred_roots.sort();
 
-    let roots: Vec<PathBuf> = priority_roots.into_iter().chain(deferred_roots).collect();
+    let extra_roots = state.extra_roots.lock().clone();
+    let roots: Vec<PathBuf> = priority_roots
+        .into_iter()
+        .chain(deferred_roots)
+        .chain(extra_roots.into_iter().filter(|r| r.is_dir() && !r.starts_with(&state.scan_root)))
+        .collect();
     perf_log(format!(
-        "index_scan_roots total={} priority+deferred",
+        "index_scan_roots total={} (incl. extra pathindexing roots)",
         roots.len()
     ));
 
@@ -3127,6 +3140,8 @@ fn start_fsevent_watcher_worker(
         // pathignore_changed when actual rule entries change (ignores whitespace/comments).
         let mut last_config_entries =
             pathignore_active_entries(&fs::read_to_string(&state.config_file_path).unwrap_or_default());
+        let mut last_pathindexing_entries =
+            pathindexing::pathindexing_active_entries(&fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default());
 
         loop {
             if state.watcher_stop.load(AtomicOrdering::Acquire) {
@@ -3156,6 +3171,70 @@ fn start_fsevent_watcher_worker(
                             if new_entries != last_config_entries {
                                 last_config_entries = new_entries;
                                 app.emit("pathignore_changed", ()).ok();
+                            }
+                            continue;
+                        }
+                        if path == state.pathindexing_file_path {
+                            let new_entries = pathindexing::pathindexing_active_entries(
+                                &fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default(),
+                            );
+                            if new_entries != last_pathindexing_entries {
+                                let old_roots = pathindexing::parse_pathindexing_paths_unchecked(
+                                    &last_pathindexing_entries.join("\n"),
+                                );
+                                let new_roots = pathindexing::load_pathindexing_roots(&state.pathindexing_file_path);
+                                last_pathindexing_entries = new_entries;
+
+                                let bg_state = state.clone();
+                                let bg_app = app.clone();
+                                let bg_new_roots = new_roots.clone();
+                                *state.extra_roots.lock() = new_roots;
+                                if state.pathindexing_active.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
+                                    eprintln!("[pathindexing] scan already in progress, skipping");
+                                    continue;
+                                }
+                                set_state(&state, IndexState::Indexing, None);
+                                emit_index_state(&app, "Indexing", None);
+                                std::thread::spawn(move || {
+                                    // Wait for initial indexing to finish before writing to DB
+                                    while bg_state.indexing_active.load(AtomicOrdering::Acquire) {
+                                        std::thread::sleep(Duration::from_secs(1));
+                                        eprintln!("[pathindexing] waiting for indexing to finish...");
+                                    }
+                                    eprintln!("[pathindexing] background scan starting...");
+                                    let mut prev_roots = old_roots;
+                                    let mut target_roots = bg_new_roots;
+                                    loop {
+                                        let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&bg_state);
+                                        match pathindexing::handle_pathindexing_change(
+                                            &bg_state, &prev_roots, &target_roots, &ign_roots, &ign_patterns,
+                                        ) {
+                                            Ok(()) => {
+                                                eprintln!("[pathindexing] background scan done");
+                                                if let Ok(c) = db_connection(&bg_state.db_path) {
+                                                    let roots_str: Vec<String> = target_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+                                                    let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
+                                                }
+                                                let _ = refresh_and_emit_status_counts(&bg_app, &bg_state);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[pathindexing] change handling error: {e}");
+                                            }
+                                        }
+                                        // Check if extra_roots changed while we were scanning
+                                        let current = bg_state.extra_roots.lock().clone();
+                                        if current == target_roots {
+                                            break;
+                                        }
+                                        eprintln!("[pathindexing] extra_roots changed during scan, reconciling...");
+                                        prev_roots = target_roots;
+                                        target_roots = current;
+                                    }
+                                    set_state(&bg_state, IndexState::Ready, None);
+                                    emit_index_state(&bg_app, "Ready", None);
+                                    bg_app.emit("pathindexing_changed", ()).ok();
+                                    bg_state.pathindexing_active.store(false, AtomicOrdering::Release);
+                                });
                             }
                             continue;
                         }
@@ -3446,6 +3525,11 @@ fn open_pathignore(state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = path;
     Ok(())
+}
+
+#[tauri::command]
+fn open_pathindexing(state: State<'_, AppState>) -> AppResult<()> {
+    pathindexing::open_pathindexing_file(&state.pathindexing_file_path)
 }
 
 #[tauri::command]
@@ -5606,12 +5690,18 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     }
     eprintln!("[startup] +{}ms pathignore done", setup_started.elapsed().as_millis());
 
+    let pathindexing_file_path = app_data_dir.join(".pathindexing");
+    let extra_roots = pathindexing::load_pathindexing_roots(&pathindexing_file_path);
+    eprintln!("[startup] +{}ms pathindexing loaded: {} extra roots", setup_started.elapsed().as_millis(), extra_roots.len());
+
     let state = AppState {
         db_path,
         home_dir,
         scan_root,
         cwd,
         config_file_path,
+        pathindexing_file_path,
+        extra_roots: Arc::new(Mutex::new(extra_roots)),
         path_ignores: Arc::new(path_ignores),
         path_ignore_patterns: Arc::new(path_ignore_patterns),
         db_ready: Arc::new(AtomicBool::new(false)),
@@ -5627,6 +5717,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         watcher_stop: Arc::new(AtomicBool::new(false)),
         watcher_active: Arc::new(AtomicBool::new(false)),
         frontend_ready: Arc::new(AtomicBool::new(false)),
+        pathindexing_active: Arc::new(AtomicBool::new(false)),
     };
 
     eprintln!("[startup] +{}ms AppState created", setup_started.elapsed().as_millis());
@@ -5758,6 +5849,68 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         stored_event_id,
                         true,
                     );
+                    // Scan any extra roots added to .pathindexing while the app was not running
+                    {
+                        let scan_state = state.clone();
+                        let scan_app = app_handle.clone();
+                        std::thread::spawn(move || {
+                            let stored_roots: Vec<PathBuf> = db_connection(&scan_state.db_path)
+                                .ok()
+                                .and_then(|c| get_meta(&c, "indexed_extra_roots"))
+                                .map(|v| {
+                                    v.lines()
+                                        .filter(|l| !l.is_empty())
+                                        .map(PathBuf::from)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let current_roots = scan_state.extra_roots.lock().clone();
+                            let stored_set: std::collections::HashSet<&PathBuf> = stored_roots.iter().collect();
+                            let added: Vec<PathBuf> = current_roots
+                                .iter()
+                                .filter(|r| !stored_set.contains(r))
+                                .cloned()
+                                .collect();
+                            let removed: Vec<PathBuf> = stored_roots
+                                .iter()
+                                .filter(|r| !current_roots.contains(r))
+                                .cloned()
+                                .collect();
+                            if added.is_empty() && removed.is_empty() {
+                                return;
+                            }
+                            if scan_state.pathindexing_active.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
+                                eprintln!("[pathindexing] scan already in progress, skipping startup diff");
+                                return;
+                            }
+                            eprintln!(
+                                "[pathindexing] startup diff: +{} added, -{} removed",
+                                added.len(),
+                                removed.len()
+                            );
+                            // Wait for initial watcher replay to finish
+                            while scan_state.indexing_active.load(std::sync::atomic::Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                            let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&scan_state);
+                            match pathindexing::handle_pathindexing_change(
+                                &scan_state, &stored_roots, &current_roots, &ign_roots, &ign_patterns,
+                            ) {
+                                Ok(()) => {
+                                    eprintln!("[pathindexing] startup scan done");
+                                    // Update stored roots
+                                    if let Ok(c) = db_connection(&scan_state.db_path) {
+                                        let roots_str: Vec<String> = current_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+                                        let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
+                                    }
+                                    let _ = refresh_and_emit_status_counts(&scan_app, &scan_state);
+                                    scan_app.emit("pathindexing_changed", ()).ok();
+                                }
+                                Err(e) => eprintln!("[pathindexing] startup scan error: {e}"),
+                            }
+                            scan_state.pathindexing_active.store(false, AtomicOrdering::Release);
+                        });
+                    }
                 } else {
                     if !effective_complete {
                         eprintln!("[mac] index incomplete or entries empty; starting full index");
@@ -5876,6 +6029,7 @@ pub fn run() {
             check_full_disk_access,
             open_privacy_settings,
             open_pathignore,
+            open_pathindexing,
             restart_app
         ])
         .run(tauri::generate_context!())
@@ -5929,6 +6083,8 @@ mod tests {
     fn test_state_for(db_path: PathBuf, home_dir: PathBuf, cwd: PathBuf) -> AppState {
         AppState {
             config_file_path: home_dir.join(".pathignore"),
+            pathindexing_file_path: home_dir.join(".pathindexing"),
+            extra_roots: Arc::new(Mutex::new(Vec::new())),
             db_path,
             home_dir: home_dir.clone(),
             scan_root: home_dir.clone(),
@@ -5948,6 +6104,7 @@ mod tests {
             watcher_stop: Arc::new(AtomicBool::new(false)),
             watcher_active: Arc::new(AtomicBool::new(false)),
             frontend_ready: Arc::new(AtomicBool::new(true)),
+            pathindexing_active: Arc::new(AtomicBool::new(false)),
         }
     }
 

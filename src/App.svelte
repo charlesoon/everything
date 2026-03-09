@@ -128,6 +128,7 @@
   let isMaximized = false;
   let showFdaBanner = false;
   let showPathignoreBanner = false;
+  let showPathindexingBanner = false;
   let fdaSettingsOpened = false;
   const FDA_DISMISSED_KEY = 'everything-fda-dismissed';
   const appWindow = getCurrentWindow();
@@ -1590,7 +1591,15 @@
       })
     );
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction, unlistenPathignore, unlistenResized].filter(Boolean);
+    const unlistenPathindexing = await step(
+      'listen(pathindexing_changed)',
+      () => listen('pathindexing_changed', () => {
+        showPathindexingBanner = true;
+        scheduleSearch();
+      })
+    );
+
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction, unlistenPathignore, unlistenPathindexing, unlistenResized].filter(Boolean);
     startupLog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
@@ -1786,6 +1795,15 @@
   </div>
   {/if}
 
+  {#if showPathindexingBanner}
+  <div class="fda-banner" role="alert">
+    <span class="fda-banner-text">인덱싱 경로(.pathindexing)가 변경되어 반영되었습니다.</span>
+    <div class="fda-banner-actions">
+      <button class="fda-btn-dismiss" on:click={() => showPathindexingBanner = false}>닫기</button>
+    </div>
+  </div>
+  {/if}
+
   <header class="search-bar">
     <input
       bind:this={searchInputEl}
@@ -1916,6 +1934,9 @@
           <svg class="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5 5.5 5.5 0 1 0 13.5 9.2z"/></svg>
           Dark
         {/if}
+      </button>
+      <button class="status-btn" on:click={() => invoke('open_pathindexing')} title="추가 인덱싱 경로(.pathindexing) 열기">
+        Add
       </button>
       <button class="status-btn" on:click={() => invoke('open_pathignore')} title="설정 파일(.pathignore) 열기">
         Ignore
