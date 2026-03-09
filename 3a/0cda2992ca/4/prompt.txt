@@ -1,0 +1,608 @@
+Conduct a thorough, line-by-line code review with a critical perspective.
+
+**Usage:**
+```bash
+/ln:codereview           # Review all uncommitted changes (default)
+/ln:codereview all       # Review all uncommitted changes (staged + unstaged)
+/ln:codereview unstaged  # Review only unstaged changes
+```
+
+## Review Scope
+
+**Mode 1: All uncommitted changes (default)**
+- Command: `git diff HEAD` (staged + unstaged)
+- Reviews everything not yet committed
+
+**Mode 2: Unstaged only**
+- Command: `git diff` (working directory changes only)
+- Reviews only files not yet staged
+
+All modes include:
+1. **Critical examination**: Line-by-line inspection with skeptical mindset
+2. **Pattern validation**: Verify adherence to project conventions and guides
+
+## Review Categories
+
+### Code Quality
+- **Clean code**: No TODO comments, no unused code
+- **Naming conventions**: Consistent with project standards
+- **File organization**: Proper separation of concerns
+- **Documentation**: Adequate comments where necessary
+
+### Technical Validation
+- **Build verification**: Zero warnings, all tests pass
+- **Type safety**: No type errors or unsafe operations
+- **Performance**: No memory leaks, efficient algorithms
+- **Security**: No hardcoded secrets or vulnerabilities
+
+### Architecture Review
+- **Design patterns**: Appropriate use of patterns
+- **Dependency management**: Minimal coupling
+- **Error handling**: Comprehensive error coverage
+- **Concurrency**: Thread safety and race conditions
+
+### Design Principles (OCP/SRP)
+
+**OCP (Open-Closed Principle) violations to catch:**
+- Adding `else if` / `switch case` to extend existing behavior
+- Modifying stable code instead of creating new modules
+- Missing extension points (strategy, registry, plugin patterns)
+
+**SRP (Single Responsibility Principle) violations to catch:**
+- One file handling multiple unrelated concerns
+- Functions/classes that change for multiple reasons
+- God objects or utility dumps
+
+**When found, suggest:**
+- Extract new behavior into separate file/class
+- Use strategy/registry pattern for extensibility
+- Split multi-responsibility files into focused modules
+
+## Review Process
+
+### Step 0: Understand Project Context (MANDATORY)
+
+Before reviewing any code, you MUST understand the project environment:
+
+1. **Read CLAUDE.md** - Check project root and user's `~/.claude/CLAUDE.md` for project-specific conventions
+2. **Identify app type** - Read entry points, config files, or main modules to determine:
+   - **Platform**: Desktop (Electron) / Mobile (React Native, Flutter, iOS, Android) / Web server / CLI / Library
+   - **User model**: Single-user vs Multi-user
+   - **Network exposure**: Local-only vs Network-exposed API
+3. **Understand architecture** - Scan key files to grasp the overall structure
+
+**Why this matters:**
+- Security concerns differ drastically between local desktop app and public API server
+- "Memory leak" in a short-lived CLI is irrelevant; in a long-running server it's critical
+- Path traversal in local-only app with file dialog is low-risk; in server accepting arbitrary input it's critical
+
+**DO NOT skip this step.** Reviewing without context leads to false positives and wastes everyone's time.
+
+### Step 1: Analyze Changes
+
+Determine review mode from command argument (default: `all`):
+
+**Mode: all (default)**
+```bash
+git diff HEAD  # All uncommitted changes (staged + unstaged)
+```
+
+**Mode: unstaged**
+```bash
+git diff  # Only unstaged changes
+```
+
+### Step 2: Validate Build
+- TypeScript: `npx tsc --noEmit`
+- Linting: `npm run lint`
+- Testing: `npm run test`
+- Language-specific checks per development guides
+
+### Step 3: Generate Report
+
+I will provide a structured report with:
+
+#### Critical Issues 🚨
+- **ONLY** issues that will cause runtime crashes, data loss, or security breaches
+- Must be reproducible with concrete steps
+- Example: SQL injection, unhandled null causing crash, infinite loop
+
+#### Major Issues ⚠️
+- Issues that cause incorrect behavior users will notice
+- Must demonstrate actual failure scenario
+- Example: Wrong calculation result, UI not updating, API returning wrong data
+
+#### Minor Issues 💡
+- Style violations or optimization opportunities
+- Suggestions for improvement
+- Example: Inconsistent naming, missing error message
+
+**DO NOT mark as Critical/Major:**
+- Theoretical concerns without concrete failure scenario
+- "Could potentially cause..." without proof
+- Design preferences or "I would do it differently"
+
+#### Positive Highlights ✅
+- Well-implemented patterns
+- Good practices observed
+
+## Review Principles
+
+- **No temporary solutions**: Reject workarounds or hacks
+- **Complete implementation**: No partial features with TODOs
+- **Performance first**: Consider memory, CPU, and I/O impact
+- **Build cleanliness**: Zero warnings tolerance
+- **Guide compliance**: Follow all development guides in docs/
+
+## ⛔ Anti-Hallucination Rules
+
+Before reporting ANY issue, you MUST:
+
+1. **READ the actual code** - Don't guess based on patterns. Read the exact lines.
+2. **TRACE the execution flow** - Follow the code path. If you claim race condition, prove it step by step.
+3. **VERIFY the issue exists** - Can you reproduce it? Show concrete scenario.
+4. **CHECK context** - What's the runtime environment? Desktop vs server, single-user vs multi-user?
+5. **CONFIRM it's not intentional** - fire-and-forget, placeholder values updated later, etc. may be by design.
+
+### Issue Validation Checklist
+
+For each issue you want to report, answer:
+1. Did I read the ACTUAL code, not just the diff snippet?
+2. Can I show the EXACT line numbers where this fails?
+3. Is this a REAL bug or theoretical concern that can't happen in practice?
+4. Does the surrounding code already handle this case?
+
+### What NOT to report as issues:
+- Singleton with placeholder that gets updated in init/start method
+- "Memory leak" in single-user desktop app with bounded data
+- "Race condition" when there's already a guard (e.g., `if (this.running) return`)
+- Intentional fire-and-forget patterns with error logging
+- "Missing cleanup" when cleanup exists in useEffect return or stop() method
+
+## Exclusions (Do NOT Review)
+
+- **Git submodule reference changes only**: Skip dirty submodule states, submodule commit hash changes in the main repo. Source code inside submodules CAN and SHOULD be reviewed when requested.
+
+## Output Format
+
+The review will be delivered as a comprehensive report with:
+- Severity-based issue categorization
+- Specific line references for each issue
+- Concrete suggestions for fixes
+- Overall code health assessment
+
+---
+
+[Request interrupted by user]
+
+---
+
+아무것도 건들이지 않는 idle 상태에서 cpu가 15~20%를 왔다갔다 해. cpu가 가끔 30이상 올라가는데 분석한 결과를 참고해서 수정했어. 그 전에 수정한 것들이 deferred call이나 메모리에 큐잉했다 10초마나 처리하는 로직들이 큰 의미 없다면 롤백하는게 좋겠어
+
+제공해주신 샘플링 결과를 분석해 보면, 대부분의 스레드(메인 스레드, UI 이벤트 스레드, Tokio 워커 스레드 등)는 이벤트를 대기하며 쉬고 있는 상태(Waiting/Sleeping)입니다.
+
+실제로 CPU를 가장 많이 소모하고 있는 부분은 **Thread_47544129**에서 실행 중인 SQLite 데이터베이스 조회(Query) 작업입니다.
+
+구체적인 병목 지점은 다음과 같습니다:
+
+실행 흐름: everything::start_fsevent_watcher_worker → everything::refresh_and_emit_status_counts → everything::update_status_counts → everything::update_counts
+
+상세 원인 (main.rs의 update_counts 함수):
+
+main.rs:588 위치의 DB 쿼리 (432 샘플 / 약 432ms): rusqlite::Connection::query_row에서 압도적으로 많은 CPU 시간을 소모하고 있습니다. 내부적으로 SQLite의 sqlite3BtreeNext와 pread(디스크 I/O) 호출이 매우 잦은 것으로 보아, 인덱스가 없는 컬럼으로 검색(Full Table Scan)을 하고 있거나 매우 많은 양의 데이터를 순회하며 읽어오고 있을 확률이 높습니다.
+main.rs:581 위치의 DB 쿼리 (40 샘플 / 약 40ms): 여기에서도 유사하게 데이터베이스 조회가 발생하여 CPU를 소모합니다.
+💡 해결 권장 사항:
+
+main.rs 파일의 581번째 줄과 588번째 줄에서 실행되는 쿼리를 확인해 보세요.
+해당 테이블에 적절한 인덱스(Index)가 생성되어 있는지 확인하고 추가하는 것을 추천합니다.
+쿼리가 너무 자주 호출되는 것이라면(예: 파일 변경 이벤트가 발생할 때마다 전체 상태를 무거운 쿼리로 다시 계산), 캐싱을 적용하거나 쿼리를 더욱 가볍게 최적화해야 합니다.
+
+---
+
+이 분석에 대해서 어떻게 생각해?
+
+🔍 주요 CPU 소비 구간 분석
+1. SQLite DB 연결(Open) 및 해제(Close) 반복 오버헤드 (Thread_47596262)
+가장 눈에 띄는 비효율 구간입니다. 파일 시스템 이벤트를 감시하고 상태를 업데이트하는 백그라운드 워커에서 발생하고 있습니다.
+
+경로: everything::start_fsevent_watcher_worker -> everything::refresh_and_emit_status_counts -> everything::update_counts (main.rs: 582)
+문제점: 상태 카운트를 갱신하기 위해 쿼리를 날릴 때마다 DB 연결을 새로 열고(db_connection_with_timeout), 쿼리(query_row)를 실행한 뒤, 다시 닫는(drop_in_place) 과정이 반복되고 있습니다.
+단순한 쿼리를 실행하는데도 연결을 맺고 스키마를 분석하는 과정 등에서 추가적인 파일 I/O 및 CPU 작업이 불필요하게 낭비되고 있습니다.
+2. 대량의 검색 결과 JSON 직렬화(Serialization) 오버헤드 (Thread_47596419)
+Tauri에서 검색 결과를 프론트엔드(WebView)로 전달하는 과정에서 비용이 발생하고 있습니다.
+
+경로: tokio-runtime-worker -> everything::run::... (main.rs: 3933) -> serde_json::ser -> SearchResultDto/EntryDto 직렬화
+문제점: Rust 백엔드에서 검색된 객체들(SearchResultDto, EntryDto)을 JSON 포맷의 문자열로 직렬화(Serialization)하고 있습니다. 코드를 보면 특히 문자열 내부의 특수 문자를 이스케이프 처리(format_escaped_str)하고 직렬화하는 부분에서 점유율이 나오고 있습니다.
+한 번에 전송하는 데이터(검색 결과 배열)의 크기가 크다면 직렬화 비용과 IPC 통신 비용이 크게 증가하여 성능 저하 및 CPU 스파이크를 유발할 수 있습니다.
+💡 해결 및 최적화 제안
+DB Connection 유지 혹은 Connection Pool 도입 (가장 시급)
+
+update_counts 등의 함수 호출 시 매번 rusqlite::Connection::open을 호출하여 연결을 맺지 말고, 앱 실행 시 연결된 커넥션을 스레드 간에 공유(Arc<Mutex<Connection>> 등)하거나 Connection Pool(r2d2, r2d2_sqlite, deadpool-sqlite 등)을 사용하도록 db_connection 로직을 수정하세요.
+검색 데이터 반환 최적화 (Pagination / Chunking)
+
+프론트엔드로 보내는 검색 결과 수가 많다면 한 번에 모두 전송하지 말고 페이징(Pagination) 처리를 하거나 뷰포트에 보이는 만큼만 쪼개서(스트리밍/청크 등) 전송하도록 하여 serde_json의 부하를 줄이는 것이 좋습니다.
+확인이 필요하시다면 제가 main.rs 구조를 직접 읽고(코드 확인 도구 사용) DB 연결 생성 부분이나 최적화가 필요한 부분을 직접 시도 및 수정해드릴 수도 있는데, 수정 작업을 진행해드릴까요?
+
+---
+
+응 수정해줘
+
+---
+
+이 분석도 확인해줘
+
+제공해주신 sample 분석 결과를 보면, CPU를 가장 많이 사용하고 있는 주범은 Thread_47626446 스레드에서 실행 중인 everything::purge_ignored_entries (main.rs:1202) 함수입니다.
+
+상세한 분석 내용은 다음과 같습니다:
+
+everything::purge_ignored_entries의 무거운 DB 쿼리 (Thread_47626446)
+
+이 스레드는 샘플링된 1826번의 순간 중에 1826번 모두 SQLite 데이터베이스 쿼리를 실행(rusqlite::Connection::execute)하는 데 사용되었습니다.
+내부를 보면 sqlite3BtreeNext 함수가 1200번 이상 호출되며 **Full Table Scan(전체 테이블 스캔)**을 수행하고 있고, likeFunc를 통해 LIKE 문자열 패턴 매칭을 수행하고 있습니다.
+인덱스를 타지 못하고 전체 테이블의 문자열을 스캔하며 LIKE 비교를 하고 있기 때문에 막대한 양의 CPU 연산 자원을 소모하고 있습니다.
+다른 스레드의 병목 현상 (Thread_47626447)
+
+everything::start_fsevent_watcher_worker 스레드에서는 everything::upsert_rows (main.rs:1754)를 통해 DB 트랜잭션을 실행하려 하고 있습니다.
+하지만 1번 항목에서 언급된 purge_ignored_entries 작업이 DB 자원을 강하게 점유하고 있어서, DB 락(Lock)을 획득하지 못하고 btreeInvokeBusyHandler -> sqlite3OsSleep -> nanosleep 함수에 빠져 대기(Sleep) 상태로 멈춰 있습니다.
+해결 채안:
+
+main.rs의 1202번째 줄 쯤에 있는 purge_ignored_entries 함수 구문에서 사용되는 SELECT 또는 DELETE 쿼리가 무엇인지 확인해야 합니다.
+DB 쿼리에 LIKE '%...%' 같은 패턴을 사용하고 있거나 테이블 인덱스(Index)가 누락되어 Full Scan이 발생하고 있지 않은지 점검하여 쿼리 최적화 혹은 인덱스 생성을 진행하면 이 문제를 해결할 수 있습니다.
+
+---
+
+응 수정해줘
+
+---
+
+Conduct a thorough, line-by-line code review with a critical perspective.
+
+**Usage:**
+```bash
+/ln:codereview           # Review all uncommitted changes (default)
+/ln:codereview all       # Review all uncommitted changes (staged + unstaged)
+/ln:codereview unstaged  # Review only unstaged changes
+```
+
+## Review Scope
+
+**Mode 1: All uncommitted changes (default)**
+- Command: `git diff HEAD` (staged + unstaged)
+- Reviews everything not yet committed
+
+**Mode 2: Unstaged only**
+- Command: `git diff` (working directory changes only)
+- Reviews only files not yet staged
+
+All modes include:
+1. **Critical examination**: Line-by-line inspection with skeptical mindset
+2. **Pattern validation**: Verify adherence to project conventions and guides
+
+## Review Categories
+
+### Code Quality
+- **Clean code**: No TODO comments, no unused code
+- **Naming conventions**: Consistent with project standards
+- **File organization**: Proper separation of concerns
+- **Documentation**: Adequate comments where necessary
+
+### Technical Validation
+- **Build verification**: Zero warnings, all tests pass
+- **Type safety**: No type errors or unsafe operations
+- **Performance**: No memory leaks, efficient algorithms
+- **Security**: No hardcoded secrets or vulnerabilities
+
+### Architecture Review
+- **Design patterns**: Appropriate use of patterns
+- **Dependency management**: Minimal coupling
+- **Error handling**: Comprehensive error coverage
+- **Concurrency**: Thread safety and race conditions
+
+### Design Principles (OCP/SRP)
+
+**OCP (Open-Closed Principle) violations to catch:**
+- Adding `else if` / `switch case` to extend existing behavior
+- Modifying stable code instead of creating new modules
+- Missing extension points (strategy, registry, plugin patterns)
+
+**SRP (Single Responsibility Principle) violations to catch:**
+- One file handling multiple unrelated concerns
+- Functions/classes that change for multiple reasons
+- God objects or utility dumps
+
+**When found, suggest:**
+- Extract new behavior into separate file/class
+- Use strategy/registry pattern for extensibility
+- Split multi-responsibility files into focused modules
+
+## Review Process
+
+### Step 0: Understand Project Context (MANDATORY)
+
+Before reviewing any code, you MUST understand the project environment:
+
+1. **Read CLAUDE.md** - Check project root and user's `~/.claude/CLAUDE.md` for project-specific conventions
+2. **Identify app type** - Read entry points, config files, or main modules to determine:
+   - **Platform**: Desktop (Electron) / Mobile (React Native, Flutter, iOS, Android) / Web server / CLI / Library
+   - **User model**: Single-user vs Multi-user
+   - **Network exposure**: Local-only vs Network-exposed API
+3. **Understand architecture** - Scan key files to grasp the overall structure
+
+**Why this matters:**
+- Security concerns differ drastically between local desktop app and public API server
+- "Memory leak" in a short-lived CLI is irrelevant; in a long-running server it's critical
+- Path traversal in local-only app with file dialog is low-risk; in server accepting arbitrary input it's critical
+
+**DO NOT skip this step.** Reviewing without context leads to false positives and wastes everyone's time.
+
+### Step 1: Analyze Changes
+
+Determine review mode from command argument (default: `all`):
+
+**Mode: all (default)**
+```bash
+git diff HEAD  # All uncommitted changes (staged + unstaged)
+```
+
+**Mode: unstaged**
+```bash
+git diff  # Only unstaged changes
+```
+
+### Step 2: Validate Build
+- TypeScript: `npx tsc --noEmit`
+- Linting: `npm run lint`
+- Testing: `npm run test`
+- Language-specific checks per development guides
+
+### Step 3: Generate Report
+
+I will provide a structured report with:
+
+#### Critical Issues 🚨
+- **ONLY** issues that will cause runtime crashes, data loss, or security breaches
+- Must be reproducible with concrete steps
+- Example: SQL injection, unhandled null causing crash, infinite loop
+
+#### Major Issues ⚠️
+- Issues that cause incorrect behavior users will notice
+- Must demonstrate actual failure scenario
+- Example: Wrong calculation result, UI not updating, API returning wrong data
+
+#### Minor Issues 💡
+- Style violations or optimization opportunities
+- Suggestions for improvement
+- Example: Inconsistent naming, missing error message
+
+**DO NOT mark as Critical/Major:**
+- Theoretical concerns without concrete failure scenario
+- "Could potentially cause..." without proof
+- Design preferences or "I would do it differently"
+
+#### Positive Highlights ✅
+- Well-implemented patterns
+- Good practices observed
+
+## Review Principles
+
+- **No temporary solutions**: Reject workarounds or hacks
+- **Complete implementation**: No partial features with TODOs
+- **Performance first**: Consider memory, CPU, and I/O impact
+- **Build cleanliness**: Zero warnings tolerance
+- **Guide compliance**: Follow all development guides in docs/
+
+## ⛔ Anti-Hallucination Rules
+
+Before reporting ANY issue, you MUST:
+
+1. **READ the actual code** - Don't guess based on patterns. Read the exact lines.
+2. **TRACE the execution flow** - Follow the code path. If you claim race condition, prove it step by step.
+3. **VERIFY the issue exists** - Can you reproduce it? Show concrete scenario.
+4. **CHECK context** - What's the runtime environment? Desktop vs server, single-user vs multi-user?
+5. **CONFIRM it's not intentional** - fire-and-forget, placeholder values updated later, etc. may be by design.
+
+### Issue Validation Checklist
+
+For each issue you want to report, answer:
+1. Did I read the ACTUAL code, not just the diff snippet?
+2. Can I show the EXACT line numbers where this fails?
+3. Is this a REAL bug or theoretical concern that can't happen in practice?
+4. Does the surrounding code already handle this case?
+
+### What NOT to report as issues:
+- Singleton with placeholder that gets updated in init/start method
+- "Memory leak" in single-user desktop app with bounded data
+- "Race condition" when there's already a guard (e.g., `if (this.running) return`)
+- Intentional fire-and-forget patterns with error logging
+- "Missing cleanup" when cleanup exists in useEffect return or stop() method
+
+## Exclusions (Do NOT Review)
+
+- **Git submodule reference changes only**: Skip dirty submodule states, submodule commit hash changes in the main repo. Source code inside submodules CAN and SHOULD be reviewed when requested.
+
+## Output Format
+
+The review will be delivered as a comprehensive report with:
+- Severity-based issue categorization
+- Specific line references for each issue
+- Concrete suggestions for fixes
+- Overall code health assessment
+
+---
+
+Conduct a thorough, line-by-line code review with a critical perspective.
+
+**Usage:**
+```bash
+/ln:codereview           # Review all uncommitted changes (default)
+/ln:codereview all       # Review all uncommitted changes (staged + unstaged)
+/ln:codereview unstaged  # Review only unstaged changes
+```
+
+## Review Scope
+
+**Mode 1: All uncommitted changes (default)**
+- Command: `git diff HEAD` (staged + unstaged)
+- Reviews everything not yet committed
+
+**Mode 2: Unstaged only**
+- Command: `git diff` (working directory changes only)
+- Reviews only files not yet staged
+
+All modes include:
+1. **Critical examination**: Line-by-line inspection with skeptical mindset
+2. **Pattern validation**: Verify adherence to project conventions and guides
+
+## Review Categories
+
+### Code Quality
+- **Clean code**: No TODO comments, no unused code
+- **Naming conventions**: Consistent with project standards
+- **File organization**: Proper separation of concerns
+- **Documentation**: Adequate comments where necessary
+
+### Technical Validation
+- **Build verification**: Zero warnings, all tests pass
+- **Type safety**: No type errors or unsafe operations
+- **Performance**: No memory leaks, efficient algorithms
+- **Security**: No hardcoded secrets or vulnerabilities
+
+### Architecture Review
+- **Design patterns**: Appropriate use of patterns
+- **Dependency management**: Minimal coupling
+- **Error handling**: Comprehensive error coverage
+- **Concurrency**: Thread safety and race conditions
+
+### Design Principles (OCP/SRP)
+
+**OCP (Open-Closed Principle) violations to catch:**
+- Adding `else if` / `switch case` to extend existing behavior
+- Modifying stable code instead of creating new modules
+- Missing extension points (strategy, registry, plugin patterns)
+
+**SRP (Single Responsibility Principle) violations to catch:**
+- One file handling multiple unrelated concerns
+- Functions/classes that change for multiple reasons
+- God objects or utility dumps
+
+**When found, suggest:**
+- Extract new behavior into separate file/class
+- Use strategy/registry pattern for extensibility
+- Split multi-responsibility files into focused modules
+
+## Review Process
+
+### Step 0: Understand Project Context (MANDATORY)
+
+Before reviewing any code, you MUST understand the project environment:
+
+1. **Read CLAUDE.md** - Check project root and user's `~/.claude/CLAUDE.md` for project-specific conventions
+2. **Identify app type** - Read entry points, config files, or main modules to determine:
+   - **Platform**: Desktop (Electron) / Mobile (React Native, Flutter, iOS, Android) / Web server / CLI / Library
+   - **User model**: Single-user vs Multi-user
+   - **Network exposure**: Local-only vs Network-exposed API
+3. **Understand architecture** - Scan key files to grasp the overall structure
+
+**Why this matters:**
+- Security concerns differ drastically between local desktop app and public API server
+- "Memory leak" in a short-lived CLI is irrelevant; in a long-running server it's critical
+- Path traversal in local-only app with file dialog is low-risk; in server accepting arbitrary input it's critical
+
+**DO NOT skip this step.** Reviewing without context leads to false positives and wastes everyone's time.
+
+### Step 1: Analyze Changes
+
+Determine review mode from command argument (default: `all`):
+
+**Mode: all (default)**
+```bash
+git diff HEAD  # All uncommitted changes (staged + unstaged)
+```
+
+**Mode: unstaged**
+```bash
+git diff  # Only unstaged changes
+```
+
+### Step 2: Validate Build
+- TypeScript: `npx tsc --noEmit`
+- Linting: `npm run lint`
+- Testing: `npm run test`
+- Language-specific checks per development guides
+
+### Step 3: Generate Report
+
+I will provide a structured report with:
+
+#### Critical Issues 🚨
+- **ONLY** issues that will cause runtime crashes, data loss, or security breaches
+- Must be reproducible with concrete steps
+- Example: SQL injection, unhandled null causing crash, infinite loop
+
+#### Major Issues ⚠️
+- Issues that cause incorrect behavior users will notice
+- Must demonstrate actual failure scenario
+- Example: Wrong calculation result, UI not updating, API returning wrong data
+
+#### Minor Issues 💡
+- Style violations or optimization opportunities
+- Suggestions for improvement
+- Example: Inconsistent naming, missing error message
+
+**DO NOT mark as Critical/Major:**
+- Theoretical concerns without concrete failure scenario
+- "Could potentially cause..." without proof
+- Design preferences or "I would do it differently"
+
+#### Positive Highlights ✅
+- Well-implemented patterns
+- Good practices observed
+
+## Review Principles
+
+- **No temporary solutions**: Reject workarounds or hacks
+- **Complete implementation**: No partial features with TODOs
+- **Performance first**: Consider memory, CPU, and I/O impact
+- **Build cleanliness**: Zero warnings tolerance
+- **Guide compliance**: Follow all development guides in docs/
+
+## ⛔ Anti-Hallucination Rules
+
+Before reporting ANY issue, you MUST:
+
+1. **READ the actual code** - Don't guess based on patterns. Read the exact lines.
+2. **TRACE the execution flow** - Follow the code path. If you claim race condition, prove it step by step.
+3. **VERIFY the issue exists** - Can you reproduce it? Show concrete scenario.
+4. **CHECK context** - What's the runtime environment? Desktop vs server, single-user vs multi-user?
+5. **CONFIRM it's not intentional** - fire-and-forget, placeholder values updated later, etc. may be by design.
+
+### Issue Validation Checklist
+
+For each issue you want to report, answer:
+1. Did I read the ACTUAL code, not just the diff snippet?
+2. Can I show the EXACT line numbers where this fails?
+3. Is this a REAL bug or theoretical concern that can't happen in practice?
+4. Does the surrounding code already handle this case?
+
+### What NOT to report as issues:
+- Singleton with placeholder that gets updated in init/start method
+- "Memory leak" in single-user desktop app with bounded data
+- "Race condition" when there's already a guard (e.g., `if (this.running) return`)
+- Intentional fire-and-forget patterns with error logging
+- "Missing cleanup" when cleanup exists in useEffect return or stop() method
+
+## Exclusions (Do NOT Review)
+
+- **Git submodule reference changes only**: Skip dirty submodule states, submodule commit hash changes in the main repo. Source code inside submodules CAN and SHOULD be reviewed when requested.
+
+## Output Format
+
+The review will be delivered as a comprehensive report with:
+- Severity-based issue categorization
+- Specific line references for each issue
+- Concrete suggestions for fixes
+- Overall code health assessment
+
+---
+
+좋아 모두 수정해줘
