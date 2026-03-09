@@ -1,0 +1,107 @@
+system dark theme에서 light theme로 설정한 뒤에 타이틀바 더블클릭(전체화면)으로 동작할 때 배경이 dark theme로 창이 확대되다가 웹 화면이 커지는 이슈가 있어. 어떻게 수정할까?
+
+---
+
+commit
+
+---
+
+Index: Error
+Watcher update failed: unable to open database file
+
+일시적으로 발생한거야? 원인 분석해줘
+
+ing_active=false
+[watcher] db_connection FAILED after 0ms: unable to open database file (upsert=3 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=3 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 0ms: unable to open database file (upsert=6 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=6 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=4 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=4 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 4ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 0ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 3ms: unable to open database file (upsert=8 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=8 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=3 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=3 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 2ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[watcher] db_connection FAILED after 0ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=2 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=2 indexing_active=false
+[watcher] db_connection FAILED after 1ms: unable to open database file (upsert=1 delete=0 indexing_active=false)
+[watcher] process_watcher_paths ERROR: unable to open database file | batch_size=1 indexing_active=false
+[rpc/search] total=191.794ms execute=191.791ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=481.948ms execute=437.272ms total_count=44.673ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173929 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=74.257ms execute=74.251ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=114.971ms execute=76.294ms total_count=38.673ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173929 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=359.651ms execute=359.649ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=423.904ms execute=348.414ms total_count=75.487ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173929 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=102.730ms execute=102.728ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=254.705ms execute=204.235ms total_count=50.467ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173931 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=116.679ms execute=116.675ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=203.902ms execute=120.423ms total_count=83.476ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173932 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=73.025ms execute=73.021ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=148.425ms execute=89.733ms total_count=58.688ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173931 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=91.805ms execute=91.801ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=162.499ms execute=72.681ms total_count=89.815ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173931 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=61.325ms execute=61.323ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=80.451ms execute=58.159ms total_count=22.289ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173931 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=119.339ms execute=119.337ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=641.795ms execute=174.079ms total_count=467.711ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173932 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=605.949ms execute=605.945ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=441.891ms execute=404.287ms total_count=37.601ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=90.821ms execute=90.818ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=275.986ms execute=133.153ms total_count=142.829ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=116.710ms execute=116.704ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=241.390ms execute=116.659ms total_count=124.727ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=62.499ms execute=62.496ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=92.610ms execute=69.837ms total_count=22.770ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=77.025ms execute=77.021ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=118.686ms execute=81.998ms total_count=36.684ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=59.330ms execute=59.328ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=100.511ms execute=67.985ms total_count=32.523ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=67.280ms execute=67.277ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=134.697ms execute=79.880ms total_count=54.812ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=70.657ms execute=70.652ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=83.750ms execute=60.376ms total_count=23.371ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=58.599ms execute=58.596ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=76.068ms execute=55.969ms total_count=20.097ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173933 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=59.337ms execute=59.335ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=81.038ms execute=56.059ms total_count=24.976ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173934 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=62.032ms execute=62.021ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+[rpc/search] total=137.004ms execute=75.436ms total_count=61.566ms include_total=true query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=1173935 total_known=true db_ready=true indexing_active=false
+[rpc/search] total=81.023ms execute=81.020ms total_count=0.000ms include_total=false query="" mode=empty sort=name/asc limit=500 offset=0 results=500 total_count=0 total_known=false db_ready=true indexing_active=false
+
+---
+
+1, 2, 3의 수정에 따라 cpu 사용량, indexing 속도, 메모리 어떤 것에 영향을 미치는지 영향 범위를 알려줘
+
+---
+
+수정 진행해줘
