@@ -1,0 +1,8 @@
+# Session Context
+
+## User Prompts
+
+### Prompt 1
+
+아직도 reset 후 완료까지 1분 18초걸려. 50초 미만이 될 때까지 테스트하고 시간 측정과 개선을 반복해
+
