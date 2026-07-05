@@ -1284,13 +1284,9 @@
       return;
     }
 
-    if (event.key === 'Enter') {
+    if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
       event.preventDefault();
-      if (platform === 'windows') {
-        await openSelected();
-      } else {
-        await startRename();
-      }
+      await openSelected();
       return;
     }
 
@@ -1560,10 +1556,6 @@
       })
     );
 
-    const unlistenFocus = await step('listen(focus_search)', () => listen('focus_search', () => {
-      void focusSearch();
-    }));
-
     const unlistenCtxMenuAction = await step(
       'listen(context_menu_action)',
       () => listen('context_menu_action', (event) => {
@@ -1599,7 +1591,7 @@
       })
     );
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenFocus, unlistenCtxMenuAction, unlistenPathignore, unlistenPathindexing, unlistenResized].filter(Boolean);
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenCtxMenuAction, unlistenPathignore, unlistenPathindexing, unlistenResized].filter(Boolean);
     startupLog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
@@ -1883,7 +1875,7 @@
               tabindex="0"
             >
               <div class="cell name">
-                <img class="file-icon" src={iconFor(entry)} alt="" />
+                <img class="file-icon" src={iconFor(entry)} alt="" draggable="false" />
                 <span class="ellipsis" class:name-editing={editing.active && editing.index === index}>{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
               </div>
               <div class="cell path"><span class="ellipsis">{displayPath(entry.dir)}</span></div>
@@ -2515,6 +2507,7 @@
     cursor: default;
     -webkit-user-select: none;
     user-select: none;
+    -webkit-user-drag: none;
     outline: none;
   }
 
@@ -2558,6 +2551,9 @@
     width: 16px;
     height: 16px;
     flex: 0 0 auto;
+    -webkit-user-drag: none;
+    user-drag: none;
+    pointer-events: none;
   }
 
   .name-editing {

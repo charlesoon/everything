@@ -51,24 +51,26 @@ npm run dev
 ### Data Flow
 
 1. App start → scan filesystem → batch upsert into `entries` table (SQLite WAL mode)
-   - macOS: jwalk incremental scan of `$HOME`
+   - macOS fresh index: parallel jwalk scan of `$HOME` (workers → channel → single writer, sorted `INSERT OR IGNORE` batches); secondary indexes + FTS rebuild + ANALYZE are deferred to the background finalizing thread (`finalize_fresh_index`, `fts_dirty` meta flag heals crashes)
+   - macOS restart catchup: single parallel pass; each worker preloads its root's rows over its own read connection, upserts only new/changed rows, and deletes vanished rows via preload-map set difference (no per-row run_id stamping)
    - Windows: NTFS MFT scan of `C:\` → builds MemIndex for instant search → background DB upsert
-2. User types → Svelte calls `search` command → Rust checks MemIndex first, then queries SQLite (LIKE-based multi-mode) → returns `SearchResultDto { entries, modeLabel, totalCount, totalKnown }`
+2. User types → Svelte calls `search` command → Rust checks MemIndex first, then queries SQLite (LIKE + FTS5 trigram multi-mode) → returns `SearchResultDto { entries, modeLabel, totalCount, totalKnown }`
 3. If results are sparse, a live scan (jwalk/fd_search) runs in a background thread
-4. File watcher detects changes → upsert/delete affected paths
+4. File watcher detects changes → upsert/delete affected paths over a persistent write connection (`watcher_conn`)
    - macOS: FSEvents (direct fsevent-sys, supports event ID replay)
    - Windows: USN Change Journal → ReadDirectoryChangesW fallback
 
 ### Key Design Decisions
 
-- **Search modes:** Query containing `/` or `\` → path search; containing `*` or `?` → glob-to-LIKE; simple `*.ext` → extension lookup; otherwise → 3-phase name search (exact → prefix → contains)
-- **Sort:** Backend SQL `ORDER BY` (name/mtime/size × asc/desc), not relevance. Relevance sorting applied only on first page (offset=0) for name sort.
+- **Search modes:** Query containing `/` or `\` → path search; containing `*` or `?` → glob-to-LIKE; simple `*.ext` → extension lookup; otherwise → 3-phase name search (exact → prefix → contains). The contains phase and non-name sorts use the FTS5 trigram index (queries ≥ 3 chars, gated by `fts_ready`); globs with a leading wildcard use an FTS literal-run prefilter + LIKE verify.
+- **Search connections:** pooled warm read connections (`search_conn_pool`, max 3, 1GB mmap, cached prepared statements) reused across keystrokes; total counts use FTS-only `COUNT` (no join) where possible. The pool is only cleared on `reset_index`, not by watcher updates.
+- **Sort:** Backend SQL `ORDER BY` (name/mtime/size × asc/desc), not relevance. Relevance sorting applied only on first page (offset=0) for name sort (decorate–sort–undecorate; ranks computed once per row).
 - **Recent ops cache:** 2-second TTL prevents watcher from re-processing app-initiated rename/trash operations
 - **Icons:** macOS: NSWorkspace via swift subprocess, cached by extension, prewarmed. Windows: IShellItemImageFactory (per-file for exe/lnk) + SHGetFileInfo (extension-based fallback)
 - **Virtual scroll:** Fixed 26px row height, OverlayScrollbars, renders only visible rows ± buffer
 - **Indexing root:** macOS: `$HOME`, Windows: `C:\`. Skips `.git`, `node_modules`, `DerivedData`, `.build` suffixes, platform-specific noisy directories
 - **Context menu:** macOS: custom frontend menu. Windows: native Explorer context menu via Shell API, actions returned via `context_menu_action` event
-- **Enter key:** Opens on Windows, starts rename on macOS. F2 starts rename on both platforms.
+- **Enter key:** Opens the selected file(s) on both platforms. Cmd/Ctrl+Enter reveals in Finder/Explorer. F2 starts rename on both platforms.
 - **MemIndex (Windows):** In-memory index built during MFT/WalkDir scan provides instant search before DB is populated. Freed after background DB upsert completes.
 - **Windows fallback chain:** MFT scan → USN watcher → non-admin WalkDir → RDCW watcher
 
@@ -78,7 +80,7 @@ npm run dev
 
 ### Backend Events (→ Frontend)
 
-`index_progress`, `index_state` (includes `isCatchup`), `index_updated`, `context_menu_action` (Windows), `focus_search` (macOS)
+`index_progress`, `index_state` (includes `isCatchup`), `index_updated`, `context_menu_action` (Windows)
 
 ## Design Spec
 

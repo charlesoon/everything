@@ -19,8 +19,6 @@ use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
-#[cfg(target_os = "macos")]
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use walkdir::WalkDir;
@@ -78,18 +76,22 @@ CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE OF name ON entries BEGIN
 END;";
 
 const REBUILD_FTS_SQL: &str = "INSERT INTO entries_fts(entries_fts) VALUES('rebuild');";
+
+/// Secondary indexes on `entries`. Single source of truth shared by
+/// `ensure_db_indexes` (startup/catchup) and `finalize_fresh_index` (which
+/// builds them before ANALYZE so the planner gets stats for all of them).
+const CREATE_ENTRIES_INDEXES_SQL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
+CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_entries_indexed_at ON entries(indexed_at);";
 const DEFERRED_DIR_NAMES: &[&str] = &[
     "Library", ".Trash", ".Trashes",
     // Windows system directories (deferred when scan_root is C:\)
     "Windows", "Program Files", "Program Files (x86)",
     "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs",
 ];
-const SHALLOW_SCAN_DEPTH: usize = 6;
-fn jwalk_num_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(4).min(16))
-        .unwrap_or(8)
-}
 
 
 pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
@@ -391,6 +393,13 @@ pub(crate) struct AppState {
     pub(crate) frontend_ready: Arc<AtomicBool>,
     /// Guards against concurrent pathindexing background threads.
     pub(crate) pathindexing_active: Arc<AtomicBool>,
+    /// Warm read connections reused across searches. Opening a connection per
+    /// search costs ~1-2ms (open + PRAGMAs + schema parse) and starts with a
+    /// cold SQLite page cache; reuse keeps hot pages and prepared statements.
+    pub(crate) search_conn_pool: Arc<Mutex<Vec<Connection>>>,
+    /// Persistent write connection for watcher-driven incremental updates.
+    /// Opening a connection per event batch dominated single-file update cost.
+    pub(crate) watcher_conn: Arc<Mutex<Option<Connection>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -472,12 +481,59 @@ pub(crate) fn db_connection(db_path: &Path) -> AppResult<Connection> {
 
 fn db_connection_for_search(db_path: &Path) -> AppResult<Connection> {
     let conn = db_connection_with_timeout(db_path, 500)?;
+    // mmap_size must cover the whole DB file (entries + FTS index) so reads hit
+    // the shared OS page cache instead of per-connection pread into a cold cache.
     conn.execute_batch(
         "PRAGMA cache_size = -32768;
-         PRAGMA mmap_size = 268435456;",
+         PRAGMA mmap_size = 1073741824;",
     )
     .map_err(|e| e.to_string())?;
+    conn.set_prepared_statement_cache_capacity(64);
     Ok(conn)
+}
+
+const SEARCH_CONN_POOL_MAX: usize = 3;
+
+/// A search connection borrowed from `AppState::search_conn_pool`; returned to
+/// the pool on drop. Derefs to `rusqlite::Connection`.
+struct PooledSearchConn {
+    conn: Option<Connection>,
+    pool: Arc<Mutex<Vec<Connection>>>,
+}
+
+impl std::ops::Deref for PooledSearchConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("pooled connection present until drop")
+    }
+}
+
+impl Drop for PooledSearchConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let mut pool = self.pool.lock();
+            if pool.len() < SEARCH_CONN_POOL_MAX {
+                pool.push(conn);
+            }
+        }
+    }
+}
+
+fn pooled_search_connection(state: &AppState) -> AppResult<PooledSearchConn> {
+    let reused = state.search_conn_pool.lock().pop();
+    let conn = match reused {
+        Some(conn) => {
+            // A time-budget progress handler must never leak across borrows: a
+            // stale handler would interrupt every future query on this conn.
+            conn.progress_handler(0, None::<fn() -> bool>);
+            conn
+        }
+        None => db_connection_for_search(&state.db_path)?,
+    };
+    Ok(PooledSearchConn {
+        conn: Some(conn),
+        pool: state.search_conn_pool.clone(),
+    })
 }
 
 pub(crate) fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
@@ -616,16 +672,8 @@ fn ensure_db_indexes(db_path: &Path) -> AppResult<()> {
     let t = Instant::now();
     let conn = db_connection(db_path)?;
 
-    conn.execute_batch(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
-        CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);
-        CREATE INDEX IF NOT EXISTS idx_entries_indexed_at ON entries(indexed_at);
-        "#,
-    )
-    .map_err(|e| e.to_string())?;
+    conn.execute_batch(CREATE_ENTRIES_INDEXES_SQL)
+        .map_err(|e| e.to_string())?;
     eprintln!("[init_db] +{}ms indexes ensured", t.elapsed().as_millis());
 
     let legacy_key = "migration_drop_idx_entries_dir_name_nocase_v1";
@@ -711,6 +759,9 @@ fn update_counts(conn: &Connection) -> AppResult<(u64, Option<i64>)> {
 }
 
 pub(crate) fn invalidate_search_caches(state: &AppState) {
+    // Note: search_conn_pool is intentionally NOT cleared here — pooled
+    // connections stay valid across data changes (this runs on every watcher
+    // batch), and dropping them would re-cold-start the page cache.
     state.fd_search_cache.lock().take();
     state.negative_name_cache.lock().clear();
 }
@@ -814,6 +865,61 @@ fn sort_clause(sort_by: &str, sort_dir: &str, prefix: &str) -> String {
 
 fn contains_glob_meta(s: &str) -> bool {
     s.contains('*') || s.contains('?')
+}
+
+/// Quote a plain query string as an FTS5 phrase (`"..."`), so trigram MATCH
+/// performs a substring lookup with no query-syntax interpretation.
+fn fts_phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
+}
+
+/// Build an FTS5 trigram prefilter for a glob pattern: every literal run of
+/// 3+ chars must be present as a substring (`"lit1" AND "lit2"`). Returns None
+/// when no run is long enough to form a trigram (prefilter would not narrow).
+fn glob_fts_match_expr(glob: &str) -> Option<String> {
+    let mut runs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in glob.chars() {
+        if ch == '*' || ch == '?' {
+            if !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    let exprs: Vec<String> = runs
+        .iter()
+        .filter(|r| r.chars().count() >= 3)
+        .map(|r| fts_phrase(r))
+        .collect();
+    if exprs.is_empty() {
+        None
+    } else {
+        Some(exprs.join(" AND "))
+    }
+}
+
+/// A LIKE pattern starting with a wildcard cannot use the name index range
+/// scan; those are the glob shapes worth routing through the FTS prefilter.
+fn like_pattern_unindexable(name_like: &str) -> bool {
+    name_like.starts_with('%') || name_like.starts_with('_')
+}
+
+/// The FTS trigram prefilter for a `GlobName` query: `Some(match_expr)` when the
+/// pattern's LIKE form can't use the name index (leading wildcard) and has a
+/// 3+ char literal run to narrow on; `None` means evaluate the plain LIKE.
+/// `execute_search` and `compute_total_count` share this so the counted set and
+/// the returned page always route the same way.
+fn glob_fts_prefilter(fts_ready: bool, name_like: &str, query: &str) -> Option<String> {
+    if fts_ready && like_pattern_unindexable(name_like) {
+        glob_fts_match_expr(query)
+    } else {
+        None
+    }
 }
 
 /// Detect if a LIKE pattern is a pure extension filter (e.g. `%.rs`).
@@ -1637,7 +1743,6 @@ fn relevance_rank(entry: &EntryDto, query_lower: &str, path_suffix: &str) -> u8 
     }
 
     let name = entry.name.to_lowercase();
-    let path = entry.path.to_lowercase();
 
     if name == query_lower {
         return 0;
@@ -1648,6 +1753,9 @@ fn relevance_rank(entry: &EntryDto, query_lower: &str, path_suffix: &str) -> u8 
     if name.contains(query_lower) {
         return 2;
     }
+
+    // Path lowercasing is deferred: most entries rank 0-2 on name alone.
+    let path = entry.path.to_lowercase();
     if path.ends_with(path_suffix) {
         return 3;
     }
@@ -1679,25 +1787,28 @@ fn sort_entries_with_relevance(
     }
     let path_suffix = format!("/{query_lower}");
 
-    entries.sort_by(|a, b| {
-        let ra = relevance_rank(a, &query_lower, &path_suffix);
-        let rb = relevance_rank(b, &query_lower, &path_suffix);
-        if ra != rb {
-            return ra.cmp(&rb);
+    // Rank every entry once (decorate–sort–undecorate): relevance_rank
+    // lowercases name/path, far too expensive to recompute per comparison.
+    let mut decorated: Vec<(u8, usize, EntryDto)> = entries
+        .drain(..)
+        .map(|entry| {
+            let rank = relevance_rank(&entry, &query_lower, &path_suffix);
+            // For highly-relevant matches, prefer shallower paths first
+            // so `~/name` ranks above deep descendants with the same name.
+            let depth = if rank <= 3 { path_depth(&entry.path) } else { 0 };
+            (rank, depth, entry)
+        })
+        .collect();
+    decorated.sort_by(|a, b| {
+        if a.0 != b.0 {
+            return a.0.cmp(&b.0);
         }
-
-        // For highly-relevant matches, prefer shallower paths first
-        // so `~/name` ranks above deep descendants with the same name.
-        if ra <= 3 {
-            let da = path_depth(&a.path);
-            let db = path_depth(&b.path);
-            if da != db {
-                return da.cmp(&db);
-            }
+        if a.0 <= 3 && a.1 != b.1 {
+            return a.1.cmp(&b.1);
         }
-
-        entry_cmp(a, b, sort_by, sort_dir)
+        entry_cmp(&a.2, &b.2, sort_by, sort_dir)
     });
+    entries.extend(decorated.into_iter().map(|(_, _, entry)| entry));
 }
 
 fn filter_ignored_entries(
@@ -1840,31 +1951,22 @@ fn find_search(
     entries
 }
 
-pub(crate) fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult<usize> {
+/// Bulk insert for the fresh-index path: every path is new, so the upsert
+/// arm is unnecessary. OR IGNORE keeps overlapping extra roots harmless.
+/// Callers on the hot path pre-sort batches by path in the scan workers so
+/// the UNIQUE(path) b-tree sees near-sequential inserts.
+/// Run one transaction binding every row of `rows` to `sql` — a 9-placeholder
+/// INSERT variant (`path, name, dir, is_dir, ext, mtime, size, indexed_at,
+/// run_id`). Shared by `insert_rows_fresh` and `upsert_rows`, which differ only
+/// in the INSERT conflict clause.
+fn write_rows(conn: &mut Connection, rows: &[IndexRow], sql: &str) -> AppResult<usize> {
     if rows.is_empty() {
         return Ok(0);
     }
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     {
-        let mut stmt = tx
-            .prepare(
-                r#"
-                INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
-                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                ON CONFLICT(path) DO UPDATE SET
-                  name = excluded.name,
-                  dir = excluded.dir,
-                  is_dir = excluded.is_dir,
-                  ext = excluded.ext,
-                  mtime = excluded.mtime,
-                  size = excluded.size,
-                  indexed_at = excluded.indexed_at,
-                  run_id = excluded.run_id
-                "#,
-            )
-            .map_err(|e| e.to_string())?;
-
+        let mut stmt = tx.prepare(sql).map_err(|e| e.to_string())?;
         for row in rows {
             stmt.execute(params![
                 row.path,
@@ -1882,6 +1984,37 @@ pub(crate) fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(rows.len())
+}
+
+pub(crate) fn insert_rows_fresh(conn: &mut Connection, rows: &[IndexRow]) -> AppResult<usize> {
+    write_rows(
+        conn,
+        rows,
+        r#"
+        INSERT OR IGNORE INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+}
+
+pub(crate) fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult<usize> {
+    write_rows(
+        conn,
+        rows,
+        r#"
+        INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT(path) DO UPDATE SET
+          name = excluded.name,
+          dir = excluded.dir,
+          is_dir = excluded.is_dir,
+          ext = excluded.ext,
+          mtime = excluded.mtime,
+          size = excluded.size,
+          indexed_at = excluded.indexed_at,
+          run_id = excluded.run_id
+        "#,
+    )
 }
 
 pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize> {
@@ -1923,11 +2056,14 @@ pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppRe
                 .execute(params![&normalized])
                 .map_err(|e| e.to_string())?;
 
-            // Delete children using B-tree range scan: path >= "{normalized}{sep}" AND path < "{normalized}\x7F"
-            // \x7F (127) is higher than both '/' (47) and '\' (92), so this captures all children.
+            // Delete children using B-tree range scan:
+            // path >= "{normalized}{sep}" AND path < "{normalized}{sep+1}".
+            // The exclusive upper bound is the separator's successor char, so
+            // only true descendants match — a \x7F bound would also capture
+            // prefix siblings ("proj0" would take "proj00" down with it).
             let sep = std::path::MAIN_SEPARATOR;
             let range_start = format!("{normalized}{sep}");
-            let range_end = format!("{normalized}\x7F");
+            let range_end = format!("{normalized}{}", (sep as u8 + 1) as char);
             deleted += stmt_children
                 .execute(params![&range_start, &range_end])
                 .map_err(|e| e.to_string())?;
@@ -2103,7 +2239,7 @@ fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) 
     }
 
     std::thread::spawn(move || {
-        let result = run_incremental_index(&app, &state);
+        let result = run_incremental_index(Some(&app), &state);
         if let Err(ref err) = result {
             eprintln!("[index] run_incremental_index failed: {err}");
             if !silent {
@@ -2160,26 +2296,97 @@ fn preload_existing_entries(
     map
 }
 
-fn stamp_run_id_batch(conn: &mut Connection, paths: &[String], run_id: i64) -> AppResult<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
+/// Deferred fresh-index finalization: secondary indexes, FTS rebuild (+
+/// triggers), and ANALYZE. Runs on the finalizing thread after Ready so the
+/// user-visible indexing phase does not wait for DDL. Search stays correct
+/// meanwhile: prefix queries fall back when INDEXED BY fails, and fts_ready
+/// gates every FTS path. The watcher is still paused (indexing_active), so
+/// no upsert can slip past the not-yet-recreated FTS triggers.
+fn finalize_fresh_index(state: &AppState) {
+    let Ok(conn) = db_connection(&state.db_path) else {
+        return;
+    };
+    let t_idx = Instant::now();
+    let _ = conn.execute_batch(CREATE_ENTRIES_INDEXES_SQL);
+    eprintln!("[timing] create_indexes {}ms", t_idx.elapsed().as_millis());
 
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    {
-        let mut stmt = tx
-            .prepare("UPDATE entries SET run_id = ?1 WHERE path = ?2")
-            .map_err(|e| e.to_string())?;
-        for path in paths {
-            stmt.execute(params![run_id, path])
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
+    let fts_t = Instant::now();
+    let _ = conn.execute_batch(CREATE_FTS_TRIGGERS_SQL);
+    let _ = conn.execute_batch(REBUILD_FTS_SQL);
+    state.fts_ready.store(true, AtomicOrdering::Release);
+    let _ = set_meta(&conn, "fts_dirty", "0");
+    eprintln!("[index] fts_rebuild {}ms", fts_t.elapsed().as_millis());
+
+    let t_analyze = Instant::now();
+    let _ = conn.execute_batch("ANALYZE");
+    eprintln!("[timing] analyze {}ms", t_analyze.elapsed().as_millis());
 }
 
-fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
+/// Existing rows for `dir_path` itself and its DIRECT children only.
+/// (`preload_existing_entries` loads the whole subtree — for the scan root
+/// that would be the entire DB.)
+fn preload_direct_children(
+    conn: &Connection,
+    dir_path: &str,
+) -> HashMap<String, (Option<i64>, Option<i64>)> {
+    let mut map = HashMap::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT path, mtime, size FROM entries WHERE dir = ?1 OR path = ?1")
+    else {
+        return map;
+    };
+    let rows = match stmt.query_map(params![dir_path], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return map,
+    };
+    for row in rows.flatten() {
+        map.insert(row.0, (row.1, row.2));
+    }
+    map
+}
+
+/// Remove `row`'s path from a preload map, returning true when it was present
+/// AND unchanged (same mtime + size). A false return means the row is new or
+/// modified and must be (re)written; paths left in the map after the scan are
+/// the vanished ones to delete.
+fn row_unchanged(
+    existing: &mut HashMap<String, (Option<i64>, Option<i64>)>,
+    row: &IndexRow,
+) -> bool {
+    matches!(
+        existing.remove(&row.path),
+        Some((old_mtime, old_size)) if old_mtime == row.mtime && old_size == row.size
+    )
+}
+
+/// Build the shared rayon thread pool for a parallel filesystem scan. Scanning
+/// is I/O-bound (stat() blocks on disk), so we oversubscribe cores. Returns the
+/// pool, its thread count, and the CPU count (callers derive worker count from
+/// it differently). Shared by the fresh and catchup scan branches.
+fn build_scan_pool() -> (Arc<jwalk::rayon::ThreadPool>, usize, usize) {
+    let n_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool_threads = (n_cpus * 2).max(8);
+    let pool = Arc::new(
+        jwalk::rayon::ThreadPoolBuilder::new()
+            .num_threads(pool_threads)
+            .build()
+            .expect("failed to build rayon pool for parallel scan"),
+    );
+    (pool, pool_threads, n_cpus)
+}
+
+/// `app: None` runs the index pipeline without UI event emission and without
+/// spawning the background finalizing thread (the caller finalizes explicitly)
+/// — used by benchmarks/tests to exercise the real indexing path.
+fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -> AppResult<()> {
     let started = Instant::now();
     perf_log(format!(
         "index_run_start home={} db={}",
@@ -2197,6 +2404,15 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0)
         == 0;
+    // A previous run crashed between dropping the FTS triggers and completing
+    // the rebuild: the FTS index may silently miss rows. Stop trusting it now;
+    // finalize_fresh_index below rebuilds it and clears the flag.
+    let fts_dirty: bool = get_meta(&conn, "fts_dirty")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if fts_dirty && !is_fresh_run {
+        state.fts_ready.store(false, AtomicOrdering::Release);
+    }
     if is_fresh_run {
         let _ = conn.execute_batch(
             "DROP INDEX IF EXISTS idx_entries_dir_ext_name_nocase;
@@ -2208,20 +2424,18 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
 
     let result = run_incremental_index_inner(app, state, &mut conn);
 
-    if is_fresh_run {
-        let t_idx = Instant::now();
-        let _ = conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
-             CREATE INDEX IF NOT EXISTS idx_entries_mtime ON entries(mtime);
-             CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
-             CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);",
-        );
-        eprintln!("[timing] create_indexes {}ms", t_idx.elapsed().as_millis());
+    // Fresh runs defer secondary-index creation, FTS rebuild, and ANALYZE to
+    // finalize_fresh_index (background finalizing thread): search is already
+    // functional via the LIKE/INDEXED-BY fallbacks and fts_ready gating, so
+    // the user-visible indexing phase ends without waiting for DDL.
+    if !is_fresh_run {
+        let t_analyze = Instant::now();
+        // Catchup barely shifts table statistics; PRAGMA optimize re-analyzes
+        // only when SQLite deems it worthwhile (usually a no-op) instead of
+        // rescanning every index on every start.
+        let _ = conn.execute_batch("PRAGMA optimize;");
+        eprintln!("[timing] analyze {}ms", t_analyze.elapsed().as_millis());
     }
-
-    let t_analyze = Instant::now();
-    let _ = conn.execute_batch("ANALYZE");
-    eprintln!("[timing] analyze {}ms", t_analyze.elapsed().as_millis());
     let t_checkpoint = Instant::now();
     let _ = restore_normal_pragmas(&conn);
     eprintln!("[timing] checkpoint {}ms", t_checkpoint.elapsed().as_millis());
@@ -2232,9 +2446,12 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
             let extra_roots = state.extra_roots.lock().clone();
             let roots_str: Vec<String> = extra_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
             let _ = set_meta(&conn, "indexed_extra_roots", &roots_str.join("\n"));
-            // Run ensure_db_indexes + GC cleanup sequentially in one background thread,
-            // then transition to Ready and release indexing_active.
-            {
+            // Transition to Ready, then run deferred DDL (fresh finalization,
+            // ensure_db_indexes) + GC in one background thread. Search works
+            // during the DDL window via LIKE/INDEXED-BY fallbacks; the watcher
+            // stays paused until indexing_active is released at the end, so
+            // no rows can slip past the not-yet-recreated FTS triggers.
+            if let Some(app) = app {
                 let fin_app = app.clone();
                 let fin_state = state.clone();
                 std::thread::spawn(move || {
@@ -2247,28 +2464,39 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
                     }
                     let _guard = IndexingGuard(Arc::clone(&fin_state.indexing_active));
 
-                    // 1. Ensure any new indexes exist (DDL, may take a few seconds on large DB)
-                    if let Err(e) = ensure_db_indexes(&fin_state.db_path) {
-                        eprintln!("[finalizing] ensure_db_indexes error: {e}");
-                    }
-                    // 2. Drop any orphaned entries_gc_* tables from crashed sessions
-                    if let Ok(c) = db_connection(&fin_state.db_path) {
-                        if let Err(e) = cleanup_entries_gc_tables(&c) {
-                            eprintln!("[gc] cleanup error: {e}");
-                        }
-                    }
-                    // 3. Transition to Ready: update state and emit event
-                    // (index_updated already emitted by run_incremental_index_inner;
-                    //  only Ready state transition + index_state event needed here)
+                    // 1. Transition to Ready: update state and emit event
+                    // (index_updated already emitted by run_incremental_index_inner)
                     let message = fin_state.status.lock().message.clone();
                     {
                         let mut status = fin_state.status.lock();
                         status.state = IndexState::Ready;
                     }
                     emit_index_state(&fin_app, "Ready", message);
+                    perf_log("index_state=Ready (finalizing continues in background)");
+
+                    // 2. Fresh runs (or crash recovery): build secondary
+                    // indexes, rebuild FTS, ANALYZE.
+                    if is_fresh_run || fts_dirty {
+                        finalize_fresh_index(&fin_state);
+                    }
+                    // 3. Ensure any new indexes exist (DDL, may take a few seconds on large DB)
+                    if let Err(e) = ensure_db_indexes(&fin_state.db_path) {
+                        eprintln!("[finalizing] ensure_db_indexes error: {e}");
+                    }
+                    // 4. Drop any orphaned entries_gc_* tables from crashed sessions
+                    if let Ok(c) = db_connection(&fin_state.db_path) {
+                        if let Err(e) = cleanup_entries_gc_tables(&c) {
+                            eprintln!("[gc] cleanup error: {e}");
+                        }
+                    }
                     // indexing_active released by _guard Drop
-                    perf_log("index_state=Ready (finalizing complete)");
+                    perf_log("finalizing complete");
                 });
+            } else {
+                // Bench/test path: the caller runs finalize_fresh_index /
+                // ensure_db_indexes itself so each phase can be timed.
+                state.status.lock().state = IndexState::Ready;
+                state.indexing_active.store(false, AtomicOrdering::Release);
             }
             let snapshot = state.status.lock().clone();
             perf_log(format!(
@@ -2294,7 +2522,7 @@ fn run_incremental_index(app: &AppHandle, state: &AppState) -> AppResult<()> {
 }
 
 fn run_incremental_index_inner(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     conn: &mut Connection,
 ) -> AppResult<()> {
@@ -2323,6 +2551,9 @@ fn run_incremental_index_inner(
     // Mark FTS as not ready so search falls back to LIKE queries during bulk insert.
     if is_fresh {
         state.fts_ready.store(false, AtomicOrdering::Release);
+        // Persisted so a crash before the FTS rebuild completes is healed on
+        // the next run (finalize_fresh_index runs whenever the flag is set).
+        let _ = set_meta(conn, "fts_dirty", "1");
         let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
     }
 
@@ -2331,26 +2562,22 @@ fn run_incremental_index_inner(
     let mut permission_errors: u64 = 0;
     let mut current_path = String::new();
     let mut batch: Vec<IndexRow> = Vec::with_capacity(flush_batch_size);
-    // Fresh index: DB was empty, stamp_batch is never used; avoid large pre-allocation.
-    let mut stamp_batch: Vec<String> = Vec::with_capacity(if is_fresh { 0 } else { flush_batch_size });
+    // Paths removed because they vanished from disk (catchup set-difference).
+    let mut catchup_deleted: u64 = 0;
     let mut last_emit = Instant::now();
     let mut last_perf_emit = Instant::now();
 
-    // Preload scan_root-level entries (direct children only, not recursive)
+    // Preload scan_root-level entries (direct children only, not recursive).
+    // Seen entries are removed; leftovers are vanished top-level paths whose
+    // subtrees are deleted below.
     let scan_str = state.scan_root.to_string_lossy().to_string();
-    let root_existing = preload_existing_entries(conn, &scan_str);
+    let mut root_existing = preload_direct_children(conn, &scan_str);
 
     // Index scan_root itself
     if let Some(mut row) = index_row_from_path(&state.scan_root) {
         scanned += 1;
         row.run_id = current_run_id;
-        if let Some((old_mtime, old_size)) = root_existing.get(&row.path) {
-            if *old_mtime == row.mtime && *old_size == row.size {
-                stamp_batch.push(row.path);
-            } else {
-                batch.push(row);
-            }
-        } else {
+        if !row_unchanged(&mut root_existing, &row) {
             batch.push(row);
         }
     }
@@ -2376,13 +2603,7 @@ fn run_incremental_index_inner(
 
             if let Some(mut row) = index_row_from_path(&child_path) {
                 row.run_id = current_run_id;
-                if let Some((old_mtime, old_size)) = root_existing.get(&row.path) {
-                    if *old_mtime == row.mtime && *old_size == row.size {
-                        stamp_batch.push(row.path);
-                    } else {
-                        batch.push(row);
-                    }
-                } else {
+                if !row_unchanged(&mut root_existing, &row) {
                     batch.push(row);
                 }
             }
@@ -2397,29 +2618,52 @@ fn run_incremental_index_inner(
         }
     }
 
-
-    // Flush home-level stamp batch
-    if stamp_batch.len() >= flush_batch_size {
-        stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-        stamp_batch.clear();
+    // Direct children still in the map vanished from disk (or are newly
+    // ignored): their entire subtrees are stale.
+    if !is_fresh && !root_existing.is_empty() {
+        let vanished: Vec<String> = root_existing.into_keys().collect();
+        catchup_deleted += delete_paths(conn, &vanished)? as u64;
     }
 
     priority_roots.sort();
     deferred_roots.sort();
 
     let extra_roots = state.extra_roots.lock().clone();
+    let scanned_extra_roots: Vec<PathBuf> = extra_roots
+        .into_iter()
+        .filter(|r| r.is_dir() && !r.starts_with(&state.scan_root))
+        .collect();
+    // Extra roots that were indexed on a previous run but are no longer
+    // scanned (removed from .pathindexing or vanished) leave stale subtrees.
+    if !is_fresh {
+        if let Some(prev) = get_meta(conn, "indexed_extra_roots") {
+            let current_set: std::collections::HashSet<String> = scanned_extra_roots
+                .iter()
+                .map(|r| r.to_string_lossy().to_string())
+                .collect();
+            let stale: Vec<String> = prev
+                .split('\n')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .filter(|s| !current_set.contains(*s) && !Path::new(s).starts_with(&state.scan_root))
+                .map(|s| s.to_string())
+                .collect();
+            if !stale.is_empty() {
+                catchup_deleted += delete_paths(conn, &stale)? as u64;
+            }
+        }
+    }
     let roots: Vec<PathBuf> = priority_roots
         .into_iter()
         .chain(deferred_roots)
-        .chain(extra_roots.into_iter().filter(|r| r.is_dir() && !r.starts_with(&state.scan_root)))
+        .chain(scanned_extra_roots)
         .collect();
     perf_log(format!(
         "index_scan_roots total={} (incl. extra pathindexing roots)",
         roots.len()
     ));
 
-    // 2-pass indexing: shallow first (depth <= SHALLOW_SCAN_DEPTH), then deep
-    // Both passes use jwalk for parallel scanning
+    // Both branches below use jwalk for parallel scanning.
     let arc_ignored_roots = Arc::new(runtime_ignored_roots.clone());
     let arc_ignored_patterns = Arc::new(runtime_ignored_patterns.clone());
 
@@ -2433,23 +2677,13 @@ fn run_incremental_index_inner(
 
         // Flush scan_root + direct-children batch before parallel workers start.
         if !batch.is_empty() {
-            upsert_rows(conn, &batch)?;
+            batch.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+            insert_rows_fresh(conn, &batch)?;
             batch.clear();
         }
 
         // Shared rayon pool: all workers share one pool sized for maximum I/O throughput.
-        // Filesystem scanning is I/O-bound (stat() calls block on disk), so we use more
-        // threads than CPU cores to keep the I/O pipeline saturated.
-        let n_cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let pool_threads = (n_cpus * 2).max(8);
-        let shared_pool = Arc::new(
-            jwalk::rayon::ThreadPoolBuilder::new()
-                .num_threads(pool_threads)
-                .build()
-                .expect("failed to build rayon pool for fresh index"),
-        );
+        let (shared_pool, pool_threads, n_cpus) = build_scan_pool();
         let n_workers = n_cpus.min(roots.len().max(1));
         eprintln!(
             "[index] fresh parallel scan: {} workers, {} pool threads, {} roots",
@@ -2551,6 +2785,11 @@ fn run_incremental_index_inner(
                                     }
 
                                     if local_batch.len() >= flush_size {
+                                        // Sort on the worker (parallel) so the
+                                        // single writer thread gets b-tree
+                                        // friendly, pre-ordered batches.
+                                        local_batch
+                                            .sort_unstable_by(|a, b| a.path.cmp(&b.path));
                                         let _ = tx.send((
                                             std::mem::replace(&mut local_batch, Vec::with_capacity(flush_size)),
                                             local_scanned,
@@ -2587,6 +2826,7 @@ fn run_incremental_index_inner(
 
                     // Flush partial batch remaining after all roots processed.
                     if !local_batch.is_empty() || local_scanned > 0 || local_perm_errors > 0 {
+                        local_batch.sort_unstable_by(|a, b| a.path.cmp(&b.path));
                         let _ = tx.send((
                             local_batch,
                             local_scanned,
@@ -2610,11 +2850,13 @@ fn run_incremental_index_inner(
                     current_path = path;
                 }
                 if !worker_batch.is_empty() {
-                    upsert_rows(conn, &worker_batch)?;
+                    insert_rows_fresh(conn, &worker_batch)?;
                 }
                 if last_emit.elapsed() >= Duration::from_millis(200) {
                     set_progress(state, scanned, indexed, &current_path);
-                    emit_index_progress(app, scanned, indexed, current_path.clone());
+                    if let Some(app) = app {
+                        emit_index_progress(app, scanned, indexed, current_path.clone());
+                    }
                     last_emit = Instant::now();
                 }
             }
@@ -2628,233 +2870,258 @@ fn run_incremental_index_inner(
             indexed,
         ));
     } else {
-        // INCREMENTAL INDEX: 2-pass sequential scan (shallow first, then deep).
-        for pass in 0..2u8 {
-            let pass_label = if pass == 0 { "shallow" } else { "deep" };
-            let pass_started = Instant::now();
-            let mut pass_scanned = 0u64;
-            let mut pass_indexed = 0u64;
+        // INCREMENTAL CATCHUP: single parallel pass with worker-side change
+        // detection. Each worker preloads its root's existing rows over its own
+        // read connection (WAL allows readers concurrent with the writer),
+        // walks the root once, and sends only new/changed rows for upsert plus
+        // vanished paths (preload leftovers) for deletion. Unchanged rows are
+        // left untouched — the previous design walked every root twice and
+        // rewrote run_id on every unchanged row (one UPDATE per file).
 
-            for root in &roots {
-                let root_started = Instant::now();
-                let mut root_scanned = 0u64;
-                let mut root_indexed = 0u64;
-                let mut root_permission_errors = 0u64;
-                let root_str = root.to_string_lossy().to_string();
+        // Flush scan_root + direct-children batch before parallel workers start.
+        if !batch.is_empty() {
+            upsert_rows(conn, &batch)?;
+            batch.clear();
+        }
 
-                let existing = preload_existing_entries(conn, &root_str);
+        let (shared_pool, pool_threads, n_cpus) = build_scan_pool();
+        // Each worker holds one root's preload map in memory; cap workers to
+        // bound peak memory when several large roots are processed at once.
+        let n_workers = n_cpus.min(roots.len().max(1)).min(8);
+        eprintln!(
+            "[index] catchup parallel scan: {} workers, {} pool threads, {} roots",
+            n_workers,
+            pool_threads,
+            roots.len()
+        );
 
+        // (rows to upsert, vanished paths to delete, scanned, indexed, perm_errors, current path)
+        type CatchupMsg = (Vec<IndexRow>, Vec<String>, u64, u64, u64, String);
+        let (row_tx, row_rx) = std::sync::mpsc::channel::<CatchupMsg>();
+        let roots_arc: Arc<Vec<PathBuf>> = Arc::new(roots);
+        let par_started = Instant::now();
+        let worker_db_path = state.db_path.clone();
+
+        std::thread::scope(|scope| -> AppResult<()> {
+            for worker_idx in 0..n_workers {
+                let tx = row_tx.clone();
                 let skip_roots = arc_ignored_roots.clone();
                 let skip_patterns = arc_ignored_patterns.clone();
+                let roots_ref = roots_arc.clone();
+                let run_id = current_run_id;
+                let n_w = n_workers;
+                let pool = shared_pool.clone();
+                let flush_size = BATCH_SIZE;
+                let worker_db = worker_db_path.clone();
 
-                let num_threads = jwalk_num_threads();
-                let current_pass = pass;
-                let mut builder = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
-                    .follow_links(false)
-                    .skip_hidden(false)
-                    .parallelism(jwalk::Parallelism::RayonNewPool(num_threads));
-                if pass == 0 {
-                    builder = builder.max_depth(SHALLOW_SCAN_DEPTH);
-                }
-                let walker = builder.process_read_dir(move |_depth, path, _state, children| {
-                    children.retain_mut(|entry_result| {
-                        match entry_result {
-                            Ok(entry) => {
-                                let full_path = path.join(&entry.file_name);
-                                if should_skip_path(&full_path, &skip_roots, &skip_patterns) {
-                                    return false;
-                                }
-                                // Skip metadata pre-fetch for pass-1 shallow entries
-                                // (they'll be skipped in the main loop anyway).
-                                if current_pass != 1 || entry.depth > SHALLOW_SCAN_DEPTH {
-                                    entry.client_state = fs::symlink_metadata(&full_path).ok();
-                                }
-                                true
-                            }
-                            Err(_) => false,
-                        }
-                    });
-                });
+                scope.spawn(move || {
+                    let worker_conn = db_connection(&worker_db).ok();
+                    let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
+                    let mut local_scanned = 0u64;
+                    let mut local_indexed = 0u64;
+                    let mut local_perm_errors = 0u64;
+                    let mut local_path = String::new();
 
-                for result in walker {
-                    match result {
-                        Ok(entry) => {
-                            let entry_depth = entry.depth;
-                            let path = entry.path();
-                            if path == root.as_path() {
-                                continue;
-                            }
+                    for i in (worker_idx..roots_ref.len()).step_by(n_w) {
+                        let root = &roots_ref[i];
+                        let root_started = Instant::now();
+                        let mut root_scanned = 0u64;
+                        let mut root_indexed = 0u64;
+                        let mut root_perm_errors = 0u64;
+                        let root_str = root.to_string_lossy().to_string();
 
-                            // Pass 1: skip shallow entries already indexed in pass 0.
-                            if pass == 1 && entry_depth <= SHALLOW_SCAN_DEPTH {
-                                continue;
-                            }
+                        let mut existing = worker_conn
+                            .as_ref()
+                            .map(|c| preload_existing_entries(c, &root_str))
+                            .unwrap_or_default();
+                        // The walk below skips the root entry itself (its row is
+                        // maintained by the scan_root direct-children loop) — it
+                        // must not be treated as vanished.
+                        existing.remove(&root_str);
 
-                            scanned += 1;
-                            root_scanned += 1;
-                            current_path = path.to_string_lossy().to_string();
+                        let s_roots = skip_roots.clone();
+                        let s_patterns = skip_patterns.clone();
+                        let walker =
+                            jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
+                                .follow_links(false)
+                                .skip_hidden(false)
+                                .parallelism(jwalk::Parallelism::RayonExistingPool {
+                                    pool: pool.clone(),
+                                    busy_timeout: None,
+                                })
+                                .process_read_dir(move |_depth, path, _state, children| {
+                                    children.retain_mut(|entry_result| match entry_result {
+                                        Ok(entry) => {
+                                            let full_path = path.join(&entry.file_name);
+                                            if should_skip_path(
+                                                &full_path,
+                                                &s_roots,
+                                                &s_patterns,
+                                            ) {
+                                                return false;
+                                            }
+                                            entry.client_state =
+                                                fs::symlink_metadata(&full_path).ok();
+                                            true
+                                        }
+                                        Err(_) => false,
+                                    });
+                                });
 
-                            let metadata = match entry.client_state {
-                                Some(m) => m,
-                                None => {
-                                    permission_errors += 1;
-                                    root_permission_errors += 1;
-                                    continue;
-                                }
-                            };
-
-                            if let Some(mut row) =
-                                index_row_from_path_and_metadata(&path, &metadata)
-                            {
-                                row.run_id = current_run_id;
-                                if let Some((old_mtime, old_size)) = existing.get(&row.path) {
-                                    if *old_mtime == row.mtime && *old_size == row.size {
-                                        stamp_batch.push(row.path);
-                                    } else {
-                                        indexed += 1;
-                                        root_indexed += 1;
-                                        batch.push(row);
+                        for result in walker {
+                            match result {
+                                Ok(entry) => {
+                                    let path = entry.path();
+                                    if path == root.as_path() {
+                                        continue;
                                     }
-                                } else {
-                                    indexed += 1;
-                                    root_indexed += 1;
-                                    batch.push(row);
+                                    local_scanned += 1;
+                                    root_scanned += 1;
+                                    local_path = path.to_string_lossy().to_string();
+
+                                    let metadata = match entry.client_state {
+                                        Some(m) => m,
+                                        None => {
+                                            local_perm_errors += 1;
+                                            root_perm_errors += 1;
+                                            continue;
+                                        }
+                                    };
+
+                                    if let Some(mut row) =
+                                        index_row_from_path_and_metadata(&path, &metadata)
+                                    {
+                                        row.run_id = run_id;
+                                        if !row_unchanged(&mut existing, &row) {
+                                            local_indexed += 1;
+                                            root_indexed += 1;
+                                            local_batch.push(row);
+                                        }
+                                    }
+
+                                    if local_batch.len() >= flush_size {
+                                        let _ = tx.send((
+                                            std::mem::replace(
+                                                &mut local_batch,
+                                                Vec::with_capacity(flush_size),
+                                            ),
+                                            Vec::new(),
+                                            local_scanned,
+                                            local_indexed,
+                                            local_perm_errors,
+                                            local_path.clone(),
+                                        ));
+                                        local_scanned = 0;
+                                        local_indexed = 0;
+                                        local_perm_errors = 0;
+                                    }
+                                }
+                                Err(err) => {
+                                    local_scanned += 1;
+                                    root_scanned += 1;
+                                    local_perm_errors += 1;
+                                    root_perm_errors += 1;
+                                    if local_perm_errors <= 20 || perf_log_enabled() {
+                                        eprintln!("[index] permission error: {}", err);
+                                    }
                                 }
                             }
-
-                            if batch.len() >= flush_batch_size {
-                                upsert_rows(conn, &batch)?;
-                                batch.clear();
-                            }
-
-                            if stamp_batch.len() >= flush_batch_size {
-                                stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-                                stamp_batch.clear();
-                            }
-
-                            if last_emit.elapsed() >= Duration::from_millis(200) {
-                                set_progress(state, scanned, indexed, &current_path);
-                                emit_index_progress(app, scanned, indexed, current_path.clone());
-                                last_emit = Instant::now();
-                            }
-                            if perf_log_enabled()
-                                && last_perf_emit.elapsed() >= Duration::from_secs(1)
-                            {
-                                perf_log(format!(
-                                    "index_progress pass={} scanned={} indexed={} current_path={}",
-                                    pass_label, scanned, indexed, current_path
-                                ));
-                                last_perf_emit = Instant::now();
-                            }
                         }
-                        Err(err) => {
-                            scanned += 1;
-                            root_scanned += 1;
-                            permission_errors += 1;
-                            root_permission_errors += 1;
-                            if permission_errors <= 20 || perf_log_enabled() {
-                                eprintln!("[index] permission error: {}", err);
-                            }
+
+                        // Rows still in the map were not seen on disk: deleted.
+                        if !existing.is_empty() {
+                            let deletes: Vec<String> = existing.into_keys().collect();
+                            let _ = tx.send((
+                                Vec::new(),
+                                deletes,
+                                0,
+                                0,
+                                0,
+                                String::new(),
+                            ));
                         }
+
+                        eprintln!(
+                            "[timing]   walk_catchup {} {}ms scanned={} indexed={} err={}",
+                            root_str,
+                            root_started.elapsed().as_millis(),
+                            root_scanned,
+                            root_indexed,
+                            root_perm_errors,
+                        );
                     }
+
+                    if !local_batch.is_empty() || local_scanned > 0 || local_perm_errors > 0 {
+                        let _ = tx.send((
+                            local_batch,
+                            Vec::new(),
+                            local_scanned,
+                            local_indexed,
+                            local_perm_errors,
+                            local_path,
+                        ));
+                    }
+                });
+            }
+
+            drop(row_tx);
+
+            for (worker_batch, deletes, s, i, pe, path) in row_rx {
+                scanned += s;
+                indexed += i;
+                permission_errors += pe;
+                if !path.is_empty() {
+                    current_path = path;
                 }
-
-                pass_scanned += root_scanned;
-                pass_indexed += root_indexed;
-
-                eprintln!(
-                    "[timing]   walk_{} {} {}ms scanned={} indexed={} err={}",
-                    pass_label,
-                    root_str,
-                    root_started.elapsed().as_millis(),
-                    root_scanned,
-                    root_indexed,
-                    root_permission_errors
-                );
-                perf_log(format!(
-                    "index_root_done pass={} root={} elapsed_ms={} scanned={} indexed={} permission_errors={}",
-                    pass_label,
-                    root.to_string_lossy(),
-                    root_started.elapsed().as_millis(),
-                    root_scanned,
-                    root_indexed,
-                    root_permission_errors,
-                ));
+                if !worker_batch.is_empty() {
+                    upsert_rows(conn, &worker_batch)?;
+                }
+                if !deletes.is_empty() {
+                    catchup_deleted += delete_paths(conn, &deletes)? as u64;
+                }
+                if last_emit.elapsed() >= Duration::from_millis(200) {
+                    set_progress(state, scanned, indexed, &current_path);
+                    if let Some(app) = app {
+                        emit_index_progress(app, scanned, indexed, current_path.clone());
+                    }
+                    last_emit = Instant::now();
+                }
+                if perf_log_enabled() && last_perf_emit.elapsed() >= Duration::from_secs(1) {
+                    perf_log(format!(
+                        "index_progress pass=catchup_par scanned={} indexed={} current_path={}",
+                        scanned, indexed, current_path
+                    ));
+                    last_perf_emit = Instant::now();
+                }
             }
+            Ok(())
+        })?;
 
-            // Flush between passes.
-            if !batch.is_empty() {
-                upsert_rows(conn, &batch)?;
-                batch.clear();
-            }
-            if !stamp_batch.is_empty() {
-                stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-                stamp_batch.clear();
-            }
-
-            perf_log(format!(
-                "index_pass_done pass={} elapsed_ms={} scanned={} indexed={}",
-                pass_label,
-                pass_started.elapsed().as_millis(),
-                pass_scanned,
-                pass_indexed,
-            ));
-
-            // After shallow pass emit progress so UI shows searchable state early.
-            if pass == 0 {
-                let _ = refresh_and_emit_status_counts(app, state);
-                let _ = app.emit(
-                    "index_updated",
-                    IndexUpdatedEvent {
-                        entries_count: state.status.lock().entries_count,
-                        last_updated: now_epoch(),
-                        permission_errors,
-                    },
-                );
-            }
-        }
+        perf_log(format!(
+            "index_pass_done pass=catchup_par elapsed_ms={} scanned={} indexed={} deleted={}",
+            par_started.elapsed().as_millis(),
+            scanned,
+            indexed,
+            catchup_deleted,
+        ));
     }
 
     if !batch.is_empty() {
         upsert_rows(conn, &batch)?;
     }
 
-    if !stamp_batch.is_empty() {
-        stamp_run_id_batch(conn, &stamp_batch, current_run_id)?;
-    }
-
-    // Fresh index: rebuild FTS from all inserted rows (single bulk op),
-    // then recreate FTS triggers for future incremental updates.
-    if is_fresh {
-        let fts_t = Instant::now();
-        let _ = conn.execute_batch(REBUILD_FTS_SQL);
-        let _ = conn.execute_batch(CREATE_FTS_TRIGGERS_SQL);
-        state.fts_ready.store(true, AtomicOrdering::Release);
-        eprintln!("[index] fts_rebuild {}ms", fts_t.elapsed().as_millis());
-    }
+    // Fresh index: FTS rebuild + trigger recreation happen in
+    // finalize_fresh_index on the background finalizing thread; fts_ready
+    // stays false so search keeps using the LIKE fallbacks until then.
 
     set_progress(state, scanned, indexed, &current_path);
-    emit_index_progress(app, scanned, indexed, current_path.clone());
+    if let Some(app) = app {
+        emit_index_progress(app, scanned, indexed, current_path.clone());
+    }
 
-    // Remove entries not seen in this run (deleted files)
-    // Fresh index: DB was empty before this run, no stale entries possible
-    let deleted_count: i64 = if is_fresh {
-        0
-    } else {
-        let count = conn
-            .query_row(
-                "SELECT COUNT(*) FROM entries WHERE run_id < ?1",
-                params![current_run_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        conn.execute(
-            "DELETE FROM entries WHERE run_id < ?1",
-            params![current_run_id],
-        )
-        .map_err(|e| e.to_string())?;
-        count
-    };
+    // Deleted files were removed as preload-map leftovers per root during the
+    // catchup scan (set difference), replacing the old full-table run_id sweep.
+    let deleted_count: i64 = catchup_deleted as i64;
 
     set_meta(conn, "last_run_id", &current_run_id.to_string())?;
 
@@ -2890,8 +3157,10 @@ fn run_incremental_index_inner(
             None
         };
     }
-    emit_index_progress(app, scanned, indexed, current_path);
-    emit_index_updated(app, entries_count, updated_at, permission_errors);
+    if let Some(app) = app {
+        emit_index_progress(app, scanned, indexed, current_path);
+        emit_index_updated(app, entries_count, updated_at, permission_errors);
+    }
     perf_log(format!(
         "index_scan_done scanned={} indexed={} deleted={} entries={} permission_errors={}",
         scanned, indexed, deleted_count, entries_count, permission_errors
@@ -2981,23 +3250,32 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
     }
 
     let op_start = std::time::Instant::now();
-    let mut conn = db_connection(&state.db_path).map_err(|e| {
-        eprintln!(
-            "[watcher] db_connection FAILED after {}ms: {} (upsert={} delete={} indexing_active={})",
-            op_start.elapsed().as_millis(),
-            e,
-            to_upsert.len(),
-            to_delete.len(),
-            state.indexing_active.load(AtomicOrdering::Acquire)
-        );
-        e
-    })?;
-    let mut changed = 0;
+    // Reuse one persistent write connection across event batches: opening a
+    // connection per batch dominated the cost of small (single-file) updates.
+    let mut conn_slot = state.watcher_conn.lock();
+    if conn_slot.is_none() {
+        *conn_slot = Some(db_connection(&state.db_path).map_err(|e| {
+            eprintln!(
+                "[watcher] db_connection FAILED after {}ms: {} (upsert={} delete={} indexing_active={})",
+                op_start.elapsed().as_millis(),
+                e,
+                to_upsert.len(),
+                to_delete.len(),
+                state.indexing_active.load(AtomicOrdering::Acquire)
+            );
+            e
+        })?);
+    }
+    let conn = conn_slot.as_mut().expect("watcher connection present");
 
-    changed += upsert_rows(&mut conn, &to_upsert)?;
-    changed += delete_paths(&mut conn, &to_delete)?;
-
-    Ok(changed)
+    let result = upsert_rows(conn, &to_upsert)
+        .and_then(|up| delete_paths(conn, &to_delete).map(|del| up + del));
+    if result.is_err() {
+        // Drop the connection on failure so the next batch reopens cleanly
+        // (the caller already handles busy-retry by re-queueing paths).
+        *conn_slot = None;
+    }
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -3574,6 +3852,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         // Fast reset: rename entries (O(1), no data movement) → create new empty table
         // → FTS rebuild from empty content table (instant) → background DROP old table.
         // This avoids per-row WAL writes that make DELETE FROM entries slow at scale.
+        let _ = set_meta(&conn, "fts_dirty", "1");
         let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
         let _ = conn.execute_batch("DROP TABLE IF EXISTS entries_gc_reset;");
         conn.execute_batch("ALTER TABLE entries RENAME TO entries_gc_reset;")
@@ -3586,6 +3865,8 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         // after indexing completes — avoids a race between DROP TABLE and the new indexer
         // both competing for the SQLite WAL write lock.
 
+        // Clears every meta row (last_run_id, cached counts, and the fts_dirty=1
+        // set above) so the follow-up index runs fresh with a clean FTS.
         conn.execute("DELETE FROM meta", [])
             .map_err(|e| e.to_string())?;
 
@@ -3602,6 +3883,9 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         }
 
         invalidate_search_caches(&state);
+        // Schema was swapped (entries renamed + recreated): drop pooled search
+        // connections so nothing holds statements against the old table.
+        state.search_conn_pool.lock().clear();
 
         emit_index_state(&app, "Indexing", None);
         emit_index_updated(&app, 0, now_epoch(), 0);
@@ -3656,12 +3940,11 @@ fn search_log_enabled() -> bool {
 
 /// Returns the total number of entries matching `query` without LIMIT/OFFSET.
 /// Returns `None` when the total is unknown or intentionally skipped.
-fn compute_total_count(
-    db_path: &Path,
-    home_dir: &Path,
-    execution: &SearchExecution,
-    fts_ready: bool,
-) -> Option<u32> {
+fn compute_total_count(state: &AppState, execution: &SearchExecution) -> Option<u32> {
+    let home_dir = &state.home_dir;
+    // Read once here, as `execute_search` does independently — the count path
+    // and the result path each snapshot `fts_ready` after the search runs.
+    let fts_ready = state.fts_ready.load(AtomicOrdering::Acquire);
     // When fewer results than the limit were returned the total is exact.
     if (execution.results.len() as u32) < execution.effective_limit {
         return Some(
@@ -3683,8 +3966,18 @@ fn compute_total_count(
     {
         return Some(execution.results.len() as u32);
     }
-    let Ok(conn) = db_connection_for_search(db_path) else {
+    let Ok(conn) = pooled_search_connection(state) else {
         return None;
+    };
+    // Counting matches from the trigram postings alone: joining entries just to
+    // count doubles the work, and the FTS index is authoritative while in sync.
+    let fts_only_count = |query: &str| -> u32 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entries_fts WHERE entries_fts MATCH ?1",
+            params![fts_phrase(query)],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
     };
     let mode = parse_query(&execution.query);
     let total = match mode {
@@ -3692,17 +3985,9 @@ fn compute_total_count(
             .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
             .unwrap_or(0),
         SearchMode::NameSearch { name_like } => {
-            if execution.sort_by != "name" && execution.query.chars().count() >= 3 && fts_ready {
-                let fts_match = format!("\"{}\"", execution.query.replace('"', "\"\""));
-                conn.query_row(
-                    "SELECT COUNT(*) \
-                     FROM entries_fts f \
-                     JOIN entries e ON e.id = f.rowid \
-                     WHERE entries_fts MATCH ?1",
-                    params![fts_match],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0)
+            let fts_ok = fts_ready && execution.query.chars().count() >= 3;
+            if execution.sort_by != "name" && fts_ok {
+                fts_only_count(&execution.query)
             } else {
                 let escaped = escape_like(&execution.query);
                 let prefix_like = format!("{}%", escaped);
@@ -3715,6 +4000,9 @@ fn compute_total_count(
                     .unwrap_or(0);
                 if prefix_count > 0 {
                     prefix_count
+                } else if fts_ok {
+                    // Phase-2 contains fallback was served by FTS.
+                    fts_only_count(&execution.query)
                 } else {
                     // Phase-2 contains fallback was used.
                     conn.query_row(
@@ -3726,13 +4014,25 @@ fn compute_total_count(
                 }
             }
         }
-        SearchMode::GlobName { name_like } => conn
-            .query_row(
-                "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
-                params![name_like],
-                |r| r.get(0),
-            )
-            .unwrap_or(0),
+        SearchMode::GlobName { name_like } => {
+            let fts_prefilter = glob_fts_prefilter(fts_ready, &name_like, &execution.query);
+            if let Some(match_expr) = fts_prefilter {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries_fts f JOIN entries e ON e.id = f.rowid \
+                     WHERE entries_fts MATCH ?1 AND e.name LIKE ?2 ESCAPE '\\'",
+                    params![match_expr, name_like],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0)
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries WHERE name LIKE ?1 ESCAPE '\\'",
+                    params![name_like],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0)
+            }
+        }
         SearchMode::ExtSearch { ext, .. } => conn
             .query_row(
                 "SELECT COUNT(*) FROM entries WHERE ext = ?1",
@@ -3972,7 +4272,7 @@ fn execute_search(
 
     #[cfg(target_os = "macos")]
     let db_unavailable;
-    match db_connection_for_search(&state.db_path) {
+    match pooled_search_connection(state) {
         Ok(conn) => {
             #[cfg(target_os = "macos")]
             { db_unavailable = false; }
@@ -3986,7 +4286,7 @@ fn execute_search(
                         LIMIT ?1 OFFSET ?2
                         "#,
                     );
-                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
                     let rows = stmt
                         .query_map(params![effective_limit, offset], row_to_entry)
                         .map_err(|e| e.to_string())?;
@@ -4002,7 +4302,7 @@ fn execute_search(
                         // prefix results, causing contains matches to be silently excluded
                         // (e.g. a large file "myapp_foo.zip" missing from size-desc results).
                         // FTS5 trigram index covers all substring matches in one indexed pass.
-                        let fts_match = format!("\"{}\"", query.replace('"', "\"\""));
+                        let fts_match = fts_phrase(&query);
                         let sql = format!(
                             r#"
                             SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
@@ -4013,7 +4313,7 @@ fn execute_search(
                             LIMIT ?2 OFFSET ?3
                             "#,
                         );
-                        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
                         let rows = stmt
                             .query_map(params![fts_match, effective_limit, offset], row_to_entry)
                             .map_err(|e| e.to_string())?;
@@ -4037,7 +4337,7 @@ fn execute_search(
                             LIMIT ?2
                             "#,
                         );
-                        let mut stmt = conn.prepare(&exact_sql).map_err(|e| e.to_string())?;
+                        let mut stmt = conn.prepare_cached(&exact_sql).map_err(|e| e.to_string())?;
                         let rows = stmt
                             .query_map(params![exact_query, effective_limit], row_to_entry)
                             .map_err(|e| e.to_string())?;
@@ -4077,11 +4377,11 @@ fn execute_search(
                             LIMIT ?3 OFFSET ?4
                             "#,
                         );
-                        let mut stmt = match conn.prepare(&prefix_sql_indexed) {
+                        let mut stmt = match conn.prepare_cached(&prefix_sql_indexed) {
                             Ok(s) => s,
                             Err(_) => {
                                 eprintln!("[search] idx_entries_name_nocase unavailable, using fallback");
-                                conn.prepare(&prefix_sql_fallback).map_err(|e| e.to_string())?
+                                conn.prepare_cached(&prefix_sql_fallback).map_err(|e| e.to_string())?
                             }
                         };
                         let rows = stmt
@@ -4095,9 +4395,47 @@ fn execute_search(
                         }
                     }
 
-                    if results.is_empty() && offset == 0 {
-                        // Phase 2: contains-match (LIKE '%q%') with tight time budget.
-                        // Combines probe + fetch in one pass to avoid double scan overhead.
+                    if results.is_empty() && fts_ready && query.chars().count() >= 3 {
+                        // Phase 2: contains-match via FTS5 trigram — indexed, complete
+                        // (no time budget), and paginatable. Reached only when exact and
+                        // prefix found nothing, so no exclusion predicates are needed.
+                        // For offset>0 the page belongs to the contains result set only
+                        // when the query has no prefix matches at all (guard below).
+                        let serve_contains_page = if offset == 0 {
+                            true
+                        } else {
+                            !conn
+                                .query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM entries WHERE name LIKE ?1 ESCAPE '\\')",
+                                    params![prefix_like],
+                                    |r| r.get::<_, bool>(0),
+                                )
+                                .unwrap_or(true)
+                        };
+                        if serve_contains_page {
+                            let fts_match = fts_phrase(&query);
+                            let phase2_sql = format!(
+                                r#"
+                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                                FROM entries_fts f
+                                JOIN entries e ON e.id = f.rowid
+                                WHERE entries_fts MATCH ?1
+                                ORDER BY {order_by}
+                                LIMIT ?2 OFFSET ?3
+                                "#,
+                            );
+                            let mut stmt2 =
+                                conn.prepare_cached(&phase2_sql).map_err(|e| e.to_string())?;
+                            let rows2 = stmt2
+                                .query_map(params![fts_match, effective_limit, offset], row_to_entry)
+                                .map_err(|e| e.to_string())?;
+                            for row in rows2 {
+                                results.push(row.map_err(|e| e.to_string())?);
+                            }
+                        }
+                    } else if results.is_empty() && offset == 0 {
+                        // Phase 2 fallback (query < 3 chars or FTS rebuilding):
+                        // contains-match (LIKE '%q%') with tight time budget.
                         let phase2_start = Instant::now();
                         conn.progress_handler(
                             2_000,
@@ -4139,21 +4477,49 @@ fn execute_search(
                 }
 
                 SearchMode::GlobName { name_like } => {
-                    let sql = format!(
-                        r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                        FROM entries e
-                        WHERE e.name LIKE ?1 ESCAPE '\'
-                        ORDER BY {order_by}
-                        LIMIT ?2 OFFSET ?3
-                        "#,
-                    );
-                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map(params![name_like, effective_limit, offset], row_to_entry)
-                        .map_err(|e| e.to_string())?;
-                    for row in rows {
-                        results.push(row.map_err(|e| e.to_string())?);
+                    // Leading-wildcard patterns can't use the name index; narrow with the
+                    // FTS trigram index on literal runs first, then verify the full glob
+                    // with LIKE. Prefix-shaped patterns keep the plain LIKE (index range).
+                    let fts_prefilter = glob_fts_prefilter(fts_ready, name_like, &query);
+                    if let Some(match_expr) = fts_prefilter {
+                        let sql = format!(
+                            r#"
+                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                            FROM entries_fts f
+                            JOIN entries e ON e.id = f.rowid
+                            WHERE entries_fts MATCH ?1
+                              AND e.name LIKE ?2 ESCAPE '\'
+                            ORDER BY {order_by}
+                            LIMIT ?3 OFFSET ?4
+                            "#,
+                        );
+                        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                        let rows = stmt
+                            .query_map(
+                                params![match_expr, name_like, effective_limit, offset],
+                                row_to_entry,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        for row in rows {
+                            results.push(row.map_err(|e| e.to_string())?);
+                        }
+                    } else {
+                        let sql = format!(
+                            r#"
+                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                            FROM entries e
+                            WHERE e.name LIKE ?1 ESCAPE '\'
+                            ORDER BY {order_by}
+                            LIMIT ?2 OFFSET ?3
+                            "#,
+                        );
+                        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                        let rows = stmt
+                            .query_map(params![name_like, effective_limit, offset], row_to_entry)
+                            .map_err(|e| e.to_string())?;
+                        for row in rows {
+                            results.push(row.map_err(|e| e.to_string())?);
+                        }
                     }
                 }
 
@@ -4167,7 +4533,7 @@ fn execute_search(
                         LIMIT ?2 OFFSET ?3
                         "#,
                     );
-                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
                     let rows = stmt
                         .query_map(params![ext, effective_limit, offset], row_to_entry)
                         .map_err(|e| e.to_string())?;
@@ -4238,7 +4604,8 @@ fn execute_search(
                             LIMIT ?{limit_idx} OFFSET ?{offset_idx}
                             "#,
                         );
-                        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                        // Dynamic shape (one condition per resolved dir): not worth caching.
+                        let mut stmt = conn.prepare(sql.as_str()).map_err(|e| e.to_string())?;
                         let rows = stmt
                             .query_map(params_from_iter(sql_params.iter()), row_to_entry)
                             .map_err(|e| e.to_string())?;
@@ -4271,7 +4638,7 @@ fn execute_search(
                                 LIMIT ?4 OFFSET ?5
                                 "#,
                             );
-                            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                            let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
                             let rows = stmt
                                 .query_map(
                                     params![
@@ -4298,7 +4665,7 @@ fn execute_search(
                                 LIMIT ?3 OFFSET ?4
                                 "#,
                             );
-                            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                            let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
                             let rows = stmt
                                 .query_map(
                                     params![dir_like_exact, dir_like_sub, effective_limit, offset],
@@ -4335,7 +4702,7 @@ fn execute_search(
                                         LIMIT ?4
                                         "#,
                                     );
-                                    if let Ok(mut stmt) = conn.prepare(&sql) {
+                                    if let Ok(mut stmt) = conn.prepare_cached(&sql) {
                                         if let Ok(rows) = stmt.query_map(
                                             params![
                                                 pfx,
@@ -4374,7 +4741,7 @@ fn execute_search(
                                     LIMIT ?4 OFFSET ?5
                                     "#,
                                 );
-                                if let Ok(mut stmt) = conn.prepare(&sql) {
+                                if let Ok(mut stmt) = conn.prepare_cached(&sql) {
                                     if let Ok(rows) = stmt.query_map(
                                         params![
                                             dir_like_exact,
@@ -4546,8 +4913,7 @@ async fn search(
         let include_total = include_total.unwrap_or(true);
         let count_started = Instant::now();
         let (total_count, total_known) = if include_total {
-            let fts_ok = state.fts_ready.load(AtomicOrdering::Acquire);
-            match compute_total_count(&state.db_path, &state.home_dir, &execution, fts_ok) {
+            match compute_total_count(&state, &execution) {
                 Some(v) => (v, true),
                 None => (0, false),
             }
@@ -4648,6 +5014,18 @@ async fn open(paths: Vec<String>) -> AppResult<()> {
                     }
                 } else if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
+                    // kLSApplicationNotFoundErr: no app claims this file type.
+                    // Hand the open to Finder, which shows the system
+                    // "no application set to open" chooser dialog.
+                    if stderr.contains("kLSApplicationNotFoundErr") || stderr.contains("-10814") {
+                        let fallback = Command::new("open")
+                            .args(["-a", "Finder", path])
+                            .status()
+                            .map_err(|e| e.to_string())?;
+                        if fallback.success() {
+                            continue;
+                        }
+                    }
                     return Err(format!("Failed to open: {path} ({stderr})",));
                 }
             }
@@ -5600,27 +5978,6 @@ fn start_bench_runner(app_handle: AppHandle, state: AppState) {
     });
 }
 
-#[cfg(target_os = "macos")]
-fn register_global_shortcut(app: &AppHandle) -> AppResult<()> {
-    let shortcut = Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
-
-    app.global_shortcut()
-        .on_shortcut(shortcut, move |app_handle, _, _| {
-            if let Some(window) = app_handle.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-            let _ = app_handle.emit("focus_search", ());
-        })
-        .map_err(|e| format!("Failed to register global shortcut: {e}"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn register_global_shortcut(_app: &AppHandle) -> AppResult<()> {
-    Ok(())
-}
-
 fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     let setup_started = std::time::Instant::now();
     eprintln!("[startup] setup_app() entered");
@@ -5718,13 +6075,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         watcher_active: Arc::new(AtomicBool::new(false)),
         frontend_ready: Arc::new(AtomicBool::new(false)),
         pathindexing_active: Arc::new(AtomicBool::new(false)),
+        search_conn_pool: Arc::new(Mutex::new(Vec::new())),
+        watcher_conn: Arc::new(Mutex::new(None)),
     };
 
     eprintln!("[startup] +{}ms AppState created", setup_started.elapsed().as_millis());
     app.manage(state.clone());
-    if !bench_mode {
-        register_global_shortcut(&app.handle())?;
-    }
     // Context menu item IDs use the "ctx_" prefix by convention.
     // All matching IDs are forwarded as "context_menu_action" events to the frontend.
     #[cfg(target_os = "macos")]
@@ -5744,7 +6100,6 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             let _ = app.emit("context_menu_action", action);
         });
     }
-    eprintln!("[startup] +{}ms global shortcut registered", setup_started.elapsed().as_millis());
     if bench_mode {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.hide();
@@ -5768,6 +6123,15 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
         state.db_ready.store(true, AtomicOrdering::Release);
         eprintln!("[startup/thread] +{}ms db_ready=true -- launching indexing immediately", thread_started.elapsed().as_millis());
+
+        // If a previous run crashed mid FTS rebuild, don't trust the FTS index
+        // until the healing rebuild (finalize_fresh_index) completes.
+        if let Ok(c) = db_connection(&state.db_path) {
+            if get_meta(&c, "fts_dirty").map(|v| v == "1").unwrap_or(false) {
+                eprintln!("[startup/thread] fts_dirty=1 -- FTS disabled until rebuild");
+                state.fts_ready.store(false, AtomicOrdering::Release);
+            }
+        }
 
         // Deferred housekeeping -- purge + status counts run in background
         {
@@ -5978,8 +6342,7 @@ pub fn run() {
     }
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_decorum::init())
-        .plugin(tauri_plugin_drag::init())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+        .plugin(tauri_plugin_drag::init());
 
     if !cfg!(debug_assertions) {
         builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
@@ -6105,6 +6468,8 @@ mod tests {
             watcher_active: Arc::new(AtomicBool::new(false)),
             frontend_ready: Arc::new(AtomicBool::new(true)),
             pathindexing_active: Arc::new(AtomicBool::new(false)),
+            search_conn_pool: Arc::new(Mutex::new(Vec::new())),
+            watcher_conn: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -6521,5 +6886,465 @@ mod tests {
         assert!(result.results[0].name == "archive.tar.gz");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fts_phrase_quotes_and_escapes() {
+        assert_eq!(fts_phrase("test"), "\"test\"");
+        assert_eq!(fts_phrase("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn glob_fts_match_expr_extracts_literal_runs() {
+        assert_eq!(
+            glob_fts_match_expr("*test*.js"),
+            Some("\"test\" AND \".js\"".to_string())
+        );
+        assert_eq!(glob_fts_match_expr("icon*"), Some("\"icon\"".to_string()));
+        // runs shorter than a trigram are dropped
+        assert_eq!(glob_fts_match_expr("*ab*cd*"), None);
+        assert_eq!(glob_fts_match_expr("a?b"), None);
+        // ? splits runs like * (".md" is 3 chars, kept)
+        assert_eq!(
+            glob_fts_match_expr("spec?.md"),
+            Some("\"spec\" AND \".md\"".to_string())
+        );
+        assert_eq!(glob_fts_match_expr("***"), None);
+    }
+
+    #[test]
+    fn like_pattern_unindexable_detects_leading_wildcard() {
+        assert!(like_pattern_unindexable("%test%.js"));
+        assert!(like_pattern_unindexable("_est"));
+        assert!(!like_pattern_unindexable("icon%"));
+        assert!(!like_pattern_unindexable("te_st%"));
+    }
+
+    /// Contains-search via FTS phase 2 must return complete results and support
+    /// pagination (offset > 0) when the query has no prefix matches.
+    #[test]
+    fn execute_search_fts_contains_returns_and_paginates() {
+        let root = temp_case_dir("fts_contains_paginate");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        let now = now_epoch();
+        // Names that CONTAIN "zzfrag" but never start with it.
+        for i in 0..10 {
+            let name = format!("file_zzfrag_{i:02}.txt");
+            let path = root.join(&name);
+            conn.execute(
+                "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+                 VALUES(?1, ?2, ?3, 0, 'txt', NULL, NULL, ?4, 1)",
+                params![
+                    path.to_string_lossy().to_string(),
+                    name,
+                    root.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let state = test_state_for(db_path.clone(), root.clone(), root.clone());
+        state.status.lock().state = IndexState::Ready;
+
+        // Page 1: all 6 requested rows present (complete contains results).
+        let page1 = execute_search(
+            &state,
+            "zzfrag".to_string(),
+            Some(6),
+            Some(0),
+            Some("name".to_string()),
+            Some("asc".to_string()),
+        )
+        .unwrap();
+        assert_eq!(page1.results.len(), 6, "page1: {:?}", page1.mode_label);
+        // Page 2: remaining 4 rows via offset pagination.
+        let page2 = execute_search(
+            &state,
+            "zzfrag".to_string(),
+            Some(6),
+            Some(6),
+            Some("name".to_string()),
+            Some("asc".to_string()),
+        )
+        .unwrap();
+        assert_eq!(page2.results.len(), 4, "page2: {:?}", page2.mode_label);
+        let mut all: Vec<String> = page1
+            .results
+            .iter()
+            .chain(page2.results.iter())
+            .map(|e| e.name.clone())
+            .collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 10, "no dup/missing rows across pages");
+
+        // Total count matches the contains set.
+        let total = compute_total_count(&state, &page1);
+        assert_eq!(total, Some(10));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Glob with leading wildcard goes through the FTS prefilter and must return
+    /// the same rows as plain LIKE evaluation.
+    #[test]
+    fn execute_search_glob_fts_prefilter_matches_like() {
+        let root = temp_case_dir("glob_fts_prefilter");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        let now = now_epoch();
+        for (name, ext) in [
+            ("alpha_test_one.js", "js"),
+            ("beta_test_two.js", "js"),
+            ("gamma_test.ts", "ts"),
+            ("delta_other.js", "js"),
+            ("TEST_upper.JS", "js"),
+        ] {
+            let path = root.join(name);
+            conn.execute(
+                "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+                 VALUES(?1, ?2, ?3, 0, ?4, NULL, NULL, ?5, 1)",
+                params![
+                    path.to_string_lossy().to_string(),
+                    name,
+                    root.to_string_lossy().to_string(),
+                    ext,
+                    now
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let state = test_state_for(db_path.clone(), root.clone(), root.clone());
+        state.status.lock().state = IndexState::Ready;
+
+        let result = execute_search(
+            &state,
+            "*test*.js".to_string(),
+            Some(300),
+            Some(0),
+            Some("name".to_string()),
+            Some("asc".to_string()),
+        )
+        .unwrap();
+        let mut names: Vec<&str> = result.results.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        // LIKE is ASCII-case-insensitive: TEST_upper.JS matches too.
+        assert_eq!(
+            names,
+            vec!["TEST_upper.JS", "alpha_test_one.js", "beta_test_two.js"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Indexing benchmark against a synthetic tree (BENCH_TREE env var).
+    ///
+    /// Measures the real pipeline: fresh index (parallel scan + bulk insert +
+    /// FTS rebuild + index build), no-change restart catchup, churn catchup,
+    /// and watcher-style incremental updates (apply_path_changes).
+    ///
+    /// Run:
+    /// ```sh
+    /// BENCH_TREE=/path/to/tree cargo test --release --manifest-path src-tauri/Cargo.toml \
+    ///   -- --ignored bench_index_speed --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_index_speed() {
+        let Ok(tree) = std::env::var("BENCH_TREE") else {
+            eprintln!("BENCH_TREE not set; skipping");
+            return;
+        };
+        let tree_root = PathBuf::from(&tree);
+        assert!(tree_root.is_dir(), "BENCH_TREE does not exist");
+        let work = temp_case_dir("bench_index_speed");
+        fs::create_dir_all(&work).unwrap();
+        let db_path = work.join("index.db");
+        init_db_tables(&db_path).unwrap();
+
+        let state = test_state_for(db_path.clone(), tree_root.clone(), tree_root.clone());
+
+        // 1) Fresh index (empty DB). The scan phase ends the user-visible
+        // "Indexing" state; DDL finalization runs on the finalizing thread in
+        // production — timed separately here.
+        let t = Instant::now();
+        run_incremental_index(None, &state).expect("fresh index");
+        let fresh_ready_ms = t.elapsed().as_millis();
+        let t_fin = Instant::now();
+        finalize_fresh_index(&state);
+        ensure_db_indexes(&db_path).unwrap();
+        let fresh_finalize_ms = t_fin.elapsed().as_millis();
+        let entries_after_fresh: i64 = db_connection(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        eprintln!(
+            "IDXBENCH fresh_ms={} fresh_ready_ms={fresh_ready_ms} fresh_finalize_bg_ms={fresh_finalize_ms} entries={entries_after_fresh}",
+            fresh_ready_ms + fresh_finalize_ms
+        );
+        assert!(entries_after_fresh > 0);
+        // FTS must be in sync after finalization (search relies on it).
+        let fts_count: i64 = db_connection(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entries_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, entries_after_fresh, "FTS in sync after fresh");
+
+        // 2) No-change catchup (app restart with warm index).
+        let t = Instant::now();
+        run_incremental_index(None, &state).expect("catchup");
+        eprintln!("IDXBENCH catchup_nochange_ms={}", t.elapsed().as_millis());
+        let entries_after_catchup: i64 = db_connection(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entries_after_fresh, entries_after_catchup);
+
+        // 3) Churn catchup: +1000 new files, -500 deleted, 500 modified.
+        let dirs: Vec<PathBuf> = fs::read_dir(&tree_root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert!(!dirs.is_empty());
+        let mut created = Vec::new();
+        for i in 0..1000 {
+            let p = dirs[i % dirs.len()].join(format!("churn_new_{i:04}.tmp"));
+            fs::write(&p, b"new").unwrap();
+            created.push(p);
+        }
+        let existing_files: Vec<PathBuf> = WalkDir::new(&dirs[0])
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| {
+                // exclude the churn files created above
+                !p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("churn_new_"))
+                    .unwrap_or(false)
+            })
+            .take(1000)
+            .collect();
+        assert!(existing_files.len() >= 1000, "need 1000 files in first dir");
+        for p in &existing_files[..500] {
+            fs::remove_file(p).unwrap();
+        }
+        for p in &existing_files[500..1000] {
+            fs::write(p, b"modified_content_larger").unwrap();
+        }
+        let t = Instant::now();
+        run_incremental_index(None, &state).expect("churn catchup");
+        eprintln!("IDXBENCH catchup_churn_ms={}", t.elapsed().as_millis());
+        let entries_after_churn: i64 = db_connection(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            entries_after_churn,
+            entries_after_fresh + 1000 - 500,
+            "churn bookkeeping"
+        );
+
+        // 4) Watcher-style updates. Realistic shapes: single-file change and
+        //    a 20-file burst, measured through apply_path_changes.
+        let mut single_ms = Vec::new();
+        for i in 0..20usize {
+            let p = &created[i];
+            fs::write(p, format!("touch_{i}_x")).unwrap();
+            let batch = vec![p.clone()];
+            let t = Instant::now();
+            apply_path_changes(&state, &batch).expect("watcher single");
+            single_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mut burst_ms = Vec::new();
+        for round in 0..10usize {
+            let batch: Vec<PathBuf> = (0..20)
+                .map(|i| {
+                    let p = created[100 + round * 20 + i].clone();
+                    fs::write(&p, format!("burst_{round}_{i}_xx")).unwrap();
+                    p
+                })
+                .collect();
+            let t = Instant::now();
+            apply_path_changes(&state, &batch).expect("watcher burst");
+            burst_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let med = |v: &mut Vec<f64>| -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        eprintln!(
+            "IDXBENCH watcher_single_med_ms={:.3} watcher_burst20_med_ms={:.3}",
+            med(&mut single_ms),
+            med(&mut burst_ms)
+        );
+
+        // Restore tree for reuse: remove churn artifacts, recreate deleted files.
+        for p in &created {
+            let _ = fs::remove_file(p);
+        }
+        for p in &existing_files[..500] {
+            let _ = fs::write(p, b"");
+        }
+        for p in &existing_files[500..1000] {
+            let _ = fs::write(p, b"");
+        }
+        let _ = fs::remove_dir_all(work);
+    }
+
+    /// Latency benchmark against a copy of a real index DB.
+    ///
+    /// Run:
+    /// ```sh
+    /// BENCH_DB=/path/to/bench.db BENCH_OUT=/path/to/report.json \
+    ///   cargo test --release --manifest-path src-tauri/Cargo.toml \
+    ///   -- --ignored bench_search_latency --nocapture
+    /// ```
+    /// Measures execute_search + compute_total_count per query (one UI keystroke
+    /// equals both). Negative-name cache is cleared between iterations so the DB
+    /// path is always exercised.
+    #[test]
+    #[ignore]
+    fn bench_search_latency() {
+        let Ok(db) = std::env::var("BENCH_DB") else {
+            eprintln!("BENCH_DB not set; skipping");
+            return;
+        };
+        let db_path = PathBuf::from(db);
+        assert!(db_path.exists(), "BENCH_DB does not exist");
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()));
+        let iters: u32 = std::env::var("BENCH_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+
+        let state = test_state_for(db_path.clone(), home.clone(), home.clone());
+        // Steady state: index complete (IndexStatus defaults to Indexing, which
+        // would trigger spotlight merging for sub-limit results).
+        state.status.lock().state = IndexState::Ready;
+
+        // (label, query, sort_by, sort_dir)
+        let cases: Vec<(&str, &str, &str, &str)> = vec![
+            ("type_t", "t", "name", "asc"),
+            ("type_te", "te", "name", "asc"),
+            ("type_tes", "tes", "name", "asc"),
+            ("type_test", "test", "name", "asc"),
+            ("contains_icon", "icon", "name", "asc"),
+            ("contains_index", "index", "name", "asc"),
+            ("contains_readme", "readme", "name", "asc"),
+            ("exact_main_rs", "main.rs", "name", "asc"),
+            ("exact_package_json", "package.json", "name", "asc"),
+            ("prefix_read", "read", "name", "asc"),
+            ("ext_png", "*.png", "name", "asc"),
+            ("ext_js", "*.js", "name", "asc"),
+            ("glob_test_js", "*test*.js", "name", "asc"),
+            ("glob_icon_star", "icon*", "name", "asc"),
+            ("path_src_js", "src/ *.js", "name", "asc"),
+            ("path_everything_main", "everything/ main", "name", "asc"),
+            ("sort_mtime_test", "test", "mtime", "desc"),
+            ("sort_size_test", "test", "size", "desc"),
+            ("empty_query", "", "name", "asc"),
+            ("no_match", "zzqx_no_match_9", "name", "asc"),
+        ];
+
+        fn fnv1a(s: &str) -> u64 {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in s.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+
+        let mut report = Vec::new();
+        for (label, query, sort_by, sort_dir) in &cases {
+            let mut search_ms = Vec::new();
+            let mut count_ms = Vec::new();
+            let mut mode = String::new();
+            let mut n_results = 0usize;
+            let mut total_count: Option<u32> = None;
+            let mut results_hash: u64 = 0;
+            let mut first_paths: Vec<String> = Vec::new();
+            for _ in 0..iters {
+                state.negative_name_cache.lock().clear();
+                let t0 = Instant::now();
+                let execution = execute_search(
+                    &state,
+                    query.to_string(),
+                    Some(300),
+                    Some(0),
+                    Some(sort_by.to_string()),
+                    Some(sort_dir.to_string()),
+                )
+                .expect("search failed");
+                search_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                let t1 = Instant::now();
+                total_count = compute_total_count(&state, &execution);
+                count_ms.push(t1.elapsed().as_secs_f64() * 1000.0);
+                mode = execution.mode_label.clone();
+                n_results = execution.results.len();
+                let joined = execution
+                    .results
+                    .iter()
+                    .map(|e| e.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                results_hash = fnv1a(&joined);
+                first_paths = execution
+                    .results
+                    .iter()
+                    .take(3)
+                    .map(|e| e.path.clone())
+                    .collect();
+            }
+            let med = |v: &mut Vec<f64>| -> f64 {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let s_med = med(&mut search_ms);
+            let c_med = med(&mut count_ms);
+            let s_min = search_ms.first().copied().unwrap_or(0.0);
+            let s_max = search_ms.last().copied().unwrap_or(0.0);
+            eprintln!(
+                "BENCH {label:>22} q={query:?} mode={mode:<14} n={n_results:<4} total={total_count:?} search med={s_med:8.2}ms (min={s_min:.2} max={s_max:.2}) count med={c_med:8.2}ms keystroke={:8.2}ms",
+                s_med + c_med
+            );
+            report.push(serde_json::json!({
+                "label": label,
+                "query": query,
+                "sort_by": sort_by,
+                "sort_dir": sort_dir,
+                "mode": mode,
+                "results": n_results,
+                "total_count": total_count,
+                "results_hash": format!("{results_hash:016x}"),
+                "first_paths": first_paths,
+                "search_ms": search_ms,
+                "count_ms": count_ms,
+                "search_med_ms": s_med,
+                "count_med_ms": c_med,
+                "keystroke_med_ms": s_med + c_med,
+            }));
+        }
+
+        if let Ok(out) = std::env::var("BENCH_OUT") {
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            fs::write(&out, json).unwrap();
+            eprintln!("BENCH report written to {out}");
+        }
     }
 }
