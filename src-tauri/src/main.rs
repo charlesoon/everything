@@ -21,14 +21,13 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use walkdir::WalkDir;
-
 mod fd_search;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mem_search;
 mod pathindexing;
 mod query;
+mod rescan;
 #[cfg(target_os = "windows")]
 mod win;
 use fd_search::{FdSearchCache, FdSearchResultDto};
@@ -38,6 +37,10 @@ const DEFAULT_LIMIT: u32 = 300;
 const SHORT_QUERY_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 1000;
 pub(crate) const BATCH_SIZE: usize = 10_000;
+/// In-flight batches between scan workers and the single DB writer. Workers
+/// block (backpressure) instead of queueing unbounded row batches in memory
+/// when SQLite falls behind the filesystem walk.
+const SCAN_CHANNEL_CAP: usize = 8;
 const RECENT_OP_TTL: Duration = Duration::from_secs(2);
 pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -479,6 +482,17 @@ pub(crate) fn db_connection(db_path: &Path) -> AppResult<Connection> {
     db_connection_with_timeout(db_path, 3000)
 }
 
+/// Connection for maintenance passes (index builds, FTS rebuild, ANALYZE,
+/// VACUUM): their sorts and rebuilds spill through SQLite's temp store, and
+/// the default `temp_store=MEMORY` would pull hundreds of MB of spill into
+/// the heap on a large DB — this connection sends it to disk instead.
+fn db_connection_for_maintenance(db_path: &Path) -> AppResult<Connection> {
+    let conn = db_connection(db_path)?;
+    conn.execute_batch("PRAGMA temp_store = FILE;")
+        .map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
 fn db_connection_for_search(db_path: &Path) -> AppResult<Connection> {
     let conn = db_connection_with_timeout(db_path, 500)?;
     // mmap_size must cover the whole DB file (entries + FTS index) so reads hit
@@ -670,7 +684,7 @@ fn init_db_tables(db_path: &Path) -> AppResult<()> {
 /// when new indexes are added; runs after db_ready so it does not block startup.
 fn ensure_db_indexes(db_path: &Path) -> AppResult<()> {
     let t = Instant::now();
-    let conn = db_connection(db_path)?;
+    let conn = db_connection_for_maintenance(db_path)?;
 
     conn.execute_batch(CREATE_ENTRIES_INDEXES_SQL)
         .map_err(|e| e.to_string())?;
@@ -1429,12 +1443,7 @@ fn purge_ignored_entries(db_path: &Path, ignored_roots: &[PathBuf]) -> AppResult
         }
 
         let prefix = root_str.trim_end_matches('/');
-        // Use range condition instead of LIKE+ESCAPE: SQLite disables the index
-        // range-scan optimization when an ESCAPE clause is present, causing a full
-        // table scan even though `path` has a UNIQUE (implicit) index.
-        // "\u{10FFFF}" is the maximum Unicode code point; any valid path sorts below it.
-        let lo = format!("{prefix}/");
-        let hi = format!("{prefix}/\u{10FFFF}");
+        let (lo, hi) = subtree_range_bounds(prefix);
         conn.execute(
             "DELETE FROM entries WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
             params![prefix, lo, hi],
@@ -1621,32 +1630,11 @@ fn index_row_from_path(path: &Path) -> Option<IndexRow> {
     index_row_from_path_and_metadata(path, &metadata)
 }
 
-fn index_row_from_walkdir_entry(entry: &walkdir::DirEntry) -> Option<IndexRow> {
+pub(crate) fn index_row_from_walkdir_entry(entry: &walkdir::DirEntry) -> Option<IndexRow> {
     let metadata = entry.metadata().ok()?;
     index_row_from_path_and_metadata(entry.path(), &metadata)
 }
 
-
-fn collect_rows_recursive(
-    root: &Path,
-    ignored_roots: &[PathBuf],
-    ignored_patterns: &[IgnorePattern],
-) -> Vec<IndexRow> {
-    let mut rows = Vec::new();
-
-    let iter = WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| !should_skip_path(entry.path(), ignored_roots, ignored_patterns));
-
-    for entry in iter.flatten() {
-        if let Some(row) = index_row_from_walkdir_entry(&entry) {
-            rows.push(row);
-        }
-    }
-
-    rows
-}
 
 fn entry_from_index_row(row: IndexRow) -> EntryDto {
     EntryDto {
@@ -2017,6 +2005,21 @@ pub(crate) fn upsert_rows(conn: &mut Connection, rows: &[IndexRow]) -> AppResult
     )
 }
 
+/// B-tree range bounds selecting every row strictly under `path`:
+/// `path >= "{path}{sep}" AND path < "{path}{sep+1}"`. The exclusive upper
+/// bound is the separator's successor char, so only true descendants match —
+/// a \x7F bound would also capture prefix siblings ("proj0" would take
+/// "proj00" down with it). Use this instead of LIKE+ESCAPE: SQLite disables
+/// the index range-scan optimization when an ESCAPE clause is present,
+/// causing a full table scan even though `path` has a UNIQUE index.
+pub(crate) fn subtree_range_bounds(path: &str) -> (String, String) {
+    let sep = std::path::MAIN_SEPARATOR;
+    (
+        format!("{path}{sep}"),
+        format!("{path}{}", (sep as u8 + 1) as char),
+    )
+}
+
 pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppResult<usize> {
     if raw_paths.is_empty() {
         return Ok(0);
@@ -2056,14 +2059,7 @@ pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppRe
                 .execute(params![&normalized])
                 .map_err(|e| e.to_string())?;
 
-            // Delete children using B-tree range scan:
-            // path >= "{normalized}{sep}" AND path < "{normalized}{sep+1}".
-            // The exclusive upper bound is the separator's successor char, so
-            // only true descendants match — a \x7F bound would also capture
-            // prefix siblings ("proj0" would take "proj00" down with it).
-            let sep = std::path::MAIN_SEPARATOR;
-            let range_start = format!("{normalized}{sep}");
-            let range_end = format!("{normalized}{}", (sep as u8 + 1) as char);
+            let (range_start, range_end) = subtree_range_bounds(&normalized);
             deleted += stmt_children
                 .execute(params![&range_start, &range_end])
                 .map_err(|e| e.to_string())?;
@@ -2266,36 +2262,6 @@ fn is_deferred_dir(path: &Path, home_dir: &Path) -> bool {
             .unwrap_or(false)
 }
 
-fn preload_existing_entries(
-    conn: &Connection,
-    dir_prefix: &str,
-) -> HashMap<String, (Option<i64>, Option<i64>)> {
-    let like_pattern = format!("{}/%", escape_like(dir_prefix));
-    let mut stmt = match conn.prepare(
-        "SELECT path, mtime, size FROM entries WHERE path LIKE ?1 ESCAPE '\\' OR path = ?2",
-    ) {
-        Ok(s) => s,
-        Err(_) => return HashMap::new(),
-    };
-
-    let mut map = HashMap::new();
-    let rows = match stmt.query_map(params![like_pattern, dir_prefix], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    }) {
-        Ok(r) => r,
-        Err(_) => return map,
-    };
-
-    for row in rows.flatten() {
-        map.insert(row.0, (row.1, row.2));
-    }
-    map
-}
-
 /// Deferred fresh-index finalization: secondary indexes, FTS rebuild (+
 /// triggers), and ANALYZE. Runs on the finalizing thread after Ready so the
 /// user-visible indexing phase does not wait for DDL. Search stays correct
@@ -2303,7 +2269,7 @@ fn preload_existing_entries(
 /// gates every FTS path. The watcher is still paused (indexing_active), so
 /// no upsert can slip past the not-yet-recreated FTS triggers.
 fn finalize_fresh_index(state: &AppState) {
-    let Ok(conn) = db_connection(&state.db_path) else {
+    let Ok(conn) = db_connection_for_maintenance(&state.db_path) else {
         return;
     };
     let t_idx = Instant::now();
@@ -2322,9 +2288,74 @@ fn finalize_fresh_index(state: &AppState) {
     eprintln!("[timing] analyze {}ms", t_analyze.elapsed().as_millis());
 }
 
+/// Free pages must exceed this many bytes (and 25% of the DB) before the
+/// maintenance VACUUM kicks in — it rewrites the whole file, so it should only
+/// run when mass rewrites have left real garbage behind.
+const VACUUM_MIN_FREE_BYTES: i64 = 100 * 1024 * 1024;
+
+/// Post-indexing storage maintenance, run while the watcher is still paused:
+/// reclaim accumulated free pages (threshold-gated VACUUM), truncate the WAL,
+/// and release this connection's page cache.
+fn run_db_maintenance(state: &AppState) {
+    let Ok(conn) = db_connection_for_maintenance(&state.db_path) else {
+        return;
+    };
+
+    let pragma_i64 = |name: &str| -> i64 {
+        conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .unwrap_or(0)
+    };
+    let free_pages = pragma_i64("freelist_count");
+    let total_pages = pragma_i64("page_count");
+    let free_bytes = free_pages.saturating_mul(pragma_i64("page_size"));
+    if total_pages > 0 && free_pages * 4 >= total_pages && free_bytes >= VACUUM_MIN_FREE_BYTES {
+        let t = Instant::now();
+        match conn.execute_batch("VACUUM") {
+            Ok(()) => eprintln!(
+                "[maintenance] vacuum reclaimed {}MB in {}ms",
+                free_bytes / (1024 * 1024),
+                t.elapsed().as_millis()
+            ),
+            Err(e) => eprintln!("[maintenance] vacuum failed: {e}"),
+        }
+    }
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let _ = conn.execute_batch("PRAGMA shrink_memory;");
+}
+
+/// Ask macOS malloc to hand freed-but-retained regions back to the OS. Without
+/// this a large indexing pass leaves hundreds of MB of empty malloc regions
+/// resident until system memory pressure reclaims them.
+fn release_memory_to_os() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            fn malloc_zone_pressure_relief(
+                zone: *mut std::os::raw::c_void,
+                goal: usize,
+            ) -> usize;
+        }
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+}
+
+/// Remove `row`'s path from the direct-children preload map, returning true
+/// when it was present AND unchanged (same mtime + size). Paths left in the
+/// map after the scan are the vanished ones to delete. (Whole-subtree diffs
+/// use the hash-compacted `rescan::SubtreeDiff` instead; this String-keyed map
+/// only ever holds one directory level.)
+fn row_unchanged(
+    existing: &mut HashMap<String, (Option<i64>, Option<i64>)>,
+    row: &IndexRow,
+) -> bool {
+    matches!(
+        existing.remove(&row.path),
+        Some((old_mtime, old_size)) if old_mtime == row.mtime && old_size == row.size
+    )
+}
+
 /// Existing rows for `dir_path` itself and its DIRECT children only.
-/// (`preload_existing_entries` loads the whole subtree — for the scan root
-/// that would be the entire DB.)
+/// (A recursive subtree load for the scan root would be the entire DB.)
 fn preload_direct_children(
     conn: &Connection,
     dir_path: &str,
@@ -2349,20 +2380,6 @@ fn preload_direct_children(
         map.insert(row.0, (row.1, row.2));
     }
     map
-}
-
-/// Remove `row`'s path from a preload map, returning true when it was present
-/// AND unchanged (same mtime + size). A false return means the row is new or
-/// modified and must be (re)written; paths left in the map after the scan are
-/// the vanished ones to delete.
-fn row_unchanged(
-    existing: &mut HashMap<String, (Option<i64>, Option<i64>)>,
-    row: &IndexRow,
-) -> bool {
-    matches!(
-        existing.remove(&row.path),
-        Some((old_mtime, old_size)) if old_mtime == row.mtime && old_size == row.size
-    )
 }
 
 /// Build the shared rayon thread pool for a parallel filesystem scan. Scanning
@@ -2489,6 +2506,11 @@ fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -> AppResult
                             eprintln!("[gc] cleanup error: {e}");
                         }
                     }
+                    // 5. Storage + memory maintenance: reclaim free pages
+                    // (threshold-gated VACUUM), truncate the WAL, and return
+                    // freed heap to the OS while the watcher is still paused.
+                    run_db_maintenance(&fin_state);
+                    release_memory_to_os();
                     // indexing_active released by _guard Drop
                     perf_log("finalizing complete");
                 });
@@ -2693,7 +2715,7 @@ fn run_incremental_index_inner(
         );
 
         type ScanMsg = (Vec<IndexRow>, u64, u64, u64, String);
-        let (row_tx, row_rx) = std::sync::mpsc::channel::<ScanMsg>();
+        let (row_tx, row_rx) = std::sync::mpsc::sync_channel::<ScanMsg>(SCAN_CHANNEL_CAP);
         let roots_arc: Arc<Vec<PathBuf>> = Arc::new(roots);
         let par_started = Instant::now();
 
@@ -2897,7 +2919,7 @@ fn run_incremental_index_inner(
 
         // (rows to upsert, vanished paths to delete, scanned, indexed, perm_errors, current path)
         type CatchupMsg = (Vec<IndexRow>, Vec<String>, u64, u64, u64, String);
-        let (row_tx, row_rx) = std::sync::mpsc::channel::<CatchupMsg>();
+        let (row_tx, row_rx) = std::sync::mpsc::sync_channel::<CatchupMsg>(SCAN_CHANNEL_CAP);
         let roots_arc: Arc<Vec<PathBuf>> = Arc::new(roots);
         let par_started = Instant::now();
         let worker_db_path = state.db_path.clone();
@@ -2932,12 +2954,12 @@ fn run_incremental_index_inner(
 
                         let mut existing = worker_conn
                             .as_ref()
-                            .map(|c| preload_existing_entries(c, &root_str))
-                            .unwrap_or_default();
+                            .map(|c| rescan::SubtreeDiff::load(c, &root_str))
+                            .unwrap_or_else(rescan::SubtreeDiff::empty);
                         // The walk below skips the root entry itself (its row is
                         // maintained by the scan_root direct-children loop) — it
                         // must not be treated as vanished.
-                        existing.remove(&root_str);
+                        existing.forget(&root_str);
 
                         let s_roots = skip_roots.clone();
                         let s_patterns = skip_patterns.clone();
@@ -2984,6 +3006,9 @@ fn run_incremental_index_inner(
                                         None => {
                                             local_perm_errors += 1;
                                             root_perm_errors += 1;
+                                            // Unreadable metadata: keep the
+                                            // existing row, don't delete it.
+                                            existing.mark_errored(&path);
                                             continue;
                                         }
                                     };
@@ -2992,7 +3017,7 @@ fn run_incremental_index_inner(
                                         index_row_from_path_and_metadata(&path, &metadata)
                                     {
                                         row.run_id = run_id;
-                                        if !row_unchanged(&mut existing, &row) {
+                                        if !existing.check_unchanged(&row) {
                                             local_indexed += 1;
                                             root_indexed += 1;
                                             local_batch.push(row);
@@ -3021,6 +3046,18 @@ fn run_incremental_index_inner(
                                     root_scanned += 1;
                                     local_perm_errors += 1;
                                     root_perm_errors += 1;
+                                    // Keep rows under an unreadable directory;
+                                    // NotFound means it truly vanished and its
+                                    // rows should become deletion leftovers.
+                                    let vanished = err
+                                        .io_error()
+                                        .map(|e| e.kind() == std::io::ErrorKind::NotFound)
+                                        .unwrap_or(false);
+                                    if !vanished {
+                                        if let Some(p) = err.path() {
+                                            existing.mark_errored(p);
+                                        }
+                                    }
                                     if local_perm_errors <= 20 || perf_log_enabled() {
                                         eprintln!("[index] permission error: {}", err);
                                     }
@@ -3028,17 +3065,16 @@ fn run_incremental_index_inner(
                             }
                         }
 
-                        // Rows still in the map were not seen on disk: deleted.
-                        if !existing.is_empty() {
-                            let deletes: Vec<String> = existing.into_keys().collect();
-                            let _ = tx.send((
-                                Vec::new(),
-                                deletes,
-                                0,
-                                0,
-                                0,
-                                String::new(),
-                            ));
+                        // Rows still in the snapshot were not seen on disk:
+                        // deleted. Path strings are re-read from the DB (the
+                        // snapshot only keeps hashes).
+                        if let Some(c) = worker_conn.as_ref() {
+                            let mut deletes = existing.leftover_paths(c, &root_str);
+                            while !deletes.is_empty() {
+                                let rest = deletes.split_off(flush_size.min(deletes.len()));
+                                let chunk = std::mem::replace(&mut deletes, rest);
+                                let _ = tx.send((Vec::new(), chunk, 0, 0, 0, String::new()));
+                            }
                         }
 
                         eprintln!(
@@ -3367,6 +3403,184 @@ fn persist_event_id(db_path: &Path, event_id: u64) -> AppResult<()> {
 #[cfg(target_os = "macos")]
 const MUST_SCAN_THRESHOLD: usize = 10;
 
+/// Minimum spacing between two MustScanSubDirs subtree rescans of the same
+/// path. Extra events arriving inside the window are deferred (kept queued),
+/// not dropped, so an FSEvents overflow storm can't trigger back-to-back
+/// full-subtree rescans.
+#[cfg(target_os = "macos")]
+const RESCAN_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Watch roots for the FSEvents stream: `$HOME` plus canonicalized
+/// `.pathindexing` extra roots (FSEvents needs real paths — `/tmp` is a
+/// symlink to `/private/tmp`). Also returns (canonical → stored) prefix pairs
+/// so event paths can be mapped back to the form rows are stored under.
+#[cfg(target_os = "macos")]
+fn fsevent_watch_roots(state: &AppState) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
+    let mut roots = vec![state.home_dir.clone()];
+    let mut remaps: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for stored in state.extra_roots.lock().iter() {
+        let canonical = fs::canonicalize(stored).unwrap_or_else(|_| stored.clone());
+        // The remap is independent of watch selection: even a root watched by
+        // proxy (canonical form inside $HOME or duplicating another root)
+        // still delivers canonical event paths that must translate back.
+        if canonical != *stored {
+            remaps.push((canonical.clone(), stored.clone()));
+        }
+        if canonical.starts_with(&state.home_dir) || roots.contains(&canonical) {
+            continue; // already covered by another registered root
+        }
+        roots.push(canonical);
+    }
+    // Longest canonical prefix first so nested roots remap correctly.
+    remaps.sort_by_key(|(canonical, _)| std::cmp::Reverse(canonical.as_os_str().len()));
+    (roots, remaps)
+}
+
+/// Translate FSEvents' canonical paths back to stored-prefix form at the
+/// single point events enter the worker, so every consumer sees paths in the
+/// form rows are stored under.
+#[cfg(target_os = "macos")]
+fn remap_fs_event(
+    event: mac::fsevent_watcher::FsEvent,
+    remaps: &[(PathBuf, PathBuf)],
+) -> mac::fsevent_watcher::FsEvent {
+    use mac::fsevent_watcher::FsEvent;
+    if remaps.is_empty() {
+        return event;
+    }
+    match event {
+        FsEvent::Paths(paths) => FsEvent::Paths(
+            paths
+                .into_iter()
+                .map(|p| remap_event_path(p, remaps))
+                .collect(),
+        ),
+        FsEvent::MustScanSubDirs(p) => FsEvent::MustScanSubDirs(remap_event_path(p, remaps)),
+        FsEvent::HistoryDone => FsEvent::HistoryDone,
+    }
+}
+
+/// Map an FSEvents path (always canonical) back to the stored-prefix form,
+/// e.g. `/private/tmp/x` → `/tmp/x` when `/tmp` is the indexed root.
+#[cfg(target_os = "macos")]
+fn remap_event_path(path: PathBuf, remaps: &[(PathBuf, PathBuf)]) -> PathBuf {
+    for (canonical, stored) in remaps {
+        if let Ok(rest) = path.strip_prefix(canonical) {
+            return if rest.as_os_str().is_empty() {
+                stored.clone()
+            } else {
+                stored.join(rest)
+            };
+        }
+    }
+    path
+}
+
+/// Queue `path` for a subtree rescan, collapsing paths already covered by a
+/// queued ancestor and deferring past the cooldown of recent overlapping
+/// rescans.
+#[cfg(target_os = "macos")]
+fn queue_subtree_rescan(
+    path: PathBuf,
+    queued: &mut HashMap<PathBuf, Instant>,
+    finished: &Mutex<Vec<(PathBuf, Instant)>>,
+) {
+    if queued.keys().any(|q| path.starts_with(q)) {
+        return; // an equal or ancestor rescan is already queued
+    }
+    let mut not_before = Instant::now();
+    for (done, at) in finished.lock().iter() {
+        if path.starts_with(done) || done.starts_with(&path) {
+            let earliest = *at + RESCAN_COOLDOWN;
+            if earliest > not_before {
+                not_before = earliest;
+            }
+        }
+    }
+    // Queued descendants are covered by this wider rescan.
+    queued.retain(|q, _| !q.starts_with(&path));
+    queued.insert(path, not_before);
+}
+
+/// Spawn the next due queued subtree rescan on a background thread
+/// (single-flight via `inflight`): a rescan can walk millions of entries over
+/// minutes and must not block the watcher loop from draining events. Skipped
+/// while an index pass is active — the pass reconciles the same ground — and
+/// retried on the next loop tick.
+#[cfg(target_os = "macos")]
+fn spawn_due_subtree_rescan(
+    app: &AppHandle,
+    state: &AppState,
+    queued: &mut HashMap<PathBuf, Instant>,
+    inflight: &Arc<AtomicBool>,
+    finished: &Arc<Mutex<Vec<(PathBuf, Instant)>>>,
+) {
+    if queued.is_empty()
+        || inflight.load(AtomicOrdering::Acquire)
+        || state.indexing_active.load(AtomicOrdering::Acquire)
+    {
+        return;
+    }
+    let now = Instant::now();
+    let Some(path) = queued
+        .iter()
+        .find(|(_, due)| **due <= now)
+        .map(|(path, _)| path.clone())
+    else {
+        return;
+    };
+    queued.remove(&path);
+    inflight.store(true, AtomicOrdering::Release);
+
+    let app = app.clone();
+    let state = state.clone();
+    let inflight = Arc::clone(inflight);
+    let finished = Arc::clone(finished);
+    std::thread::spawn(move || {
+        let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
+        let started = Instant::now();
+        let result = db_connection(&state.db_path).and_then(|mut conn| {
+            let counts =
+                rescan::rescan_subtree(&mut conn, &path, &ignored_roots, &ignored_patterns)?;
+            let _ = conn.execute_batch("PRAGMA shrink_memory;");
+            Ok(counts)
+        });
+        match result {
+            Ok((upserted, deleted)) => {
+                eprintln!(
+                    "[watcher] MustScanSubDirs rescan {}: upserted={} deleted={} {}ms",
+                    path.display(),
+                    upserted,
+                    deleted,
+                    started.elapsed().as_millis()
+                );
+                if upserted + deleted > 0 {
+                    invalidate_search_caches(&state);
+                    touch_status_updated(&state);
+                    let _ = refresh_and_emit_status_counts(&app, &state);
+                }
+                if upserted + deleted >= BATCH_SIZE {
+                    release_memory_to_os();
+                }
+            }
+            Err(err) => eprintln!(
+                "[watcher] MustScanSubDirs rescan {} failed: {err}",
+                path.display()
+            ),
+        }
+        let mut finished = finished.lock();
+        finished.push((path, Instant::now()));
+        finished.retain(|(_, at)| at.elapsed() < RESCAN_COOLDOWN);
+        inflight.store(false, AtomicOrdering::Release);
+    });
+}
+
+#[cfg(target_os = "macos")]
+enum WatcherExit {
+    Stop,
+    Rebuild,
+}
+
 #[cfg(target_os = "macos")]
 fn start_fsevent_watcher_worker(
     app: AppHandle,
@@ -3374,12 +3588,41 @@ fn start_fsevent_watcher_worker(
     since_event_id: Option<u64>,
     conditional: bool,
 ) {
-    use std::sync::mpsc::{self, RecvTimeoutError};
     std::thread::spawn(move || {
-        let (tx, rx) = mpsc::channel();
+        let mut since_event_id = since_event_id;
+        let mut replay = conditional;
+        // Rescan bookkeeping outlives stream rebuilds: the cooldown history
+        // and the single-flight guard for the background rescan thread.
+        let rescan_inflight = Arc::new(AtomicBool::new(false));
+        let finished_rescans: Arc<Mutex<Vec<(PathBuf, Instant)>>> =
+            Arc::new(Mutex::new(Vec::new()));
 
-        let mut watcher =
-            match mac::fsevent_watcher::FsEventWatcher::new(&state.home_dir, since_event_id, tx) {
+        // Each pass runs one FSEvents stream; the stream is rebuilt (with
+        // event-id continuity) when .pathindexing roots change.
+        loop {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (watch_roots, remaps) = fsevent_watch_roots(&state);
+
+            let built = mac::fsevent_watcher::FsEventWatcher::new(
+                &watch_roots,
+                since_event_id,
+                tx.clone(),
+            );
+            let built = match built {
+                Err(err) if watch_roots.len() > 1 => {
+                    eprintln!(
+                        "[watcher] FSEvents init failed for {} roots ({err}); falling back to home-only watch",
+                        watch_roots.len()
+                    );
+                    mac::fsevent_watcher::FsEventWatcher::new(
+                        std::slice::from_ref(&state.home_dir),
+                        since_event_id,
+                        tx,
+                    )
+                }
+                other => other,
+            };
+            let mut watcher = match built {
                 Ok(w) => w,
                 Err(err) => {
                     set_state(
@@ -3396,239 +3639,288 @@ fn start_fsevent_watcher_worker(
                 }
             };
 
-        state.watcher_active.store(true, AtomicOrdering::Release);
+            state.watcher_active.store(true, AtomicOrdering::Release);
 
-        if conditional {
-            perf_log("conditional_startup: watcher started, awaiting history replay");
-            set_state(&state, IndexState::Ready, None);
-            emit_index_state(&app, "Ready", None);
+            if replay {
+                perf_log("conditional_startup: watcher started, awaiting history replay");
+                set_state(&state, IndexState::Ready, None);
+                emit_index_state(&app, "Ready", None);
+            }
+
+            let exit = run_fsevent_stream(
+                &app,
+                &state,
+                &rx,
+                &watcher,
+                &remaps,
+                replay,
+                &rescan_inflight,
+                &finished_rescans,
+            );
+
+            let eid = watcher.last_event_id();
+            let _ = persist_event_id(&state.db_path, eid);
+            watcher.stop();
+
+            match exit {
+                WatcherExit::Rebuild => {
+                    since_event_id = Some(eid);
+                    replay = false;
+                    eprintln!("[watcher] rebuilding FSEvents stream with updated watch roots");
+                }
+                WatcherExit::Stop => break,
+            }
         }
-
-        let mut pending_paths: HashSet<PathBuf> = HashSet::new();
-        let mut deadline: Option<Instant> = None;
-        let mut last_flush = Instant::now();
-        let mut last_status_emit = Instant::now();
-        let mut pending_status_emit = false;
-
-        let mut must_scan_count: usize = 0;
-        let mut replay_phase = conditional;
-        let mut full_scan_triggered = false;
-
-        // Snapshot config file entries at watcher start so we only emit
-        // pathignore_changed when actual rule entries change (ignores whitespace/comments).
-        let mut last_config_entries =
-            pathignore_active_entries(&fs::read_to_string(&state.config_file_path).unwrap_or_default());
-        let mut last_pathindexing_entries =
-            pathindexing::pathindexing_active_entries(&fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default());
-
-        loop {
-            if state.watcher_stop.load(AtomicOrdering::Acquire) {
-                break;
-            }
-
-            let wait = match deadline {
-                Some(due) => {
-                    let now = Instant::now();
-                    if now >= due {
-                        Duration::from_millis(0)
-                    } else {
-                        due - now
-                    }
-                }
-                None => Duration::from_secs(1),
-            };
-            match rx.recv_timeout(wait) {
-                Ok(mac::fsevent_watcher::FsEvent::Paths(paths)) => {
-                    let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
-                    let prev_len = pending_paths.len();
-                    for path in paths {
-                        if path == state.config_file_path {
-                            let new_entries = pathignore_active_entries(
-                                &fs::read_to_string(&state.config_file_path).unwrap_or_default(),
-                            );
-                            if new_entries != last_config_entries {
-                                last_config_entries = new_entries;
-                                app.emit("pathignore_changed", ()).ok();
-                            }
-                            continue;
-                        }
-                        if path == state.pathindexing_file_path {
-                            let new_entries = pathindexing::pathindexing_active_entries(
-                                &fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default(),
-                            );
-                            if new_entries != last_pathindexing_entries {
-                                let old_roots = pathindexing::parse_pathindexing_paths_unchecked(
-                                    &last_pathindexing_entries.join("\n"),
-                                );
-                                let new_roots = pathindexing::load_pathindexing_roots(&state.pathindexing_file_path);
-                                last_pathindexing_entries = new_entries;
-
-                                let bg_state = state.clone();
-                                let bg_app = app.clone();
-                                let bg_new_roots = new_roots.clone();
-                                *state.extra_roots.lock() = new_roots;
-                                if state.pathindexing_active.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
-                                    eprintln!("[pathindexing] scan already in progress, skipping");
-                                    continue;
-                                }
-                                set_state(&state, IndexState::Indexing, None);
-                                emit_index_state(&app, "Indexing", None);
-                                std::thread::spawn(move || {
-                                    // Wait for initial indexing to finish before writing to DB
-                                    while bg_state.indexing_active.load(AtomicOrdering::Acquire) {
-                                        std::thread::sleep(Duration::from_secs(1));
-                                        eprintln!("[pathindexing] waiting for indexing to finish...");
-                                    }
-                                    eprintln!("[pathindexing] background scan starting...");
-                                    let mut prev_roots = old_roots;
-                                    let mut target_roots = bg_new_roots;
-                                    loop {
-                                        let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&bg_state);
-                                        match pathindexing::handle_pathindexing_change(
-                                            &bg_state, &prev_roots, &target_roots, &ign_roots, &ign_patterns,
-                                        ) {
-                                            Ok(()) => {
-                                                eprintln!("[pathindexing] background scan done");
-                                                if let Ok(c) = db_connection(&bg_state.db_path) {
-                                                    let roots_str: Vec<String> = target_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
-                                                    let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
-                                                }
-                                                let _ = refresh_and_emit_status_counts(&bg_app, &bg_state);
-                                            }
-                                            Err(e) => {
-                                                eprintln!("[pathindexing] change handling error: {e}");
-                                            }
-                                        }
-                                        // Check if extra_roots changed while we were scanning
-                                        let current = bg_state.extra_roots.lock().clone();
-                                        if current == target_roots {
-                                            break;
-                                        }
-                                        eprintln!("[pathindexing] extra_roots changed during scan, reconciling...");
-                                        prev_roots = target_roots;
-                                        target_roots = current;
-                                    }
-                                    set_state(&bg_state, IndexState::Ready, None);
-                                    emit_index_state(&bg_app, "Ready", None);
-                                    bg_app.emit("pathindexing_changed", ()).ok();
-                                    bg_state.pathindexing_active.store(false, AtomicOrdering::Release);
-                                });
-                            }
-                            continue;
-                        }
-                        if !should_skip_path(&path, &ignored_roots, &ignored_patterns) {
-                            pending_paths.insert(path);
-                        }
-                    }
-                    if pending_paths.len() > prev_len {
-                        deadline = Some(Instant::now() + WATCH_DEBOUNCE);
-                    }
-                }
-                Ok(mac::fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
-                    must_scan_count += 1;
-                    if replay_phase
-                        && must_scan_count >= MUST_SCAN_THRESHOLD
-                        && !full_scan_triggered
-                    {
-                        perf_log(format!(
-                            "conditional_startup: MustScanSubDirs={} >= threshold, triggering full scan",
-                            must_scan_count
-                        ));
-                        full_scan_triggered = true;
-                        let _ = start_full_index_worker(app.clone(), state.clone());
-                    }
-                    if !state.indexing_active.load(AtomicOrdering::Acquire) {
-                        let (ignored_roots, ignored_patterns) =
-                            cached_effective_ignore_rules(&state);
-                        let rows = collect_rows_recursive(&path, &ignored_roots, &ignored_patterns);
-                        if !rows.is_empty() {
-                            eprintln!(
-                                "[watcher] MustScanSubDirs DB write: rows={} path={}",
-                                rows.len(),
-                                path.display()
-                            );
-                            if let Ok(mut conn) = db_connection(&state.db_path) {
-                                if upsert_rows(&mut conn, &rows).is_ok() {
-                                    invalidate_search_caches(&state);
-                                    touch_status_updated(&state);
-                                    if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                                        let _ = refresh_and_emit_status_counts(&app, &state);
-                                        last_status_emit = Instant::now();
-                                        pending_status_emit = false;
-                                    } else {
-                                        pending_status_emit = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(mac::fsevent_watcher::FsEvent::HistoryDone) => {
-                    eprintln!(
-                        "[watcher] HistoryDone: pending_paths={} indexing_active={}",
-                        pending_paths.len(),
-                        state.indexing_active.load(AtomicOrdering::Acquire)
-                    );
-                    process_watcher_paths(
-                        &app,
-                        &state,
-                        &mut pending_paths,
-                        &mut deadline,
-                        &mut last_status_emit,
-                        &mut pending_status_emit,
-                    );
-                    if replay_phase {
-                        replay_phase = false;
-                        if !full_scan_triggered {
-                            perf_log(format!(
-                                "conditional_startup: HistoryDone, MustScanSubDirs={}, skipping full scan",
-                                must_scan_count
-                            ));
-                            let _ = refresh_and_emit_status_counts(&app, &state);
-                            last_status_emit = Instant::now();
-                            pending_status_emit = false;
-                        }
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-
-            if let Some(due) = deadline {
-                if Instant::now() >= due {
-                    process_watcher_paths(
-                        &app,
-                        &state,
-                        &mut pending_paths,
-                        &mut deadline,
-                        &mut last_status_emit,
-                        &mut pending_status_emit,
-                    );
-                }
-            }
-
-            if pending_status_emit && last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                let _ = refresh_and_emit_status_counts(&app, &state);
-                last_status_emit = Instant::now();
-                pending_status_emit = false;
-            }
-
-            // Periodic event_id flush
-            if last_flush.elapsed() >= EVENT_ID_FLUSH_INTERVAL {
-                let eid = watcher.last_event_id();
-                let _ = persist_event_id(&state.db_path, eid);
-                last_flush = Instant::now();
-            }
-
-        }
-
-        // Final flush on shutdown
-        let eid = watcher.last_event_id();
-        let _ = persist_event_id(&state.db_path, eid);
-        watcher.stop();
         state.watcher_active.store(false, AtomicOrdering::Release);
         eprintln!("[watcher] fsevent watcher stopped");
     });
+}
+
+/// Drive one FSEvents stream until shutdown or a watch-roots change.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_fsevent_stream(
+    app: &AppHandle,
+    state: &AppState,
+    rx: &std::sync::mpsc::Receiver<mac::fsevent_watcher::FsEvent>,
+    watcher: &mac::fsevent_watcher::FsEventWatcher,
+    remaps: &[(PathBuf, PathBuf)],
+    replay: bool,
+    rescan_inflight: &Arc<AtomicBool>,
+    finished_rescans: &Arc<Mutex<Vec<(PathBuf, Instant)>>>,
+) -> WatcherExit {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let mut pending_paths: HashSet<PathBuf> = HashSet::new();
+    let mut deadline: Option<Instant> = None;
+    let mut last_flush = Instant::now();
+    let mut last_status_emit = Instant::now();
+    let mut pending_status_emit = false;
+
+    let mut must_scan_count: usize = 0;
+    let mut replay_phase = replay;
+    let mut full_scan_triggered = false;
+    let mut rebuild_requested = false;
+
+    // MustScanSubDirs rescans awaiting execution: path → earliest run time.
+    let mut queued_rescans: HashMap<PathBuf, Instant> = HashMap::new();
+
+    // Snapshot config file entries at stream start so we only emit
+    // pathignore_changed when actual rule entries change (ignores whitespace/comments).
+    let mut last_config_entries =
+        pathignore_active_entries(&fs::read_to_string(&state.config_file_path).unwrap_or_default());
+    let mut last_pathindexing_entries =
+        pathindexing::pathindexing_active_entries(&fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default());
+
+    loop {
+        if state.watcher_stop.load(AtomicOrdering::Acquire) {
+            break;
+        }
+
+        let wait = match deadline {
+            Some(due) => {
+                let now = Instant::now();
+                if now >= due {
+                    Duration::from_millis(0)
+                } else {
+                    due - now
+                }
+            }
+            None => Duration::from_secs(1),
+        };
+        match rx.recv_timeout(wait).map(|ev| remap_fs_event(ev, remaps)) {
+            Ok(mac::fsevent_watcher::FsEvent::Paths(paths)) => {
+                let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
+                let prev_len = pending_paths.len();
+                for path in paths {
+                    if path == state.config_file_path {
+                        let new_entries = pathignore_active_entries(
+                            &fs::read_to_string(&state.config_file_path).unwrap_or_default(),
+                        );
+                        if new_entries != last_config_entries {
+                            last_config_entries = new_entries;
+                            app.emit("pathignore_changed", ()).ok();
+                        }
+                        continue;
+                    }
+                    if path == state.pathindexing_file_path {
+                        let new_entries = pathindexing::pathindexing_active_entries(
+                            &fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default(),
+                        );
+                        if new_entries != last_pathindexing_entries {
+                            let old_roots = pathindexing::parse_pathindexing_paths_unchecked(
+                                &last_pathindexing_entries.join("\n"),
+                            );
+                            let new_roots = pathindexing::load_pathindexing_roots(&state.pathindexing_file_path);
+                            last_pathindexing_entries = new_entries;
+
+                            let bg_state = state.clone();
+                            let bg_app = app.clone();
+                            let bg_new_roots = new_roots.clone();
+                            *state.extra_roots.lock() = new_roots;
+                            // Roots changed: rebuild the FSEvents stream so
+                            // the new extra roots are watched live.
+                            rebuild_requested = true;
+                            if state.pathindexing_active.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
+                                eprintln!("[pathindexing] scan already in progress, skipping");
+                                continue;
+                            }
+                            set_state(&state, IndexState::Indexing, None);
+                            emit_index_state(&app, "Indexing", None);
+                            std::thread::spawn(move || {
+                                // Wait for initial indexing to finish before writing to DB
+                                while bg_state.indexing_active.load(AtomicOrdering::Acquire) {
+                                    std::thread::sleep(Duration::from_secs(1));
+                                    eprintln!("[pathindexing] waiting for indexing to finish...");
+                                }
+                                eprintln!("[pathindexing] background scan starting...");
+                                let mut prev_roots = old_roots;
+                                let mut target_roots = bg_new_roots;
+                                loop {
+                                    let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&bg_state);
+                                    match pathindexing::handle_pathindexing_change(
+                                        &bg_state, &prev_roots, &target_roots, &ign_roots, &ign_patterns,
+                                    ) {
+                                        Ok(()) => {
+                                            eprintln!("[pathindexing] background scan done");
+                                            if let Ok(c) = db_connection(&bg_state.db_path) {
+                                                let roots_str: Vec<String> = target_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+                                                let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
+                                            }
+                                            let _ = refresh_and_emit_status_counts(&bg_app, &bg_state);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[pathindexing] change handling error: {e}");
+                                        }
+                                    }
+                                    // Check if extra_roots changed while we were scanning
+                                    let current = bg_state.extra_roots.lock().clone();
+                                    if current == target_roots {
+                                        break;
+                                    }
+                                    eprintln!("[pathindexing] extra_roots changed during scan, reconciling...");
+                                    prev_roots = target_roots;
+                                    target_roots = current;
+                                }
+                                set_state(&bg_state, IndexState::Ready, None);
+                                emit_index_state(&bg_app, "Ready", None);
+                                bg_app.emit("pathindexing_changed", ()).ok();
+                                bg_state.pathindexing_active.store(false, AtomicOrdering::Release);
+                            });
+                        }
+                        continue;
+                    }
+                    if !should_skip_path(&path, &ignored_roots, &ignored_patterns) {
+                        pending_paths.insert(path);
+                    }
+                }
+                if pending_paths.len() > prev_len {
+                    deadline = Some(Instant::now() + WATCH_DEBOUNCE);
+                }
+            }
+            Ok(mac::fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
+                must_scan_count += 1;
+                if replay_phase
+                    && must_scan_count >= MUST_SCAN_THRESHOLD
+                    && !full_scan_triggered
+                {
+                    perf_log(format!(
+                        "conditional_startup: MustScanSubDirs={} >= threshold, triggering full scan",
+                        must_scan_count
+                    ));
+                    full_scan_triggered = true;
+                    let _ = start_full_index_worker(app.clone(), state.clone());
+                }
+                // Dropped events mean this subtree must be reconciled with
+                // disk. Queue a streaming rescan (spawned from the loop
+                // tail): bounded memory, change-detected, and rate-limited.
+                queue_subtree_rescan(path, &mut queued_rescans, finished_rescans);
+            }
+            Ok(mac::fsevent_watcher::FsEvent::HistoryDone) => {
+                eprintln!(
+                    "[watcher] HistoryDone: pending_paths={} indexing_active={}",
+                    pending_paths.len(),
+                    state.indexing_active.load(AtomicOrdering::Acquire)
+                );
+                process_watcher_paths(
+                    &app,
+                    &state,
+                    &mut pending_paths,
+                    &mut deadline,
+                    &mut last_status_emit,
+                    &mut pending_status_emit,
+                );
+                if replay_phase {
+                    replay_phase = false;
+                    if !full_scan_triggered {
+                        perf_log(format!(
+                            "conditional_startup: HistoryDone, MustScanSubDirs={}, skipping full scan",
+                            must_scan_count
+                        ));
+                        let _ = refresh_and_emit_status_counts(&app, &state);
+                        last_status_emit = Instant::now();
+                        pending_status_emit = false;
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Some(due) = deadline {
+            if Instant::now() >= due {
+                process_watcher_paths(
+                    &app,
+                    &state,
+                    &mut pending_paths,
+                    &mut deadline,
+                    &mut last_status_emit,
+                    &mut pending_status_emit,
+                );
+            }
+        }
+
+        if pending_status_emit && last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
+            let _ = refresh_and_emit_status_counts(&app, &state);
+            last_status_emit = Instant::now();
+            pending_status_emit = false;
+        }
+
+        spawn_due_subtree_rescan(
+            &app,
+            &state,
+            &mut queued_rescans,
+            rescan_inflight,
+            finished_rescans,
+        );
+
+        // Periodic event_id flush
+        if last_flush.elapsed() >= EVENT_ID_FLUSH_INTERVAL {
+            let eid = watcher.last_event_id();
+            let _ = persist_event_id(&state.db_path, eid);
+            last_flush = Instant::now();
+        }
+
+        if rebuild_requested {
+            break;
+        }
+    }
+
+    // Final flush before this stream goes away (shutdown or rebuild).
+    process_watcher_paths(
+        app,
+        state,
+        &mut pending_paths,
+        &mut deadline,
+        &mut last_status_emit,
+        &mut pending_status_emit,
+    );
+
+    if rebuild_requested && !state.watcher_stop.load(AtomicOrdering::Acquire) {
+        WatcherExit::Rebuild
+    } else {
+        WatcherExit::Stop
+    }
 }
 
 fn validate_new_name(new_name: &str) -> AppResult<String> {
@@ -5326,11 +5618,12 @@ async fn rename(
         let _ = delete_paths(&mut conn, &[path.clone()])?;
 
         if original_is_dir {
-            let rows =
-                collect_rows_recursive(&new_path, &state.path_ignores, &state.path_ignore_patterns);
-            for chunk in rows.chunks(BATCH_SIZE) {
-                let _ = upsert_rows(&mut conn, chunk)?;
-            }
+            let _ = rescan::rescan_subtree(
+                &mut conn,
+                &new_path,
+                &state.path_ignores,
+                &state.path_ignore_patterns,
+            )?;
         } else {
             let row = index_row_from_path(&new_path)
                 .ok_or_else(|| "Cannot read renamed file info.".to_string())?;
@@ -6408,6 +6701,51 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remap_event_path_maps_canonical_to_stored_prefix() {
+        let remaps = vec![(PathBuf::from("/private/tmp"), PathBuf::from("/tmp"))];
+        assert_eq!(
+            remap_event_path(PathBuf::from("/private/tmp/foo/bar.txt"), &remaps),
+            PathBuf::from("/tmp/foo/bar.txt")
+        );
+        assert_eq!(
+            remap_event_path(PathBuf::from("/private/tmp"), &remaps),
+            PathBuf::from("/tmp")
+        );
+        assert_eq!(
+            remap_event_path(PathBuf::from("/private/var/x"), &remaps),
+            PathBuf::from("/private/var/x"),
+            "paths outside any remap prefix must pass through"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_subtree_rescan_collapses_covered_paths() {
+        let finished = Mutex::new(Vec::new());
+        let mut queued = HashMap::new();
+        queue_subtree_rescan(PathBuf::from("/h/a/b"), &mut queued, &finished);
+        queue_subtree_rescan(PathBuf::from("/h/a/b/c"), &mut queued, &finished);
+        assert_eq!(queued.len(), 1, "descendant is covered by queued ancestor");
+        queue_subtree_rescan(PathBuf::from("/h/a"), &mut queued, &finished);
+        assert_eq!(queued.len(), 1, "wider rescan replaces queued descendants");
+        assert!(queued.contains_key(Path::new("/h/a")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_subtree_rescan_defers_within_cooldown() {
+        let finished = Mutex::new(vec![(PathBuf::from("/h/a"), Instant::now())]);
+        let mut queued = HashMap::new();
+        queue_subtree_rescan(PathBuf::from("/h/a/x"), &mut queued, &finished);
+        let due = queued.get(Path::new("/h/a/x")).expect("queued");
+        assert!(
+            *due > Instant::now() + RESCAN_COOLDOWN - Duration::from_secs(60),
+            "overlapping rescan must be deferred past the cooldown window"
+        );
+    }
+
     fn mk_entry(path: &str, name: &str) -> EntryDto {
         let parent = Path::new(path)
             .parent()
@@ -7125,7 +7463,7 @@ mod tests {
             fs::write(&p, b"new").unwrap();
             created.push(p);
         }
-        let existing_files: Vec<PathBuf> = WalkDir::new(&dirs[0])
+        let existing_files: Vec<PathBuf> = walkdir::WalkDir::new(&dirs[0])
             .into_iter()
             .flatten()
             .filter(|e| e.file_type().is_file())

@@ -3,7 +3,7 @@ use fsevent_sys::core_foundation as cf;
 use fsevent_sys::core_foundation::CFRunLoopRef;
 
 use std::ffi::CStr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -88,17 +88,30 @@ extern "C" fn stream_callback(
 }
 
 impl FsEventWatcher {
+    /// Watch one FSEvents stream over all `roots` (e.g. `$HOME` plus
+    /// `.pathindexing` extra roots). Roots must be real paths — FSEvents does
+    /// not resolve symlinks; the caller canonicalizes and remaps event paths.
     pub fn new(
-        root: &Path,
+        roots: &[PathBuf],
         since_event_id: Option<u64>,
         tx: mpsc::Sender<FsEvent>,
     ) -> Result<Self, String> {
+        if roots.is_empty() {
+            return Err("no watch roots given".to_string());
+        }
         let since_when = since_event_id.unwrap_or(fs::kFSEventStreamEventIdSinceNow);
         let last_event_id = Arc::new(AtomicU64::new(since_when));
 
-        let root_str = root
-            .to_str()
-            .ok_or_else(|| "root path is not valid UTF-8".to_string())?;
+        // Validate all roots in safe code before any raw allocation exists, so
+        // early returns below need no manual cleanup.
+        let c_paths: Vec<std::ffi::CString> = roots
+            .iter()
+            .map(|root| {
+                root.to_str()
+                    .ok_or_else(|| format!("watch root is not valid UTF-8: {}", root.display()))
+                    .and_then(|s| std::ffi::CString::new(s).map_err(|e| e.to_string()))
+            })
+            .collect::<Result<_, String>>()?;
 
         let context_info = Box::new(CallbackInfo {
             tx,
@@ -117,21 +130,22 @@ impl FsEventWatcher {
         let flags = fs::kFSEventStreamCreateFlagFileEvents;
 
         let stream = unsafe {
-            let c_path = std::ffi::CString::new(root_str).map_err(|e| e.to_string())?;
-            let cf_string = cf::CFStringCreateWithCString(
-                cf::kCFAllocatorDefault,
-                c_path.as_ptr(),
-                cf::kCFStringEncodingUTF8,
-            );
-            if cf_string.is_null() {
-                drop(Box::from_raw(context_ptr));
-                return Err("failed to create CFString for root path".to_string());
-            }
-
             let cf_array =
                 cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 0, &cf::kCFTypeArrayCallBacks);
-            cf::CFArrayAppendValue(cf_array, cf_string);
-            cf::CFRelease(cf_string);
+            for c_path in &c_paths {
+                let cf_string = cf::CFStringCreateWithCString(
+                    cf::kCFAllocatorDefault,
+                    c_path.as_ptr(),
+                    cf::kCFStringEncodingUTF8,
+                );
+                if cf_string.is_null() {
+                    cf::CFRelease(cf_array);
+                    drop(Box::from_raw(context_ptr));
+                    return Err("failed to create CFString for watch root".to_string());
+                }
+                cf::CFArrayAppendValue(cf_array, cf_string);
+                cf::CFRelease(cf_string);
+            }
 
             let s = fs::FSEventStreamCreate(
                 cf::kCFAllocatorDefault,

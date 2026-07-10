@@ -36,6 +36,7 @@ npm run dev
 
 - **`main.rs`** (~4800 lines) — Core backend: app state (`AppState`), SQLite schema init, indexer (jwalk), search (LIKE-based multi-mode), file actions (open/reveal/trash/rename/quick_look), Tauri command handlers. Contains all `#[tauri::command]` functions and event emissions.
 - **`query.rs`** — Search query parser: classifies input into `SearchMode` variants (`Empty`, `NameSearch`, `GlobName`, `ExtSearch`, `PathSearch`). Handles glob-to-LIKE conversion and LIKE escaping. Has unit tests.
+- **`rescan.rs`** — Streaming subtree rescan (`rescan_subtree` + `SubtreeDiff`): diffs a directory tree against the DB with a hash-compacted snapshot (~24 B/row), upserts only new/changed rows in batches, deletes vanished rows. Used by the MustScanSubDirs handler, directory rename, and (via `SubtreeDiff`) catchup workers. Has unit tests.
 - **`fd_search.rs`** — jwalk-based live filesystem search (5s timeout, max 5000 entries)
 - **`mem_search.rs`** — In-memory compact entry search (`MemIndex`): built during MFT/WalkDir scan for instant results while DB upsert runs in background. Uses binary search, ext/dir maps, and time-budgeted contains matching.
 - **`gitignore_filter.rs`** — Lazy .gitignore discovery and matching (depth 3, `ignore` crate)
@@ -51,13 +52,14 @@ npm run dev
 ### Data Flow
 
 1. App start → scan filesystem → batch upsert into `entries` table (SQLite WAL mode)
-   - macOS fresh index: parallel jwalk scan of `$HOME` (workers → channel → single writer, sorted `INSERT OR IGNORE` batches); secondary indexes + FTS rebuild + ANALYZE are deferred to the background finalizing thread (`finalize_fresh_index`, `fts_dirty` meta flag heals crashes)
-   - macOS restart catchup: single parallel pass; each worker preloads its root's rows over its own read connection, upserts only new/changed rows, and deletes vanished rows via preload-map set difference (no per-row run_id stamping)
+   - macOS fresh index: parallel jwalk scan of `$HOME` (workers → bounded `sync_channel(8)` → single writer, sorted `INSERT OR IGNORE` batches — backpressure caps queued-batch memory); secondary indexes + FTS rebuild + ANALYZE are deferred to the background finalizing thread (`finalize_fresh_index` with `temp_store=FILE`, `fts_dirty` meta flag heals crashes)
+   - macOS restart catchup: single parallel pass; each worker snapshots its root's rows into a hash-compacted `SubtreeDiff` over its own read connection, upserts only new/changed rows, and deletes vanished rows via snapshot leftovers (no per-row run_id stamping)
+   - The finalizing thread ends with storage/memory maintenance: threshold-gated `VACUUM` (free pages ≥ 25% and ≥ 100MB), `wal_checkpoint(TRUNCATE)`, `shrink_memory`, and `malloc_zone_pressure_relief` (returns freed heap to the OS)
    - Windows: NTFS MFT scan of `C:\` → builds MemIndex for instant search → background DB upsert
 2. User types → Svelte calls `search` command → Rust checks MemIndex first, then queries SQLite (LIKE + FTS5 trigram multi-mode) → returns `SearchResultDto { entries, modeLabel, totalCount, totalKnown }`
 3. If results are sparse, a live scan (jwalk/fd_search) runs in a background thread
 4. File watcher detects changes → upsert/delete affected paths over a persistent write connection (`watcher_conn`)
-   - macOS: FSEvents (direct fsevent-sys, supports event ID replay)
+   - macOS: FSEvents (direct fsevent-sys, supports event ID replay). One stream watches `$HOME` plus canonicalized `.pathindexing` extra roots (`/tmp` → `/private/tmp`; event paths are remapped back to the stored prefix). The stream is rebuilt with event-id continuity when `.pathindexing` changes. `MustScanSubDirs` (kernel event-queue overflow) queues a streaming `rescan_subtree` on a single-flight background thread — change-detected, batch-bounded memory, per-path 5-min cooldown — instead of materializing the whole subtree in one Vec on the watcher loop
    - Windows: USN Change Journal → ReadDirectoryChangesW fallback
 
 ### Key Design Decisions
@@ -90,7 +92,7 @@ Full product spec is at `doc/spec.md` (English) and `doc/spec_KR.md` (Korean). D
 
 - Rust error handling: `AppResult<T> = Result<T, String>` — errors are string-mapped for Tauri IPC
 - Serde: all DTOs use `#[serde(rename_all = "camelCase")]`
-- DB version tracked via `PRAGMA user_version` (currently 5); version bump clears all entries and re-indexes
+- DB version tracked via `PRAGMA user_version` (currently 7); version bump clears all entries and re-indexes
 - Batch size for DB writes: 10,000 rows (macOS), 50,000 rows (Windows MFT)
 - Frontend state is plain Svelte 5 reactive variables (no stores)
 - Platform-specific code uses `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "windows")]` conditional compilation
