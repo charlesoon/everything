@@ -2161,6 +2161,28 @@ pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) 
     Ok(())
 }
 
+/// Emit status-bar counts from the in-memory `IndexStatus` (maintained
+/// incrementally by the watcher) and persist them for instant startup reads.
+/// Unlike `refresh_and_emit_status_counts` this never queries `entries`, so
+/// it is safe on every watcher batch: the COUNT(*)/MAX() recount there was a
+/// periodic whole-table scan — a visible CPU spike every ~2s on large DBs.
+#[cfg(target_os = "macos")]
+fn emit_and_persist_cached_counts(app: &AppHandle, state: &AppState) {
+    let (entries_count, last_updated) = {
+        let status = state.status.lock();
+        (status.entries_count, status.last_updated)
+    };
+    // Best-effort persist over the shared watcher connection; the next full
+    // recount rewrites the cache if the connection isn't open.
+    if let Some(conn) = state.watcher_conn.lock().as_ref() {
+        let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
+        if let Some(lu) = last_updated {
+            let _ = set_meta(conn, "cached_last_updated", &lu.to_string());
+        }
+    }
+    emit_status_counts(app, state);
+}
+
 /// Load cached entries count from meta table (instant) and emit Ready state + counts.
 /// Used on Windows startup paths where the index is already complete from a prior run.
 #[cfg(target_os = "windows")]
@@ -3247,8 +3269,36 @@ pub(crate) fn is_recently_touched(state: &AppState, path: &str) -> bool {
     })
 }
 
+/// Result of one watcher batch: `changed` mirrors the old rows-touched count,
+/// `count_delta` is the exact net change in `entries` row count (inserted
+/// minus deleted), so callers can maintain `entries_count` incrementally
+/// instead of re-running `COUNT(*)` over the whole table.
 #[cfg(target_os = "macos")]
-fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
+struct PathChangeOutcome {
+    changed: usize,
+    count_delta: i64,
+}
+
+/// How many of `rows` already exist in `entries`, checked in chunks that stay
+/// under SQLite's bound-parameter limit. Point lookups on the UNIQUE path
+/// index — cheap even for large watcher batches.
+#[cfg(target_os = "macos")]
+fn count_existing_paths(conn: &Connection, rows: &[IndexRow]) -> AppResult<usize> {
+    let mut existing: i64 = 0;
+    for chunk in rows.chunks(500) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT COUNT(*) FROM entries WHERE path IN ({placeholders})");
+        existing += conn
+            .query_row(&sql, params_from_iter(chunk.iter().map(|r| &r.path)), |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(existing.max(0) as usize)
+}
+
+#[cfg(target_os = "macos")]
+fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<PathChangeOutcome> {
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
     let mut to_upsert_map: HashMap<String, IndexRow> = HashMap::new();
     let mut to_delete = Vec::new();
@@ -3282,7 +3332,10 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
     let to_upsert = to_upsert_map.into_values().collect::<Vec<_>>();
 
     if to_upsert.is_empty() && to_delete.is_empty() {
-        return Ok(0);
+        return Ok(PathChangeOutcome {
+            changed: 0,
+            count_delta: 0,
+        });
     }
 
     let op_start = std::time::Instant::now();
@@ -3304,8 +3357,15 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<usize> {
     }
     let conn = conn_slot.as_mut().expect("watcher connection present");
 
-    let result = upsert_rows(conn, &to_upsert)
-        .and_then(|up| delete_paths(conn, &to_delete).map(|del| up + del));
+    let result: AppResult<PathChangeOutcome> = (|| {
+        let existing = count_existing_paths(conn, &to_upsert)?;
+        let up = upsert_rows(conn, &to_upsert)?;
+        let del = delete_paths(conn, &to_delete)?;
+        Ok(PathChangeOutcome {
+            changed: up + del,
+            count_delta: to_upsert.len() as i64 - existing as i64 - del as i64,
+        })
+    })();
     if result.is_err() {
         // Drop the connection on failure so the next batch reopens cleanly
         // (the caller already handles busy-retry by re-queueing paths).
@@ -3341,13 +3401,21 @@ fn process_watcher_paths(
     batch.sort();
 
     match apply_path_changes(state, &batch) {
-        Ok(changed) => {
+        Ok(outcome) => {
             *deadline = None;
-            if changed > 0 {
+            if outcome.changed > 0 {
                 invalidate_search_caches(state);
-                touch_status_updated(state);
+                {
+                    // Maintain counts incrementally — the rows just written
+                    // carry indexed_at = now, and outcome.count_delta is the
+                    // exact net row change, so no COUNT(*)/MAX() needed.
+                    let mut status = state.status.lock();
+                    status.entries_count =
+                        (status.entries_count as i64 + outcome.count_delta).max(0) as u64;
+                    status.last_updated = Some(now_epoch());
+                }
                 if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-                    let _ = refresh_and_emit_status_counts(app, state);
+                    emit_and_persist_cached_counts(app, state);
                     *last_status_emit = Instant::now();
                     *pending_status_emit = false;
                 } else {
@@ -3881,7 +3949,7 @@ fn run_fsevent_stream(
         }
 
         if pending_status_emit && last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-            let _ = refresh_and_emit_status_counts(&app, &state);
+            emit_and_persist_cached_counts(&app, &state);
             last_status_emit = Instant::now();
             pending_status_emit = false;
         }
@@ -6499,6 +6567,21 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 let effective_complete = index_complete && !entries_empty;
 
                 if stored_event_id.is_some() && effective_complete {
+                    // Seed status counts from the cached meta before the
+                    // watcher starts, so its incremental count updates build
+                    // on the last known total instead of 0 (the HistoryDone
+                    // full recount later corrects any replay drift).
+                    if let Ok(c) = db_connection(&state.db_path) {
+                        let cached_count = get_meta(&c, "cached_entries_count")
+                            .and_then(|v| v.parse::<u64>().ok());
+                        let cached_updated = get_meta(&c, "cached_last_updated")
+                            .and_then(|v| v.parse::<i64>().ok());
+                        if let Some(count) = cached_count {
+                            let mut status = state.status.lock();
+                            status.entries_count = count;
+                            status.last_updated = cached_updated;
+                        }
+                    }
                     // Conditional startup: try watcher replay first, skip full scan if OK
                     start_fsevent_watcher_worker(
                         app_handle.clone(),
@@ -6506,6 +6589,28 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         stored_event_id,
                         true,
                     );
+                    // This path skips run_incremental_index, whose finalizing
+                    // thread is the only other ensure_db_indexes call site —
+                    // without this, indexes added to the schema after this DB
+                    // was created would never be built (e.g. a missing
+                    // idx_entries_indexed_at degrades MAX(indexed_at) to a
+                    // full-table scan on every status recount).
+                    {
+                        let idx_state = state.clone();
+                        std::thread::spawn(move || {
+                            // Let the startup replay settle first; if replay
+                            // escalated to a full scan, wait it out — its
+                            // finalizing thread ensures indexes itself and the
+                            // CREATE INDEX IF NOT EXISTS here just no-ops.
+                            std::thread::sleep(Duration::from_secs(5));
+                            while idx_state.indexing_active.load(AtomicOrdering::Acquire) {
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                            if let Err(e) = ensure_db_indexes(&idx_state.db_path) {
+                                eprintln!("[startup] ensure_db_indexes error: {e}");
+                            }
+                        });
+                    }
                     // Scan any extra roots added to .pathindexing while the app was not running
                     {
                         let scan_state = state.clone();
@@ -6938,6 +7043,57 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apply_path_changes_count_delta_matches_db() {
+        let root = temp_case_dir("apply_count_delta");
+        let home = root.join("home");
+        // Work under a subdirectory: loading ignore rules recreates
+        // home/.pathignore (ensure_pathignore_exists), so home itself can
+        // never play the "vanished directory" role.
+        let docs = home.join("docs");
+        fs::create_dir_all(&docs).unwrap();
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
+        let state = test_state_for(db_path.clone(), home.clone(), root.clone());
+
+        let file_a = docs.join("a.txt");
+        let file_b = docs.join("b.txt");
+        fs::write(&file_a, "a").unwrap();
+        fs::write(&file_b, "b").unwrap();
+
+        // Two new files → +2
+        let out = apply_path_changes(&state, &[file_a.clone(), file_b.clone()]).unwrap();
+        assert_eq!(out.count_delta, 2);
+        assert_eq!(out.changed, 2);
+
+        // Re-upserting an existing path → no net change
+        let out = apply_path_changes(&state, &[file_a.clone()]).unwrap();
+        assert_eq!(out.count_delta, 0);
+
+        // Vanished file → -1
+        fs::remove_file(&file_b).unwrap();
+        let out = apply_path_changes(&state, &[file_b.clone()]).unwrap();
+        assert_eq!(out.count_delta, -1);
+
+        // A vanished directory sweeps its remaining subtree rows: a.txt is
+        // still in the DB and goes with the range delete → -1.
+        fs::remove_dir_all(&docs).unwrap();
+        let out = apply_path_changes(&state, &[docs.clone()]).unwrap();
+        assert_eq!(out.count_delta, -1);
+
+        // Accumulated deltas must equal the authoritative COUNT(*)
+        let conn = db_connection(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
 
         let _ = fs::remove_dir_all(root);
     }
