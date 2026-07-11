@@ -722,6 +722,24 @@ pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<(
     Ok(())
 }
 
+/// Persist the status-bar counts so the next startup can seed them without a
+/// COUNT(*)/MAX() scan over `entries`. Best-effort: write errors are ignored.
+pub(crate) fn persist_cached_counts(conn: &Connection, entries_count: u64, last_updated: Option<i64>) {
+    let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
+    if let Some(lu) = last_updated {
+        let _ = set_meta(conn, "cached_last_updated", &lu.to_string());
+    }
+}
+
+/// Read the status-bar counts persisted by [`persist_cached_counts`]. Returns
+/// `(None, _)` when no count has been cached yet (e.g. a never-indexed DB).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn load_cached_counts(conn: &Connection) -> (Option<u64>, Option<i64>) {
+    let count = get_meta(conn, "cached_entries_count").and_then(|v| v.parse::<u64>().ok());
+    let last_updated = get_meta(conn, "cached_last_updated").and_then(|v| v.parse::<i64>().ok());
+    (count, last_updated)
+}
+
 pub(crate) fn cleanup_entries_gc_tables(conn: &Connection) -> AppResult<()> {
     let tables: Vec<String> = {
         let mut stmt = conn
@@ -2153,10 +2171,7 @@ pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) 
         status.last_updated = last_updated;
     }
     // Persist cached counts so next startup can read them instantly
-    let _ = set_meta(&conn, "cached_entries_count", &entries_count.to_string());
-    if let Some(lu) = last_updated {
-        let _ = set_meta(&conn, "cached_last_updated", &lu.to_string());
-    }
+    persist_cached_counts(&conn, entries_count, last_updated);
     emit_status_counts(app, state);
     Ok(())
 }
@@ -2175,10 +2190,7 @@ fn emit_and_persist_cached_counts(app: &AppHandle, state: &AppState) {
     // Best-effort persist over the shared watcher connection; the next full
     // recount rewrites the cache if the connection isn't open.
     if let Some(conn) = state.watcher_conn.lock().as_ref() {
-        let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
-        if let Some(lu) = last_updated {
-            let _ = set_meta(conn, "cached_last_updated", &lu.to_string());
-        }
+        persist_cached_counts(conn, entries_count, last_updated);
     }
     emit_status_counts(app, state);
 }
@@ -2190,12 +2202,8 @@ pub(crate) fn set_ready_with_cached_counts(app: &AppHandle, state: &AppState) {
     let (count, last_updated) = db_connection(&state.db_path)
         .ok()
         .map(|conn| {
-            let c = get_meta(&conn, "cached_entries_count")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            let lu = get_meta(&conn, "cached_last_updated")
-                .and_then(|v| v.parse::<i64>().ok());
-            (c, lu)
+            let (c, lu) = load_cached_counts(&conn);
+            (c.unwrap_or(0), lu)
         })
         .unwrap_or((0, None));
 
@@ -3194,10 +3202,7 @@ fn run_incremental_index_inner(
         status.last_updated = last_updated;
     }
     // Persist cached counts for instant startup next time
-    let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
-    if let Some(lu) = last_updated {
-        let _ = set_meta(conn, "cached_last_updated", &lu.to_string());
-    }
+    persist_cached_counts(conn, entries_count, last_updated);
     let updated_at = last_updated.unwrap_or_else(now_epoch);
 
     {
@@ -3544,9 +3549,28 @@ fn remap_event_path(path: PathBuf, remaps: &[(PathBuf, PathBuf)]) -> PathBuf {
     path
 }
 
+/// Earliest instant `path` may be rescanned, given the cooldown of recent
+/// overlapping rescans. `Instant::now()` when nothing overlaps.
+#[cfg(target_os = "macos")]
+fn rescan_not_before(path: &Path, finished: &Mutex<Vec<(PathBuf, Instant)>>) -> Instant {
+    let mut not_before = Instant::now();
+    for (done, at) in finished.lock().iter() {
+        if path.starts_with(done) || done.starts_with(path) {
+            let earliest = *at + RESCAN_COOLDOWN;
+            if earliest > not_before {
+                not_before = earliest;
+            }
+        }
+    }
+    not_before
+}
+
 /// Queue `path` for a subtree rescan, collapsing paths already covered by a
 /// queued ancestor and deferring past the cooldown of recent overlapping
-/// rescans.
+/// rescans. The stored due time is only a lower bound — `spawn_due_subtree_rescan`
+/// re-checks the cooldown when it selects a path, so a rescan that is still
+/// in flight when `path` is queued (and thus not yet in `finished`) is honored
+/// once it completes.
 #[cfg(target_os = "macos")]
 fn queue_subtree_rescan(
     path: PathBuf,
@@ -3556,15 +3580,7 @@ fn queue_subtree_rescan(
     if queued.keys().any(|q| path.starts_with(q)) {
         return; // an equal or ancestor rescan is already queued
     }
-    let mut not_before = Instant::now();
-    for (done, at) in finished.lock().iter() {
-        if path.starts_with(done) || done.starts_with(&path) {
-            let earliest = *at + RESCAN_COOLDOWN;
-            if earliest > not_before {
-                not_before = earliest;
-            }
-        }
-    }
+    let not_before = rescan_not_before(&path, finished);
     // Queued descendants are covered by this wider rescan.
     queued.retain(|q, _| !q.starts_with(&path));
     queued.insert(path, not_before);
@@ -3597,6 +3613,15 @@ fn spawn_due_subtree_rescan(
     else {
         return;
     };
+    // The stored due time is a lower bound; re-check the cooldown now that an
+    // overlapping rescan may have finished since this path was queued (e.g. the
+    // just-completed inflight rescan of the same subtree). If still cooling
+    // down, push the due time out and leave it queued for a later tick.
+    let not_before = rescan_not_before(&path, finished);
+    if not_before > now {
+        queued.insert(path, not_before);
+        return;
+    }
     queued.remove(&path);
     inflight.store(true, AtomicOrdering::Release);
 
@@ -3605,6 +3630,23 @@ fn spawn_due_subtree_rescan(
     let inflight = Arc::clone(inflight);
     let finished = Arc::clone(finished);
     std::thread::spawn(move || {
+        // Hold the exclusive-writer guard for the rescan's duration: it opens
+        // its own write connection and both walks and deletes over many
+        // seconds, so without this it can race the full-index writer (fresh
+        // insert hits SQLITE_BUSY and aborts), the .pathindexing scan, and the
+        // live watcher's upserts (a deleted-and-recreated file gets wrongly
+        // swept as vanished). All three already stand down on indexing_active.
+        if state
+            .indexing_active
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            // An index pass started between the due-check and here; it
+            // reconciles the same ground. Record no cooldown stamp, so a later
+            // MustScanSubDirs re-queues this subtree.
+            inflight.store(false, AtomicOrdering::Release);
+            return;
+        }
         let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
         let started = Instant::now();
         let result = db_connection(&state.db_path).and_then(|mut conn| {
@@ -3613,6 +3655,8 @@ fn spawn_due_subtree_rescan(
             let _ = conn.execute_batch("PRAGMA shrink_memory;");
             Ok(counts)
         });
+        state.indexing_active.store(false, AtomicOrdering::Release);
+        let succeeded = result.is_ok();
         match result {
             Ok((upserted, deleted)) => {
                 eprintln!(
@@ -3637,7 +3681,11 @@ fn spawn_due_subtree_rescan(
             ),
         }
         let mut finished = finished.lock();
-        finished.push((path, Instant::now()));
+        // Only stamp the cooldown on success: a failed rescan left the subtree
+        // unreconciled, so it must not be blocked from a prompt retry.
+        if succeeded {
+            finished.push((path, Instant::now()));
+        }
         finished.retain(|(_, at)| at.elapsed() < RESCAN_COOLDOWN);
         inflight.store(false, AtomicOrdering::Release);
     });
@@ -3664,6 +3712,10 @@ fn start_fsevent_watcher_worker(
         let rescan_inflight = Arc::new(AtomicBool::new(false));
         let finished_rescans: Arc<Mutex<Vec<(PathBuf, Instant)>>> =
             Arc::new(Mutex::new(Vec::new()));
+        // Queued-but-not-yet-spawned rescans must also outlive stream rebuilds:
+        // a .pathindexing edit rebuilds the stream, and a rescan deferred by
+        // cooldown or the inflight guard would otherwise be silently dropped.
+        let mut queued_rescans: HashMap<PathBuf, Instant> = HashMap::new();
 
         // Each pass runs one FSEvents stream; the stream is rebuilt (with
         // event-id continuity) when .pathindexing roots change.
@@ -3703,6 +3755,11 @@ fn start_fsevent_watcher_worker(
                         "Error",
                         Some(format!("FSEvents watcher initialization failed: {err}")),
                     );
+                    // A prior iteration may have set watcher_active on a
+                    // successful build; clear it before bailing so reset_index
+                    // doesn't spin for its full 5s deadline waiting on a
+                    // watcher thread that has already exited.
+                    state.watcher_active.store(false, AtomicOrdering::Release);
                     return;
                 }
             };
@@ -3724,6 +3781,7 @@ fn start_fsevent_watcher_worker(
                 replay,
                 &rescan_inflight,
                 &finished_rescans,
+                &mut queued_rescans,
             );
 
             let eid = watcher.last_event_id();
@@ -3756,6 +3814,7 @@ fn run_fsevent_stream(
     replay: bool,
     rescan_inflight: &Arc<AtomicBool>,
     finished_rescans: &Arc<Mutex<Vec<(PathBuf, Instant)>>>,
+    queued_rescans: &mut HashMap<PathBuf, Instant>,
 ) -> WatcherExit {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -3769,9 +3828,6 @@ fn run_fsevent_stream(
     let mut replay_phase = replay;
     let mut full_scan_triggered = false;
     let mut rebuild_requested = false;
-
-    // MustScanSubDirs rescans awaiting execution: path → earliest run time.
-    let mut queued_rescans: HashMap<PathBuf, Instant> = HashMap::new();
 
     // Snapshot config file entries at stream start so we only emit
     // pathignore_changed when actual rule entries change (ignores whitespace/comments).
@@ -3902,7 +3958,7 @@ fn run_fsevent_stream(
                 // Dropped events mean this subtree must be reconciled with
                 // disk. Queue a streaming rescan (spawned from the loop
                 // tail): bounded memory, change-detected, and rate-limited.
-                queue_subtree_rescan(path, &mut queued_rescans, finished_rescans);
+                queue_subtree_rescan(path, queued_rescans, finished_rescans);
             }
             Ok(mac::fsevent_watcher::FsEvent::HistoryDone) => {
                 eprintln!(
@@ -3954,13 +4010,20 @@ fn run_fsevent_stream(
             pending_status_emit = false;
         }
 
-        spawn_due_subtree_rescan(
-            &app,
-            &state,
-            &mut queued_rescans,
-            rescan_inflight,
-            finished_rescans,
-        );
+        // Hold rescans until replay finishes: during replay the MustScanSubDirs
+        // count decides whether to escalate to a full scan, and a rescan
+        // grabbing the indexing_active guard first would preempt that. Queued
+        // rescans survive to drain once replay ends (or are subsumed by the
+        // full scan, which reconciles the same ground).
+        if !replay_phase {
+            spawn_due_subtree_rescan(
+                &app,
+                &state,
+                queued_rescans,
+                rescan_inflight,
+                finished_rescans,
+            );
+        }
 
         // Periodic event_id flush
         if last_flush.elapsed() >= EVENT_ID_FLUSH_INTERVAL {
@@ -6544,17 +6607,19 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             if bench_mode {
                 let _ = start_full_index_worker(app_handle.clone(), state.clone());
             } else {
-                let (stored_event_id, index_complete) = db_connection(&state.db_path)
-                    .ok()
-                    .map(|c| {
-                        let eid = get_meta(&c, "last_event_id")
-                            .and_then(|v| v.parse::<u64>().ok());
-                        let complete = get_meta(&c, "index_complete")
-                            .map(|v| v == "1")
-                            .unwrap_or(false);
-                        (eid, complete)
-                    })
-                    .unwrap_or((None, false));
+                let (stored_event_id, index_complete, cached_count, cached_updated) =
+                    db_connection(&state.db_path)
+                        .ok()
+                        .map(|c| {
+                            let eid = get_meta(&c, "last_event_id")
+                                .and_then(|v| v.parse::<u64>().ok());
+                            let complete = get_meta(&c, "index_complete")
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
+                            let (count, updated) = load_cached_counts(&c);
+                            (eid, complete, count, updated)
+                        })
+                        .unwrap_or((None, false, None, None));
 
                 let entries_empty = db_connection(&state.db_path)
                     .ok()
@@ -6567,20 +6632,15 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 let effective_complete = index_complete && !entries_empty;
 
                 if stored_event_id.is_some() && effective_complete {
-                    // Seed status counts from the cached meta before the
-                    // watcher starts, so its incremental count updates build
-                    // on the last known total instead of 0 (the HistoryDone
-                    // full recount later corrects any replay drift).
-                    if let Ok(c) = db_connection(&state.db_path) {
-                        let cached_count = get_meta(&c, "cached_entries_count")
-                            .and_then(|v| v.parse::<u64>().ok());
-                        let cached_updated = get_meta(&c, "cached_last_updated")
-                            .and_then(|v| v.parse::<i64>().ok());
-                        if let Some(count) = cached_count {
-                            let mut status = state.status.lock();
-                            status.entries_count = count;
-                            status.last_updated = cached_updated;
-                        }
+                    // Seed status counts from the cached meta (read above on
+                    // the same connection) before the watcher starts, so its
+                    // incremental count updates build on the last known total
+                    // instead of 0 (the HistoryDone full recount later corrects
+                    // any replay drift).
+                    if let Some(count) = cached_count {
+                        let mut status = state.status.lock();
+                        status.entries_count = count;
+                        status.last_updated = cached_updated;
                     }
                     // Conditional startup: try watcher replay first, skip full scan if OK
                     start_fsevent_watcher_worker(
