@@ -24,6 +24,7 @@ use std::os::windows::process::CommandExt;
 mod fd_search;
 #[cfg(target_os = "macos")]
 mod mac;
+mod mcp_server;
 mod mem_search;
 mod pathindexing;
 mod query;
@@ -4551,6 +4552,523 @@ fn compute_total_count(state: &AppState, execution: &SearchExecution) -> Option<
     Some(total)
 }
 
+/// Core DB search shared by the Tauri `search` command and the MCP server
+/// (`mcp_server::run_stdio_server`): dispatches the parsed `mode` to the
+/// mode-specific SQL against `conn`. Takes no AppState so it can run against a
+/// bare read connection when the app itself is not running.
+#[allow(clippy::too_many_arguments)]
+fn run_db_search(
+    conn: &Connection,
+    home_dir: &Path,
+    fts_ready: bool,
+    mode: &SearchMode,
+    query: &str,
+    effective_limit: u32,
+    offset: u32,
+    sort_by: &str,
+    sort_dir: &str,
+) -> AppResult<Vec<EntryDto>> {
+    let order_by = sort_clause(sort_by, sort_dir, "e.");
+    let mut results = Vec::with_capacity(effective_limit as usize);
+    match mode {
+        SearchMode::Empty => {
+            let sql = format!(
+                r#"
+                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                FROM entries e
+                ORDER BY {order_by}
+                LIMIT ?1 OFFSET ?2
+                "#,
+            );
+            let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![effective_limit, offset], row_to_entry)
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                results.push(row.map_err(|e| e.to_string())?);
+            }
+        }
+
+        SearchMode::NameSearch { name_like } => {
+            if sort_by != "name" && query.chars().count() >= 3 && fts_ready {
+                // Non-name sort: use FTS5 trigram for globally correct ordering.
+                // The 3-phase approach only returns prefix matches for non-empty
+                // prefix results, causing contains matches to be silently excluded
+                // (e.g. a large file "myapp_foo.zip" missing from size-desc results).
+                // FTS5 trigram index covers all substring matches in one indexed pass.
+                let fts_match = fts_phrase(query);
+                let sql = format!(
+                    r#"
+                    SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                    FROM entries_fts f
+                    JOIN entries e ON e.id = f.rowid
+                    WHERE entries_fts MATCH ?1
+                    ORDER BY {order_by}
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                );
+                let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![fts_match, effective_limit, offset], row_to_entry)
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    results.push(row.map_err(|e| e.to_string())?);
+                }
+            } else {
+
+            let escaped_query = escape_like(query);
+            let exact_query = query.to_string();
+            let prefix_like = format!("{}%", escaped_query);
+            let bare_order = sort_clause(sort_by, sort_dir, "");
+
+            if offset == 0 {
+                let exact_sql = format!(
+                    r#"
+                    SELECT path, name, dir, is_dir, ext, size, mtime
+                    FROM entries
+                    WHERE name COLLATE NOCASE = ?1
+                    ORDER BY {bare_order}
+                    LIMIT ?2
+                    "#,
+                );
+                let mut stmt = conn.prepare_cached(&exact_sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![exact_query, effective_limit], row_to_entry)
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    results.push(row.map_err(|e| e.to_string())?);
+                }
+            }
+
+            if (results.len() as u32) < effective_limit {
+                let remaining = effective_limit - results.len() as u32;
+                let adj_offset = if offset > 0 {
+                    offset.saturating_sub(results.len() as u32)
+                } else {
+                    0
+                };
+
+                // Try indexed prefix search first; fall back to unindexed if
+                // the index is temporarily unavailable (during background DB
+                // rebuild the index may be dropped then recreated).
+                let prefix_sql_indexed = format!(
+                    r#"
+                    SELECT path, name, dir, is_dir, ext, size, mtime
+                    FROM entries INDEXED BY idx_entries_name_nocase
+                    WHERE name LIKE ?1 ESCAPE '\'
+                      AND name COLLATE NOCASE != ?2
+                    ORDER BY {bare_order}
+                    LIMIT ?3 OFFSET ?4
+                    "#,
+                );
+                let prefix_sql_fallback = format!(
+                    r#"
+                    SELECT path, name, dir, is_dir, ext, size, mtime
+                    FROM entries
+                    WHERE name LIKE ?1 ESCAPE '\'
+                      AND name COLLATE NOCASE != ?2
+                    ORDER BY {bare_order}
+                    LIMIT ?3 OFFSET ?4
+                    "#,
+                );
+                let mut stmt = match conn.prepare_cached(&prefix_sql_indexed) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        eprintln!("[search] idx_entries_name_nocase unavailable, using fallback");
+                        conn.prepare_cached(&prefix_sql_fallback).map_err(|e| e.to_string())?
+                    }
+                };
+                let rows = stmt
+                    .query_map(
+                        params![prefix_like, exact_query, remaining, adj_offset],
+                        row_to_entry,
+                    )
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    results.push(row.map_err(|e| e.to_string())?);
+                }
+            }
+
+            if results.is_empty() && fts_ready && query.chars().count() >= 3 {
+                // Phase 2: contains-match via FTS5 trigram — indexed, complete
+                // (no time budget), and paginatable. Reached only when exact and
+                // prefix found nothing, so no exclusion predicates are needed.
+                // For offset>0 the page belongs to the contains result set only
+                // when the query has no prefix matches at all (guard below).
+                let serve_contains_page = if offset == 0 {
+                    true
+                } else {
+                    !conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM entries WHERE name LIKE ?1 ESCAPE '\\')",
+                            params![prefix_like],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .unwrap_or(true)
+                };
+                if serve_contains_page {
+                    let fts_match = fts_phrase(query);
+                    let phase2_sql = format!(
+                        r#"
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                        FROM entries_fts f
+                        JOIN entries e ON e.id = f.rowid
+                        WHERE entries_fts MATCH ?1
+                        ORDER BY {order_by}
+                        LIMIT ?2 OFFSET ?3
+                        "#,
+                    );
+                    let mut stmt2 =
+                        conn.prepare_cached(&phase2_sql).map_err(|e| e.to_string())?;
+                    let rows2 = stmt2
+                        .query_map(params![fts_match, effective_limit, offset], row_to_entry)
+                        .map_err(|e| e.to_string())?;
+                    for row in rows2 {
+                        results.push(row.map_err(|e| e.to_string())?);
+                    }
+                }
+            } else if results.is_empty() && offset == 0 {
+                // Phase 2 fallback (query < 3 chars or FTS rebuilding):
+                // contains-match (LIKE '%q%') with tight time budget.
+                let phase2_start = Instant::now();
+                conn.progress_handler(
+                    2_000,
+                    Some(move || phase2_start.elapsed().as_millis() > 5),
+                );
+
+                {
+
+                    let phase2_sql = format!(
+                        r#"
+                        SELECT path, name, dir, is_dir, ext, size, mtime
+                        FROM entries
+                        WHERE name LIKE ?1 ESCAPE '\'
+                          AND name COLLATE NOCASE != ?2
+                          AND name NOT LIKE ?3 ESCAPE '\'
+                        ORDER BY {bare_order}
+                        LIMIT ?4
+                        "#,
+                    );
+                    if let Ok(mut stmt2) = conn.prepare(&phase2_sql) {
+                        if let Ok(rows2) = stmt2.query_map(
+                            params![name_like, exact_query, prefix_like, effective_limit],
+                            row_to_entry,
+                        ) {
+                            for row in rows2 {
+                                match row {
+                                    Ok(entry) => results.push(entry),
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                }
+
+                conn.progress_handler(0, None::<fn() -> bool>);
+            }
+
+            } // end sort_by == "name" branch
+        }
+
+        SearchMode::GlobName { name_like } => {
+            // Leading-wildcard patterns can't use the name index; narrow with the
+            // FTS trigram index on literal runs first, then verify the full glob
+            // with LIKE. Prefix-shaped patterns keep the plain LIKE (index range).
+            let fts_prefilter = glob_fts_prefilter(fts_ready, name_like, query);
+            if let Some(match_expr) = fts_prefilter {
+                let sql = format!(
+                    r#"
+                    SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                    FROM entries_fts f
+                    JOIN entries e ON e.id = f.rowid
+                    WHERE entries_fts MATCH ?1
+                      AND e.name LIKE ?2 ESCAPE '\'
+                    ORDER BY {order_by}
+                    LIMIT ?3 OFFSET ?4
+                    "#,
+                );
+                let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(
+                        params![match_expr, name_like, effective_limit, offset],
+                        row_to_entry,
+                    )
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    results.push(row.map_err(|e| e.to_string())?);
+                }
+            } else {
+                let sql = format!(
+                    r#"
+                    SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                    FROM entries e
+                    WHERE e.name LIKE ?1 ESCAPE '\'
+                    ORDER BY {order_by}
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                );
+                let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![name_like, effective_limit, offset], row_to_entry)
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    results.push(row.map_err(|e| e.to_string())?);
+                }
+            }
+        }
+
+        SearchMode::ExtSearch { ext, name_like: _ } => {
+            let sql = format!(
+                r#"
+                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                FROM entries e
+                WHERE e.ext = ?1
+                ORDER BY {order_by}
+                LIMIT ?2 OFFSET ?3
+                "#,
+            );
+            let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![ext, effective_limit, offset], row_to_entry)
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                results.push(row.map_err(|e| e.to_string())?);
+            }
+        }
+
+        SearchMode::PathSearch {
+            path_like: _,
+            name_like,
+            dir_hint,
+        } => {
+            let resolved_dirs: Vec<String> = resolve_dir_hint(home_dir, dir_hint)
+                .map(|p| vec![p.to_string_lossy().to_string()])
+                .unwrap_or_default();
+            let resolved_dirs = if resolved_dirs.is_empty() {
+                resolve_dirs_from_db(&conn, dir_hint)
+            } else {
+                resolved_dirs
+            };
+
+            if !resolved_dirs.is_empty() {
+                let ext_shortcut = extract_ext_from_like(name_like);
+                let mut sql_params: Vec<SqlValue> = Vec::new();
+                let mut dir_conditions = Vec::new();
+                let sep = std::path::MAIN_SEPARATOR;
+
+                for d in &resolved_dirs {
+                    let i = sql_params.len();
+                    let pfx = format!("{d}{sep}");
+                    let pfx_end = format!("{d}\x7F");
+                    sql_params.push(SqlValue::Text(d.clone()));
+                    sql_params.push(SqlValue::Text(pfx));
+                    sql_params.push(SqlValue::Text(pfx_end));
+                    dir_conditions.push(format!(
+                        "(e.dir = ?{} OR (e.dir >= ?{} AND e.dir < ?{}))",
+                        i + 1,
+                        i + 2,
+                        i + 3
+                    ));
+                }
+                let dir_where = dir_conditions.join(" OR ");
+
+                let name_filter = if name_like == "%" {
+                    String::new()
+                } else if let Some(ref ext_val) = ext_shortcut {
+                    let i = sql_params.len();
+                    sql_params.push(SqlValue::Text(ext_val.clone()));
+                    format!(" AND e.ext = ?{}", i + 1)
+                } else {
+                    let i = sql_params.len();
+                    sql_params.push(SqlValue::Text(name_like.clone()));
+                    format!(" AND e.name LIKE ?{} ESCAPE '\\'", i + 1)
+                };
+
+                let limit_idx = sql_params.len() + 1;
+                let offset_idx = sql_params.len() + 2;
+                sql_params.push(SqlValue::Integer(effective_limit as i64));
+                sql_params.push(SqlValue::Integer(offset as i64));
+
+                let sql = format!(
+                    r#"
+                    SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                    FROM entries e
+                    WHERE ({dir_where}){name_filter}
+                    ORDER BY {order_by}
+                    LIMIT ?{limit_idx} OFFSET ?{offset_idx}
+                    "#,
+                );
+                // Dynamic shape (one condition per resolved dir): not worth caching.
+                let mut stmt = conn.prepare(sql.as_str()).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params_from_iter(sql_params.iter()), row_to_entry)
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    results.push(row.map_err(|e| e.to_string())?);
+                }
+            } else {
+                let sep = std::path::MAIN_SEPARATOR;
+                let sep_str = sep.to_string();
+                let escaped_sep = escape_like(&sep_str);
+                let (native_hint, is_absolute) = normalize_hint_to_native(dir_hint);
+                let dir_suffix = escape_like(&native_hint);
+                let dir_prefix = if is_absolute {
+                    String::new()
+                } else {
+                    escaped_sep.clone()
+                };
+                let dir_like_exact = format!("%{dir_prefix}{dir_suffix}");
+                let dir_like_sub = format!("%{dir_prefix}{dir_suffix}{escaped_sep}%");
+                let ext_shortcut = extract_ext_from_like(name_like);
+
+                if let Some(ext_val) = ext_shortcut {
+                    let sql = format!(
+                        r#"
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                        FROM entries e
+                        WHERE e.ext = ?1
+                          AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
+                        ORDER BY {order_by}
+                        LIMIT ?4 OFFSET ?5
+                        "#,
+                    );
+                    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(
+                            params![
+                                ext_val,
+                                dir_like_exact,
+                                dir_like_sub,
+                                effective_limit,
+                                offset
+                            ],
+                            row_to_entry,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for row in rows {
+                        results.push(row.map_err(|e| e.to_string())?);
+                    }
+                } else if name_like == "%" {
+                    // Directory listing: no name filter needed, no time budget
+                    let sql = format!(
+                        r#"
+                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                        FROM entries e
+                        WHERE e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\'
+                        ORDER BY {order_by}
+                        LIMIT ?3 OFFSET ?4
+                        "#,
+                    );
+                    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(
+                            params![dir_like_exact, dir_like_sub, effective_limit, offset],
+                            row_to_entry,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for row in rows {
+                        results.push(row.map_err(|e| e.to_string())?);
+                    }
+                } else {
+                    // Phase A: fast prefix search via name index
+                    // "%main%" -> strip leading '%' -> "main%" can use idx_entries_name_nocase
+                    let prefix_like = if name_like.starts_with('%') {
+                        let rest = &name_like[1..];
+                        if !rest.is_empty() && !rest.starts_with('%') {
+                            Some(rest.to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        // Already a prefix pattern (e.g. "test%"), use as-is
+                        Some(name_like.clone())
+                    };
+
+                    if offset == 0 {
+                        if let Some(ref pfx) = prefix_like {
+                            let sql = format!(
+                                r#"
+                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                                FROM entries e INDEXED BY idx_entries_name_nocase
+                                WHERE e.name LIKE ?1 ESCAPE '\'
+                                  AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
+                                ORDER BY {order_by}
+                                LIMIT ?4
+                                "#,
+                            );
+                            if let Ok(mut stmt) = conn.prepare_cached(&sql) {
+                                if let Ok(rows) = stmt.query_map(
+                                    params![
+                                        pfx,
+                                        dir_like_exact,
+                                        dir_like_sub,
+                                        effective_limit
+                                    ],
+                                    row_to_entry,
+                                ) {
+                                    for row in rows {
+                                        match row {
+                                            Ok(entry) => results.push(entry),
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Phase B: time-budgeted contains fallback if prefix found too few
+                    if results.len() < effective_limit as usize {
+                        let path_start = Instant::now();
+                        conn.progress_handler(
+                            2_000,
+                            Some(move || path_start.elapsed().as_millis() > 5),
+                        );
+
+                        let sql = format!(
+                            r#"
+                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
+                            FROM entries e
+                            WHERE (e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\')
+                              AND e.name LIKE ?3 ESCAPE '\'
+                            ORDER BY {order_by}
+                            LIMIT ?4 OFFSET ?5
+                            "#,
+                        );
+                        if let Ok(mut stmt) = conn.prepare_cached(&sql) {
+                            if let Ok(rows) = stmt.query_map(
+                                params![
+                                    dir_like_exact,
+                                    dir_like_sub,
+                                    name_like,
+                                    effective_limit,
+                                    offset
+                                ],
+                                row_to_entry,
+                            ) {
+                                for row in rows {
+                                    match row {
+                                        Ok(entry) => results.push(entry),
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                        }
+
+                        conn.progress_handler(0, None::<fn() -> bool>);
+
+                        // Deduplicate (Phase A prefix results overlap with Phase B contains)
+                        let mut seen = std::collections::HashSet::new();
+                        results.retain(|e| seen.insert(e.path.clone()));
+                        results.truncate(effective_limit as usize);
+                    }
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
 fn execute_search(
     state: &AppState,
     query: String,
@@ -4601,7 +5119,6 @@ fn execute_search(
 
     let is_indexing = matches!(state.status.lock().state, IndexState::Indexing);
     let fts_ready = state.fts_ready.load(AtomicOrdering::Acquire);
-    let order_by = sort_clause(&sort_by, &sort_dir, "e.");
 
     let mut results = Vec::with_capacity(effective_limit as usize);
     let mode = parse_query(&query);
@@ -4699,502 +5216,17 @@ fn execute_search(
         Ok(conn) => {
             #[cfg(target_os = "macos")]
             { db_unavailable = false; }
-            match &mode {
-                SearchMode::Empty => {
-                    let sql = format!(
-                        r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                        FROM entries e
-                        ORDER BY {order_by}
-                        LIMIT ?1 OFFSET ?2
-                        "#,
-                    );
-                    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map(params![effective_limit, offset], row_to_entry)
-                        .map_err(|e| e.to_string())?;
-                    for row in rows {
-                        results.push(row.map_err(|e| e.to_string())?);
-                    }
-                }
-
-                SearchMode::NameSearch { name_like } => {
-                    if sort_by != "name" && query.chars().count() >= 3 && fts_ready {
-                        // Non-name sort: use FTS5 trigram for globally correct ordering.
-                        // The 3-phase approach only returns prefix matches for non-empty
-                        // prefix results, causing contains matches to be silently excluded
-                        // (e.g. a large file "myapp_foo.zip" missing from size-desc results).
-                        // FTS5 trigram index covers all substring matches in one indexed pass.
-                        let fts_match = fts_phrase(&query);
-                        let sql = format!(
-                            r#"
-                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                            FROM entries_fts f
-                            JOIN entries e ON e.id = f.rowid
-                            WHERE entries_fts MATCH ?1
-                            ORDER BY {order_by}
-                            LIMIT ?2 OFFSET ?3
-                            "#,
-                        );
-                        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![fts_match, effective_limit, offset], row_to_entry)
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
-                        }
-                    } else {
-
-                    let escaped_query = escape_like(&query);
-                    let exact_query = query.clone();
-                    let prefix_like = format!("{}%", escaped_query);
-                    let bare_order = sort_clause(&sort_by, &sort_dir, "");
-
-                    if offset == 0 {
-                        let exact_sql = format!(
-                            r#"
-                            SELECT path, name, dir, is_dir, ext, size, mtime
-                            FROM entries
-                            WHERE name COLLATE NOCASE = ?1
-                            ORDER BY {bare_order}
-                            LIMIT ?2
-                            "#,
-                        );
-                        let mut stmt = conn.prepare_cached(&exact_sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![exact_query, effective_limit], row_to_entry)
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
-                        }
-                    }
-
-                    if (results.len() as u32) < effective_limit {
-                        let remaining = effective_limit - results.len() as u32;
-                        let adj_offset = if offset > 0 {
-                            offset.saturating_sub(results.len() as u32)
-                        } else {
-                            0
-                        };
-
-                        // Try indexed prefix search first; fall back to unindexed if
-                        // the index is temporarily unavailable (during background DB
-                        // rebuild the index may be dropped then recreated).
-                        let prefix_sql_indexed = format!(
-                            r#"
-                            SELECT path, name, dir, is_dir, ext, size, mtime
-                            FROM entries INDEXED BY idx_entries_name_nocase
-                            WHERE name LIKE ?1 ESCAPE '\'
-                              AND name COLLATE NOCASE != ?2
-                            ORDER BY {bare_order}
-                            LIMIT ?3 OFFSET ?4
-                            "#,
-                        );
-                        let prefix_sql_fallback = format!(
-                            r#"
-                            SELECT path, name, dir, is_dir, ext, size, mtime
-                            FROM entries
-                            WHERE name LIKE ?1 ESCAPE '\'
-                              AND name COLLATE NOCASE != ?2
-                            ORDER BY {bare_order}
-                            LIMIT ?3 OFFSET ?4
-                            "#,
-                        );
-                        let mut stmt = match conn.prepare_cached(&prefix_sql_indexed) {
-                            Ok(s) => s,
-                            Err(_) => {
-                                eprintln!("[search] idx_entries_name_nocase unavailable, using fallback");
-                                conn.prepare_cached(&prefix_sql_fallback).map_err(|e| e.to_string())?
-                            }
-                        };
-                        let rows = stmt
-                            .query_map(
-                                params![prefix_like, exact_query, remaining, adj_offset],
-                                row_to_entry,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
-                        }
-                    }
-
-                    if results.is_empty() && fts_ready && query.chars().count() >= 3 {
-                        // Phase 2: contains-match via FTS5 trigram — indexed, complete
-                        // (no time budget), and paginatable. Reached only when exact and
-                        // prefix found nothing, so no exclusion predicates are needed.
-                        // For offset>0 the page belongs to the contains result set only
-                        // when the query has no prefix matches at all (guard below).
-                        let serve_contains_page = if offset == 0 {
-                            true
-                        } else {
-                            !conn
-                                .query_row(
-                                    "SELECT EXISTS(SELECT 1 FROM entries WHERE name LIKE ?1 ESCAPE '\\')",
-                                    params![prefix_like],
-                                    |r| r.get::<_, bool>(0),
-                                )
-                                .unwrap_or(true)
-                        };
-                        if serve_contains_page {
-                            let fts_match = fts_phrase(&query);
-                            let phase2_sql = format!(
-                                r#"
-                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                                FROM entries_fts f
-                                JOIN entries e ON e.id = f.rowid
-                                WHERE entries_fts MATCH ?1
-                                ORDER BY {order_by}
-                                LIMIT ?2 OFFSET ?3
-                                "#,
-                            );
-                            let mut stmt2 =
-                                conn.prepare_cached(&phase2_sql).map_err(|e| e.to_string())?;
-                            let rows2 = stmt2
-                                .query_map(params![fts_match, effective_limit, offset], row_to_entry)
-                                .map_err(|e| e.to_string())?;
-                            for row in rows2 {
-                                results.push(row.map_err(|e| e.to_string())?);
-                            }
-                        }
-                    } else if results.is_empty() && offset == 0 {
-                        // Phase 2 fallback (query < 3 chars or FTS rebuilding):
-                        // contains-match (LIKE '%q%') with tight time budget.
-                        let phase2_start = Instant::now();
-                        conn.progress_handler(
-                            2_000,
-                            Some(move || phase2_start.elapsed().as_millis() > 5),
-                        );
-
-                        {
-
-                            let phase2_sql = format!(
-                                r#"
-                                SELECT path, name, dir, is_dir, ext, size, mtime
-                                FROM entries
-                                WHERE name LIKE ?1 ESCAPE '\'
-                                  AND name COLLATE NOCASE != ?2
-                                  AND name NOT LIKE ?3 ESCAPE '\'
-                                ORDER BY {bare_order}
-                                LIMIT ?4
-                                "#,
-                            );
-                            if let Ok(mut stmt2) = conn.prepare(&phase2_sql) {
-                                if let Ok(rows2) = stmt2.query_map(
-                                    params![name_like, exact_query, prefix_like, effective_limit],
-                                    row_to_entry,
-                                ) {
-                                    for row in rows2 {
-                                        match row {
-                                            Ok(entry) => results.push(entry),
-                                            Err(_) => break,
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        conn.progress_handler(0, None::<fn() -> bool>);
-                    }
-
-                    } // end sort_by == "name" branch
-                }
-
-                SearchMode::GlobName { name_like } => {
-                    // Leading-wildcard patterns can't use the name index; narrow with the
-                    // FTS trigram index on literal runs first, then verify the full glob
-                    // with LIKE. Prefix-shaped patterns keep the plain LIKE (index range).
-                    let fts_prefilter = glob_fts_prefilter(fts_ready, name_like, &query);
-                    if let Some(match_expr) = fts_prefilter {
-                        let sql = format!(
-                            r#"
-                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                            FROM entries_fts f
-                            JOIN entries e ON e.id = f.rowid
-                            WHERE entries_fts MATCH ?1
-                              AND e.name LIKE ?2 ESCAPE '\'
-                            ORDER BY {order_by}
-                            LIMIT ?3 OFFSET ?4
-                            "#,
-                        );
-                        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(
-                                params![match_expr, name_like, effective_limit, offset],
-                                row_to_entry,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
-                        }
-                    } else {
-                        let sql = format!(
-                            r#"
-                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                            FROM entries e
-                            WHERE e.name LIKE ?1 ESCAPE '\'
-                            ORDER BY {order_by}
-                            LIMIT ?2 OFFSET ?3
-                            "#,
-                        );
-                        let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params![name_like, effective_limit, offset], row_to_entry)
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
-                        }
-                    }
-                }
-
-                SearchMode::ExtSearch { ext, name_like: _ } => {
-                    let sql = format!(
-                        r#"
-                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                        FROM entries e
-                        WHERE e.ext = ?1
-                        ORDER BY {order_by}
-                        LIMIT ?2 OFFSET ?3
-                        "#,
-                    );
-                    let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map(params![ext, effective_limit, offset], row_to_entry)
-                        .map_err(|e| e.to_string())?;
-                    for row in rows {
-                        results.push(row.map_err(|e| e.to_string())?);
-                    }
-                }
-
-                SearchMode::PathSearch {
-                    path_like: _,
-                    name_like,
-                    dir_hint,
-                } => {
-                    let resolved_dirs: Vec<String> = resolve_dir_hint(&state.home_dir, dir_hint)
-                        .map(|p| vec![p.to_string_lossy().to_string()])
-                        .unwrap_or_default();
-                    let resolved_dirs = if resolved_dirs.is_empty() {
-                        resolve_dirs_from_db(&conn, dir_hint)
-                    } else {
-                        resolved_dirs
-                    };
-
-                    if !resolved_dirs.is_empty() {
-                        let ext_shortcut = extract_ext_from_like(name_like);
-                        let mut sql_params: Vec<SqlValue> = Vec::new();
-                        let mut dir_conditions = Vec::new();
-                        let sep = std::path::MAIN_SEPARATOR;
-
-                        for d in &resolved_dirs {
-                            let i = sql_params.len();
-                            let pfx = format!("{d}{sep}");
-                            let pfx_end = format!("{d}\x7F");
-                            sql_params.push(SqlValue::Text(d.clone()));
-                            sql_params.push(SqlValue::Text(pfx));
-                            sql_params.push(SqlValue::Text(pfx_end));
-                            dir_conditions.push(format!(
-                                "(e.dir = ?{} OR (e.dir >= ?{} AND e.dir < ?{}))",
-                                i + 1,
-                                i + 2,
-                                i + 3
-                            ));
-                        }
-                        let dir_where = dir_conditions.join(" OR ");
-
-                        let name_filter = if name_like == "%" {
-                            String::new()
-                        } else if let Some(ref ext_val) = ext_shortcut {
-                            let i = sql_params.len();
-                            sql_params.push(SqlValue::Text(ext_val.clone()));
-                            format!(" AND e.ext = ?{}", i + 1)
-                        } else {
-                            let i = sql_params.len();
-                            sql_params.push(SqlValue::Text(name_like.clone()));
-                            format!(" AND e.name LIKE ?{} ESCAPE '\\'", i + 1)
-                        };
-
-                        let limit_idx = sql_params.len() + 1;
-                        let offset_idx = sql_params.len() + 2;
-                        sql_params.push(SqlValue::Integer(effective_limit as i64));
-                        sql_params.push(SqlValue::Integer(offset as i64));
-
-                        let sql = format!(
-                            r#"
-                            SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                            FROM entries e
-                            WHERE ({dir_where}){name_filter}
-                            ORDER BY {order_by}
-                            LIMIT ?{limit_idx} OFFSET ?{offset_idx}
-                            "#,
-                        );
-                        // Dynamic shape (one condition per resolved dir): not worth caching.
-                        let mut stmt = conn.prepare(sql.as_str()).map_err(|e| e.to_string())?;
-                        let rows = stmt
-                            .query_map(params_from_iter(sql_params.iter()), row_to_entry)
-                            .map_err(|e| e.to_string())?;
-                        for row in rows {
-                            results.push(row.map_err(|e| e.to_string())?);
-                        }
-                    } else {
-                        let sep = std::path::MAIN_SEPARATOR;
-                        let sep_str = sep.to_string();
-                        let escaped_sep = escape_like(&sep_str);
-                        let (native_hint, is_absolute) = normalize_hint_to_native(dir_hint);
-                        let dir_suffix = escape_like(&native_hint);
-                        let dir_prefix = if is_absolute {
-                            String::new()
-                        } else {
-                            escaped_sep.clone()
-                        };
-                        let dir_like_exact = format!("%{dir_prefix}{dir_suffix}");
-                        let dir_like_sub = format!("%{dir_prefix}{dir_suffix}{escaped_sep}%");
-                        let ext_shortcut = extract_ext_from_like(name_like);
-
-                        if let Some(ext_val) = ext_shortcut {
-                            let sql = format!(
-                                r#"
-                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                                FROM entries e
-                                WHERE e.ext = ?1
-                                  AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
-                                ORDER BY {order_by}
-                                LIMIT ?4 OFFSET ?5
-                                "#,
-                            );
-                            let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                            let rows = stmt
-                                .query_map(
-                                    params![
-                                        ext_val,
-                                        dir_like_exact,
-                                        dir_like_sub,
-                                        effective_limit,
-                                        offset
-                                    ],
-                                    row_to_entry,
-                                )
-                                .map_err(|e| e.to_string())?;
-                            for row in rows {
-                                results.push(row.map_err(|e| e.to_string())?);
-                            }
-                        } else if name_like == "%" {
-                            // Directory listing: no name filter needed, no time budget
-                            let sql = format!(
-                                r#"
-                                SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                                FROM entries e
-                                WHERE e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\'
-                                ORDER BY {order_by}
-                                LIMIT ?3 OFFSET ?4
-                                "#,
-                            );
-                            let mut stmt = conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
-                            let rows = stmt
-                                .query_map(
-                                    params![dir_like_exact, dir_like_sub, effective_limit, offset],
-                                    row_to_entry,
-                                )
-                                .map_err(|e| e.to_string())?;
-                            for row in rows {
-                                results.push(row.map_err(|e| e.to_string())?);
-                            }
-                        } else {
-                            // Phase A: fast prefix search via name index
-                            // "%main%" -> strip leading '%' -> "main%" can use idx_entries_name_nocase
-                            let prefix_like = if name_like.starts_with('%') {
-                                let rest = &name_like[1..];
-                                if !rest.is_empty() && !rest.starts_with('%') {
-                                    Some(rest.to_string())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                // Already a prefix pattern (e.g. "test%"), use as-is
-                                Some(name_like.clone())
-                            };
-
-                            if offset == 0 {
-                                if let Some(ref pfx) = prefix_like {
-                                    let sql = format!(
-                                        r#"
-                                        SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                                        FROM entries e INDEXED BY idx_entries_name_nocase
-                                        WHERE e.name LIKE ?1 ESCAPE '\'
-                                          AND (e.dir LIKE ?2 ESCAPE '\' OR e.dir LIKE ?3 ESCAPE '\')
-                                        ORDER BY {order_by}
-                                        LIMIT ?4
-                                        "#,
-                                    );
-                                    if let Ok(mut stmt) = conn.prepare_cached(&sql) {
-                                        if let Ok(rows) = stmt.query_map(
-                                            params![
-                                                pfx,
-                                                dir_like_exact,
-                                                dir_like_sub,
-                                                effective_limit
-                                            ],
-                                            row_to_entry,
-                                        ) {
-                                            for row in rows {
-                                                match row {
-                                                    Ok(entry) => results.push(entry),
-                                                    Err(_) => break,
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Phase B: time-budgeted contains fallback if prefix found too few
-                            if results.len() < effective_limit as usize {
-                                let path_start = Instant::now();
-                                conn.progress_handler(
-                                    2_000,
-                                    Some(move || path_start.elapsed().as_millis() > 5),
-                                );
-
-                                let sql = format!(
-                                    r#"
-                                    SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
-                                    FROM entries e
-                                    WHERE (e.dir LIKE ?1 ESCAPE '\' OR e.dir LIKE ?2 ESCAPE '\')
-                                      AND e.name LIKE ?3 ESCAPE '\'
-                                    ORDER BY {order_by}
-                                    LIMIT ?4 OFFSET ?5
-                                    "#,
-                                );
-                                if let Ok(mut stmt) = conn.prepare_cached(&sql) {
-                                    if let Ok(rows) = stmt.query_map(
-                                        params![
-                                            dir_like_exact,
-                                            dir_like_sub,
-                                            name_like,
-                                            effective_limit,
-                                            offset
-                                        ],
-                                        row_to_entry,
-                                    ) {
-                                        for row in rows {
-                                            match row {
-                                                Ok(entry) => results.push(entry),
-                                                Err(_) => break,
-                                            }
-                                        }
-                                    }
-                                }
-
-                                conn.progress_handler(0, None::<fn() -> bool>);
-
-                                // Deduplicate (Phase A prefix results overlap with Phase B contains)
-                                let mut seen = std::collections::HashSet::new();
-                                results.retain(|e| seen.insert(e.path.clone()));
-                                results.truncate(effective_limit as usize);
-                            }
-                        }
-                    }
-                }
-            }
+            results = run_db_search(
+                &conn,
+                &state.home_dir,
+                fts_ready,
+                &mode,
+                &query,
+                effective_limit,
+                offset,
+                &sort_by,
+                &sort_dir,
+            )?;
 
             if results.is_empty() && !query.is_empty() && offset == 0 && allow_find_fallback {
                 results = find_search(
@@ -6407,6 +6439,14 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     eprintln!("[startup] setup_app() entered");
     let bench_mode = bench_mode_enabled();
 
+    // Register this binary as an MCP server for Claude Code / Codex so agents
+    // pick it up automatically. Best-effort, off the startup path.
+    std::thread::spawn(|| {
+        for line in mcp_server::register_all() {
+            eprintln!("[mcp] {line}");
+        }
+    });
+
     #[cfg(target_os = "macos")]
     if let Some(window) = app.get_webview_window("main") {
         use tauri::window::Color;
@@ -6858,6 +6898,10 @@ pub fn run() {
 }
 
 fn main() {
+    // `--mcp` / `--register-mcp` run headless and must not boot the GUI.
+    if mcp_server::handle_cli_args() {
+        return;
+    }
     run();
 }
 
