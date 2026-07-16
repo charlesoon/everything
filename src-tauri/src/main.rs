@@ -47,6 +47,31 @@ pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
 const NEGATIVE_CACHE_FALLBACK_WINDOW: Duration = Duration::from_millis(550);
 const DB_VERSION: i32 = 7;
+/// Index DB filename inside the app data dir. Shared with the MCP server's
+/// fallback path derivation (`mcp_server::default_db_path`).
+pub(crate) const DB_FILE_NAME: &str = "index.db";
+
+/// Clamp + short-query cap shared by the app `search` command and the MCP
+/// server, so the DB-protection limit policy can't drift between surfaces.
+/// Only the `default` differs per surface.
+pub(crate) fn effective_search_limit(query: &str, requested: Option<u32>, default: u32) -> u32 {
+    let base = requested.unwrap_or(default).clamp(1, MAX_LIMIT);
+    if !query.is_empty() && query.chars().count() <= 1 {
+        base.min(SHORT_QUERY_LIMIT)
+    } else {
+        base
+    }
+}
+
+/// Home directory resolution shared by app startup and the MCP server, so
+/// path-mode queries resolve against the same root in both processes.
+pub(crate) fn resolve_home_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() }),
+    )
+}
 
 const CREATE_ENTRIES_TABLE_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS entries (
@@ -459,6 +484,29 @@ fn perf_log_enabled() -> bool {
     *PERF_LOG_ENABLED.get_or_init(|| env_truthy("FASTFIND_PERF_LOG") || bench_mode_enabled())
 }
 
+/// Unique per-test scratch directory (not created). Shared by the main.rs and
+/// mcp_server.rs test modules; on Windows it stays under the cwd because the
+/// system temp dir has proven flaky for DB files there.
+#[cfg(test)]
+pub(crate) fn temp_case_dir(case: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = if cfg!(target_os = "windows") {
+        std::env::current_dir()
+            .map(|dir| dir.join("tmp-test-dirs"))
+            .unwrap_or_else(|_| std::env::temp_dir())
+    } else {
+        std::env::temp_dir()
+    };
+    base.join(format!(
+        "everything_{case}_{}_{}",
+        std::process::id(),
+        stamp
+    ))
+}
+
 pub(crate) fn perf_log(message: impl AsRef<str>) {
     if perf_log_enabled() {
         eprintln!("[perf] {}", message.as_ref());
@@ -706,12 +754,22 @@ fn ensure_db_indexes(db_path: &Path) -> AppResult<()> {
 }
 
 pub(crate) fn get_meta(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )
-    .ok()
+    conn.prepare_cached("SELECT value FROM meta WHERE key = ?1")
+        .ok()?
+        .query_row(params![key], |row| row.get(0))
+        .ok()
+}
+
+/// Whether the FTS trigram index is trustworthy: the shadow table exists and
+/// no crashed/in-flight rebuild has flagged it dirty. Single source of the
+/// gating rule, shared by the startup thread and the MCP server (which
+/// re-derives readiness from the DB because it runs in a separate process).
+pub(crate) fn fts_usable(conn: &Connection) -> bool {
+    let has_fts: bool = conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entries_fts')")
+        .and_then(|mut stmt| stmt.query_row([], |r| r.get(0)))
+        .unwrap_or(false);
+    has_fts && get_meta(conn, "fts_dirty").map_or(true, |v| v != "1")
 }
 
 pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<()> {
@@ -868,6 +926,12 @@ fn mark_negative_name_fallback_checked(state: &AppState, query_lower: &str) {
         entry.fallback_checked = true;
     }
 }
+
+/// Sort keys/dirs `sort_clause` dispatches on (its `_` arm falls back to
+/// name-asc). The MCP tool schema and argument validation reference these so
+/// the advertised vocabulary can't drift from the SQL dispatch below.
+pub(crate) const SORT_KEYS: &[&str] = &["name", "mtime", "size", "dir"];
+pub(crate) const SORT_DIRS: &[&str] = &["asc", "desc"];
 
 fn sort_clause(sort_by: &str, sort_dir: &str, prefix: &str) -> String {
     match (sort_by, sort_dir) {
@@ -5078,12 +5142,7 @@ fn execute_search(
     sort_dir: Option<String>,
 ) -> AppResult<SearchExecution> {
     let query = query.trim().to_string();
-    let base_limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let effective_limit = if !query.is_empty() && query.chars().count() <= 1 {
-        base_limit.min(SHORT_QUERY_LIMIT)
-    } else {
-        base_limit
-    };
+    let effective_limit = effective_search_limit(&query, limit, DEFAULT_LIMIT);
     let offset = offset.unwrap_or(0);
 
     let sort_by = sort_by.unwrap_or_else(|| "name".to_string());
@@ -5120,7 +5179,9 @@ fn execute_search(
     let is_indexing = matches!(state.status.lock().state, IndexState::Indexing);
     let fts_ready = state.fts_ready.load(AtomicOrdering::Acquire);
 
-    let mut results = Vec::with_capacity(effective_limit as usize);
+    // Only a placeholder for the DB-unavailable path; every successful path
+    // wholly reassigns it (run_db_search owns the real allocation).
+    let mut results = Vec::new();
     let mode = parse_query(&query);
     let is_name_mode = matches!(&mode, SearchMode::NameSearch { .. });
     let allow_find_fallback = !is_indexing
@@ -5128,14 +5189,7 @@ fn execute_search(
             &mode,
             SearchMode::GlobName { .. } | SearchMode::ExtSearch { .. }
         );
-    let mut mode_label = match &mode {
-        SearchMode::Empty => "empty",
-        SearchMode::NameSearch { .. } => "name",
-        SearchMode::GlobName { .. } => "glob",
-        SearchMode::ExtSearch { .. } => "ext",
-        SearchMode::PathSearch { .. } => "path",
-    }
-    .to_string();
+    let mut mode_label = mode.label().to_string();
 
     // Fast path: search in-memory index if available (DB upsert still in progress)
     {
@@ -6439,14 +6493,6 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     eprintln!("[startup] setup_app() entered");
     let bench_mode = bench_mode_enabled();
 
-    // Register this binary as an MCP server for Claude Code / Codex so agents
-    // pick it up automatically. Best-effort, off the startup path.
-    std::thread::spawn(|| {
-        for line in mcp_server::register_all() {
-            eprintln!("[mcp] {line}");
-        }
-    });
-
     #[cfg(target_os = "macos")]
     if let Some(window) = app.get_webview_window("main") {
         use tauri::window::Color;
@@ -6491,12 +6537,17 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
-    let db_path = app_data_dir.join("index.db");
-    let home_dir = PathBuf::from(
-        std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() }),
-    );
+    let db_path = app_data_dir.join(DB_FILE_NAME);
+    let home_dir = resolve_home_dir();
+
+    // Register this binary as an MCP server for Claude Code / Codex so agents
+    // pick it up automatically. Passes the Tauri-resolved DB path so the
+    // standalone MCP process serves exactly this index instead of guessing
+    // the app-data layout. Best-effort, off the startup path.
+    {
+        let mcp_db_path = db_path.clone();
+        std::thread::spawn(move || mcp_server::register_all_and_log(Some(mcp_db_path)));
+    }
     let scan_root = if cfg!(windows) {
         PathBuf::from("C:\\")
     } else {
@@ -6591,8 +6642,8 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         // If a previous run crashed mid FTS rebuild, don't trust the FTS index
         // until the healing rebuild (finalize_fresh_index) completes.
         if let Ok(c) = db_connection(&state.db_path) {
-            if get_meta(&c, "fts_dirty").map(|v| v == "1").unwrap_or(false) {
-                eprintln!("[startup/thread] fts_dirty=1 -- FTS disabled until rebuild");
+            if !fts_usable(&c) {
+                eprintln!("[startup/thread] FTS dirty or missing -- disabled until rebuild");
                 state.fts_ready.store(false, AtomicOrdering::Release);
             }
         }
@@ -6969,25 +7020,6 @@ mod tests {
             size: None,
             mtime: None,
         }
-    }
-
-    fn temp_case_dir(case: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let base = if cfg!(target_os = "windows") {
-            std::env::current_dir()
-                .map(|dir| dir.join("tmp-test-dirs"))
-                .unwrap_or_else(|_| std::env::temp_dir())
-        } else {
-            std::env::temp_dir()
-        };
-        base.join(format!(
-            "everything_{case}_{}_{}",
-            std::process::id(),
-            stamp
-        ))
     }
 
     fn test_state_for(db_path: PathBuf, home_dir: PathBuf, cwd: PathBuf) -> AppState {

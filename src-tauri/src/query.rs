@@ -18,6 +18,20 @@ pub enum SearchMode {
     },
 }
 
+impl SearchMode {
+    /// Stable mode label surfaced as the frontend's `modeLabel` and in MCP
+    /// search output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SearchMode::Empty => "empty",
+            SearchMode::NameSearch { .. } => "name",
+            SearchMode::GlobName { .. } => "glob",
+            SearchMode::ExtSearch { .. } => "ext",
+            SearchMode::PathSearch { .. } => "path",
+        }
+    }
+}
+
 pub fn escape_like(value: &str) -> String {
     value
         .replace('\\', "\\\\")

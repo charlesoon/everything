@@ -10,11 +10,15 @@ use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 
-use crate::query::{parse_query, SearchMode};
-use crate::{get_meta, run_db_search, sort_entries_with_relevance, AppResult, EntryDto, MAX_LIMIT};
+use crate::query::parse_query;
+use crate::{
+    db_connection_for_search, effective_search_limit, fts_usable, resolve_home_dir,
+    run_db_search, sort_entries_with_relevance, AppResult, EntryDto, DB_FILE_NAME, MAX_LIMIT,
+    SORT_DIRS, SORT_KEYS,
+};
 
 const SERVER_NAME: &str = "everything";
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -49,9 +53,7 @@ pub fn handle_cli_args() -> bool {
         return true;
     }
     if args.iter().any(|a| a == "--register-mcp") {
-        for line in register_all() {
-            eprintln!("[mcp] {line}");
-        }
+        register_all_and_log(None);
         return true;
     }
     false
@@ -61,33 +63,32 @@ pub fn handle_cli_args() -> bool {
 // Paths (resolved without Tauri: the MCP server runs outside the app)
 // ---------------------------------------------------------------------------
 
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-}
-
-/// The same location Tauri's `app_data_dir()` resolves for the app identifier
-/// `com.everything.app`, computed without a Tauri context.
+/// The index DB to serve. Registration entries written by the app pin the
+/// Tauri-resolved path via `EVERYTHING_MCP_DB`; the hand-derived guess below
+/// (Tauri's `app_data_dir()` layout for `com.everything.app`) is only the
+/// fallback for entries or invocations without that pin.
 fn default_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("EVERYTHING_MCP_DB") {
         return PathBuf::from(p);
     }
     #[cfg(target_os = "macos")]
     {
-        home_dir().join("Library/Application Support/com.everything.app/index.db")
+        resolve_home_dir()
+            .join("Library/Application Support/com.everything.app")
+            .join(DB_FILE_NAME)
     }
     #[cfg(target_os = "windows")]
     {
         let roaming = std::env::var("APPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir().join("AppData").join("Roaming"));
-        roaming.join("com.everything.app").join("index.db")
+            .unwrap_or_else(|_| resolve_home_dir().join("AppData").join("Roaming"));
+        roaming.join("com.everything.app").join(DB_FILE_NAME)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        home_dir().join(".local/share/com.everything.app/index.db")
+        resolve_home_dir()
+            .join(".local/share/com.everything.app")
+            .join(DB_FILE_NAME)
     }
 }
 
@@ -102,35 +103,13 @@ fn open_search_connection(db_path: &Path) -> AppResult<Connection> {
             db_path.display()
         ));
     }
-    // READ_WRITE (not CREATE) so WAL recovery can run, but the connection is
-    // pinned read-only via query_only: the watcher/indexer own all writes.
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute_batch(
-        "PRAGMA query_only=ON;
-         PRAGMA busy_timeout=2000;
-         PRAGMA cache_size=-32768;
-         PRAGMA mmap_size=1073741824;",
-    )
-    .map_err(|e| e.to_string())?;
-    conn.set_prepared_statement_cache_capacity(64);
+    // Same tuning as the app's pooled search connections, plus: pinned
+    // read-only (the watcher/indexer own all writes) and a longer busy
+    // timeout since no keystroke latency is at stake here.
+    let conn = db_connection_for_search(db_path)?;
+    conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=2000;")
+        .map_err(|e| e.to_string())?;
     Ok(conn)
-}
-
-/// FTS is usable when the shadow table exists and the app has not flagged it
-/// dirty (mid-rebuild / crash). Mirrors the startup gating in `main.rs`.
-fn compute_fts_ready(conn: &Connection) -> bool {
-    let has_fts: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='entries_fts')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(false);
-    has_fts && get_meta(conn, "fts_dirty").map_or(true, |v| v != "1")
 }
 
 struct SearchArgs {
@@ -150,11 +129,11 @@ fn parse_search_args(arguments: &Value) -> Result<SearchArgs, String> {
     if query.is_empty() {
         return Err("`query` is required and must be a non-empty string.".to_string());
     }
-    let limit = arguments
+    let requested_limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
-        .map(|v| (v as u32).clamp(1, MAX_LIMIT))
-        .unwrap_or(MCP_DEFAULT_LIMIT);
+        .map(|v| v.min(u32::MAX as u64) as u32);
+    let limit = effective_search_limit(&query, requested_limit, MCP_DEFAULT_LIMIT);
     let offset = arguments
         .get("offset")
         .and_then(|v| v.as_u64())
@@ -162,13 +141,13 @@ fn parse_search_args(arguments: &Value) -> Result<SearchArgs, String> {
         .unwrap_or(0);
     let sort_by = match arguments.get("sort_by").and_then(|v| v.as_str()) {
         None => "name".to_string(),
-        Some(s @ ("name" | "mtime" | "size" | "dir")) => s.to_string(),
-        Some(other) => return Err(format!("Invalid sort_by {other:?} (name|mtime|size|dir).")),
+        Some(s) if SORT_KEYS.contains(&s) => s.to_string(),
+        Some(other) => return Err(format!("Invalid sort_by {other:?} (one of {SORT_KEYS:?}).")),
     };
     let sort_dir = match arguments.get("sort_dir").and_then(|v| v.as_str()) {
         None => "asc".to_string(),
-        Some(s @ ("asc" | "desc")) => s.to_string(),
-        Some(other) => return Err(format!("Invalid sort_dir {other:?} (asc|desc).")),
+        Some(s) if SORT_DIRS.contains(&s) => s.to_string(),
+        Some(other) => return Err(format!("Invalid sort_dir {other:?} (one of {SORT_DIRS:?}).")),
     };
     Ok(SearchArgs {
         query,
@@ -177,16 +156,6 @@ fn parse_search_args(arguments: &Value) -> Result<SearchArgs, String> {
         sort_by,
         sort_dir,
     })
-}
-
-fn mode_label(mode: &SearchMode) -> &'static str {
-    match mode {
-        SearchMode::Empty => "empty",
-        SearchMode::NameSearch { .. } => "name",
-        SearchMode::GlobName { .. } => "glob",
-        SearchMode::ExtSearch { .. } => "ext",
-        SearchMode::PathSearch { .. } => "path",
-    }
 }
 
 fn format_results(args: &SearchArgs, label: &str, results: &[EntryDto]) -> String {
@@ -268,12 +237,12 @@ impl McpServer {
             // Notification (notifications/initialized, notifications/cancelled, ...)
             return None;
         };
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let params = msg.get("params").unwrap_or(&Value::Null);
         let result = match method {
-            "initialize" => Ok(handle_initialize(&params)),
+            "initialize" => Ok(handle_initialize(params)),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": [search_tool_definition()] })),
-            "tools/call" => self.handle_tools_call(&params),
+            "tools/call" => self.handle_tools_call(params),
             _ => Err((-32601, format!("Method not found: {method}"))),
         };
         Some(match result {
@@ -287,12 +256,11 @@ impl McpServer {
         if name != "search" {
             return Err((-32602, format!("Unknown tool: {name:?}")));
         }
-        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-        let text = match parse_search_args(&arguments).and_then(|args| self.do_search(&args)) {
-            Ok(text) => return Ok(tool_result(&text, false)),
-            Err(message) => message,
-        };
-        Ok(tool_result(&text, true))
+        let arguments = params.get("arguments").unwrap_or(&Value::Null);
+        Ok(match parse_search_args(arguments).and_then(|args| self.do_search(&args)) {
+            Ok(text) => tool_result(&text, false),
+            Err(message) => tool_result(&message, true),
+        })
     }
 
     fn do_search(&mut self, args: &SearchArgs) -> Result<String, String> {
@@ -301,7 +269,7 @@ impl McpServer {
         }
         let conn = self.conn.as_ref().expect("connection opened above");
         let mode = parse_query(&args.query);
-        let fts_ready = compute_fts_ready(conn);
+        let fts_ready = fts_usable(conn);
         let searched = run_db_search(
             conn,
             &self.home_dir,
@@ -325,7 +293,7 @@ impl McpServer {
         if args.offset == 0 && args.sort_by == "name" {
             sort_entries_with_relevance(&mut results, &args.query, &args.sort_by, &args.sort_dir);
         }
-        Ok(format_results(args, mode_label(&mode), &results))
+        Ok(format_results(args, mode.label(), &results))
     }
 }
 
@@ -378,13 +346,13 @@ fn search_tool_definition() -> Value {
                 },
                 "sort_by": {
                     "type": "string",
-                    "enum": ["name", "mtime", "size", "dir"],
+                    "enum": SORT_KEYS,
                     "default": "name",
                     "description": "Sort key; 'name' also ranks exact/prefix matches first."
                 },
                 "sort_dir": {
                     "type": "string",
-                    "enum": ["asc", "desc"],
+                    "enum": SORT_DIRS,
                     "default": "asc"
                 }
             },
@@ -417,7 +385,7 @@ pub fn run_stdio_server() {
         env!("CARGO_PKG_VERSION"),
         db_path.display()
     );
-    let mut server = McpServer::new(db_path, home_dir());
+    let mut server = McpServer::new(db_path, resolve_home_dir());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -448,35 +416,52 @@ enum RegisterOutcome {
 }
 
 /// Registers this binary (with `--mcp`) as an MCP server for every supported
-/// agent CLI found on this machine. Best-effort and idempotent; returns
-/// human-readable log lines. Called in the background on app startup and by
-/// `--register-mcp`.
-pub fn register_all() -> Vec<String> {
+/// agent CLI found on this machine, logging one line per agent. Best-effort
+/// and idempotent. `db_path` is the app-resolved index path to pin into the
+/// entries (via `EVERYTHING_MCP_DB`); `None` falls back to the derived
+/// default. Called in the background on app startup and by `--register-mcp`.
+pub fn register_all_and_log(db_path: Option<PathBuf>) {
+    for line in register_all(db_path) {
+        eprintln!("[mcp] {line}");
+    }
+}
+
+pub fn register_all(db_path: Option<PathBuf>) -> Vec<String> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => return vec![format!("registration skipped: current_exe failed: {e}")],
     };
-    let home = home_dir();
-    let mut logs = Vec::new();
-    let targets: [(&str, fn(&Path, &Path) -> Result<RegisterOutcome, String>, PathBuf); 2] = [
-        ("Claude Code", register_claude, home.join(".claude.json")),
-        ("Codex", register_codex, home.join(".codex").join("config.toml")),
-    ];
-    for (agent, register, config_path) in targets {
-        match register(&config_path, &exe) {
-            Ok(RegisterOutcome::Updated) => {
-                logs.push(format!("{agent}: registered in {}", config_path.display()))
-            }
-            Ok(RegisterOutcome::Unchanged) => {
-                logs.push(format!("{agent}: already registered"))
-            }
-            Ok(RegisterOutcome::Skipped(reason)) => {
-                logs.push(format!("{agent}: skipped ({reason})"))
-            }
-            Err(e) => logs.push(format!("{agent}: registration failed: {e}")),
+    let db_path = db_path.unwrap_or_else(default_db_path);
+    let home = resolve_home_dir();
+    let claude_config = home.join(".claude.json");
+    let codex_config = home.join(".codex").join("config.toml");
+    vec![
+        outcome_line(
+            "Claude Code",
+            &claude_config,
+            register_claude(&claude_config, &exe, &db_path),
+        ),
+        outcome_line(
+            "Codex",
+            &codex_config,
+            register_codex(&codex_config, &exe, &db_path),
+        ),
+    ]
+}
+
+fn outcome_line(
+    agent: &str,
+    config_path: &Path,
+    result: Result<RegisterOutcome, String>,
+) -> String {
+    match result {
+        Ok(RegisterOutcome::Updated) => {
+            format!("{agent}: registered in {}", config_path.display())
         }
+        Ok(RegisterOutcome::Unchanged) => format!("{agent}: already registered"),
+        Ok(RegisterOutcome::Skipped(reason)) => format!("{agent}: skipped ({reason})"),
+        Err(e) => format!("{agent}: registration failed: {e}"),
     }
-    logs
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
@@ -491,7 +476,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
 /// Claude Code user-scope config: `mcpServers.everything` in `~/.claude.json`.
 /// Never clobbers an unreadable file, preserves all other keys, and only
 /// writes when the entry actually changes.
-fn register_claude(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, String> {
+fn register_claude(config_path: &Path, exe: &Path, db_path: &Path) -> Result<RegisterOutcome, String> {
     let claude_dir_exists = config_path
         .parent()
         .map(|d| d.join(".claude").is_dir())
@@ -519,7 +504,7 @@ fn register_claude(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, St
         "type": "stdio",
         "command": exe.to_string_lossy(),
         "args": ["--mcp"],
-        "env": {},
+        "env": { "EVERYTHING_MCP_DB": db_path.to_string_lossy() },
     });
     if servers.get(SERVER_NAME) == Some(&desired) {
         return Ok(RegisterOutcome::Unchanged);
@@ -533,7 +518,7 @@ fn register_claude(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, St
 
 /// Codex config: `[mcp_servers.everything]` in `~/.codex/config.toml`.
 /// Edited with toml_edit so user comments/formatting survive.
-fn register_codex(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, String> {
+fn register_codex(config_path: &Path, exe: &Path, db_path: &Path) -> Result<RegisterOutcome, String> {
     let codex_dir = config_path.parent().unwrap_or(Path::new("."));
     if !codex_dir.is_dir() {
         return Ok(RegisterOutcome::Skipped("Codex not detected"));
@@ -547,6 +532,7 @@ fn register_codex(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, Str
         .parse()
         .map_err(|e| format!("{} is not valid TOML ({e}); not touching it", config_path.display()))?;
     let exe_str = exe.to_string_lossy();
+    let db_str = db_path.to_string_lossy();
 
     let servers = doc
         .entry("mcp_servers")
@@ -568,7 +554,13 @@ fn register_codex(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, Str
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str()).eq(["--mcp"]))
             .unwrap_or(false);
-        if command_matches && args_match {
+        let db_matches = existing
+            .get("env")
+            .and_then(|e| e.get("EVERYTHING_MCP_DB"))
+            .and_then(|v| v.as_str())
+            .map(|p| p == db_str)
+            .unwrap_or(false);
+        if command_matches && args_match && db_matches {
             return Ok(RegisterOutcome::Unchanged);
         }
     }
@@ -578,6 +570,9 @@ fn register_codex(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, Str
     let mut args = toml_edit::Array::new();
     args.push("--mcp");
     server["args"] = toml_edit::value(args);
+    let mut env = toml_edit::InlineTable::new();
+    env.insert("EVERYTHING_MCP_DB", db_str.as_ref().into());
+    server["env"] = toml_edit::value(env);
     servers.insert(SERVER_NAME, toml_edit::Item::Table(server));
 
     atomic_write(config_path, &doc.to_string())?;
@@ -591,18 +586,9 @@ fn register_codex(config_path: &Path, exe: &Path) -> Result<RegisterOutcome, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static CASE_SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn temp_case_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "everything_mcp_{}_{}_{}",
-            name,
-            std::process::id(),
-            CASE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = crate::temp_case_dir(&format!("mcp_{name}"));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -774,25 +760,36 @@ mod tests {
         let root = temp_case_dir("claude_reg");
         let config = root.join(".claude.json");
         let exe = Path::new("/Applications/Everything.app/Contents/MacOS/Everything");
+        let db = Path::new("/data/app/index.db");
 
         // Not detected: neither ~/.claude.json nor ~/.claude exist.
         assert_eq!(
-            register_claude(&config, exe).unwrap(),
+            register_claude(&config, exe, db).unwrap(),
             RegisterOutcome::Skipped("Claude Code not detected")
         );
 
         // Detected via ~/.claude dir: file is created from scratch.
         fs::create_dir_all(root.join(".claude")).unwrap();
-        assert_eq!(register_claude(&config, exe).unwrap(), RegisterOutcome::Updated);
+        assert_eq!(register_claude(&config, exe, db).unwrap(), RegisterOutcome::Updated);
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
         assert_eq!(parsed["mcpServers"]["everything"]["args"], json!(["--mcp"]));
         assert_eq!(
             parsed["mcpServers"]["everything"]["command"],
             json!(exe.to_string_lossy())
         );
+        assert_eq!(
+            parsed["mcpServers"]["everything"]["env"]["EVERYTHING_MCP_DB"],
+            json!(db.to_string_lossy())
+        );
 
         // Second run: no rewrite.
-        assert_eq!(register_claude(&config, exe).unwrap(), RegisterOutcome::Unchanged);
+        assert_eq!(register_claude(&config, exe, db).unwrap(), RegisterOutcome::Unchanged);
+
+        // A changed DB path re-registers (stale pin is refreshed).
+        assert_eq!(
+            register_claude(&config, exe, Path::new("/data/other.db")).unwrap(),
+            RegisterOutcome::Updated
+        );
 
         // Existing unrelated keys and servers survive an update.
         fs::write(
@@ -800,7 +797,7 @@ mod tests {
             r#"{"theme":"dark","mcpServers":{"other":{"type":"stdio","command":"x"}},"projects":{"/p":{"history":[1,2]}}}"#,
         )
         .unwrap();
-        assert_eq!(register_claude(&config, exe).unwrap(), RegisterOutcome::Updated);
+        assert_eq!(register_claude(&config, exe, db).unwrap(), RegisterOutcome::Updated);
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
         assert_eq!(parsed["theme"], "dark");
         assert_eq!(parsed["mcpServers"]["other"]["command"], "x");
@@ -809,7 +806,7 @@ mod tests {
 
         // Corrupt file: refuse to clobber.
         fs::write(&config, "{oops").unwrap();
-        assert!(register_claude(&config, exe).is_err());
+        assert!(register_claude(&config, exe, db).is_err());
         assert_eq!(fs::read_to_string(&config).unwrap(), "{oops");
     }
 
@@ -818,20 +815,28 @@ mod tests {
         let root = temp_case_dir("codex_reg");
         let config = root.join(".codex").join("config.toml");
         let exe = Path::new("/usr/local/bin/everything");
+        let db = Path::new("/data/app/index.db");
 
         assert_eq!(
-            register_codex(&config, exe).unwrap(),
+            register_codex(&config, exe, db).unwrap(),
             RegisterOutcome::Skipped("Codex not detected")
         );
 
         fs::create_dir_all(root.join(".codex")).unwrap();
-        assert_eq!(register_codex(&config, exe).unwrap(), RegisterOutcome::Updated);
+        assert_eq!(register_codex(&config, exe, db).unwrap(), RegisterOutcome::Updated);
         let raw = fs::read_to_string(&config).unwrap();
         assert!(raw.contains("[mcp_servers.everything]"), "got: {raw}");
         assert!(raw.contains(r#"command = "/usr/local/bin/everything""#));
         assert!(raw.contains(r#"args = ["--mcp"]"#));
+        assert!(raw.contains(r#"EVERYTHING_MCP_DB = "/data/app/index.db""#), "got: {raw}");
 
-        assert_eq!(register_codex(&config, exe).unwrap(), RegisterOutcome::Unchanged);
+        assert_eq!(register_codex(&config, exe, db).unwrap(), RegisterOutcome::Unchanged);
+
+        // A changed DB path re-registers (stale pin is refreshed).
+        assert_eq!(
+            register_codex(&config, exe, Path::new("/data/other.db")).unwrap(),
+            RegisterOutcome::Updated
+        );
 
         // Comments and unrelated settings survive; stale entry gets replaced.
         fs::write(
@@ -839,7 +844,7 @@ mod tests {
             "# my codex config\nmodel = \"o3\"\n\n[mcp_servers.everything]\ncommand = \"/old/path\"\nargs = [\"--mcp\"]\n",
         )
         .unwrap();
-        assert_eq!(register_codex(&config, exe).unwrap(), RegisterOutcome::Updated);
+        assert_eq!(register_codex(&config, exe, db).unwrap(), RegisterOutcome::Updated);
         let raw = fs::read_to_string(&config).unwrap();
         assert!(raw.contains("# my codex config"));
         assert!(raw.contains("model = \"o3\""));
@@ -848,7 +853,7 @@ mod tests {
 
         // Corrupt TOML: refuse to clobber.
         fs::write(&config, "[broken").unwrap();
-        assert!(register_codex(&config, exe).is_err());
+        assert!(register_codex(&config, exe, db).is_err());
         assert_eq!(fs::read_to_string(&config).unwrap(), "[broken");
     }
 }
