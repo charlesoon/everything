@@ -149,6 +149,7 @@
   const iconLoading = new Set();
   const iconRetry = new Map();
   let iconVersion = 0;
+  let iconRetryTick = 0;
 
   const HIGHLIGHT_CACHE_MAX = 300;
   let highlightCache = new Map();
@@ -185,6 +186,7 @@
   $: tableGridStyle = `--col-name:${colWidths.name}px;--col-path:${colWidths.path}px;--col-size:${colWidths.size}px;--col-modified:${colWidths.modified}px;--table-min-width:${tableMinWidth}px;--header-offset:${-headerScrollLeft}px;`;
 
   $: {
+    iconRetryTick;
     for (const entry of visibleRows) {
       void ensureIcon(entry);
     }
@@ -339,7 +341,11 @@
     }
     const delay = ICON_RETRY_BASE_MS * attempts;
     iconRetry.set(key, { at: Date.now() + delay, attempts });
-    setTimeout(() => void ensureIcon(entry), delay);
+    // Wake the visible-rows scan rather than retrying this entry directly, so
+    // rows that scrolled away or belong to a stale search don't spend a load.
+    setTimeout(() => {
+      iconRetryTick += 1;
+    }, delay);
   }
 
   function syncColumnWidthsToContainer() {
@@ -552,6 +558,11 @@
   function primaryEntry() {
     const idx = lastSelectedIndex >= 0 ? lastSelectedIndex : -1;
     return idx >= 0 ? results[idx] : null;
+  }
+
+  function invokeOnPrimary(cmd) {
+    const e = primaryEntry();
+    if (e) void invoke(cmd, { path: e.path });
   }
 
   function buildSelectionInfo(indices, rows) {
@@ -812,7 +823,8 @@
           paths,
           x: event.clientX,
           y: event.clientY,
-          singleSelection: selectedIndices.size === 1
+          singleSelection: selectedIndices.size === 1,
+          singleIsDir: (selectedIndices.size === 1 && primaryEntry()?.isDir) || false
         });
       }
       return;
@@ -1624,16 +1636,8 @@
       () => listen('context_menu_action', (event) => {
         switch (event.payload) {
           case 'open': void openSelected(); break;
-          case 'show_package_contents': {
-            const e = primaryEntry();
-            if (e) void invoke('show_package_contents', { path: e.path });
-            break;
-          }
-          case 'quick_look': {
-            const e = primaryEntry();
-            if (e) void invoke('quick_look', { path: e.path });
-            break;
-          }
+          case 'show_package_contents': invokeOnPrimary('show_package_contents'); break;
+          case 'quick_look': invokeOnPrimary('quick_look'); break;
           case 'open_with': void openWithFallback(); break;
           case 'reveal': void revealSelected(); break;
           case 'copy_files': void copyFiles(); break;
@@ -2032,7 +2036,7 @@
   {#if contextMenu.visible}
     <div class="context-menu" style={`left:${contextMenu.x}px;top:${contextMenu.y}px;`}>
       <button on:click={() => (closeContextMenu(), openSelected())}>Open</button>
-      <button on:click={async () => { closeContextMenu(); const e = primaryEntry(); if (e) await invoke('quick_look', { path: e.path }); }}>Quick Look</button>
+      <button on:click={() => { closeContextMenu(); invokeOnPrimary('quick_look'); }}>Quick Look</button>
       <button on:click={() => (closeContextMenu(), openWithFallback())}>Open With... (Reveal in Finder)</button>
       <button on:click={() => (closeContextMenu(), revealSelected())}>Reveal in Finder</button>
       <button on:click={() => (closeContextMenu(), copySelectedPaths())}>Copy Path</button>

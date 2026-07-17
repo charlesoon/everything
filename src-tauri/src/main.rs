@@ -5859,12 +5859,11 @@ const PACKAGE_EXTENSIONS: &[&str] = &[
 ];
 
 #[cfg(target_os = "macos")]
-fn is_macos_package(path: &str) -> bool {
-    let p = Path::new(path);
-    p.extension()
+fn has_package_extension(path: &str) -> bool {
+    Path::new(path)
+        .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| PACKAGE_EXTENSIONS.iter().any(|pkg| pkg.eq_ignore_ascii_case(e)))
-        && p.is_dir()
 }
 
 /// Finder-style "Show Package Contents": browse a package directory (e.g. an
@@ -6150,6 +6149,7 @@ async fn show_context_menu(
     x: f64,
     y: f64,
     _single_selection: bool,
+    _single_is_dir: bool,
     app: AppHandle,
 ) -> AppResult<()> {
     let window = app
@@ -6187,6 +6187,7 @@ async fn show_context_menu(
     x: f64,
     y: f64,
     single_selection: bool,
+    single_is_dir: bool,
     app: AppHandle,
 ) -> AppResult<()> {
     use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
@@ -6195,8 +6196,10 @@ async fn show_context_menu(
         .get_webview_window("main")
         .ok_or_else(|| "Main window not found".to_string())?;
 
+    // The frontend passes isDir from the index entry, so no stat is needed here.
     let show_package = single_selection
-        && paths.first().map(|p| is_macos_package(p)).unwrap_or(false);
+        && single_is_dir
+        && paths.first().is_some_and(|p| has_package_extension(p));
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
@@ -6205,13 +6208,17 @@ async fn show_context_menu(
         let app = app_clone;
         let result = (|| -> Result<(), tauri::Error> {
             let open = MenuItem::with_id(&app, "ctx_open", "Open", true, None::<&str>)?;
-            let show_pkg = MenuItem::with_id(
-                &app,
-                "ctx_show_package_contents",
-                "Show Package Contents",
-                true,
-                None::<&str>,
-            )?;
+            let show_pkg = show_package
+                .then(|| {
+                    MenuItem::with_id(
+                        &app,
+                        "ctx_show_package_contents",
+                        "Show Package Contents",
+                        true,
+                        None::<&str>,
+                    )
+                })
+                .transpose()?;
             let quick_look =
                 MenuItem::with_id(&app, "ctx_quick_look", "Quick Look", true, None::<&str>)?;
             let open_with =
@@ -6243,9 +6250,9 @@ async fn show_context_menu(
             let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![
                 &open, &quick_look, &open_with, &sep1, &reveal, &sep2, &copy_files, &copy_path, &sep3, &trash,
             ];
-            if show_package {
+            if let Some(show_pkg) = &show_pkg {
                 // Finder places "Show Package Contents" directly after "Open".
-                items.insert(1, &show_pkg);
+                items.insert(1, show_pkg);
             }
             if single_selection {
                 items.push(&rename);
@@ -6274,6 +6281,7 @@ async fn show_context_menu(
     _x: f64,
     _y: f64,
     _single_selection: bool,
+    _single_is_dir: bool,
     _app: AppHandle,
 ) -> AppResult<()> {
     Err("Native context menu is only supported on Windows and macOS".to_string())
@@ -6324,6 +6332,7 @@ async fn get_file_icon(
             return cached;
         }
 
+        let per_path_key = cache_key != ext_lower;
         let icon = path
             .as_deref()
             .filter(|p| !p.is_empty())
@@ -6332,13 +6341,13 @@ async fn get_file_icon(
                 // Per-path miss: serve the generic ext icon from the ext-keyed
                 // cache (prewarmed for common exts) instead of regenerating it
                 // for every path, and store it back under the ext key.
-                if cache_key != ext_lower {
+                if per_path_key {
                     if let Some(cached) = state.icon_cache.lock().get(&ext_lower).cloned() {
                         return Some(cached);
                     }
                 }
                 let system = load_system_icon_png(&ext_lower);
-                if cache_key != ext_lower {
+                if per_path_key {
                     if let Some(png) = &system {
                         state.icon_cache.lock().insert(ext_lower.clone(), png.clone());
                     }
