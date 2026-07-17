@@ -80,7 +80,7 @@ npm run dev
 
 ### Tauri IPC Commands
 
-`get_index_status`, `get_home_dir`, `get_platform`, `start_full_index`, `reset_index`, `search`, `fd_search`, `open`, `open_with`, `reveal_in_finder`, `copy_paths`, `copy_files` (macOS), `move_to_trash`, `rename`, `get_file_icon`, `show_context_menu`, `quick_look` (macOS), `check_full_disk_access` (macOS), `open_privacy_settings` (macOS), `set_native_theme`, `mark_frontend_ready`, `frontend_log`
+`get_index_status`, `get_home_dir`, `get_platform`, `start_full_index`, `reset_index`, `search`, `fd_search`, `open`, `open_with`, `reveal_in_finder`, `show_package_contents` (macOS), `copy_paths`, `copy_files` (macOS), `move_to_trash`, `rename`, `get_file_icon`, `show_context_menu`, `quick_look` (macOS), `check_full_disk_access` (macOS), `open_privacy_settings` (macOS), `set_native_theme`, `mark_frontend_ready`, `frontend_log`
 
 ### Backend Events (→ Frontend)
 

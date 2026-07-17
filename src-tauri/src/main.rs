@@ -4184,12 +4184,69 @@ if let tiff = image.tiffRepresentation,
 "#
     );
 
-    let output = Command::new("swift").arg("-e").arg(script).output().ok()?;
+    run_swift_png(&script, None)
+}
+
+#[cfg(target_os = "macos")]
+fn run_swift_png(script: &str, env: Option<(&str, &str)>) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("swift");
+    cmd.arg("-e").arg(script);
+    if let Some((key, value)) = env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().ok()?;
     if output.status.success() && !output.stdout.is_empty() {
         Some(output.stdout)
     } else {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn load_path_icon_png(path: &str) -> Option<Vec<u8>> {
+    // Path is delivered via env var so it never touches the Swift source (no escaping issues).
+    // Render at 16pt/2x so AppKit selects the small Retina representation used by Finder.
+    // A 32pt/1x context selects different artwork that looks soft when scaled down in the UI.
+    let script = r#"import AppKit
+import Foundation
+guard let path = ProcessInfo.processInfo.environment["EVERYTHING_ICON_PATH"] else {
+  exit(1)
+}
+let image = NSWorkspace.shared.icon(forFile: path)
+let sidePixels = 32
+let sidePoints: CGFloat = 16
+guard let rep = NSBitmapImageRep(
+  bitmapDataPlanes: nil, pixelsWide: sidePixels, pixelsHigh: sidePixels,
+  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+) else {
+  exit(1)
+}
+rep.size = NSSize(width: sidePoints, height: sidePoints)
+NSGraphicsContext.saveGraphicsState()
+guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
+  NSGraphicsContext.restoreGraphicsState()
+  exit(1)
+}
+context.imageInterpolation = .high
+NSGraphicsContext.current = context
+image.draw(
+  in: NSRect(x: 0, y: 0, width: sidePoints, height: sidePoints),
+  from: .zero, operation: .copy, fraction: 1.0
+)
+NSGraphicsContext.restoreGraphicsState()
+if let png = rep.representation(using: .png, properties: [:]) {
+  FileHandle.standardOutput.write(png)
+} else {
+  exit(1)
+}
+"#;
+
+    // Serialize spawns: each `swift -e` is a full compiler run, and a screen of
+    // .app results would otherwise launch dozens of them at once.
+    static SPAWN_GUARD: Mutex<()> = Mutex::new(());
+    let _guard = SPAWN_GUARD.lock();
+    run_swift_png(script, Some(("EVERYTHING_ICON_PATH", path)))
 }
 
 #[cfg(target_os = "windows")]
@@ -4205,6 +4262,36 @@ fn load_system_icon_png(_ext: &str) -> Option<Vec<u8>> {
 #[cfg(target_os = "windows")]
 fn is_per_file_icon_ext(ext: &str) -> bool {
     matches!(ext, "exe" | "lnk" | "ico" | "url" | "scr" | "appx")
+}
+
+#[cfg(target_os = "macos")]
+fn is_per_file_icon_ext(ext: &str) -> bool {
+    // .app bundles carry their own icon; everything else is fine per-extension.
+    ext == "app"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn is_per_file_icon_ext(_ext: &str) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn load_icon_from_path(path: &str, _ext: &str) -> Option<Vec<u8>> {
+    win::icon::load_icon_png(path)
+}
+
+#[cfg(target_os = "macos")]
+fn load_icon_from_path(path: &str, ext: &str) -> Option<Vec<u8>> {
+    if is_per_file_icon_ext(ext) {
+        load_path_icon_png(path)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn load_icon_from_path(_path: &str, _ext: &str) -> Option<Vec<u8>> {
+    None
 }
 
 #[tauri::command]
@@ -5754,6 +5841,69 @@ fn copy_files(_paths: Vec<String>) -> AppResult<()> {
     Err("copy_files is only supported on macOS".to_string())
 }
 
+/// Directory extensions Finder presents as packages (bundles). Gates the
+/// "Show Package Contents" context-menu item.
+#[cfg(target_os = "macos")]
+const PACKAGE_EXTENSIONS: &[&str] = &[
+    "app",
+    "bundle",
+    "framework",
+    "plugin",
+    "kext",
+    "prefpane",
+    "appex",
+    "xpc",
+    "qlgenerator",
+    "xcodeproj",
+    "photoslibrary",
+];
+
+#[cfg(target_os = "macos")]
+fn is_macos_package(path: &str) -> bool {
+    let p = Path::new(path);
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| PACKAGE_EXTENSIONS.iter().any(|pkg| pkg.eq_ignore_ascii_case(e)))
+        && p.is_dir()
+}
+
+/// Finder-style "Show Package Contents": browse a package directory (e.g. an
+/// .app bundle) as a folder. Plain `open` would launch the bundle and Finder
+/// rejects the `folder` coercion for packages, so a new Finder window is
+/// pointed at the package root instead; the path travels via argv to avoid
+/// AppleScript string escaping.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn show_package_contents(path: String) -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = Command::new("osascript")
+            .args([
+                "-e", "on run argv",
+                "-e", "tell application \"Finder\"",
+                "-e", "set w to make new Finder window",
+                "-e", "set target of w to (POSIX file (item 1 of argv) as alias)",
+                "-e", "activate",
+                "-e", "end tell",
+                "-e", "end run",
+                &path,
+            ])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!("Failed to show package contents: {path}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn show_package_contents(_path: String) -> AppResult<()> {
+    Err("show_package_contents is only supported on macOS".to_string())
+}
+
 #[tauri::command]
 async fn move_to_trash(
     paths: Vec<String>,
@@ -6033,7 +6183,7 @@ async fn show_context_menu(
 #[cfg(target_os = "macos")]
 #[tauri::command]
 async fn show_context_menu(
-    _paths: Vec<String>,
+    paths: Vec<String>,
     x: f64,
     y: f64,
     single_selection: bool,
@@ -6045,6 +6195,9 @@ async fn show_context_menu(
         .get_webview_window("main")
         .ok_or_else(|| "Main window not found".to_string())?;
 
+    let show_package = single_selection
+        && paths.first().map(|p| is_macos_package(p)).unwrap_or(false);
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
     let app_clone = app.clone();
@@ -6052,6 +6205,13 @@ async fn show_context_menu(
         let app = app_clone;
         let result = (|| -> Result<(), tauri::Error> {
             let open = MenuItem::with_id(&app, "ctx_open", "Open", true, None::<&str>)?;
+            let show_pkg = MenuItem::with_id(
+                &app,
+                "ctx_show_package_contents",
+                "Show Package Contents",
+                true,
+                None::<&str>,
+            )?;
             let quick_look =
                 MenuItem::with_id(&app, "ctx_quick_look", "Quick Look", true, None::<&str>)?;
             let open_with =
@@ -6083,6 +6243,10 @@ async fn show_context_menu(
             let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![
                 &open, &quick_look, &open_with, &sep1, &reveal, &sep2, &copy_files, &copy_path, &sep3, &trash,
             ];
+            if show_package {
+                // Finder places "Show Package Contents" directly after "Open".
+                items.insert(1, &show_pkg);
+            }
             if single_selection {
                 items.push(&rename);
             }
@@ -6121,12 +6285,11 @@ async fn set_native_theme(theme: String, app: AppHandle) -> AppResult<()> {
         .get_webview_window("main")
         .ok_or_else(|| "Main window not found".to_string())?;
     let is_light = theme == "light";
-    let t = if is_light {
-        tauri::Theme::Light
-    } else {
-        tauri::Theme::Dark
-    };
-    window.set_theme(Some(t)).map_err(|e| e.to_string())?;
+    // Follow the OS appearance for the native window. Forcing a theme here
+    // would pin the webview's prefers-color-scheme, so the frontend's system
+    // theme listener would never fire again. Only the window background color
+    // (anti-flash on resize) tracks the theme the frontend reports.
+    window.set_theme(None).map_err(|e| e.to_string())?;
     use tauri::window::Color;
     let bg = if is_light {
         Color(0xF5, 0xF5, 0xF7, 0xFF)
@@ -6151,37 +6314,44 @@ async fn get_file_icon(
             ext.to_lowercase()
         };
 
-        #[cfg(target_os = "windows")]
-        let cache_key = {
-            if is_per_file_icon_ext(&ext_lower) {
-                path.as_deref().unwrap_or(&ext_lower).to_string()
-            } else {
-                ext_lower.clone()
-            }
+        let cache_key = if is_per_file_icon_ext(&ext_lower) {
+            path.as_deref().unwrap_or(&ext_lower).to_string()
+        } else {
+            ext_lower.clone()
         };
-        #[cfg(not(target_os = "windows"))]
-        let cache_key = ext_lower.clone();
 
         if let Some(cached) = state.icon_cache.lock().get(&cache_key).cloned() {
             return cached;
         }
 
-        #[cfg(target_os = "windows")]
-        let icon = {
-            let from_path = path
-                .as_deref()
-                .filter(|p| !p.is_empty())
-                .and_then(win::icon::load_icon_png);
-            from_path.or_else(|| load_system_icon_png(&ext_lower))
-        };
-        #[cfg(not(target_os = "windows"))]
-        let icon = {
-            let _ = path;
-            load_system_icon_png(&ext_lower)
-        };
+        let icon = path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| load_icon_from_path(p, &ext_lower))
+            .or_else(|| {
+                // Per-path miss: serve the generic ext icon from the ext-keyed
+                // cache (prewarmed for common exts) instead of regenerating it
+                // for every path, and store it back under the ext key.
+                if cache_key != ext_lower {
+                    if let Some(cached) = state.icon_cache.lock().get(&ext_lower).cloned() {
+                        return Some(cached);
+                    }
+                }
+                let system = load_system_icon_png(&ext_lower);
+                if cache_key != ext_lower {
+                    if let Some(png) = &system {
+                        state.icon_cache.lock().insert(ext_lower.clone(), png.clone());
+                    }
+                }
+                system
+            });
 
         let icon = icon.unwrap_or_default();
-        state.icon_cache.lock().insert(cache_key, icon.clone());
+        // Don't cache failures: a transient miss (e.g. an .app bundle still being
+        // written) would otherwise block every future retry for this key.
+        if !icon.is_empty() {
+            state.icon_cache.lock().insert(cache_key, icon.clone());
+        }
         icon
     })
     .await
@@ -6603,6 +6773,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         app.handle().on_menu_event(|app, event| {
             let action = match event.id().as_ref() {
                 "ctx_open" => "open",
+                "ctx_show_package_contents" => "show_package_contents",
                 "ctx_quick_look" => "quick_look",
                 "ctx_open_with" => "open_with",
                 "ctx_reveal" => "reveal",
@@ -6928,6 +7099,7 @@ pub fn run() {
             open,
             open_with,
             reveal_in_finder,
+            show_package_contents,
             copy_paths,
             copy_files,
             move_to_trash,

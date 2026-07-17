@@ -23,7 +23,6 @@
   const PAGE_SIZE = 500;
   let homePrefix = '';
   const COL_WIDTHS_KEY = 'everything-col-widths-v3';
-  const THEME_KEY = 'everything-theme';
   const columnKeys = ['name', 'path', 'size', 'modified'];
   const minColumnWidth = {
     name: 180,
@@ -38,13 +37,14 @@
   };
   const DEBUG_STARTUP = false;
 
-  const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  let theme = (() => { try { return localStorage.getItem(THEME_KEY) || systemTheme; } catch { return systemTheme; } })();
-  function cycleTheme() {
-    theme = theme === 'dark' ? 'light' : 'dark';
-    try { localStorage.setItem(THEME_KEY, theme); } catch {}
+  // Theme follows the system appearance; the backend call only syncs the
+  // native window background color (avoids flash on resize).
+  const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+  let theme = themeMedia.matches ? 'dark' : 'light';
+  themeMedia.addEventListener('change', (e) => {
+    theme = e.matches ? 'dark' : 'light';
     invoke('set_native_theme', { theme });
-  }
+  });
 
   function sortIconHtml(dir) {
     const d = dir === 'asc' ? 'M2.5 6.5 L5 4 L7.5 6.5' : 'M2.5 3.5 L5 6 L7.5 3.5';
@@ -55,8 +55,8 @@
   let results = [];
   let totalResults = 0;
   let totalResultsKnown = false;
+  let totalResultsQuery = null;
 
-  let dbLatencyMs = null;
   let dbLastQuery = '';
   let searchModeLabel = '';
   let selectedIndices = new Set();
@@ -143,8 +143,12 @@
   let resetInFlight = false;
   let lastReadyCount = 0;
   const ICON_CACHE_MAX = 500;
+  const ICON_RETRY_MAX_ATTEMPTS = 3;
+  const ICON_RETRY_BASE_MS = 1500;
   const iconCache = new Map();
   const iconLoading = new Set();
+  const iconRetry = new Map();
+  let iconVersion = 0;
 
   const HIGHLIGHT_CACHE_MAX = 300;
   let highlightCache = new Map();
@@ -174,6 +178,8 @@
   $: endIndex = Math.min(results.length, startIndex + visibleCount);
   $: visibleRows = results.slice(startIndex, endIndex);
   $: translateY = startIndex * rowHeight;
+
+  $: selectionInfo = buildSelectionInfo(selectedIndices, results);
 
   $: tableMinWidth = colWidths.name + colWidths.path + colWidths.size + colWidths.modified;
   $: tableGridStyle = `--col-name:${colWidths.name}px;--col-path:${colWidths.path}px;--col-size:${colWidths.size}px;--col-modified:${colWidths.modified}px;--table-min-width:${tableMinWidth}px;--header-offset:${-headerScrollLeft}px;`;
@@ -256,14 +262,19 @@
 
   const perFileIconExts = new Set(['exe', 'lnk', 'ico', 'url', 'scr', 'appx']);
 
+  function isAppBundle(entry) {
+    return platform === 'macos' && entry.isDir && entry.name.toLowerCase().endsWith('.app');
+  }
+
   function iconKey(entry) {
+    if (isAppBundle(entry)) return entry.path;
     if (entry.isDir) return '__folder__';
     const ext = (entry.ext || '').toLowerCase();
-    if (perFileIconExts.has(ext)) return entry.path;
+    if (platform === 'windows' && perFileIconExts.has(ext)) return entry.path;
     return ext || '__file__';
   }
 
-  function iconFor(entry) {
+  function iconFor(entry, _version = 0) {
     const key = iconKey(entry);
     const cached = iconCache.get(key);
     if (cached) {
@@ -271,7 +282,11 @@
       iconCache.set(key, cached);
       return cached;
     }
-    return entry.isDir ? folderFallbackIcon : fileFallbackIcon;
+    return fallbackIconFor(entry);
+  }
+
+  function fallbackIconFor(entry) {
+    return entry.isDir && !isAppBundle(entry) ? folderFallbackIcon : fileFallbackIcon;
   }
 
   function setIconCache(key, value) {
@@ -280,6 +295,7 @@
       const oldest = iconCache.keys().next().value;
       iconCache.delete(oldest);
     }
+    iconVersion += 1;
   }
 
   async function ensureIcon(entry) {
@@ -287,24 +303,43 @@
     if (iconCache.has(key) || iconLoading.has(key)) {
       return;
     }
+    const retry = iconRetry.get(key);
+    if (retry && Date.now() < retry.at) {
+      return;
+    }
 
     iconLoading.add(key);
     try {
       const bytes = await invoke('get_file_icon', {
         path: entry.path,
-        ext: entry.isDir ? 'folder' : entry.ext || '',
+        ext: isAppBundle(entry) ? 'app' : entry.isDir ? 'folder' : entry.ext || '',
       });
       if (Array.isArray(bytes) && bytes.length > 0) {
         const image = `data:image/png;base64,${bytesToBase64(Uint8Array.from(bytes))}`;
+        iconRetry.delete(key);
         setIconCache(key, image);
       } else {
-        setIconCache(key, entry.isDir ? folderFallbackIcon : fileFallbackIcon);
+        scheduleIconRetry(key, entry);
       }
     } catch {
-      setIconCache(key, entry.isDir ? folderFallbackIcon : fileFallbackIcon);
+      scheduleIconRetry(key, entry);
     } finally {
       iconLoading.delete(key);
     }
+  }
+
+  // Failed loads keep showing the fallback and retry with backoff; only after the
+  // last attempt is the fallback cached for good.
+  function scheduleIconRetry(key, entry) {
+    const attempts = (iconRetry.get(key)?.attempts ?? 0) + 1;
+    if (attempts >= ICON_RETRY_MAX_ATTEMPTS) {
+      iconRetry.delete(key);
+      setIconCache(key, fallbackIconFor(entry));
+      return;
+    }
+    const delay = ICON_RETRY_BASE_MS * attempts;
+    iconRetry.set(key, { at: Date.now() + delay, attempts });
+    setTimeout(() => void ensureIcon(entry), delay);
   }
 
   function syncColumnWidthsToContainer() {
@@ -519,6 +554,29 @@
     return idx >= 0 ? results[idx] : null;
   }
 
+  function buildSelectionInfo(indices, rows) {
+    if (indices.size === 1) {
+      const entry = rows[[...indices][0]];
+      if (!entry) return null;
+      return displayPath(entry.path);
+    }
+    if (indices.size > 1) {
+      let bytes = 0;
+      let hasFileSize = false;
+      for (const idx of indices) {
+        const entry = rows[idx];
+        if (entry && !entry.isDir && entry.size != null) {
+          bytes += entry.size;
+          hasFileSize = true;
+        }
+      }
+      const parts = [`${indices.size.toLocaleString()} selected`];
+      if (hasFileSize) parts.push(`Size: ${formatBytes(bytes)}`);
+      return parts.join(', ');
+    }
+    return null;
+  }
+
   async function refreshStatus() {
     if (statusRefreshInFlight || resetInFlight) {
       startupLog('[startup/fe] refreshStatus skipped (in-flight)');
@@ -610,7 +668,6 @@
     const searchQuery = query;
     const searchSortBy = sortBy;
     const searchSortDir = sortDir;
-    const startedAt = performance.now();
     try {
       const keepPaths = new Set(selectedPaths());
       const next = await invoke('search', {
@@ -624,7 +681,6 @@
 
       if (gen !== searchGeneration) return;
 
-      dbLatencyMs = Math.round(performance.now() - startedAt);
       dbLastQuery = searchQuery;
       const entries = Array.isArray(next.entries) ? next.entries : [];
       searchModeLabel = next.modeLabel || '';
@@ -636,7 +692,11 @@
       if (next.totalKnown) {
         totalResults = next.totalCount;
         totalResultsKnown = true;
-      } else {
+        totalResultsQuery = searchQuery;
+      } else if (!(totalResultsKnown && totalResultsQuery === searchQuery)) {
+        // Keep the last exact total while a countless refresh (e.g. the
+        // index_updated leading edge) runs for the same query; the trailing
+        // includeTotal search corrects it moments later.
         totalResults = entries.length;
         totalResultsKnown = false;
       }
@@ -1055,9 +1115,9 @@
     results = [];
     totalResults = 0;
     totalResultsKnown = false;
+    totalResultsQuery = null;
     clearSelection();
     scanned = 0;
-    dbLatencyMs = null;
     dbLastQuery = '';
     indexStatus = { ...indexStatus, state: 'Indexing', entriesCount: 0, message: null };
     indexingStartTime = Date.now();
@@ -1346,13 +1406,16 @@
     }
   }
 
-  function formatSize(entry) {
-    if (entry.isDir || entry.size == null) return '';
-    const bytes = entry.size;
+  function formatBytes(bytes) {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+
+  function formatSize(entry) {
+    if (entry.isDir || entry.size == null) return '';
+    return formatBytes(entry.size);
   }
 
   function formatModified(entry) {
@@ -1561,6 +1624,11 @@
       () => listen('context_menu_action', (event) => {
         switch (event.payload) {
           case 'open': void openSelected(); break;
+          case 'show_package_contents': {
+            const e = primaryEntry();
+            if (e) void invoke('show_package_contents', { path: e.path });
+            break;
+          }
           case 'quick_look': {
             const e = primaryEntry();
             if (e) void invoke('quick_look', { path: e.path });
@@ -1875,7 +1943,7 @@
               tabindex="0"
             >
               <div class="cell name">
-                <img class="file-icon" src={iconFor(entry)} alt="" draggable="false" />
+                <img class="file-icon" src={iconFor(entry, iconVersion)} alt="" draggable="false" />
                 <span class="ellipsis" class:name-editing={editing.active && editing.index === index}>{#each highlightSegments(entry.name, query) as seg}{#if seg.hl}<mark class="hl">{seg.text}</mark>{:else}{seg.text}{/if}{/each}</span>
               </div>
               <div class="cell path"><span class="ellipsis">{displayPath(entry.dir)}</span></div>
@@ -1890,22 +1958,26 @@
 
   <footer class="status-bar" role="status" aria-live="polite">
     <div class="status-left">
-      <span class="status-state">
-        <span class="state-dot {indexStatus.state === 'Indexing' ? 'indexing' : indexStatus.state === 'Error' ? 'error' : 'ready'}" class:pulsing={indexStatus.state === 'Ready' && indexStatus.backgroundActive}></span>
-        {#if indexStatus.state === 'Indexing'}
-          Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if}
-          {#if !indexStatus.isCatchup}
-            · {scanned.toLocaleString()} scanned
+      {#if selectionInfo}
+        <span class="status-selection ellipsis" title={selectionInfo}>{selectionInfo}</span>
+      {:else}
+        <span class="status-state">
+          <span class="state-dot {indexStatus.state === 'Indexing' ? 'indexing' : indexStatus.state === 'Error' ? 'error' : 'ready'}" class:pulsing={indexStatus.state === 'Ready' && indexStatus.backgroundActive}></span>
+          {#if indexStatus.state === 'Indexing'}
+            Indexing{#if lastReadyCount > 0} ({Math.min(99, Math.round((scanned / lastReadyCount) * 100))}%){/if}{#if indexingElapsed} · {indexingElapsed}{/if}
+            {#if !indexStatus.isCatchup}
+              · {scanned.toLocaleString()} scanned
+            {/if}
+          {:else}
+            Index: {indexStatus.state}
           {/if}
-        {:else}
-          Index: {indexStatus.state}
+        </span>
+        {#if indexingFinishedAt && indexStatus.state !== 'Indexing'}
+          <span>in {indexingFinishedAt}</span>
         {/if}
-      </span>
-      {#if indexingFinishedAt && indexStatus.state !== 'Indexing'}
-        <span>in {indexingFinishedAt}</span>
-      {/if}
-      {#if dbLatencyMs !== null && dbLastQuery}
-        <span>"{dbLastQuery}" {dbLatencyMs}ms · {totalResults} results</span>
+        {#if dbLastQuery}
+          <span>"{dbLastQuery}" · {totalResults} results</span>
+        {/if}
       {/if}
       {#if searchModeLabel === 'spotlight' || searchModeLabel === 'spotlight_timeout'}
         <span class="status-spotlight">Spotlight fallback{#if searchModeLabel === 'spotlight_timeout'} (partial){/if}</span>
@@ -1918,15 +1990,6 @@
       {/if}
     </div>
     <div class="status-right">
-      <button class="status-btn" on:click={cycleTheme} title="Switch theme">
-        {#if theme === 'dark'}
-          <svg class="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="3.5"/><line x1="8" y1="1.5" x2="8" y2="3"/><line x1="8" y1="13" x2="8" y2="14.5"/><line x1="1.5" y1="8" x2="3" y2="8"/><line x1="13" y1="8" x2="14.5" y2="8"/><line x1="3.4" y1="3.4" x2="4.5" y2="4.5"/><line x1="11.5" y1="11.5" x2="12.6" y2="12.6"/><line x1="3.4" y1="12.6" x2="4.5" y2="11.5"/><line x1="11.5" y1="4.5" x2="12.6" y2="3.4"/></svg>
-          Light
-        {:else}
-          <svg class="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 9.2A5.5 5.5 0 0 1 6.8 2.5 5.5 5.5 0 1 0 13.5 9.2z"/></svg>
-          Dark
-        {/if}
-      </button>
       <button class="status-btn" on:click={() => invoke('open_pathindexing')} title="추가 인덱싱 경로(.pathindexing) 열기">
         Add
       </button>
@@ -2608,6 +2671,10 @@
     min-width: 0;
   }
 
+  .status-selection {
+    min-width: 0;
+  }
+
   .status-right {
     display: flex;
     align-items: center;
@@ -2682,12 +2749,6 @@
 
   .rebuild-btn:disabled {
     opacity: 0.5;
-  }
-
-  .theme-icon {
-    width: 12px;
-    height: 12px;
-    flex-shrink: 0;
   }
 
   .rebuild-icon {
