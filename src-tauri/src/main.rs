@@ -7168,6 +7168,15 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             }
         }
 
+        // Handshake: the GUI beacon (gui.lock) is already held (setup_app). Before
+        // the GUI starts *writing* (housekeeping purge, indexing, watcher), wait
+        // for any resident daemon to observe the beacon and exit — releasing
+        // daemon.lock — so the two never overlap as WAL writers. init_db_tables /
+        // db_ready above already ran (idempotent, near-no-op on the daemon-built
+        // DB), so search is live immediately; only writes wait. Bounded — falls
+        // through (WAL-safe: the daemon skips VACUUM while the beacon is held).
+        daemon::wait_for_daemon_exit(&state.db_path);
+
         // Deferred housekeeping -- purge + status counts run in background
         {
             let hk_app = app_handle.clone();

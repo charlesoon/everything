@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
@@ -33,13 +33,21 @@ use crate::{
     run_incremental_index, AppState,
 };
 
-/// How often the resident daemon re-checks its invariants (GUI took over, a
-/// build needs healing, the watcher died).
+/// How often the resident daemon polls the GUI beacon so it yields writes
+/// almost immediately when the GUI launches. This is the daemon half of the
+/// handshake: the GUI waits for this exit before it starts writing, so the two
+/// never overlap as WAL writers.
+const GUI_POLL_INTERVAL: Duration = Duration::from_millis(300);
+/// Cadence for heavier supervision (heal a failed build, restart a dead
+/// watcher) — kept coarse; only the GUI-yield check needs to be fast.
 #[cfg(target_os = "macos")]
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
 /// Non-macOS reconcile cadence (no live watcher there).
 #[cfg(not(target_os = "macos"))]
 const CATCHUP_INTERVAL: Duration = Duration::from_secs(60);
+/// How long the GUI waits for a resident daemon to exit before it starts
+/// writing (the GUI half of the handshake). Bounded so startup can't hang.
+const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Advisory locks (writer coordination)
@@ -90,10 +98,47 @@ pub(crate) fn gui_is_running(db_path: &Path) -> bool {
 static GUI_BEACON: OnceLock<File> = OnceLock::new();
 
 /// Called once on GUI startup: hold `gui.lock` for the process lifetime so any
-/// daemon defers to the GUI as the single writer. Best-effort.
-pub(crate) fn hold_gui_beacon(db_path: &Path) {
-    if let Some(file) = try_acquire(&gui_lock_path(db_path)) {
-        let _ = GUI_BEACON.set(file);
+/// daemon defers to the GUI as the single writer. Returns whether the beacon
+/// was acquired — a failure means a resident daemon won't see the GUI and won't
+/// yield, so the caller should surface it rather than silently overlapping.
+pub(crate) fn hold_gui_beacon(db_path: &Path) -> bool {
+    match try_acquire(&gui_lock_path(db_path)) {
+        Some(file) => {
+            let _ = GUI_BEACON.set(file);
+            true
+        }
+        None => {
+            eprintln!(
+                "[gui] WARNING: could not acquire gui.lock beacon ({}); a background \
+                 daemon may not yield index writes to the GUI",
+                gui_lock_path(db_path).display()
+            );
+            false
+        }
+    }
+}
+
+/// The GUI half of the handshake: after holding the beacon, block until any
+/// resident daemon has observed it and exited (released `daemon.lock`) so the
+/// GUI can start writing without overlapping the daemon. Bounded — if a daemon
+/// lingers past the deadline we proceed anyway (WAL keeps writes safe).
+pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
+    let started = Instant::now();
+    let mut waited = false;
+    while daemon_running(db_path) {
+        waited = true;
+        if started.elapsed() >= DAEMON_EXIT_WAIT {
+            eprintln!(
+                "[gui] daemon still resident after {}s; proceeding (WAL-safe: the \
+                 daemon skips VACUUM while the GUI beacon is held)",
+                DAEMON_EXIT_WAIT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(GUI_POLL_INTERVAL);
+    }
+    if waited {
+        eprintln!("[gui] daemon yielded; GUI now owns index writes");
     }
 }
 
@@ -150,7 +195,11 @@ fn build_index(db_path: &Path, state: &AppState) {
             }
             // Storage/GC maintenance only after a full (re)build, matching the
             // GUI finalizing thread; a plain catchup barely changes the file.
-            if is_fresh || fts_dirty {
+            // Skip it once the GUI is coming up: run_db_maintenance's VACUUM
+            // takes an *exclusive* lock (not WAL-concurrent), so running it while
+            // the GUI falls through its wait and starts writing would hand the
+            // GUI a hard SQLITE_BUSY. The GUI's own finalize will reclaim later.
+            if (is_fresh || fts_dirty) && !gui_is_running(db_path) {
                 if let Ok(conn) = db_connection(db_path) {
                     if let Err(e) = cleanup_entries_gc_tables(&conn) {
                         eprintln!("[daemon] gc cleanup failed: {e}");
@@ -263,39 +312,68 @@ pub fn run_daemon() {
     run_polling_resident(db_path, state);
 }
 
+/// Yield to the GUI: stop the watcher and wait for it to actually exit before
+/// the caller returns (which drops `_lock`, releasing `daemon.lock`). Without
+/// waiting, the GUI could acquire the freed lock and start writing while the
+/// watcher flushes one last batch — a brief concurrent-writer window. Bounded
+/// so a wedged watcher can't block the yield forever.
+#[cfg(target_os = "macos")]
+fn yield_to_gui(state: &AppState) {
+    eprintln!("[daemon] GUI now running; yielding writes and exiting");
+    state.watcher_stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.watcher_active.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// macOS: real-time freshness via the FSEvents watcher, supervised so a failed
 /// build gets healed and a dead watcher gets restarted (instead of parking
-/// forever), and so the daemon yields promptly once the GUI takes over.
+/// forever). The GUI beacon is polled on the fast `GUI_POLL_INTERVAL` so the
+/// daemon exits within a few hundred ms of the GUI launching (handshake);
+/// heavier supervision runs on the coarse `SUPERVISE_INTERVAL`.
 #[cfg(target_os = "macos")]
 fn run_macos_resident(db_path: PathBuf, state: AppState) {
-    let mut watcher_started = false;
+    start_watcher(&db_path, &state);
+    // `None` => supervise on the first loop iteration, so a failed startup build
+    // is healed immediately rather than after one SUPERVISE_INTERVAL.
+    let mut last_supervise: Option<Instant> = None;
     loop {
         if gui_is_running(&db_path) {
-            eprintln!("[daemon] GUI now running; yielding writes and exiting");
-            // Stop the watcher so it flushes and stops writing before we exit.
-            state.watcher_stop.store(true, Ordering::Release);
-            std::thread::sleep(Duration::from_millis(200));
+            yield_to_gui(&state);
             return;
         }
-        // Heal an incomplete/failed build so MCP never stays stuck "not ready".
-        if !index_complete(&db_path) {
-            eprintln!("[daemon] index incomplete; (re)building");
-            build_index(&db_path, &state);
-        }
-        // (Re)start the watcher on first pass, or if it died (e.g. FSEvents
-        // init failure left the worker thread dead).
-        if !state.watcher_active.load(Ordering::Acquire) {
-            if watcher_started {
-                eprintln!("[daemon] watcher not active; restarting");
+        if last_supervise.map_or(true, |t| t.elapsed() >= SUPERVISE_INTERVAL) {
+            last_supervise = Some(Instant::now());
+            // Heal an incomplete/failed build so MCP never stays stuck.
+            if !index_complete(&db_path) {
+                eprintln!("[daemon] index incomplete; (re)building");
+                build_index(&db_path, &state);
             }
-            state.watcher_stop.store(false, Ordering::Release);
-            // Replay from the last persisted event id to cover the gap since
-            // the daemon last ran (idempotent upserts absorb any overlap).
-            let since = stored_event_id(&db_path);
-            crate::start_fsevent_watcher_worker(None, state.clone(), since, false);
-            watcher_started = true;
+            // Restart the watcher if it died (e.g. FSEvents init failure left
+            // the worker thread dead).
+            if !state.watcher_active.load(Ordering::Acquire) {
+                eprintln!("[daemon] watcher not active; restarting");
+                start_watcher(&db_path, &state);
+            }
         }
-        std::thread::sleep(SUPERVISE_INTERVAL);
+        std::thread::sleep(GUI_POLL_INTERVAL);
+    }
+}
+
+/// Start the FSEvents watcher, replaying from the last persisted event id to
+/// cover the gap since the daemon last ran (idempotent upserts absorb overlap).
+/// Waits briefly for the worker to publish `watcher_active` so a slow FSEvents
+/// init isn't mistaken for a dead watcher by the next supervise tick (which
+/// would double-start a second watcher).
+#[cfg(target_os = "macos")]
+fn start_watcher(db_path: &Path, state: &AppState) {
+    state.watcher_stop.store(false, Ordering::Release);
+    let since = stored_event_id(db_path);
+    crate::start_fsevent_watcher_worker(None, state.clone(), since, false);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !state.watcher_active.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -308,16 +386,21 @@ fn stored_event_id(db_path: &Path) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// Non-macOS: no headless live watcher yet, so reconcile on a fixed cadence.
-/// `build_index` heals a dirty FTS (fresh/crash-recovery finalize) as well.
+/// Non-macOS: no headless live watcher yet, so reconcile on `CATCHUP_INTERVAL`.
+/// The GUI beacon is still polled on the fast `GUI_POLL_INTERVAL` so the daemon
+/// yields promptly (handshake). `build_index` also heals a dirty FTS.
 #[cfg(not(target_os = "macos"))]
 fn run_polling_resident(db_path: PathBuf, state: AppState) {
+    let mut last_catchup = Instant::now();
     loop {
-        std::thread::sleep(CATCHUP_INTERVAL);
         if gui_is_running(&db_path) {
             eprintln!("[daemon] GUI now running; exiting");
             return;
         }
-        build_index(&db_path, &state);
+        if last_catchup.elapsed() >= CATCHUP_INTERVAL {
+            last_catchup = Instant::now();
+            build_index(&db_path, &state);
+        }
+        std::thread::sleep(GUI_POLL_INTERVAL);
     }
 }
