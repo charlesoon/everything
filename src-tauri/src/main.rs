@@ -16,12 +16,15 @@ use std::{
 };
 
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
+use rusqlite::{
+    params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 mod fd_search;
+mod daemon;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mcp_server;
@@ -429,6 +432,54 @@ pub(crate) struct AppState {
     /// Persistent write connection for watcher-driven incremental updates.
     /// Opening a connection per event batch dominated single-file update cost.
     pub(crate) watcher_conn: Arc<Mutex<Option<Connection>>>,
+}
+
+/// Construct `AppState` from resolved paths, without Tauri. Shared by GUI
+/// startup (`setup_app`) and the headless MCP index builder, which has no
+/// `AppHandle`. `app_data_dir` (the DB's parent) holds the `.pathignore` and
+/// `.pathindexing` sidecars and is itself excluded from indexing.
+pub(crate) fn build_app_state(db_path: PathBuf, home_dir: PathBuf, app_data_dir: &Path) -> AppState {
+    let scan_root = if cfg!(windows) {
+        PathBuf::from("C:\\")
+    } else {
+        home_dir.clone()
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
+    let config_file_path = app_data_dir.join(".pathignore");
+    let (mut path_ignores, path_ignore_patterns) =
+        load_pathignore_rules(&config_file_path, &home_dir, &cwd);
+    if !path_ignores.iter().any(|r| r == app_data_dir) {
+        path_ignores.push(app_data_dir.to_path_buf());
+    }
+    let pathindexing_file_path = app_data_dir.join(".pathindexing");
+    let extra_roots = pathindexing::load_pathindexing_roots(&pathindexing_file_path);
+    AppState {
+        db_path,
+        home_dir,
+        scan_root,
+        cwd,
+        config_file_path,
+        pathindexing_file_path,
+        extra_roots: Arc::new(Mutex::new(extra_roots)),
+        path_ignores: Arc::new(path_ignores),
+        path_ignore_patterns: Arc::new(path_ignore_patterns),
+        db_ready: Arc::new(AtomicBool::new(false)),
+        indexing_active: Arc::new(AtomicBool::new(false)),
+        status: Arc::new(Mutex::new(IndexStatus::default())),
+        recent_ops: Arc::new(Mutex::new(Vec::new())),
+        icon_cache: Arc::new(Mutex::new(HashMap::new())),
+        fd_search_cache: Arc::new(Mutex::new(None)),
+        negative_name_cache: Arc::new(Mutex::new(HashMap::new())),
+        ignore_cache: Arc::new(Mutex::new(None)),
+        fts_ready: Arc::new(AtomicBool::new(true)),
+        mem_index: Arc::new(RwLock::new(None)),
+        watcher_stop: Arc::new(AtomicBool::new(false)),
+        watcher_active: Arc::new(AtomicBool::new(false)),
+        frontend_ready: Arc::new(AtomicBool::new(false)),
+        pathindexing_active: Arc::new(AtomicBool::new(false)),
+        search_conn_pool: Arc::new(Mutex::new(Vec::new())),
+        watcher_conn: Arc::new(Mutex::new(None)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2227,7 +2278,7 @@ pub(crate) fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i
     Ok((entries_count, last_updated))
 }
 
-pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) -> AppResult<()> {
+pub(crate) fn refresh_and_emit_status_counts(app: Option<&AppHandle>, state: &AppState) -> AppResult<()> {
     let conn = db_connection(&state.db_path)?;
     let (entries_count, last_updated) = update_counts(&conn)?;
     {
@@ -2235,9 +2286,12 @@ pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) 
         status.entries_count = entries_count;
         status.last_updated = last_updated;
     }
-    // Persist cached counts so next startup can read them instantly
+    // Persist cached counts so next startup can read them instantly. This runs
+    // headless too (daemon mode, app=None) — only the UI emit is skipped.
     persist_cached_counts(&conn, entries_count, last_updated);
-    emit_status_counts(app, state);
+    if let Some(app) = app {
+        emit_status_counts(app, state);
+    }
     Ok(())
 }
 
@@ -2247,7 +2301,7 @@ pub(crate) fn refresh_and_emit_status_counts(app: &AppHandle, state: &AppState) 
 /// it is safe on every watcher batch: the COUNT(*)/MAX() recount there was a
 /// periodic whole-table scan — a visible CPU spike every ~2s on large DBs.
 #[cfg(target_os = "macos")]
-fn emit_and_persist_cached_counts(app: &AppHandle, state: &AppState) {
+fn emit_and_persist_cached_counts(app: Option<&AppHandle>, state: &AppState) {
     let (entries_count, last_updated) = {
         let status = state.status.lock();
         (status.entries_count, status.last_updated)
@@ -2257,7 +2311,9 @@ fn emit_and_persist_cached_counts(app: &AppHandle, state: &AppState) {
     if let Some(conn) = state.watcher_conn.lock().as_ref() {
         persist_cached_counts(conn, entries_count, last_updated);
     }
-    emit_status_counts(app, state);
+    if let Some(app) = app {
+        emit_status_counts(app, state);
+    }
 }
 
 /// Load cached entries count from meta table (instant) and emit Ready state + counts.
@@ -2363,7 +2419,7 @@ fn is_deferred_dir(path: &Path, home_dir: &Path) -> bool {
 /// meanwhile: prefix queries fall back when INDEXED BY fails, and fts_ready
 /// gates every FTS path. The watcher is still paused (indexing_active), so
 /// no upsert can slip past the not-yet-recreated FTS triggers.
-fn finalize_fresh_index(state: &AppState) {
+pub(crate) fn finalize_fresh_index(state: &AppState) {
     let Ok(conn) = db_connection_for_maintenance(&state.db_path) else {
         return;
     };
@@ -2436,9 +2492,9 @@ fn release_memory_to_os() {
 
 /// Remove `row`'s path from the direct-children preload map, returning true
 /// when it was present AND unchanged (same mtime + size). Paths left in the
-/// map after the scan are the vanished ones to delete. (Whole-subtree diffs
-/// use the hash-compacted `rescan::SubtreeDiff` instead; this String-keyed map
-/// only ever holds one directory level.)
+/// map after the scan are only reconciliation candidates; callers must confirm
+/// policy exclusion or NotFound before deletion. (Whole-subtree diffs use the
+/// hash-compacted `rescan::SubtreeDiff` instead; this map holds one level.)
 fn row_unchanged(
     existing: &mut HashMap<String, (Option<i64>, Option<i64>)>,
     row: &IndexRow,
@@ -2449,32 +2505,186 @@ fn row_unchanged(
     )
 }
 
-/// Existing rows for `dir_path` itself and its DIRECT children only.
-/// (A recursive subtree load for the scan root would be the entire DB.)
+/// Existing DIRECT children of `dir_path` only. The root row is deliberately
+/// excluded: it is maintained separately and must never become a subtree
+/// deletion candidate when its metadata cannot be read.
 fn preload_direct_children(
     conn: &Connection,
     dir_path: &str,
-) -> HashMap<String, (Option<i64>, Option<i64>)> {
+) -> AppResult<HashMap<String, (Option<i64>, Option<i64>)>> {
     let mut map = HashMap::new();
-    let Ok(mut stmt) =
-        conn.prepare("SELECT path, mtime, size FROM entries WHERE dir = ?1 OR path = ?1")
-    else {
-        return map;
-    };
-    let rows = match stmt.query_map(params![dir_path], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    }) {
-        Ok(r) => r,
-        Err(_) => return map,
-    };
-    for row in rows.flatten() {
-        map.insert(row.0, (row.1, row.2));
+    let mut stmt = conn
+        .prepare("SELECT path, mtime, size FROM entries WHERE dir = ?1 AND path <> ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![dir_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (path, mtime, size) = row.map_err(|e| e.to_string())?;
+        map.insert(path, (mtime, size));
     }
-    map
+    Ok(map)
+}
+
+fn preload_path_signature(
+    conn: &Connection,
+    path: &str,
+) -> AppResult<Option<(Option<i64>, Option<i64>)>> {
+    conn.query_row(
+        "SELECT mtime, size FROM entries WHERE path = ?1",
+        params![path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn filesystem_observation_error(stage: &str, path: &Path, error: &io::Error) -> String {
+    format!(
+        "filesystem observation failed: stage={stage} path={} kind={:?} os_error={:?}: {error}",
+        path.display(),
+        error.kind(),
+        error.raw_os_error(),
+    )
+}
+
+struct ObservedDirectChild {
+    path: PathBuf,
+    metadata: fs::Metadata,
+}
+
+/// Obtain a complete direct-child observation. Any open/iterator error, or a
+/// metadata error other than a child disappearing mid-iteration, rejects the
+/// observation so callers cannot use a partial snapshot for deletion.
+fn observe_direct_children<Open, Entries, Metadata, Skip>(
+    scan_root: &Path,
+    open: Open,
+    mut metadata_for: Metadata,
+    mut should_skip: Skip,
+) -> AppResult<Vec<ObservedDirectChild>>
+where
+    Open: FnOnce(&Path) -> io::Result<Entries>,
+    Entries: IntoIterator<Item = io::Result<PathBuf>>,
+    Metadata: FnMut(&Path) -> io::Result<fs::Metadata>,
+    Skip: FnMut(&Path) -> bool,
+{
+    let entries = open(scan_root)
+        .map_err(|error| filesystem_observation_error("read_dir_open", scan_root, &error))?;
+    let mut observed = Vec::new();
+    for entry in entries {
+        let child_path = entry.map_err(|error| {
+            filesystem_observation_error("read_dir_entry", scan_root, &error)
+        })?;
+        if should_skip(&child_path) {
+            continue;
+        }
+        match metadata_for(&child_path) {
+            Ok(metadata) => observed.push(ObservedDirectChild {
+                path: child_path,
+                metadata,
+            }),
+            // A path may disappear between readdir and stat. If it existed in
+            // the DB it remains a leftover and is re-confirmed below.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(filesystem_observation_error(
+                    "direct_child_metadata",
+                    &child_path,
+                    &error,
+                ));
+            }
+        }
+    }
+    Ok(observed)
+}
+
+struct DirectChildReconciliation {
+    delete_paths: Vec<String>,
+    present: Vec<ObservedDirectChild>,
+}
+
+/// Classify paths left over only after a complete parent enumeration. An
+/// unseen path is deletable solely when policy explicitly ignores it or a
+/// final metadata probe confirms NotFound. Every other error aborts the
+/// reconciliation before any delete is applied.
+fn reconcile_unseen_direct_children<Metadata, Skip>(
+    existing: &HashMap<String, (Option<i64>, Option<i64>)>,
+    mut metadata_for: Metadata,
+    mut should_skip: Skip,
+) -> AppResult<DirectChildReconciliation>
+where
+    Metadata: FnMut(&Path) -> io::Result<fs::Metadata>,
+    Skip: FnMut(&Path) -> bool,
+{
+    let mut paths: Vec<&String> = existing.keys().collect();
+    paths.sort_unstable();
+
+    let mut delete_paths = Vec::new();
+    let mut present = Vec::new();
+    for path_str in paths {
+        let path = Path::new(path_str);
+        if should_skip(path) {
+            delete_paths.push(path_str.clone());
+            continue;
+        }
+
+        match metadata_for(path) {
+            Ok(metadata) => present.push(ObservedDirectChild {
+                path: path.to_path_buf(),
+                metadata,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                delete_paths.push(path_str.clone());
+            }
+            Err(error) => {
+                return Err(filesystem_observation_error(
+                    "leftover_metadata",
+                    path,
+                    &error,
+                ));
+            }
+        }
+    }
+
+    Ok(DirectChildReconciliation {
+        delete_paths,
+        present,
+    })
+}
+
+fn stage_direct_child(
+    child: ObservedDirectChild,
+    scan_root: &Path,
+    current_run_id: i64,
+    existing: &mut HashMap<String, (Option<i64>, Option<i64>)>,
+    batch: &mut Vec<IndexRow>,
+    priority_roots: &mut Vec<PathBuf>,
+    deferred_roots: &mut Vec<PathBuf>,
+) {
+    if let Some(mut row) = index_row_from_path_and_metadata(&child.path, &child.metadata) {
+        row.run_id = current_run_id;
+        if !row_unchanged(existing, &row) {
+            batch.push(row);
+        }
+    }
+
+    // Preserve the previous behavior for a direct symlink to a directory:
+    // jwalk may use it as a root while still refusing nested symlink traversal.
+    let is_dir = child.metadata.is_dir()
+        || (child.metadata.file_type().is_symlink() && child.path.is_dir());
+    if is_dir {
+        if is_deferred_dir(&child.path, scan_root) {
+            deferred_roots.push(child.path);
+        } else {
+            priority_roots.push(child.path);
+        }
+    }
 }
 
 /// Build the shared rayon thread pool for a parallel filesystem scan. Scanning
@@ -2498,7 +2708,7 @@ fn build_scan_pool() -> (Arc<jwalk::rayon::ThreadPool>, usize, usize) {
 /// `app: None` runs the index pipeline without UI event emission and without
 /// spawning the background finalizing thread (the caller finalizes explicitly)
 /// — used by benchmarks/tests to exercise the real indexing path.
-fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -> AppResult<()> {
+pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -> AppResult<()> {
     let started = Instant::now();
     perf_log(format!(
         "index_run_start home={} db={}",
@@ -2685,16 +2895,25 @@ fn run_incremental_index_inner(
     let mut last_perf_emit = Instant::now();
 
     // Preload scan_root-level entries (direct children only, not recursive).
-    // Seen entries are removed; leftovers are vanished top-level paths whose
-    // subtrees are deleted below.
+    // The scan root itself is loaded separately so it can never become a
+    // subtree-deletion candidate when its metadata is temporarily unreadable.
     let scan_str = state.scan_root.to_string_lossy().to_string();
-    let mut root_existing = preload_direct_children(conn, &scan_str);
+    let mut root_existing = preload_direct_children(conn, &scan_str)?;
+    let root_signature = preload_path_signature(conn, &scan_str)?;
 
-    // Index scan_root itself
-    if let Some(mut row) = index_row_from_path(&state.scan_root) {
+    // Index scan_root itself. Failure aborts this pass before any entry delete
+    // is applied; the old root row and every descendant remain searchable.
+    let root_metadata = fs::symlink_metadata(&state.scan_root).map_err(|error| {
+        filesystem_observation_error("scan_root_metadata", &state.scan_root, &error)
+    })?;
+    if let Some(mut row) = index_row_from_path_and_metadata(&state.scan_root, &root_metadata) {
         scanned += 1;
         row.run_id = current_run_id;
-        if !row_unchanged(&mut root_existing, &row) {
+        let unchanged = matches!(
+            root_signature,
+            Some((mtime, size)) if mtime == row.mtime && size == row.size
+        );
+        if !unchanged {
             batch.push(row);
         }
     }
@@ -2703,66 +2922,126 @@ fn run_incremental_index_inner(
     let mut priority_roots: Vec<PathBuf> = Vec::new();
     let mut deferred_roots: Vec<PathBuf> = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&state.scan_root) {
-        for dir_entry in entries.flatten() {
-            let child_path = dir_entry.path();
-
-            if should_skip_path(
-                &child_path,
+    let observed_direct_children = observe_direct_children(
+        &state.scan_root,
+        |root| {
+            fs::read_dir(root)
+                .map(|entries| entries.map(|entry| entry.map(|entry| entry.path())))
+        },
+        |path| fs::symlink_metadata(path),
+        |path| {
+            should_skip_path(
+                path,
                 &runtime_ignored_roots,
                 &runtime_ignored_patterns,
-            ) {
-                continue;
-            }
+            )
+        },
+    )?;
+    for child in observed_direct_children {
+        scanned += 1;
+        current_path = child.path.to_string_lossy().to_string();
+        stage_direct_child(
+            child,
+            &state.scan_root,
+            current_run_id,
+            &mut root_existing,
+            &mut batch,
+            &mut priority_roots,
+            &mut deferred_roots,
+        );
+    }
 
+    // A successful parent enumeration only makes leftovers candidates. Each
+    // candidate is re-probed, and deletion is limited to explicit ignores or
+    // confirmed NotFound. Classification finishes before any delete runs.
+    if !is_fresh && !root_existing.is_empty() {
+        let reconciliation = reconcile_unseen_direct_children(
+            &root_existing,
+            |path| fs::symlink_metadata(path),
+            |path| {
+                should_skip_path(
+                    path,
+                    &runtime_ignored_roots,
+                    &runtime_ignored_patterns,
+                )
+            },
+        )?;
+
+        for child in reconciliation.present {
             scanned += 1;
-            current_path = child_path.to_string_lossy().to_string();
+            current_path = child.path.to_string_lossy().to_string();
+            stage_direct_child(
+                child,
+                &state.scan_root,
+                current_run_id,
+                &mut root_existing,
+                &mut batch,
+                &mut priority_roots,
+                &mut deferred_roots,
+            );
+        }
 
-            if let Some(mut row) = index_row_from_path(&child_path) {
-                row.run_id = current_run_id;
-                if !row_unchanged(&mut root_existing, &row) {
-                    batch.push(row);
-                }
+        if !reconciliation.delete_paths.is_empty() {
+            if reconciliation.delete_paths.iter().any(|path| {
+                path == &scan_str
+                    || Path::new(path).parent() != Some(state.scan_root.as_path())
+            }) {
+                return Err("direct-child deletion escaped the scan-root boundary".to_string());
             }
-
-            if child_path.is_dir() {
-                if is_deferred_dir(&child_path, &state.scan_root) {
-                    deferred_roots.push(child_path);
-                } else {
-                    priority_roots.push(child_path);
-                }
-            }
+            catchup_deleted += delete_paths(conn, &reconciliation.delete_paths)? as u64;
         }
     }
 
-    // Direct children still in the map vanished from disk (or are newly
-    // ignored): their entire subtrees are stale.
-    if !is_fresh && !root_existing.is_empty() {
-        let vanished: Vec<String> = root_existing.into_keys().collect();
-        catchup_deleted += delete_paths(conn, &vanished)? as u64;
-    }
-
     priority_roots.sort();
+    priority_roots.dedup();
     deferred_roots.sort();
+    deferred_roots.dedup();
 
     let extra_roots = state.extra_roots.lock().clone();
-    let scanned_extra_roots: Vec<PathBuf> = extra_roots
+    let configured_extra_roots: Vec<PathBuf> = extra_roots
         .into_iter()
-        .filter(|r| r.is_dir() && !r.starts_with(&state.scan_root))
+        .filter(|root| !root.starts_with(&state.scan_root))
         .collect();
-    // Extra roots that were indexed on a previous run but are no longer
-    // scanned (removed from .pathindexing or vanished) leave stale subtrees.
+    let configured_extra_set: HashSet<String> = configured_extra_roots
+        .iter()
+        .map(|root| root.to_string_lossy().to_string())
+        .collect();
+    let mut scanned_extra_roots = Vec::new();
+    for root in configured_extra_roots {
+        // metadata() intentionally follows aliases such as /tmp ->
+        // /private/tmp. Any observation error preserves previously indexed
+        // rows; only explicit removal from .pathindexing authorizes cleanup.
+        match fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => scanned_extra_roots.push(root),
+            Ok(_) => {
+                permission_errors += 1;
+                eprintln!(
+                    "[index] configured extra root is not a directory; preserving existing rows: {}",
+                    root.display()
+                );
+            }
+            Err(error) => {
+                permission_errors += 1;
+                eprintln!(
+                    "[index] {}; preserving existing extra-root rows",
+                    filesystem_observation_error("extra_root_metadata", &root, &error)
+                );
+            }
+        }
+    }
+    // Extra roots removed from .pathindexing are intentional policy changes
+    // and may be deleted. A configured-but-unreadable root remains in the
+    // configured set and is never mistaken for a removed root.
     if !is_fresh {
         if let Some(prev) = get_meta(conn, "indexed_extra_roots") {
-            let current_set: std::collections::HashSet<String> = scanned_extra_roots
-                .iter()
-                .map(|r| r.to_string_lossy().to_string())
-                .collect();
             let stale: Vec<String> = prev
                 .split('\n')
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .filter(|s| !current_set.contains(*s) && !Path::new(s).starts_with(&state.scan_root))
+                .filter(|s| {
+                    !configured_extra_set.contains(*s)
+                        && !Path::new(s).starts_with(&state.scan_root)
+                })
                 .map(|s| s.to_string())
                 .collect();
             if !stale.is_empty() {
@@ -3081,7 +3360,10 @@ fn run_incremental_index_inner(
                                                 fs::symlink_metadata(&full_path).ok();
                                             true
                                         }
-                                        Err(_) => false,
+                                        // Preserve read-dir errors so the
+                                        // outer iterator can mark their
+                                        // prefixes as errored before diffing.
+                                        Err(_) => true,
                                     });
                                 });
 
@@ -3098,14 +3380,36 @@ fn run_incremental_index_inner(
 
                                     let metadata = match entry.client_state {
                                         Some(m) => m,
-                                        None => {
-                                            local_perm_errors += 1;
-                                            root_perm_errors += 1;
-                                            // Unreadable metadata: keep the
-                                            // existing row, don't delete it.
-                                            existing.mark_errored(&path);
-                                            continue;
-                                        }
+                                        None => match fs::symlink_metadata(&path) {
+                                            // A transient first failure gets
+                                            // one cheap retry before deciding.
+                                            Ok(metadata) => metadata,
+                                            Err(error)
+                                                if error.kind() == io::ErrorKind::NotFound =>
+                                            {
+                                                // Confirmed vanished: leave it
+                                                // in the diff for deletion.
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                local_perm_errors += 1;
+                                                root_perm_errors += 1;
+                                                existing.mark_errored(&path);
+                                                if local_perm_errors <= 20
+                                                    || perf_log_enabled()
+                                                {
+                                                    eprintln!(
+                                                        "[index] {}; preserving existing subtree",
+                                                        filesystem_observation_error(
+                                                            "catchup_worker_metadata",
+                                                            &path,
+                                                            &error,
+                                                        )
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                        },
                                     };
 
                                     if let Some(mut row) =
@@ -3144,17 +3448,24 @@ fn run_incremental_index_inner(
                                     // Keep rows under an unreadable directory;
                                     // NotFound means it truly vanished and its
                                     // rows should become deletion leftovers.
-                                    let vanished = err
-                                        .io_error()
-                                        .map(|e| e.kind() == std::io::ErrorKind::NotFound)
-                                        .unwrap_or(false);
-                                    if !vanished {
-                                        if let Some(p) = err.path() {
-                                            existing.mark_errored(p);
-                                        }
-                                    }
+                                    let error_path = err.path().unwrap_or(root.as_path());
+                                    existing.observe_walk_error(
+                                        err.io_error().map(|e| e.kind()),
+                                        error_path,
+                                    );
                                     if local_perm_errors <= 20 || perf_log_enabled() {
-                                        eprintln!("[index] permission error: {}", err);
+                                        if let Some(error) = err.io_error() {
+                                            eprintln!(
+                                                "[index] {}",
+                                                filesystem_observation_error(
+                                                    "catchup_worker_walk",
+                                                    error_path,
+                                                    error,
+                                                )
+                                            );
+                                        } else {
+                                            eprintln!("[index] catchup worker walk error: {}", err);
+                                        }
                                     }
                                 }
                             }
@@ -3347,6 +3658,65 @@ pub(crate) fn is_recently_touched(state: &AppState, path: &str) -> bool {
 struct PathChangeOutcome {
     changed: usize,
     count_delta: i64,
+    retry_paths: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+struct PreparedPathChanges {
+    to_upsert: Vec<IndexRow>,
+    to_delete: Vec<String>,
+    retry_paths: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_path_changes<Metadata>(
+    state: &AppState,
+    paths: &[PathBuf],
+    ignored_roots: &[PathBuf],
+    ignored_patterns: &[IgnorePattern],
+    mut metadata_for: Metadata,
+) -> PreparedPathChanges
+where
+    Metadata: FnMut(&Path) -> io::Result<fs::Metadata>,
+{
+    let mut to_upsert_map: HashMap<String, IndexRow> = HashMap::new();
+    let mut to_delete = Vec::new();
+    let mut retry_paths = Vec::new();
+
+    for path in paths {
+        if should_skip_path(path, ignored_roots, ignored_patterns) {
+            continue;
+        }
+
+        let path_str = path.to_string_lossy().to_string();
+        if path_str.is_empty() || is_recently_touched(state, &path_str) {
+            continue;
+        }
+
+        match metadata_for(path) {
+            Ok(metadata) => {
+                if let Some(row) = index_row_from_path_and_metadata(path, &metadata) {
+                    to_upsert_map.insert(row.path.clone(), row);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                to_delete.push(path_str);
+            }
+            Err(error) => {
+                eprintln!(
+                    "[watcher] {}; preserving row and scheduling retry",
+                    filesystem_observation_error("path_change_metadata", path, &error)
+                );
+                retry_paths.push(path.clone());
+            }
+        }
+    }
+
+    PreparedPathChanges {
+        to_upsert: to_upsert_map.into_values().collect(),
+        to_delete,
+        retry_paths,
+    }
 }
 
 /// How many of `rows` already exist in `entries`, checked in chunks that stay
@@ -3370,41 +3740,23 @@ fn count_existing_paths(conn: &Connection, rows: &[IndexRow]) -> AppResult<usize
 #[cfg(target_os = "macos")]
 fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<PathChangeOutcome> {
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
-    let mut to_upsert_map: HashMap<String, IndexRow> = HashMap::new();
-    let mut to_delete = Vec::new();
-
-    for path in paths {
-        if should_skip_path(path, &ignored_roots, &ignored_patterns) {
-            continue;
-        }
-
-        let path_str = path.to_string_lossy().to_string();
-        if path_str.is_empty() {
-            continue;
-        }
-
-        if is_recently_touched(state, &path_str) {
-            continue;
-        }
-
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if let Some(row) = index_row_from_path_and_metadata(path, &metadata) {
-                    to_upsert_map.insert(row.path.clone(), row);
-                }
-            }
-            Err(_) => {
-                to_delete.push(path_str);
-            }
-        }
-    }
-
-    let to_upsert = to_upsert_map.into_values().collect::<Vec<_>>();
+    let PreparedPathChanges {
+        to_upsert,
+        to_delete,
+        retry_paths,
+    } = prepare_path_changes(
+        state,
+        paths,
+        &ignored_roots,
+        &ignored_patterns,
+        |path| fs::symlink_metadata(path),
+    );
 
     if to_upsert.is_empty() && to_delete.is_empty() {
         return Ok(PathChangeOutcome {
             changed: 0,
             count_delta: 0,
+            retry_paths,
         });
     }
 
@@ -3434,6 +3786,7 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<PathChan
         Ok(PathChangeOutcome {
             changed: up + del,
             count_delta: to_upsert.len() as i64 - existing as i64 - del as i64,
+            retry_paths,
         })
     })();
     if result.is_err() {
@@ -3451,8 +3804,11 @@ const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const DB_BUSY_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 #[cfg(target_os = "macos")]
+const FS_OBSERVATION_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+#[cfg(target_os = "macos")]
 fn process_watcher_paths(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     pending: &mut HashSet<PathBuf>,
     deadline: &mut Option<Instant>,
@@ -3472,16 +3828,28 @@ fn process_watcher_paths(
 
     match apply_path_changes(state, &batch) {
         Ok(outcome) => {
-            *deadline = None;
-            if outcome.changed > 0 {
+            let PathChangeOutcome {
+                changed,
+                count_delta,
+                retry_paths,
+            } = outcome;
+            if retry_paths.is_empty() {
+                *deadline = None;
+            } else {
+                for path in retry_paths {
+                    pending.insert(path);
+                }
+                *deadline = Some(Instant::now() + FS_OBSERVATION_RETRY_DELAY);
+            }
+            if changed > 0 {
                 invalidate_search_caches(state);
                 {
                     // Maintain counts incrementally — the rows just written
-                    // carry indexed_at = now, and outcome.count_delta is the
+                    // carry indexed_at = now, and count_delta is the
                     // exact net row change, so no COUNT(*)/MAX() needed.
                     let mut status = state.status.lock();
                     status.entries_count =
-                        (status.entries_count as i64 + outcome.count_delta).max(0) as u64;
+                        (status.entries_count as i64 + count_delta).max(0) as u64;
                     status.last_updated = Some(now_epoch());
                 }
                 if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
@@ -3524,7 +3892,9 @@ fn process_watcher_paths(
             }
             status.message = Some(format!("Watcher update failed: {err}"));
             drop(status);
-            emit_index_state(app, "Error", Some(format!("Watcher update failed: {err}")));
+            if let Some(app) = app {
+                emit_index_state(app, "Error", Some(format!("Watcher update failed: {err}")));
+            }
         }
     }
 }
@@ -3658,7 +4028,7 @@ fn queue_subtree_rescan(
 /// retried on the next loop tick.
 #[cfg(target_os = "macos")]
 fn spawn_due_subtree_rescan(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     queued: &mut HashMap<PathBuf, Instant>,
     inflight: &Arc<AtomicBool>,
@@ -3690,7 +4060,7 @@ fn spawn_due_subtree_rescan(
     queued.remove(&path);
     inflight.store(true, AtomicOrdering::Release);
 
-    let app = app.clone();
+    let app = app.cloned();
     let state = state.clone();
     let inflight = Arc::clone(inflight);
     let finished = Arc::clone(finished);
@@ -3734,7 +4104,8 @@ fn spawn_due_subtree_rescan(
                 if upserted + deleted > 0 {
                     invalidate_search_caches(&state);
                     touch_status_updated(&state);
-                    let _ = refresh_and_emit_status_counts(&app, &state);
+                    // Persist the recount even headless (daemon); emit only in GUI.
+                    let _ = refresh_and_emit_status_counts(app.as_ref(), &state);
                 }
                 if upserted + deleted >= BATCH_SIZE {
                     release_memory_to_os();
@@ -3764,7 +4135,7 @@ enum WatcherExit {
 
 #[cfg(target_os = "macos")]
 fn start_fsevent_watcher_worker(
-    app: AppHandle,
+    app: Option<AppHandle>,
     state: AppState,
     since_event_id: Option<u64>,
     conditional: bool,
@@ -3815,11 +4186,13 @@ fn start_fsevent_watcher_worker(
                         IndexState::Error,
                         Some(format!("FSEvents watcher initialization failed: {err}")),
                     );
-                    emit_index_state(
-                        &app,
-                        "Error",
-                        Some(format!("FSEvents watcher initialization failed: {err}")),
-                    );
+                    if let Some(app) = app.as_ref() {
+                        emit_index_state(
+                            app,
+                            "Error",
+                            Some(format!("FSEvents watcher initialization failed: {err}")),
+                        );
+                    }
                     // A prior iteration may have set watcher_active on a
                     // successful build; clear it before bailing so reset_index
                     // doesn't spin for its full 5s deadline waiting on a
@@ -3834,11 +4207,13 @@ fn start_fsevent_watcher_worker(
             if replay {
                 perf_log("conditional_startup: watcher started, awaiting history replay");
                 set_state(&state, IndexState::Ready, None);
-                emit_index_state(&app, "Ready", None);
+                if let Some(app) = app.as_ref() {
+                    emit_index_state(app, "Ready", None);
+                }
             }
 
             let exit = run_fsevent_stream(
-                &app,
+                app.as_ref(),
                 &state,
                 &rx,
                 &watcher,
@@ -3871,7 +4246,7 @@ fn start_fsevent_watcher_worker(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn run_fsevent_stream(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     rx: &std::sync::mpsc::Receiver<mac::fsevent_watcher::FsEvent>,
     watcher: &mac::fsevent_watcher::FsEventWatcher,
@@ -3928,7 +4303,9 @@ fn run_fsevent_stream(
                         );
                         if new_entries != last_config_entries {
                             last_config_entries = new_entries;
-                            app.emit("pathignore_changed", ()).ok();
+                            if let Some(app) = app {
+                                app.emit("pathignore_changed", ()).ok();
+                            }
                         }
                         continue;
                     }
@@ -3944,7 +4321,7 @@ fn run_fsevent_stream(
                             last_pathindexing_entries = new_entries;
 
                             let bg_state = state.clone();
-                            let bg_app = app.clone();
+                            let bg_app = app.cloned();
                             let bg_new_roots = new_roots.clone();
                             *state.extra_roots.lock() = new_roots;
                             // Roots changed: rebuild the FSEvents stream so
@@ -3955,7 +4332,9 @@ fn run_fsevent_stream(
                                 continue;
                             }
                             set_state(&state, IndexState::Indexing, None);
-                            emit_index_state(&app, "Indexing", None);
+                            if let Some(app) = app {
+                                emit_index_state(app, "Indexing", None);
+                            }
                             std::thread::spawn(move || {
                                 // Wait for initial indexing to finish before writing to DB
                                 while bg_state.indexing_active.load(AtomicOrdering::Acquire) {
@@ -3976,7 +4355,7 @@ fn run_fsevent_stream(
                                                 let roots_str: Vec<String> = target_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
                                                 let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
                                             }
-                                            let _ = refresh_and_emit_status_counts(&bg_app, &bg_state);
+                                            let _ = refresh_and_emit_status_counts(bg_app.as_ref(), &bg_state);
                                         }
                                         Err(e) => {
                                             eprintln!("[pathindexing] change handling error: {e}");
@@ -3992,8 +4371,10 @@ fn run_fsevent_stream(
                                     target_roots = current;
                                 }
                                 set_state(&bg_state, IndexState::Ready, None);
-                                emit_index_state(&bg_app, "Ready", None);
-                                bg_app.emit("pathindexing_changed", ()).ok();
+                                if let Some(bg_app) = &bg_app {
+                                    emit_index_state(bg_app, "Ready", None);
+                                    bg_app.emit("pathindexing_changed", ()).ok();
+                                }
                                 bg_state.pathindexing_active.store(false, AtomicOrdering::Release);
                             });
                         }
@@ -4018,7 +4399,9 @@ fn run_fsevent_stream(
                         must_scan_count
                     ));
                     full_scan_triggered = true;
-                    let _ = start_full_index_worker(app.clone(), state.clone());
+                    if let Some(app) = app {
+                        let _ = start_full_index_worker(app.clone(), state.clone());
+                    }
                 }
                 // Dropped events mean this subtree must be reconciled with
                 // disk. Queue a streaming rescan (spawned from the loop
@@ -4032,7 +4415,7 @@ fn run_fsevent_stream(
                     state.indexing_active.load(AtomicOrdering::Acquire)
                 );
                 process_watcher_paths(
-                    &app,
+                    app,
                     &state,
                     &mut pending_paths,
                     &mut deadline,
@@ -4046,7 +4429,7 @@ fn run_fsevent_stream(
                             "conditional_startup: HistoryDone, MustScanSubDirs={}, skipping full scan",
                             must_scan_count
                         ));
-                        let _ = refresh_and_emit_status_counts(&app, &state);
+                        let _ = refresh_and_emit_status_counts(app, &state);
                         last_status_emit = Instant::now();
                         pending_status_emit = false;
                     }
@@ -4059,7 +4442,7 @@ fn run_fsevent_stream(
         if let Some(due) = deadline {
             if Instant::now() >= due {
                 process_watcher_paths(
-                    &app,
+                    app,
                     &state,
                     &mut pending_paths,
                     &mut deadline,
@@ -4070,7 +4453,7 @@ fn run_fsevent_stream(
         }
 
         if pending_status_emit && last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
-            emit_and_persist_cached_counts(&app, &state);
+            emit_and_persist_cached_counts(app, &state);
             last_status_emit = Instant::now();
             pending_status_emit = false;
         }
@@ -4082,7 +4465,7 @@ fn run_fsevent_stream(
         // full scan, which reconciles the same ground).
         if !replay_phase {
             spawn_due_subtree_rescan(
-                &app,
+                app,
                 &state,
                 queued_rescans,
                 rescan_inflight,
@@ -4476,7 +4859,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         #[cfg(not(target_os = "windows"))]
         {
             start_full_index_worker(app.clone(), state.clone())?;
-            start_fsevent_watcher_worker(app, state, None, false);
+            start_fsevent_watcher_worker(Some(app), state, None, false);
             Ok(())
         }
     })
@@ -4996,7 +5379,7 @@ fn run_db_search(
                 .map(|p| vec![p.to_string_lossy().to_string()])
                 .unwrap_or_default();
             let resolved_dirs = if resolved_dirs.is_empty() {
-                resolve_dirs_from_db(&conn, dir_hint)
+                resolve_dirs_from_db(conn, dir_hint)
             } else {
                 resolved_dirs
             };
@@ -5005,12 +5388,10 @@ fn run_db_search(
                 let ext_shortcut = extract_ext_from_like(name_like);
                 let mut sql_params: Vec<SqlValue> = Vec::new();
                 let mut dir_conditions = Vec::new();
-                let sep = std::path::MAIN_SEPARATOR;
 
                 for d in &resolved_dirs {
                     let i = sql_params.len();
-                    let pfx = format!("{d}{sep}");
-                    let pfx_end = format!("{d}\x7F");
+                    let (pfx, pfx_end) = subtree_range_bounds(d);
                     sql_params.push(SqlValue::Text(d.clone()));
                     sql_params.push(SqlValue::Text(pfx));
                     sql_params.push(SqlValue::Text(pfx_end));
@@ -5923,7 +6304,7 @@ async fn move_to_trash(
         let _ = delete_paths(&mut conn, &deleted_targets)?;
         invalidate_search_caches(&state);
 
-        refresh_and_emit_status_counts(&app, &state)?;
+        refresh_and_emit_status_counts(Some(&app), &state)?;
         Ok(())
     })
     .await
@@ -6005,7 +6386,7 @@ async fn rename(
             Some(new_path.to_string_lossy().to_string()),
         );
 
-        refresh_and_emit_status_counts(&app, &state)?;
+        refresh_and_emit_status_counts(Some(&app), &state)?;
 
         let new_meta = fs::symlink_metadata(&new_path).ok();
         Ok(EntryDto {
@@ -6727,53 +7108,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         let mcp_db_path = db_path.clone();
         std::thread::spawn(move || mcp_server::register_all_and_log(Some(mcp_db_path)));
     }
-    let scan_root = if cfg!(windows) {
-        PathBuf::from("C:\\")
-    } else {
-        home_dir.clone()
-    };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
-    let config_file_path = app_data_dir.join(".pathignore");
-    eprintln!("[startup] +{}ms loading pathignore rules...", setup_started.elapsed().as_millis());
-    let (mut path_ignores, path_ignore_patterns) = load_pathignore_rules(&config_file_path, &home_dir, &cwd);
-    if !path_ignores.iter().any(|r| r == &app_data_dir) {
-        path_ignores.push(app_data_dir.clone());
-    }
-    eprintln!("[startup] +{}ms pathignore done", setup_started.elapsed().as_millis());
-
-    let pathindexing_file_path = app_data_dir.join(".pathindexing");
-    let extra_roots = pathindexing::load_pathindexing_roots(&pathindexing_file_path);
-    eprintln!("[startup] +{}ms pathindexing loaded: {} extra roots", setup_started.elapsed().as_millis(), extra_roots.len());
-
-    let state = AppState {
-        db_path,
-        home_dir,
-        scan_root,
-        cwd,
-        config_file_path,
-        pathindexing_file_path,
-        extra_roots: Arc::new(Mutex::new(extra_roots)),
-        path_ignores: Arc::new(path_ignores),
-        path_ignore_patterns: Arc::new(path_ignore_patterns),
-        db_ready: Arc::new(AtomicBool::new(false)),
-        indexing_active: Arc::new(AtomicBool::new(false)),
-        status: Arc::new(Mutex::new(IndexStatus::default())),
-        recent_ops: Arc::new(Mutex::new(Vec::new())),
-        icon_cache: Arc::new(Mutex::new(HashMap::new())),
-        fd_search_cache: Arc::new(Mutex::new(None)),
-        negative_name_cache: Arc::new(Mutex::new(HashMap::new())),
-        ignore_cache: Arc::new(Mutex::new(None)),
-        fts_ready: Arc::new(AtomicBool::new(true)),
-        mem_index: Arc::new(RwLock::new(None)),
-        watcher_stop: Arc::new(AtomicBool::new(false)),
-        watcher_active: Arc::new(AtomicBool::new(false)),
-        frontend_ready: Arc::new(AtomicBool::new(false)),
-        pathindexing_active: Arc::new(AtomicBool::new(false)),
-        search_conn_pool: Arc::new(Mutex::new(Vec::new())),
-        watcher_conn: Arc::new(Mutex::new(None)),
-    };
-
-    eprintln!("[startup] +{}ms AppState created", setup_started.elapsed().as_millis());
+    // The GUI owns index writes while it runs; hold the beacon for the process
+    // lifetime so the headless MCP-spawned daemon defers to us (single writer).
+    daemon::hold_gui_beacon(&db_path);
+    eprintln!("[startup] +{}ms building AppState (pathignore + pathindexing)...", setup_started.elapsed().as_millis());
+    let state = build_app_state(db_path, home_dir, &app_data_dir);
+    eprintln!("[startup] +{}ms AppState created ({} extra roots)", setup_started.elapsed().as_millis(), state.extra_roots.lock().len());
     app.manage(state.clone());
     // Context menu item IDs use the "ctx_" prefix by convention.
     // All matching IDs are forwarded as "context_menu_action" events to the frontend.
@@ -6836,7 +7176,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 // Brief pause so indexing thread can start first
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let hk_started = std::time::Instant::now();
-                let _ = refresh_and_emit_status_counts(&hk_app, &hk_state);
+                let _ = refresh_and_emit_status_counts(Some(&hk_app), &hk_state);
                 eprintln!("[startup/housekeeping] refresh_and_emit_status_counts done in {}ms", hk_started.elapsed().as_millis());
                 // Wait for frontend readiness so initial paint and first input are not contended by purge I/O.
                 const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(180);
@@ -6915,7 +7255,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                     }
                     // Conditional startup: try watcher replay first, skip full scan if OK
                     start_fsevent_watcher_worker(
-                        app_handle.clone(),
+                        Some(app_handle.clone()),
                         state.clone(),
                         stored_event_id,
                         true,
@@ -6996,7 +7336,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                                         let roots_str: Vec<String> = current_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
                                         let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
                                     }
-                                    let _ = refresh_and_emit_status_counts(&scan_app, &scan_state);
+                                    let _ = refresh_and_emit_status_counts(Some(&scan_app), &scan_state);
                                     scan_app.emit("pathindexing_changed", ()).ok();
                                 }
                                 Err(e) => eprintln!("[pathindexing] startup scan error: {e}"),
@@ -7009,7 +7349,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         eprintln!("[mac] index incomplete or entries empty; starting full index");
                     }
                     let _ = start_full_index_worker(app_handle.clone(), state.clone());
-                    start_fsevent_watcher_worker(app_handle.clone(), state.clone(), None, false);
+                    start_fsevent_watcher_worker(Some(app_handle.clone()), state.clone(), None, false);
                 }
             }
         }
@@ -7140,7 +7480,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -7231,6 +7570,30 @@ mod tests {
             search_conn_pool: Arc::new(Mutex::new(Vec::new())),
             watcher_conn: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn insert_test_entry(conn: &Connection, path: &Path, is_dir: bool, run_id: i64) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let dir = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        conn.execute(
+            "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at, run_id)
+             VALUES(?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)",
+            params![
+                path.to_string_lossy().to_string(),
+                name,
+                dir,
+                if is_dir { 1 } else { 0 },
+                now_epoch(),
+                run_id,
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7360,6 +7723,283 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preload_direct_children_never_includes_scan_root_or_grandchildren() {
+        let root = temp_case_dir("preload_direct_children");
+        let scan_root = root.join("home");
+        let child = scan_root.join("docs");
+        let grandchild = child.join("note.txt");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(&grandchild, "note").unwrap();
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        insert_test_entry(&conn, &scan_root, true, 1);
+        insert_test_entry(&conn, &child, true, 1);
+        insert_test_entry(&conn, &grandchild, false, 1);
+
+        let scan_str = scan_root.to_string_lossy().to_string();
+        let existing = preload_direct_children(&conn, &scan_str).unwrap();
+        assert_eq!(existing.len(), 1);
+        assert!(existing.contains_key(&child.to_string_lossy().to_string()));
+        assert!(!existing.contains_key(&scan_str));
+        assert!(!existing.contains_key(&grandchild.to_string_lossy().to_string()));
+        assert!(preload_path_signature(&conn, &scan_str).unwrap().is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn direct_child_observation_rejects_open_iterator_and_metadata_errors() {
+        let scan_root = PathBuf::from("/virtual/home");
+
+        let open_error = observe_direct_children(
+            &scan_root,
+            |_| -> io::Result<std::vec::IntoIter<io::Result<PathBuf>>> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            },
+            |_| -> io::Result<fs::Metadata> { unreachable!() },
+            |_| false,
+        )
+        .err()
+        .expect("open failure");
+        assert!(open_error.contains("stage=read_dir_open"));
+        assert!(open_error.contains("kind=PermissionDenied"));
+
+        let iterator_error = observe_direct_children(
+            &scan_root,
+            |_| {
+                Ok(vec![Err(io::Error::new(io::ErrorKind::Other, "iterator I/O"))]
+                    .into_iter())
+            },
+            |_| -> io::Result<fs::Metadata> { unreachable!() },
+            |_| false,
+        )
+        .err()
+        .expect("iterator failure");
+        assert!(iterator_error.contains("stage=read_dir_entry"));
+
+        let child = scan_root.join("Documents");
+        let metadata_error = observe_direct_children(
+            &scan_root,
+            |_| Ok(vec![Ok(child.clone())].into_iter()),
+            |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            |_| false,
+        )
+        .err()
+        .expect("metadata failure");
+        assert!(metadata_error.contains("stage=direct_child_metadata"));
+        assert!(metadata_error.contains(child.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn unseen_direct_children_delete_only_ignored_or_confirmed_not_found() {
+        let root = temp_case_dir("direct_child_reconcile");
+        fs::create_dir_all(&root).unwrap();
+        let ignored = root.join("ignored");
+        let missing = root.join("missing");
+        let present = root.join("present.txt");
+        fs::write(&present, "present").unwrap();
+
+        let existing = HashMap::from([
+            (ignored.to_string_lossy().to_string(), (None, None)),
+            (missing.to_string_lossy().to_string(), (None, None)),
+            (present.to_string_lossy().to_string(), (None, None)),
+        ]);
+        let reconciliation = reconcile_unseen_direct_children(
+            &existing,
+            |path| {
+                if path == missing.as_path() {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+                } else {
+                    fs::symlink_metadata(path)
+                }
+            },
+            |path| path == ignored.as_path(),
+        )
+        .unwrap();
+
+        let deleted: HashSet<String> = reconciliation.delete_paths.into_iter().collect();
+        assert_eq!(
+            deleted,
+            HashSet::from([
+                ignored.to_string_lossy().to_string(),
+                missing.to_string_lossy().to_string(),
+            ])
+        );
+        assert_eq!(reconciliation.present.len(), 1);
+        assert_eq!(reconciliation.present[0].path, present);
+
+        let denied = root.join("denied");
+        let denied_existing = HashMap::from([(
+            denied.to_string_lossy().to_string(),
+            (None, None),
+        )]);
+        let error = reconcile_unseen_direct_children(
+            &denied_existing,
+            |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            |_| false,
+        )
+        .err()
+        .expect("permission failure must abort before deletion");
+        assert!(error.contains("stage=leftover_metadata"));
+        assert!(error.contains("kind=PermissionDenied"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catchup_read_dir_failure_preserves_scan_root_subtree() {
+        let root = temp_case_dir("catchup_read_dir_failure");
+        fs::create_dir_all(&root).unwrap();
+        // A regular file has readable metadata but read_dir deterministically
+        // fails with NotADirectory on every supported platform.
+        let scan_root = root.join("home-file");
+        fs::write(&scan_root, "not a directory").unwrap();
+        let child = scan_root.join("Documents");
+        let descendant = child.join("report.txt");
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        insert_test_entry(&conn, &scan_root, false, 1);
+        insert_test_entry(&conn, &child, true, 1);
+        insert_test_entry(&conn, &descendant, false, 1);
+        set_meta(&conn, "last_run_id", "1").unwrap();
+        set_meta(&conn, "index_complete", "1").unwrap();
+        drop(conn);
+
+        let state = test_state_for(db_path.clone(), scan_root, root.clone());
+        let error = run_incremental_index(None, &state)
+            .err()
+            .expect("read_dir failure must reject catchup");
+        assert!(error.contains("stage=read_dir_open"));
+
+        let conn = db_connection(&db_path).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 3, "no existing row may be deleted");
+        assert_eq!(get_meta(&conn, "last_run_id").as_deref(), Some("1"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catchup_deletes_confirmed_missing_direct_child_subtree() {
+        let root = temp_case_dir("catchup_confirmed_missing");
+        let scan_root = root.join("home");
+        fs::create_dir_all(&scan_root).unwrap();
+        let missing = scan_root.join("old-project");
+        let descendant = missing.join("stale.txt");
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        insert_test_entry(&conn, &scan_root, true, 1);
+        insert_test_entry(&conn, &missing, true, 1);
+        insert_test_entry(&conn, &descendant, false, 1);
+        set_meta(&conn, "last_run_id", "1").unwrap();
+        drop(conn);
+
+        let state = test_state_for(db_path.clone(), scan_root, root.clone());
+        run_incremental_index(None, &state).expect("safe catchup");
+
+        let conn = db_connection(&db_path).unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE path = ?1 OR path = ?2",
+                params![
+                    missing.to_string_lossy().to_string(),
+                    descendant.to_string_lossy().to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "confirmed NotFound subtree must be removed");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn configured_unreadable_extra_root_is_preserved() {
+        let root = temp_case_dir("unreadable_extra_root");
+        let scan_root = root.join("home");
+        fs::create_dir_all(&scan_root).unwrap();
+        let extra_root = root.join("offline-volume");
+        let extra_child = extra_root.join("cached.txt");
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        insert_test_entry(&conn, &scan_root, true, 1);
+        insert_test_entry(&conn, &extra_root, true, 1);
+        insert_test_entry(&conn, &extra_child, false, 1);
+        set_meta(&conn, "last_run_id", "1").unwrap();
+        set_meta(
+            &conn,
+            "indexed_extra_roots",
+            extra_root.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let state = test_state_for(db_path.clone(), scan_root, root.clone());
+        state.extra_roots.lock().push(extra_root.clone());
+        run_incremental_index(None, &state).expect("unreadable extra root is non-destructive");
+
+        let conn = db_connection(&db_path).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE path = ?1 OR path = ?2",
+                params![
+                    extra_root.to_string_lossy().to_string(),
+                    extra_child.to_string_lossy().to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watcher_metadata_errors_delete_only_not_found_and_retry_others() {
+        let root = temp_case_dir("watcher_metadata_errors");
+        fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        let state = test_state_for(db_path, root.clone(), root.clone());
+        let missing = root.join("missing.txt");
+        let denied = root.join("denied.txt");
+
+        let prepared = prepare_path_changes(
+            &state,
+            &[missing.clone(), denied.clone()],
+            &[],
+            &[],
+            |path| {
+                if path == missing.as_path() {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+                } else {
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+                }
+            },
+        );
+
+        assert!(prepared.to_upsert.is_empty());
+        assert_eq!(
+            prepared.to_delete,
+            vec![missing.to_string_lossy().to_string()]
+        );
+        assert_eq!(prepared.retry_paths, vec![denied]);
 
         let _ = fs::remove_dir_all(root);
     }

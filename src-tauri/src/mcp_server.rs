@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::query::parse_query;
 use crate::{
-    db_connection_for_search, effective_search_limit, fts_usable, resolve_home_dir,
+    db_connection_for_search, effective_search_limit, fts_usable, get_meta, resolve_home_dir,
     run_db_search, sort_entries_with_relevance, AppResult, EntryDto, DB_FILE_NAME, MAX_LIMIT,
     SORT_DIRS, SORT_KEYS,
 };
@@ -48,6 +48,10 @@ in the output have a trailing '/'. The index covers the user's home directory \
 /// the GUI.
 pub fn handle_cli_args() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--daemon") {
+        crate::daemon::run_daemon();
+        return true;
+    }
     if args.iter().any(|a| a == "--mcp") {
         run_stdio_server();
         return true;
@@ -63,18 +67,23 @@ pub fn handle_cli_args() -> bool {
 // Paths (resolved without Tauri: the MCP server runs outside the app)
 // ---------------------------------------------------------------------------
 
+/// Tauri's bundle identifier (`identifier` in `tauri.conf.json`); it names the
+/// per-user app-data directory that holds the index DB.
+const APP_BUNDLE_ID: &str = "com.everything.app";
+
 /// The index DB to serve. Registration entries written by the app pin the
 /// Tauri-resolved path via `EVERYTHING_MCP_DB`; the hand-derived guess below
-/// (Tauri's `app_data_dir()` layout for `com.everything.app`) is only the
+/// (Tauri's `app_data_dir()` layout for `APP_BUNDLE_ID`) is only the
 /// fallback for entries or invocations without that pin.
-fn default_db_path() -> PathBuf {
+pub(crate) fn default_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("EVERYTHING_MCP_DB") {
         return PathBuf::from(p);
     }
     #[cfg(target_os = "macos")]
     {
         resolve_home_dir()
-            .join("Library/Application Support/com.everything.app")
+            .join("Library/Application Support")
+            .join(APP_BUNDLE_ID)
             .join(DB_FILE_NAME)
     }
     #[cfg(target_os = "windows")]
@@ -82,12 +91,13 @@ fn default_db_path() -> PathBuf {
         let roaming = std::env::var("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| resolve_home_dir().join("AppData").join("Roaming"));
-        roaming.join("com.everything.app").join(DB_FILE_NAME)
+        roaming.join(APP_BUNDLE_ID).join(DB_FILE_NAME)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         resolve_home_dir()
-            .join(".local/share/com.everything.app")
+            .join(".local/share")
+            .join(APP_BUNDLE_ID)
             .join(DB_FILE_NAME)
     }
 }
@@ -110,6 +120,41 @@ fn open_search_connection(db_path: &Path) -> AppResult<Connection> {
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=2000;")
         .map_err(|e| e.to_string())?;
     Ok(conn)
+}
+
+// ---------------------------------------------------------------------------
+// Index readiness (the resident daemon owns all writes)
+// ---------------------------------------------------------------------------
+//
+// The MCP process is a pure reader. Keeping the index fresh — and building it
+// the first time on a machine where the GUI was never launched — is the job of
+// the resident indexer daemon (see `crate::daemon`), which the server spawns on
+// startup. Until that daemon has produced a usable index, searches return a
+// "being prepared" notice rather than a dead end.
+
+const INDEX_BUILDING_MSG: &str = "The file index is being prepared by the \
+background indexer and is not ready yet. This can take from a few seconds to a \
+couple of minutes on first use (it covers the whole home directory). Please \
+retry the search shortly. If it never becomes ready, launch the Everything app \
+once to build the index (the background indexer may lack filesystem access).";
+
+/// A usable index means the last build ran to completion (`index_complete=1`)
+/// and left rows behind — the same readiness rule the GUI uses at startup.
+/// Anything else (missing DB, half-built, empty) means the daemon is still
+/// preparing it.
+fn index_is_usable(db_path: &Path) -> bool {
+    if !db_path.exists() {
+        return false;
+    }
+    let Ok(conn) = db_connection_for_search(db_path) else {
+        return false;
+    };
+    if get_meta(&conn, "index_complete").as_deref() != Some("1") {
+        return false;
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM entries)", [], |r| r.get::<_, i64>(0))
+        .map(|exists| exists != 0)
+        .unwrap_or(false)
 }
 
 struct SearchArgs {
@@ -214,6 +259,21 @@ impl McpServer {
         }
     }
 
+    /// Ensure a usable index exists before a search runs. Building/refreshing is
+    /// the resident daemon's job (spawned at startup), so this only opens a read
+    /// connection once one is ready and otherwise returns a "being prepared"
+    /// notice for the caller to retry.
+    fn ensure_index_ready(&mut self) -> Result<(), String> {
+        if self.conn.is_some() {
+            return Ok(());
+        }
+        if index_is_usable(&self.db_path) {
+            self.conn = Some(open_search_connection(&self.db_path)?);
+            return Ok(());
+        }
+        Err(INDEX_BUILDING_MSG.to_string())
+    }
+
     /// Handles one incoming JSON-RPC message; `None` means nothing to send
     /// (notification, or a malformed message that carries no usable id).
     fn handle_line(&mut self, line: &str) -> Option<Value> {
@@ -264,10 +324,11 @@ impl McpServer {
     }
 
     fn do_search(&mut self, args: &SearchArgs) -> Result<String, String> {
-        if self.conn.is_none() {
-            self.conn = Some(open_search_connection(&self.db_path)?);
-        }
-        let conn = self.conn.as_ref().expect("connection opened above");
+        self.ensure_index_ready()?;
+        let conn = self
+            .conn
+            .as_ref()
+            .expect("connection opened by ensure_index_ready");
         let mode = parse_query(&args.query);
         let fts_ready = fts_usable(conn);
         let searched = run_db_search(
@@ -385,6 +446,10 @@ pub fn run_stdio_server() {
         env!("CARGO_PKG_VERSION"),
         db_path.display()
     );
+    // Ensure a resident indexer daemon exists so the index gets built (first
+    // run) and stays fresh without the GUI. Idempotent: a duplicate daemon
+    // self-exits, and it outlives this MCP session.
+    crate::daemon::spawn_detached();
     let mut server = McpServer::new(db_path, resolve_home_dir());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -614,6 +679,9 @@ mod tests {
             )
             .unwrap();
         }
+        // Mark the index complete so `ensure_index_ready` serves it instead of
+        // triggering a rebuild (mirrors what a finished real build leaves).
+        crate::set_meta(&conn, "index_complete", "1").unwrap();
         db_path
     }
 
@@ -747,12 +815,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_db_is_a_tool_error_not_a_crash() {
-        let root = temp_case_dir("missing_db");
-        let mut server = McpServer::new(root.join("nope.db"), root.clone());
+    fn index_readiness_semantics() {
+        let root = temp_case_dir("readiness");
+        let db = root.join("index.db");
+        // Missing DB is not usable.
+        assert!(!index_is_usable(&db));
+        // A complete DB with rows is usable (build_test_db sets index_complete=1).
+        let _ = build_test_db(&root);
+        assert!(index_is_usable(&db));
+    }
+
+    #[test]
+    fn search_without_usable_index_reports_not_ready() {
+        let root = temp_case_dir("index_not_ready");
+        let db = root.join("index.db"); // never built
+        let mut server = McpServer::new(db, root.clone());
+        // Pure reader: no index yet -> a "being prepared, retry" tool error,
+        // and (unlike the old build-on-demand path) nothing is written.
         let (text, is_error) = call_search(&mut server, json!({ "query": "x" }));
         assert!(is_error);
-        assert!(text.contains("Index database not found"));
+        assert!(text.to_lowercase().contains("retry"), "got: {text}");
+        assert!(server.conn.is_none());
     }
 
     #[test]
