@@ -276,6 +276,10 @@
     return ext || '__file__';
   }
 
+  // `_version` is intentionally unused: the table passes `iconVersion` here so
+  // Svelte re-runs this binding when the icon cache updates (setIconCache bumps
+  // iconVersion). Removing the param would make that call site look like a
+  // mistake and invite silently breaking icon refresh.
   function iconFor(entry, _version = 0) {
     const key = iconKey(entry);
     const cached = iconCache.get(key);

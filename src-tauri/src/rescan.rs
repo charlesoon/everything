@@ -105,6 +105,19 @@ impl SubtreeDiff {
         self.errored_prefixes.push(prefix.to_path_buf());
     }
 
+    /// Reconcile a walk enumeration error against the vanished-row policy: a
+    /// confirmed `NotFound` means the path truly vanished, so its rows are left
+    /// in the diff for deletion; any other error (permission, I/O, or a non-io
+    /// walker error) means enumeration failed and the subtree's rows must be
+    /// preserved via `mark_errored`. `path` is the error's path already resolved
+    /// against a fallback root; `io_kind` is the walker error's io-error kind
+    /// (both `walkdir` and `jwalk` expose `io_error()`).
+    pub(crate) fn observe_walk_error(&mut self, io_kind: Option<std::io::ErrorKind>, path: &Path) {
+        if io_kind != Some(std::io::ErrorKind::NotFound) {
+            self.mark_errored(path);
+        }
+    }
+
     /// Paths of rows that were in the snapshot but never seen on disk, minus
     /// anything under an errored prefix. The snapshot only keeps hashes, so
     /// path strings are re-read from the DB (an index range scan).
@@ -169,15 +182,10 @@ pub(crate) fn rescan_subtree(
                 // NotFound means the path vanished mid-walk — deletion is the
                 // correct outcome. Anything else (permission, I/O) must keep
                 // the existing rows for that subtree.
-                let vanished = err
-                    .io_error()
-                    .map(|e| e.kind() == std::io::ErrorKind::NotFound)
-                    .unwrap_or(false);
-                if !vanished {
-                    if let Some(path) = err.path() {
-                        diff.mark_errored(path);
-                    }
-                }
+                diff.observe_walk_error(
+                    err.io_error().map(|e| e.kind()),
+                    err.path().unwrap_or(root),
+                );
                 continue;
             }
         };
@@ -233,15 +241,7 @@ mod tests {
     }
 
     fn temp_dir(case: &str) -> PathBuf {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "everything_rescan_{case}_{}_{}",
-            std::process::id(),
-            stamp
-        ));
+        let dir = crate::temp_case_dir(&format!("rescan_{case}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
@@ -329,14 +329,7 @@ mod tests {
     fn rescan_via_symlink_root_uses_stored_prefix() {
         let real = temp_dir("symreal");
         fs::write(real.join("f.txt"), b"f").unwrap();
-        let link = std::env::temp_dir().join(format!(
-            "everything_rescan_symlink_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let link = crate::temp_case_dir("rescan_symlink");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let mut conn = test_conn();
