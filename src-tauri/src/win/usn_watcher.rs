@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
 
+use super::dir_rescan::DirRescanQueue;
 use super::volume;
 use crate::{
     db_connection, delete_paths, invalidate_search_caches,
@@ -16,7 +17,9 @@ use crate::{
     AppState,
 };
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{
+    ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE, HANDLE,
+};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::FSCTL_READ_USN_JOURNAL;
 
@@ -40,6 +43,13 @@ const USN_REASON_FILE_DELETE: u32 = 0x00000200;
 const USN_REASON_RENAME_OLD_NAME: u32 = 0x00001000;
 const USN_REASON_RENAME_NEW_NAME: u32 = 0x00002000;
 
+/// Directory attribute bit in a USN record's FileAttributes field (S6).
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+
+/// Bounded transient-read retries before the watcher exits so its supervisor
+/// can restart it (S2). Journal-stale errors are handled separately.
+const MAX_TRANSIENT_RETRIES: u32 = 5;
+
 /// READ_USN_JOURNAL_DATA_V0 structure
 #[repr(C)]
 struct ReadUsnJournalDataV0 {
@@ -54,11 +64,12 @@ struct ReadUsnJournalDataV0 {
 struct UsnChangeRecord {
     frn: u64,
     parent_frn: u64,
-    usn: i64,
     reason: u32,
+    attributes: u32,
     name: String,
 }
 
+#[derive(Clone)]
 enum FileChange {
     Create(PathBuf),
     Delete(PathBuf),
@@ -80,7 +91,7 @@ type FrnPathCache = HashMap<u64, String>;
 /// `frn_cache`: pre-built FRN→path map from MFT scan (empty if unavailable).
 /// `outside_scan_frns`: directory FRNs known to be outside scan_root (pre-populated skip set).
 pub fn start(
-    app: AppHandle,
+    app: Option<AppHandle>,
     state: AppState,
     frn_cache: FrnPathCache,
     outside_scan_frns: HashSet<u64>,
@@ -100,42 +111,44 @@ pub fn start(
     Ok(())
 }
 
-/// Start USN watcher with replay from a previously saved position.
-/// Returns Err if the journal has been reset (different journal_id).
-pub fn start_with_resume(
-    app: AppHandle,
+/// Start the watcher resuming from an explicit position — the pre-scan journal
+/// tip captured by the MFT scan (S5) — while carrying the MFT-built FRN caches.
+/// Falls back to the current tip if the journal was recreated during the scan
+/// or the captured position has since wrapped out of the journal.
+pub fn start_at(
+    app: Option<AppHandle>,
     state: AppState,
-    stored_usn: i64,
-    stored_journal_id: u64,
+    start_usn: i64,
+    journal_id: u64,
+    frn_cache: FrnPathCache,
+    outside_scan_frns: HashSet<u64>,
 ) -> Result<(), String> {
     let vol = volume::open_volume('C')?;
     let journal = volume::query_usn_journal(&vol)?;
 
-    if journal.journal_id != stored_journal_id {
-        return Err(format!(
-            "journal_id changed: stored={} current={}",
-            stored_journal_id, journal.journal_id
-        ));
-    }
-
-    if stored_usn < journal.first_usn {
-        return Err(format!(
-            "stored USN {} < first_usn {}, journal wrapped",
-            stored_usn, journal.first_usn
-        ));
-    }
+    let (resume_usn, resume_jid) =
+        if journal.journal_id == journal_id && start_usn >= journal.first_usn {
+            (start_usn, journal_id)
+        } else {
+            perf_log(format!(
+                "[win/usn] pre-scan position unusable (stored jid={} usn={}; current jid={} first_usn={}); \
+                 starting at current tip {}",
+                journal_id, start_usn, journal.journal_id, journal.first_usn, journal.next_usn
+            ));
+            (journal.next_usn, journal.journal_id)
+        };
 
     perf_log(format!(
-        "[win/usn] resuming from stored_usn={} (current next_usn={})",
-        stored_usn, journal.next_usn
+        "[win/usn] starting watcher at usn={} journal_id={} frn_cache={} skip_frns={}",
+        resume_usn, resume_jid, frn_cache.len(), outside_scan_frns.len()
     ));
 
-    spawn_poll_loop(app, state, vol, stored_usn, journal.journal_id, HashMap::new(), HashSet::new());
+    spawn_poll_loop(app, state, vol, resume_usn, resume_jid, frn_cache, outside_scan_frns);
     Ok(())
 }
 
 fn spawn_poll_loop(
-    app: AppHandle,
+    app: Option<AppHandle>,
     state: AppState,
     vol: volume::VolumeHandle,
     initial_usn: i64,
@@ -144,12 +157,12 @@ fn spawn_poll_loop(
     outside_scan_frns: HashSet<u64>,
 ) {
     std::thread::spawn(move || {
-        poll_loop(&app, &state, &vol, initial_usn, journal_id, frn_cache, outside_scan_frns);
+        poll_loop(app.as_ref(), &state, &vol, initial_usn, journal_id, frn_cache, outside_scan_frns);
     });
 }
 
 fn poll_loop(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     vol: &volume::VolumeHandle,
     initial_usn: i64,
@@ -157,6 +170,10 @@ fn poll_loop(
     mut frn_cache: FrnPathCache,
     outside_scan_frns: HashSet<u64>,
 ) {
+    // Publish liveness so the service supervisor / indexer barrier can tell a
+    // running watcher from a dead one and wait for it to exit before a pass.
+    state.watcher_active.store(true, AtomicOrdering::Release);
+
     let scan_root = state.scan_root.clone();
     let scan_str = scan_root.to_string_lossy().to_string().replace('/', "\\");
     let scan_prefix = format!("{}\\", scan_str);
@@ -167,6 +184,10 @@ fn poll_loop(
     let mut last_flush = Instant::now();
     let mut last_usn_persist = Instant::now();
     let mut last_status_emit = Instant::now();
+    // S6: single-flight subtree rescans for directory renames.
+    let mut dir_rescans = DirRescanQueue::new();
+    // S2: consecutive transient read errors before the watcher gives up.
+    let mut transient_retries: u32 = 0;
 
     // Persistent DB connection — avoids expensive per-flush Connection::open()
     let mut db_conn = db_connection(&state.db_path).ok();
@@ -206,21 +227,47 @@ fn poll_loop(
         }
 
         let t0 = Instant::now();
-        let records = match read_usn_journal(vol.raw(), last_usn, journal_id, &mut reusable_buffer) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[win/usn] read error: {e}");
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-        };
+        let (next_usn, records) =
+            match read_usn_journal(vol.raw(), last_usn, journal_id, &mut reusable_buffer) {
+                Ok(v) => {
+                    transient_retries = 0;
+                    v
+                }
+                // S2: journal deleted/wrapped — resuming is impossible. Flag a
+                // full rescan for the supervisor and exit the watcher.
+                Err(UsnReadError::JournalStale(msg)) => {
+                    eprintln!(
+                        "[win/usn] journal stale ({msg}); requesting full rescan, exiting watcher"
+                    );
+                    state.watcher_lost_events.store(true, AtomicOrdering::Release);
+                    break;
+                }
+                // S2: transient error — bounded backoff retry, then exit so the
+                // supervisor restarts (and rescans) instead of spinning forever.
+                Err(UsnReadError::Transient(msg)) => {
+                    transient_retries += 1;
+                    eprintln!(
+                        "[win/usn] transient read error ({msg}); retry {transient_retries}/{MAX_TRANSIENT_RETRIES}"
+                    );
+                    if transient_retries > MAX_TRANSIENT_RETRIES {
+                        eprintln!("[win/usn] too many transient read errors; exiting watcher for supervisor restart");
+                        // Signal the supervisor to restart the watcher via a full
+                        // rescan (mirrors the JournalStale path above). Without
+                        // this the watcher stays dead — and live updates stop —
+                        // until the hourly periodic reconcile fires.
+                        state.watcher_lost_events.store(true, AtomicOrdering::Release);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(500 * transient_retries as u64));
+                    continue;
+                }
+            };
         diag_read_us += t0.elapsed().as_micros() as u64;
 
         diag_polls += 1;
         let t1 = Instant::now();
 
         for record in &records {
-            last_usn = record.usn;
             diag_total_records += 1;
 
             // Resolve parent path: FRN cache (MFT) → skip_frns → dir_cache → syscall
@@ -260,8 +307,19 @@ fn poll_loop(
                 );
                 if new_entries != last_config_entries {
                     last_config_entries = new_entries;
-                    app.emit("pathignore_changed", ()).ok();
+                    // Headless service: flag the supervisor to reload rules +
+                    // reconcile (app is None there). The GUI/daemon watcher also
+                    // emits the banner event.
+                    state.config_dirty.store(true, AtomicOrdering::Release);
+                    if let Some(app) = app {
+                        app.emit("pathignore_changed", ()).ok();
+                    }
                 }
+                continue;
+            }
+            // A `.pathindexing` edit changes the indexed roots — reconcile to apply.
+            if full_path == state.pathindexing_file_path {
+                state.config_dirty.store(true, AtomicOrdering::Release);
                 continue;
             }
 
@@ -298,14 +356,29 @@ fn poll_loop(
             }
 
             if (reason & USN_REASON_RENAME_NEW_NAME) != 0 {
-                // Second half of rename pair
+                // Second half of rename pair.
+                let is_dir = (record.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 if let Some(old_rename) = pending_renames.remove(&record.frn) {
-                    pending_changes.push(FileChange::Rename {
-                        old: old_rename.old_path,
-                        new: full_path,
-                    });
+                    if is_dir {
+                        // S6: a directory rename emits USN records only for the
+                        // directory entry, not its descendants, so child rows
+                        // keep stale paths. Reconcile BOTH prefixes: the old one
+                        // has vanished (rows deleted) and the new one exists
+                        // (subtree reinserted).
+                        dir_rescans.queue(old_rename.old_path);
+                        dir_rescans.queue(full_path);
+                    } else {
+                        pending_changes.push(FileChange::Rename {
+                            old: old_rename.old_path,
+                            new: full_path,
+                        });
+                    }
+                } else if is_dir {
+                    // Unpaired NEW_NAME for a directory: rescan the new subtree
+                    // so its descendants are indexed under the new path.
+                    dir_rescans.queue(full_path);
                 } else {
-                    // No matching OLD_NAME — treat as create
+                    // No matching OLD_NAME — treat as create.
                     pending_changes.push(FileChange::Create(full_path));
                 }
                 continue;
@@ -322,18 +395,34 @@ fn poll_loop(
             }
         }
 
+        // S3: advance the cursor to the journal's next-USN (from the read
+        // header) so it moves forward even when every record was filtered out.
+        last_usn = next_usn;
+
         diag_process_us += t1.elapsed().as_micros() as u64;
 
         // Expire any pending rename OLD_NAMEs that didn't get matched
         cleanup_expired_renames(&mut pending_renames, &mut pending_changes);
 
-        // Debounce: flush pending changes (5s debounce reduces DB round-trips)
+        // Debounce: flush pending changes (5s debounce reduces DB round-trips).
         if !pending_changes.is_empty() && last_flush.elapsed() >= USN_CHANGE_DEBOUNCE {
             let ta = Instant::now();
-            apply_changes(app, state, &mut pending_changes, &mut last_status_emit, &mut db_conn);
+            apply_changes(
+                app,
+                state,
+                &mut pending_changes,
+                &mut last_status_emit,
+                &mut db_conn,
+                last_usn,
+                journal_id,
+            );
             diag_apply_us += ta.elapsed().as_micros() as u64;
             last_flush = Instant::now();
         }
+
+        // S6: run any queued directory-rename subtree rescan (single-flight,
+        // on a background thread — never blocks this poll loop).
+        dir_rescans.pump(app, state);
 
         // Periodically clear positive dir_cache to handle moved/deleted directories.
         // skip_frns (negative cache) is never cleared — system dirs won't move into scan_root.
@@ -342,12 +431,19 @@ fn poll_loop(
             last_cache_clear = Instant::now();
         }
 
-        // Periodically persist USN position + last active timestamp
+        // Periodically persist the wall-clock activity timestamp for offline
+        // catchup. This is NOT the USN cursor (S4): the cursor advances
+        // transactionally with content in apply_changes, and idle-only advances
+        // go to the usn.cursor file below — so a long idle stretch of ignored
+        // events never churns PRAGMA data_version.
         if last_usn_persist.elapsed() >= USN_FLUSH_INTERVAL {
             if let Some(ref conn) = db_conn {
-                let _ = set_meta(conn, "win_last_usn", &last_usn.to_string());
-                let _ = set_meta(conn, "win_journal_id", &journal_id.to_string());
                 let _ = set_meta(conn, "win_last_active_ts", &now_epoch().to_string());
+            }
+            // Only advance the file cursor when nothing is pending; pending
+            // content persists the DB cursor when it flushes.
+            if pending_changes.is_empty() && pending_renames.is_empty() {
+                write_usn_cursor(&state.db_path, journal_id, last_usn);
             }
             last_usn_persist = Instant::now();
         }
@@ -379,6 +475,20 @@ fn poll_loop(
         let has_rename_pending = !pending_renames.is_empty();
         std::thread::sleep(if has_rename_pending { POLL_BUSY } else { POLL_IDLE });
     }
+
+    // Barrier flush: persist any unpersisted changes before this watcher thread
+    // exits (stop / journal-stale / transient exhaustion) so the indexer
+    // worker's next pass never races an in-flight batch and no batch is lost.
+    apply_changes(
+        app,
+        state,
+        &mut pending_changes,
+        &mut last_status_emit,
+        &mut db_conn,
+        last_usn,
+        journal_id,
+    );
+    state.watcher_active.store(false, AtomicOrdering::Release);
 }
 
 fn cleanup_expired_renames(
@@ -400,23 +510,27 @@ fn cleanup_expired_renames(
 }
 
 fn apply_changes(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     changes: &mut Vec<FileChange>,
     last_status_emit: &mut Instant,
     db_conn: &mut Option<rusqlite::Connection>,
+    usn: i64,
+    journal_id: u64,
 ) {
     if changes.is_empty() {
         return;
     }
 
-    // Deduplicate: keep only the last change per path.
-    // This avoids redundant stat + DB ops for files changed multiple times.
+    // Deduplicate: keep only the last change per path (avoids redundant stat +
+    // DB ops). Iterate by reference — NOT drain — so a failed DB write leaves
+    // `changes` intact for retry; the USN cursor must never advance past
+    // changes that aren't yet durable (S4).
     let mut deduped: HashMap<PathBuf, FileChange> = HashMap::new();
-    for change in changes.drain(..) {
-        match &change {
+    for change in changes.iter() {
+        match change {
             FileChange::Create(p) | FileChange::Delete(p) => {
-                deduped.insert(p.clone(), change);
+                deduped.insert(p.clone(), change.clone());
             }
             FileChange::Rename { old, new } => {
                 deduped.insert(old.clone(), FileChange::Delete(old.clone()));
@@ -435,11 +549,7 @@ fn apply_changes(
                 if is_recently_touched(state, &path_str) {
                     continue;
                 }
-                if should_skip_path(
-                    &path,
-                    &state.path_ignores,
-                    &state.path_ignore_patterns,
-                ) {
+                if should_skip_path(&path, &state.path_ignores, &state.path_ignore_patterns) {
                     continue;
                 }
                 match std::fs::symlink_metadata(&path) {
@@ -461,41 +571,57 @@ fn apply_changes(
                 to_delete.push(path_str);
             }
             FileChange::Rename { .. } => {
-                // Already decomposed into Create + Delete above
+                // Already decomposed into Create + Delete above.
             }
         }
     }
 
     if to_upsert.is_empty() && to_delete.is_empty() {
+        // Everything deduped away (recently-touched / ignored) — nothing to
+        // persist. Clear so the idle cursor file can advance past this range.
+        changes.clear();
         return;
     }
 
-    // Try to use persistent connection, reconnect if needed
+    // Try to use the persistent connection, reconnect if needed.
     if db_conn.is_none() {
         *db_conn = db_connection(&state.db_path).ok();
     }
+    let Some(conn) = db_conn.as_mut() else {
+        eprintln!("[win/usn] DB connection unavailable; keeping changes for retry");
+        return;
+    };
 
-    let changed = match db_conn.as_mut() {
-        Some(conn) => {
-            let mut total = 0;
-            if let Ok(n) = upsert_rows(conn, &to_upsert) {
-                total += n;
-            }
-            if let Ok(n) = delete_paths(conn, &to_delete) {
-                total += n;
-            }
-            total
+    // Apply content. On any failure, keep `changes` for retry and do NOT
+    // advance the cursor — dropping the in-memory batch AND advancing the
+    // cursor was the S4 defect (permanent change loss on the next crash).
+    let upserted = match upsert_rows(conn, &to_upsert) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[win/usn] upsert failed ({e}); keeping changes for retry");
+            return;
         }
-        None => {
-            eprintln!("[win/usn] DB connection unavailable");
+    };
+    let deleted = match delete_paths(conn, &to_delete) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[win/usn] delete failed ({e}); keeping changes for retry");
             return;
         }
     };
 
-    if changed > 0 {
+    // Content is durable — advance the DB cursor now (content-then-cursor:
+    // at-least-once. A crash between the content commit and here re-reads from
+    // the old cursor on resume and idempotent upserts re-apply it, so no change
+    // is ever lost — S4).
+    let _ = set_meta(conn, "win_last_usn", &usn.to_string());
+    let _ = set_meta(conn, "win_journal_id", &journal_id.to_string());
+
+    changes.clear();
+
+    if upserted + deleted > 0 {
         invalidate_search_caches(state);
         let _ = update_status_counts(state);
-
         if last_status_emit.elapsed() >= STATUS_EMIT_MIN_INTERVAL {
             let _ = refresh_and_emit_status_counts(app, state);
             *last_status_emit = Instant::now();
@@ -503,12 +629,40 @@ fn apply_changes(
     }
 }
 
+/// Classified USN journal read failure (S2).
+enum UsnReadError {
+    /// Journal deleted, being deleted, or entries aged out (wrapped). Resuming
+    /// is impossible — the watcher must request a full rescan.
+    JournalStale(String),
+    /// Transient failure — bounded retry, then exit for the supervisor.
+    Transient(String),
+}
+
+/// Classify a `FSCTL_READ_USN_JOURNAL` failure (S2). Journal-deleted /
+/// delete-in-progress / not-active all mean the resume point is gone and only a
+/// full rescan recovers; anything else is treated as transient.
+fn classify_usn_read_error(e: &windows::core::Error) -> UsnReadError {
+    let code = e.code();
+    if code == ERROR_JOURNAL_ENTRY_DELETED.to_hresult()
+        || code == ERROR_JOURNAL_DELETE_IN_PROGRESS.to_hresult()
+        || code == ERROR_JOURNAL_NOT_ACTIVE.to_hresult()
+    {
+        UsnReadError::JournalStale(format!("{e}"))
+    } else {
+        UsnReadError::Transient(format!("{e}"))
+    }
+}
+
+/// Read USN records starting at `start_usn`. Returns the journal's next-USN
+/// (from the 8-byte buffer header — S3) alongside the parsed records, so the
+/// caller advances its cursor even when every record was filtered out by the
+/// reason mask.
 fn read_usn_journal(
     handle: HANDLE,
     start_usn: i64,
     journal_id: u64,
     buffer: &mut Vec<u8>,
-) -> Result<Vec<UsnChangeRecord>, String> {
+) -> Result<(i64, Vec<UsnChangeRecord>), UsnReadError> {
     let read_data = ReadUsnJournalDataV0 {
         start_usn,
         // Only track file existence changes (create/delete/rename).
@@ -539,17 +693,22 @@ fn read_usn_journal(
         )
     };
 
-    if result.is_err() {
-        return Ok(Vec::new());
+    // S2: classify failures instead of masking them as an empty result — the
+    // old code returned Ok(empty) on any error, so a deleted/wrapped journal
+    // retried forever making no progress.
+    if let Err(e) = &result {
+        return Err(classify_usn_read_error(e));
     }
 
-    if bytes_returned < 8 {
-        return Ok(Vec::new());
+    // The first 8 bytes are the USN to resume from on the next read (S3). A
+    // successful read always returns at least this header; if somehow not,
+    // leave the cursor unchanged.
+    if (bytes_returned as usize) < 8 {
+        return Ok((start_usn, Vec::new()));
     }
+    let next_usn = i64::from_le_bytes(buffer[0..8].try_into().unwrap());
 
     let mut records = Vec::new();
-
-    // First 8 bytes: next USN
     let mut offset = 8usize;
     while offset + 4 <= bytes_returned as usize {
         let record_len =
@@ -566,7 +725,7 @@ fn read_usn_journal(
         offset += record_len;
     }
 
-    Ok(records)
+    Ok((next_usn, records))
 }
 
 fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
@@ -582,8 +741,9 @@ fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
     let frn = u64::from_le_bytes(data[8..16].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
     let parent_frn =
         u64::from_le_bytes(data[16..24].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
-    let usn = i64::from_le_bytes(data[24..32].try_into().ok()?);
     let reason = u32::from_le_bytes(data[40..44].try_into().ok()?);
+    // FileAttributes (offset 52) — used to detect directory renames (S6).
+    let attributes = u32::from_le_bytes(data[52..56].try_into().ok()?);
 
     let name_len = u16::from_le_bytes(data[56..58].try_into().ok()?) as usize;
     let name_offset = u16::from_le_bytes(data[58..60].try_into().ok()?) as usize;
@@ -606,8 +766,8 @@ fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
     Some(UsnChangeRecord {
         frn,
         parent_frn,
-        usn,
         reason,
+        attributes,
         name,
     })
 }
@@ -662,4 +822,134 @@ fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
         .unwrap_or(&path_str);
 
     Some(PathBuf::from(cleaned))
+}
+
+/// Path of the idle USN cursor file (next to index.db). See S4.
+pub(crate) fn usn_cursor_path(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("usn.cursor")
+}
+
+/// Atomically persist the idle cursor (journal_id + USN) via temp-file + rename
+/// (Windows `MoveFileEx` replaces atomically). Best-effort: the DB cursor is the
+/// durable source for content-bearing advances; this file only covers idle
+/// stretches of ignored events, kept out of the DB so it can't churn
+/// `PRAGMA data_version` (S4).
+fn write_usn_cursor(db_path: &Path, journal_id: u64, usn: i64) {
+    let path = usn_cursor_path(db_path);
+    let tmp = db_path.with_file_name("usn.cursor.tmp");
+    let body = format!("{journal_id}\n{usn}\n");
+    if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Read the idle cursor file, returning `(journal_id, usn)` when present and
+/// well-formed. Callers reconcile it against the DB cursor via `max` (S4).
+/// Exercised by tests; the production read/resume path awaits service wiring.
+#[allow(dead_code)]
+pub(crate) fn read_usn_cursor(db_path: &Path) -> Option<(u64, i64)> {
+    let text = std::fs::read_to_string(usn_cursor_path(db_path)).ok()?;
+    let mut lines = text.lines();
+    let journal_id = lines.next()?.trim().parse::<u64>().ok()?;
+    let usn = lines.next()?.trim().parse::<i64>().ok()?;
+    Some((journal_id, usn))
+}
+
+/// S4: pick the watcher resume position from the DB cursor and the idle cursor
+/// file. `db` is `(usn, journal_id)` from meta; `file` is `(journal_id, usn)`
+/// from `usn.cursor`. When both are present under the same journal, resume from
+/// the higher USN — only ignored events lie between them, so it is loss-free.
+/// Otherwise prefer the DB cursor, falling back to the file.
+/// Exercised by tests; the production resume path awaits service wiring.
+#[allow(dead_code)]
+pub(crate) fn resolve_resume_position(
+    db: (Option<i64>, Option<u64>),
+    file: Option<(u64, i64)>,
+) -> (Option<i64>, Option<u64>) {
+    match file {
+        Some((file_jid, file_usn)) => match db {
+            (Some(db_usn), Some(db_jid)) if db_jid == file_jid => {
+                (Some(db_usn.max(file_usn)), Some(db_jid))
+            }
+            (Some(db_usn), Some(db_jid)) => (Some(db_usn), Some(db_jid)),
+            _ => (Some(file_usn), Some(file_jid)),
+        },
+        None => db,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    #[test]
+    fn classifies_journal_stale_vs_transient() {
+        for stale in [
+            ERROR_JOURNAL_ENTRY_DELETED,
+            ERROR_JOURNAL_DELETE_IN_PROGRESS,
+            ERROR_JOURNAL_NOT_ACTIVE,
+        ] {
+            let e = windows::core::Error::from(stale.to_hresult());
+            assert!(matches!(
+                classify_usn_read_error(&e),
+                UsnReadError::JournalStale(_)
+            ));
+        }
+        let e = windows::core::Error::from(ERROR_ACCESS_DENIED.to_hresult());
+        assert!(matches!(
+            classify_usn_read_error(&e),
+            UsnReadError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn resume_position_prefers_max_on_matching_journal() {
+        // Same journal → higher USN wins (only ignored events lie between).
+        assert_eq!(
+            resolve_resume_position((Some(100), Some(7)), Some((7, 250))),
+            (Some(250), Some(7))
+        );
+        assert_eq!(
+            resolve_resume_position((Some(300), Some(7)), Some((7, 250))),
+            (Some(300), Some(7))
+        );
+        // Different journal id → trust the DB cursor.
+        assert_eq!(
+            resolve_resume_position((Some(100), Some(7)), Some((9, 250))),
+            (Some(100), Some(7))
+        );
+        // No DB cursor → use the file.
+        assert_eq!(
+            resolve_resume_position((None, None), Some((9, 250))),
+            (Some(250), Some(9))
+        );
+        // No file → use the DB cursor.
+        assert_eq!(
+            resolve_resume_position((Some(100), Some(7)), None),
+            (Some(100), Some(7))
+        );
+    }
+
+    #[test]
+    fn usn_cursor_roundtrip_and_malformed() {
+        let dir = crate::temp_case_dir("usn_cursor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+
+        assert_eq!(read_usn_cursor(&db_path), None);
+
+        write_usn_cursor(&db_path, 12345, 67890);
+        assert_eq!(read_usn_cursor(&db_path), Some((12345, 67890)));
+
+        // Overwrite replaces atomically.
+        write_usn_cursor(&db_path, 12345, 99999);
+        assert_eq!(read_usn_cursor(&db_path), Some((12345, 99999)));
+
+        // Malformed content → None (never a panic).
+        std::fs::write(usn_cursor_path(&db_path), b"garbage").unwrap();
+        assert_eq!(read_usn_cursor(&db_path), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

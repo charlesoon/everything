@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(target_os = "windows")]
@@ -9,11 +10,13 @@ use crate::query::SearchMode;
 use crate::{perf_log, EntryDto};
 
 /// Compact entry without redundant `path` field (path = dir + sep + name).
-/// Saves ~104 bytes per entry vs EntryDto.
-#[derive(Clone)]
+/// Saves ~104 bytes per entry vs EntryDto. `dir` is interned: entries in the
+/// same directory share one `Arc<str>` allocation instead of each holding a
+/// copy of the full parent path.
+#[derive(Debug, Clone)]
 pub struct CompactEntry {
     pub name: String,
-    pub dir: String,
+    pub dir: Arc<str>,
     pub is_dir: bool,
     pub ext: Option<String>,
     pub mtime: Option<i64>,
@@ -29,7 +32,7 @@ impl CompactEntry {
         EntryDto {
             path: self.path(),
             name: self.name.clone(),
-            dir: self.dir.clone(),
+            dir: self.dir.to_string(),
             is_dir: self.is_dir,
             ext: self.ext.clone(),
             mtime: self.mtime,

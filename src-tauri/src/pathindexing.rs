@@ -1,12 +1,16 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::AppResult;
+
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use crate::{
     db_connection, delete_paths, index_row_from_path_and_metadata,
-    invalidate_search_caches, should_skip_path, touch_status_updated,
-    upsert_rows, AppResult, AppState, IgnorePattern, BATCH_SIZE,
+    invalidate_search_caches, should_skip_path, touch_status_updated, upsert_rows,
+    AppState, IgnorePattern, BATCH_SIZE,
 };
 
 const DEFAULT_PATHINDEXING_CONTENTS: &str = "\
@@ -29,6 +33,9 @@ pub(crate) fn ensure_pathindexing_exists(path: &Path) -> AppResult<()> {
 }
 
 pub(crate) fn load_pathindexing_roots(path: &Path) -> Vec<PathBuf> {
+    // Windows: never auto-create the sidecar (D1); the editor command creates it
+    // on demand. Other platforms keep seeding a default template at startup.
+    #[cfg(not(target_os = "windows"))]
     let _ = ensure_pathindexing_exists(path);
     let Ok(contents) = fs::read_to_string(path) else {
         return Vec::new();
@@ -43,15 +50,42 @@ pub(crate) fn parse_pathindexing_entries(content: &str) -> Vec<PathBuf> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .filter_map(|l| {
             let p = PathBuf::from(l);
-            if p.is_absolute() && p.is_dir() {
-                Some(p)
-            } else {
-                None
+            if !p.is_absolute() || !p.is_dir() {
+                return None;
             }
+            // D1: `config\` is Users-writable, so a directly-edited
+            // `.pathindexing` is untrusted input to a LocalSystem service.
+            // Only allow roots that actually resolve onto the C: volume, so an
+            // edited entry (or a junction) can't redirect the service to scan
+            // another volume / network / device path (confused-deputy guard).
+            #[cfg(target_os = "windows")]
+            if !is_indexable_windows_root(&p) {
+                eprintln!(
+                    "[pathindexing] ignoring root outside the C: volume: {}",
+                    p.display()
+                );
+                return None;
+            }
+            Some(p)
         })
         .collect()
 }
 
+/// D1: true only when `p` resolves (following any reparse points) onto the `C:`
+/// volume. `canonicalize` fails for a non-existent path and rewrites junctions/
+/// symlinks to their real target, so a redirect off C: is caught here.
+#[cfg(target_os = "windows")]
+fn is_indexable_windows_root(p: &Path) -> bool {
+    let Ok(canon) = std::fs::canonicalize(p) else {
+        return false;
+    };
+    let s = canon.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].eq_ignore_ascii_case(&b'C') && b[1] == b':'
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn parse_pathindexing_paths_unchecked(content: &str) -> Vec<PathBuf> {
     content
         .lines()
@@ -64,6 +98,7 @@ pub(crate) fn parse_pathindexing_paths_unchecked(content: &str) -> Vec<PathBuf> 
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn pathindexing_active_entries(content: &str) -> Vec<String> {
     content
         .lines()
@@ -87,6 +122,7 @@ pub(crate) fn open_pathindexing_file(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn scan_extra_roots(
     state: &AppState,
     roots: &[PathBuf],
@@ -161,6 +197,7 @@ pub(crate) fn scan_extra_roots(
     Ok(total_changed)
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn remove_extra_root_entries(
     state: &AppState,
     roots: &[PathBuf],
@@ -179,6 +216,7 @@ pub(crate) fn remove_extra_root_entries(
     Ok(total)
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn handle_pathindexing_change(
     state: &AppState,
     old_roots: &[PathBuf],
@@ -210,7 +248,7 @@ pub(crate) fn handle_pathindexing_change(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

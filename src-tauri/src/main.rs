@@ -404,6 +404,12 @@ pub(crate) struct AppState {
     pub(crate) path_ignore_patterns: Arc<Vec<IgnorePattern>>,
     pub(crate) db_ready: Arc<AtomicBool>,
     pub(crate) indexing_active: Arc<AtomicBool>,
+    /// Cooperative-cancel flag for an in-progress index pass. The headless
+    /// daemon sets this when the GUI appears mid-build so the pass unwinds
+    /// promptly — returning an error and leaving `index_complete` unset — and
+    /// the GUI's bounded `wait_for_daemon_exit` always succeeds without a
+    /// concurrent-writer window. Never set on the GUI's own index path.
+    pub(crate) cancel_index: Arc<AtomicBool>,
     pub(crate) status: Arc<Mutex<IndexStatus>>,
     pub(crate) recent_ops: Arc<Mutex<Vec<RecentOp>>>,
     pub(crate) icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -421,9 +427,20 @@ pub(crate) struct AppState {
     pub(crate) watcher_stop: Arc<AtomicBool>,
     /// Set to true while a file watcher event loop is running.
     pub(crate) watcher_active: Arc<AtomicBool>,
+    /// Set by the Windows RDCW watcher when the OS reports dropped change
+    /// notifications (buffer overflow). The daemon's resident loop observes it
+    /// and triggers an immediate reconcile pass instead of waiting for the next
+    /// scheduled one, so a burst of changes can't silently drift the index.
+    #[cfg(target_os = "windows")]
+    pub(crate) watcher_lost_events: Arc<AtomicBool>,
+    /// Set by the USN watcher when a config sidecar is edited; the service
+    /// supervisor consumes it to reload rules + enqueue a reconcile pass (§3.1).
+    #[cfg(target_os = "windows")]
+    pub(crate) config_dirty: Arc<AtomicBool>,
     /// Set to true once frontend onMount has completed enough to accept user input.
     pub(crate) frontend_ready: Arc<AtomicBool>,
     /// Guards against concurrent pathindexing background threads.
+    #[cfg(target_os = "macos")]
     pub(crate) pathindexing_active: Arc<AtomicBool>,
     /// Warm read connections reused across searches. Opening a connection per
     /// search costs ~1-2ms (open + PRAGMAs + schema parse) and starts with a
@@ -431,6 +448,7 @@ pub(crate) struct AppState {
     pub(crate) search_conn_pool: Arc<Mutex<Vec<Connection>>>,
     /// Persistent write connection for watcher-driven incremental updates.
     /// Opening a connection per event batch dominated single-file update cost.
+    #[cfg(target_os = "macos")]
     pub(crate) watcher_conn: Arc<Mutex<Option<Connection>>>,
 }
 
@@ -439,19 +457,37 @@ pub(crate) struct AppState {
 /// `AppHandle`. `app_data_dir` (the DB's parent) holds the `.pathignore` and
 /// `.pathindexing` sidecars and is itself excluded from indexing.
 pub(crate) fn build_app_state(db_path: PathBuf, home_dir: PathBuf, app_data_dir: &Path) -> AppState {
+    // Default layout: the config sidecars live alongside the DB (GUI / daemon /
+    // MCP). The Windows service overrides this via build_app_state_with_config.
+    build_app_state_with_config(db_path, home_dir, app_data_dir, app_data_dir)
+}
+
+/// Like [`build_app_state`] but with the config sidecars in a directory separate
+/// from the data directory — the Windows service layout (D1), where `data\` is
+/// read-only to users and `config\` is user-writable. Both directories are
+/// excluded from indexing.
+pub(crate) fn build_app_state_with_config(
+    db_path: PathBuf,
+    home_dir: PathBuf,
+    data_dir: &Path,
+    config_dir: &Path,
+) -> AppState {
     let scan_root = if cfg!(windows) {
         PathBuf::from("C:\\")
     } else {
         home_dir.clone()
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| home_dir.clone());
-    let config_file_path = app_data_dir.join(".pathignore");
+    let config_file_path = config_dir.join(".pathignore");
     let (mut path_ignores, path_ignore_patterns) =
         load_pathignore_rules(&config_file_path, &home_dir, &cwd);
-    if !path_ignores.iter().any(|r| r == app_data_dir) {
-        path_ignores.push(app_data_dir.to_path_buf());
+    if !path_ignores.iter().any(|r| r == data_dir) {
+        path_ignores.push(data_dir.to_path_buf());
     }
-    let pathindexing_file_path = app_data_dir.join(".pathindexing");
+    if config_dir != data_dir && !path_ignores.iter().any(|r| r == config_dir) {
+        path_ignores.push(config_dir.to_path_buf());
+    }
+    let pathindexing_file_path = config_dir.join(".pathindexing");
     let extra_roots = pathindexing::load_pathindexing_roots(&pathindexing_file_path);
     AppState {
         db_path,
@@ -465,6 +501,7 @@ pub(crate) fn build_app_state(db_path: PathBuf, home_dir: PathBuf, app_data_dir:
         path_ignore_patterns: Arc::new(path_ignore_patterns),
         db_ready: Arc::new(AtomicBool::new(false)),
         indexing_active: Arc::new(AtomicBool::new(false)),
+        cancel_index: Arc::new(AtomicBool::new(false)),
         status: Arc::new(Mutex::new(IndexStatus::default())),
         recent_ops: Arc::new(Mutex::new(Vec::new())),
         icon_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -475,9 +512,15 @@ pub(crate) fn build_app_state(db_path: PathBuf, home_dir: PathBuf, app_data_dir:
         mem_index: Arc::new(RwLock::new(None)),
         watcher_stop: Arc::new(AtomicBool::new(false)),
         watcher_active: Arc::new(AtomicBool::new(false)),
+        #[cfg(target_os = "windows")]
+        watcher_lost_events: Arc::new(AtomicBool::new(false)),
+        #[cfg(target_os = "windows")]
+        config_dirty: Arc::new(AtomicBool::new(false)),
         frontend_ready: Arc::new(AtomicBool::new(false)),
+        #[cfg(target_os = "macos")]
         pathindexing_active: Arc::new(AtomicBool::new(false)),
         search_conn_pool: Arc::new(Mutex::new(Vec::new())),
+        #[cfg(target_os = "macos")]
         watcher_conn: Arc::new(Mutex::new(None)),
     }
 }
@@ -564,7 +607,33 @@ pub(crate) fn perf_log(message: impl AsRef<str>) {
     }
 }
 
+/// Set once at startup by a pure-reader process — the Windows GUI and the MCP
+/// server (§3.3). When set, `db_connection` opens the index read-only instead
+/// of read-write + WAL, so the process reads the service-owned, Users-read-only
+/// DB and any stray write surfaces as an immediate error instead of silent
+/// corruption. The service process leaves it false and owns all writes.
+static DB_READONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process a pure reader (see [`DB_READONLY`]). Call once at startup,
+/// before any DB connection is opened.
+pub(crate) fn set_db_readonly() {
+    DB_READONLY.store(true, std::sync::atomic::Ordering::Release);
+}
+
 fn db_connection_with_timeout(db_path: &Path, busy_timeout_ms: u32) -> AppResult<Connection> {
+    if DB_READONLY.load(std::sync::atomic::Ordering::Acquire) {
+        // Pure reader: read-only open, no WAL/schema pragmas. A read-only
+        // connection reads a WAL DB fine while the writer keeps -wal/-shm live;
+        // SQLITE_READONLY_RECOVERY is the caller's transient case (D1).
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute_batch(&format!("PRAGMA busy_timeout={busy_timeout_ms};"))
+            .map_err(|e| e.to_string())?;
+        return Ok(conn);
+    }
     let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
     conn.execute_batch(&format!(
         r#"
@@ -594,6 +663,8 @@ fn db_connection_for_maintenance(db_path: &Path) -> AppResult<Connection> {
 }
 
 fn db_connection_for_search(db_path: &Path) -> AppResult<Connection> {
+    // Read-only vs read-write is governed process-wide by DB_READONLY (set for
+    // the Windows GUI / MCP), so this shares the one connection opener.
     let conn = db_connection_with_timeout(db_path, 500)?;
     // mmap_size must cover the whole DB file (entries + FTS index) so reads hit
     // the shared OS page cache instead of per-connection pread into a cold cache.
@@ -1294,6 +1365,10 @@ fn ensure_pathignore_exists(path: &Path) -> AppResult<()> {
 }
 
 fn load_pathignore_rules(config_file: &Path, home_dir: &Path, cwd: &Path) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
+    // Windows: never auto-create the sidecar (D1 — a missing file means the
+    // builtin defaults; the editor command creates it on demand). Other
+    // platforms keep seeding a default template at startup.
+    #[cfg(not(target_os = "windows"))]
     let _ = ensure_pathignore_exists(config_file);
 
     let mut files = Vec::new();
@@ -1558,6 +1633,9 @@ fn ignore_rules_fingerprint(roots: &[PathBuf], patterns: &[IgnorePattern]) -> u6
     hasher.finish()
 }
 
+// Housekeeping purge is a write, so it only runs in the writer (non-Windows
+// GUI); the Windows GUI is read-only and the service owns index hygiene (§3.3).
+#[cfg(not(target_os = "windows"))]
 fn purge_ignored_entries(db_path: &Path, ignored_roots: &[PathBuf]) -> AppResult<()> {
     if ignored_roots.is_empty() {
         return Ok(());
@@ -2349,11 +2427,7 @@ pub(crate) fn start_full_index_worker(app: AppHandle, state: AppState) -> AppRes
     start_full_index_worker_inner(app, state, false)
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn start_full_index_worker_silent(app: AppHandle, state: AppState) -> AppResult<()> {
-    start_full_index_worker_inner(app, state, true)
-}
-
+#[cfg(not(target_os = "windows"))]
 fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) -> AppResult<()> {
     if state
         .indexing_active
@@ -3105,6 +3179,7 @@ fn run_incremental_index_inner(
                 // Use BATCH_SIZE (not flush_batch_size) so workers send batches every
                 // 10k rows instead of 50k → progress updates reach the main thread sooner.
                 let flush_size = BATCH_SIZE;
+                let cancel = Arc::clone(&state.cancel_index);
 
                 scope.spawn(move || {
                     let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
@@ -3114,7 +3189,7 @@ fn run_incremental_index_inner(
                     let mut local_path = String::new();
 
                     // Interleaved distribution: worker 0 handles roots[0, n_w, 2*n_w, …]
-                    for i in (worker_idx..roots_ref.len()).step_by(n_w) {
+                    'roots: for i in (worker_idx..roots_ref.len()).step_by(n_w) {
                         let root = &roots_ref[i];
                         let root_started = Instant::now();
                         let mut root_scanned = 0u64;
@@ -3152,6 +3227,14 @@ fn run_incremental_index_inner(
                                 });
 
                         for result in walker {
+                            // Cooperative cancel (daemon yielding to the GUI):
+                            // break the whole worker so no further roots are
+                            // walked; the pass returns Err and is discarded.
+                            if local_scanned % 4096 == 0
+                                && cancel.load(AtomicOrdering::Acquire)
+                            {
+                                break 'roots;
+                            }
                             match result {
                                 Ok(entry) => {
                                     let path = entry.path();
@@ -3239,6 +3322,11 @@ fn run_incremental_index_inner(
 
             // Main thread: receive row batches from workers and write to SQLite.
             for (worker_batch, s, i, pe, path) in row_rx {
+                // On cancel keep draining (so bounded-channel senders never
+                // block and the scope can join) but stop writing.
+                if state.cancel_index.load(AtomicOrdering::Acquire) {
+                    continue;
+                }
                 scanned += s;
                 indexed += i;
                 permission_errors += pe;
@@ -3309,6 +3397,7 @@ fn run_incremental_index_inner(
                 let pool = shared_pool.clone();
                 let flush_size = BATCH_SIZE;
                 let worker_db = worker_db_path.clone();
+                let cancel = Arc::clone(&state.cancel_index);
 
                 scope.spawn(move || {
                     let worker_conn = db_connection(&worker_db).ok();
@@ -3318,7 +3407,7 @@ fn run_incremental_index_inner(
                     let mut local_perm_errors = 0u64;
                     let mut local_path = String::new();
 
-                    for i in (worker_idx..roots_ref.len()).step_by(n_w) {
+                    'roots: for i in (worker_idx..roots_ref.len()).step_by(n_w) {
                         let root = &roots_ref[i];
                         let root_started = Instant::now();
                         let mut root_scanned = 0u64;
@@ -3368,6 +3457,15 @@ fn run_incremental_index_inner(
                                 });
 
                         for result in walker {
+                            // Cooperative cancel (daemon yielding to the GUI):
+                            // break the whole worker. Breaking 'roots skips this
+                            // root's leftover-delete step, so a partially-walked
+                            // root never has its unseen rows deleted.
+                            if local_scanned % 4096 == 0
+                                && cancel.load(AtomicOrdering::Acquire)
+                            {
+                                break 'roots;
+                            }
                             match result {
                                 Ok(entry) => {
                                     let path = entry.path();
@@ -3509,6 +3607,11 @@ fn run_incremental_index_inner(
             drop(row_tx);
 
             for (worker_batch, deletes, s, i, pe, path) in row_rx {
+                // On cancel keep draining (so bounded-channel senders never
+                // block and the scope can join) but stop writing.
+                if state.cancel_index.load(AtomicOrdering::Acquire) {
+                    continue;
+                }
                 scanned += s;
                 indexed += i;
                 permission_errors += pe;
@@ -3546,6 +3649,15 @@ fn run_incremental_index_inner(
             indexed,
             catchup_deleted,
         ));
+    }
+
+    // If the daemon asked us to yield (the GUI appeared mid-build), unwind now
+    // — before persisting last_run_id / cached counts — so the partial index
+    // stays "incomplete" (index_complete unset) and the GUI, or a later daemon
+    // pass, finishes it. A fresh run also leaves fts_dirty=1, which self-heals
+    // on the next run's finalize.
+    if state.cancel_index.load(AtomicOrdering::Acquire) {
+        return Err("index pass cancelled (yielding writer to GUI)".to_string());
     }
 
     if !batch.is_empty() {
@@ -3613,6 +3725,11 @@ fn trim_recent_ops(ops: &mut Vec<RecentOp>) {
     ops.retain(|op| now.duration_since(op.at) <= RECENT_OP_TTL);
 }
 
+// The recent-ops cache suppresses the app's own writes from being re-processed
+// by its watcher. On Windows the watcher lives in the indexer service (a
+// separate process) and the GUI never writes, so nothing populates this cache
+// there — see `move_to_trash`/`rename`.
+#[cfg(not(target_os = "windows"))]
 fn remember_op(
     state: &AppState,
     op_type: &'static str,
@@ -4773,12 +4890,27 @@ fn restart_app(app: AppHandle) {
     app.restart();
 }
 
+/// Relaunch `--register-service` elevated (UAC) — the GUI banner action for a
+/// missing/broken indexer service (D5). No-op off Windows.
+#[tauri::command]
+fn register_service_elevated() -> AppResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        win::register_service_elevated()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+}
+
 #[tauri::command]
 fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     {
-        win::start_windows_indexing(app, state.inner().clone());
-        Ok(())
+        // Read-only GUI (§3.3): a full (re)index is the service's job — delegate.
+        let _ = (app, state);
+        win::service_client::reset_index()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -4788,6 +4920,19 @@ fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()>
 
 #[tauri::command]
 async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    #[cfg(target_os = "windows")]
+    let out: AppResult<()> = {
+        // Read-only GUI (§3.3/D3): delegate the re-index to the service, which
+        // owns the cooldown and execution. The control-pipe call does blocking
+        // I/O with no client-side read timeout, so run it off the async runtime —
+        // a stalled service handler would otherwise freeze the GUI's IPC.
+        let _ = (app, state);
+        tauri::async_runtime::spawn_blocking(win::service_client::reset_index)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let out: AppResult<()> = {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if state.indexing_active.load(AtomicOrdering::Acquire) {
@@ -4865,6 +5010,8 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
     })
     .await
     .map_err(|e| e.to_string())?
+    };
+    out
 }
 
 fn log_search(db_path: &Path, query: &str, mode: &str, results: &[EntryDto]) {
@@ -6292,19 +6439,32 @@ async fn move_to_trash(
 ) -> AppResult<()> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        // Windows: the indexer service owns index.db (this process holds a
+        // read-only handle) and reflects the deletion through its USN watcher,
+        // so the GUI performs only the filesystem operation and keeps no
+        // recent-ops cache. Other platforms reflect the change in the DB here.
+        #[cfg(not(target_os = "windows"))]
         let mut deleted_targets = Vec::new();
 
         for path in &paths {
             trash::delete(path).map_err(|e| e.to_string())?;
-            remember_op(&state, "trash", Some(path.clone()), None);
-            deleted_targets.push(path.clone());
+            #[cfg(not(target_os = "windows"))]
+            {
+                remember_op(&state, "trash", Some(path.clone()), None);
+                deleted_targets.push(path.clone());
+            }
         }
 
-        let mut conn = db_connection(&state.db_path)?;
-        let _ = delete_paths(&mut conn, &deleted_targets)?;
-        invalidate_search_caches(&state);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut conn = db_connection(&state.db_path)?;
+            let _ = delete_paths(&mut conn, &deleted_targets)?;
+            invalidate_search_caches(&state);
+            refresh_and_emit_status_counts(Some(&app), &state)?;
+        }
+        #[cfg(target_os = "windows")]
+        let _ = (&app, &state);
 
-        refresh_and_emit_status_counts(Some(&app), &state)?;
         Ok(())
     })
     .await
@@ -6361,32 +6521,41 @@ async fn rename(
         let original_is_dir = old_path.is_dir();
         fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
 
-        let mut conn = db_connection(&state.db_path)?;
-        let _ = delete_paths(&mut conn, &[path.clone()])?;
+        // Windows: index.db is owned by the indexer service and updated via its
+        // USN watcher — directory subtree fix-ups included (S6) — so the GUI
+        // does no DB reflection and keeps no recent-ops cache. Other platforms
+        // update the DB in place.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut conn = db_connection(&state.db_path)?;
+            let _ = delete_paths(&mut conn, &[path.clone()])?;
 
-        if original_is_dir {
-            let _ = rescan::rescan_subtree(
-                &mut conn,
-                &new_path,
-                &state.path_ignores,
-                &state.path_ignore_patterns,
-            )?;
-        } else {
-            let row = index_row_from_path(&new_path)
-                .ok_or_else(|| "Cannot read renamed file info.".to_string())?;
-            let _ = upsert_rows(&mut conn, &[row])?;
+            if original_is_dir {
+                let _ = rescan::rescan_subtree(
+                    &mut conn,
+                    &new_path,
+                    &state.path_ignores,
+                    &state.path_ignore_patterns,
+                )?;
+            } else {
+                let row = index_row_from_path(&new_path)
+                    .ok_or_else(|| "Cannot read renamed file info.".to_string())?;
+                let _ = upsert_rows(&mut conn, &[row])?;
+            }
+
+            invalidate_search_caches(&state);
+
+            remember_op(
+                &state,
+                "rename",
+                Some(old_path.to_string_lossy().to_string()),
+                Some(new_path.to_string_lossy().to_string()),
+            );
+
+            refresh_and_emit_status_counts(Some(&app), &state)?;
         }
-
-        invalidate_search_caches(&state);
-
-        remember_op(
-            &state,
-            "rename",
-            Some(old_path.to_string_lossy().to_string()),
-            Some(new_path.to_string_lossy().to_string()),
-        );
-
-        refresh_and_emit_status_counts(Some(&app), &state)?;
+        #[cfg(target_os = "windows")]
+        let _ = (&app, &state);
 
         let new_meta = fs::symlink_metadata(&new_path).ok();
         Ok(EntryDto {
@@ -7097,22 +7266,40 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
-    let db_path = app_data_dir.join(DB_FILE_NAME);
     let home_dir = resolve_home_dir();
 
+    // Windows (service model, §3.3): mark this process a pure reader and point
+    // it at the machine-global ProgramData index the service writes; the GUI
+    // never touches per-user %APPDATA% and never writes. config\ (user-writable)
+    // is separate from data\ (Users read-only). Elsewhere: per-user app-data.
+    #[cfg(target_os = "windows")]
+    let (db_path, state) = {
+        set_db_readonly();
+        let data_dir = win::service_paths::data_dir().unwrap_or_else(|| app_data_dir.clone());
+        let config_dir = win::service_paths::config_dir().unwrap_or_else(|| app_data_dir.clone());
+        let _ = fs::create_dir_all(&config_dir);
+        let db_path = win::service_paths::db_path().unwrap_or_else(|| data_dir.join(DB_FILE_NAME));
+        let state = build_app_state_with_config(db_path.clone(), home_dir, &data_dir, &config_dir);
+        (db_path, state)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let (db_path, state) = {
+        let db_path = app_data_dir.join(DB_FILE_NAME);
+        let state = build_app_state(db_path.clone(), home_dir, &app_data_dir);
+        (db_path, state)
+    };
+
     // Register this binary as an MCP server for Claude Code / Codex so agents
-    // pick it up automatically. Passes the Tauri-resolved DB path so the
-    // standalone MCP process serves exactly this index instead of guessing
-    // the app-data layout. Best-effort, off the startup path.
+    // pick it up automatically, serving exactly this index. Best-effort.
     {
         let mcp_db_path = db_path.clone();
         std::thread::spawn(move || mcp_server::register_all_and_log(Some(mcp_db_path)));
     }
-    // The GUI owns index writes while it runs; hold the beacon for the process
-    // lifetime so the headless MCP-spawned daemon defers to us (single writer).
+    // Non-Windows: the GUI owns index writes while running, so hold the beacon
+    // (single-writer handshake with the daemon). On Windows the SCM service is
+    // the sole writer — no beacon (D6).
+    #[cfg(not(target_os = "windows"))]
     daemon::hold_gui_beacon(&db_path);
-    eprintln!("[startup] +{}ms building AppState (pathignore + pathindexing)...", setup_started.elapsed().as_millis());
-    let state = build_app_state(db_path, home_dir, &app_data_dir);
     eprintln!("[startup] +{}ms AppState created ({} extra roots)", setup_started.elapsed().as_millis(), state.extra_roots.lock().len());
     app.manage(state.clone());
     // Context menu item IDs use the "ctx_" prefix by convention.
@@ -7148,13 +7335,19 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         let thread_started = std::time::Instant::now();
         eprintln!("[startup/thread] init thread started");
 
-        eprintln!("[startup/thread] +{}ms calling init_db_tables...", thread_started.elapsed().as_millis());
-        if let Err(err) = init_db_tables(&state.db_path) {
-            set_state(&state, IndexState::Error, Some(err.clone()));
-            emit_index_state(&app_handle, "Error", Some(err));
-            return;
+        // Non-Windows: the GUI may be the writer, so it initializes the schema.
+        // Windows: the service owns the schema and the GUI is a read-only reader
+        // (§3.3) — it can't create tables; it just waits for the service's DB.
+        #[cfg(not(target_os = "windows"))]
+        {
+            eprintln!("[startup/thread] +{}ms calling init_db_tables...", thread_started.elapsed().as_millis());
+            if let Err(err) = init_db_tables(&state.db_path) {
+                set_state(&state, IndexState::Error, Some(err.clone()));
+                emit_index_state(&app_handle, "Error", Some(err));
+                return;
+            }
+            eprintln!("[startup/thread] +{}ms init_db_tables done", thread_started.elapsed().as_millis());
         }
-        eprintln!("[startup/thread] +{}ms init_db_tables done", thread_started.elapsed().as_millis());
 
         state.db_ready.store(true, AtomicOrdering::Release);
         eprintln!("[startup/thread] +{}ms db_ready=true -- launching indexing immediately", thread_started.elapsed().as_millis());
@@ -7175,9 +7368,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         // db_ready above already ran (idempotent, near-no-op on the daemon-built
         // DB), so search is live immediately; only writes wait. Bounded — falls
         // through (WAL-safe: the daemon skips VACUUM while the beacon is held).
+        #[cfg(not(target_os = "windows"))]
         daemon::wait_for_daemon_exit(&state.db_path);
 
-        // Deferred housekeeping -- purge + status counts run in background
+        // Deferred housekeeping (purge writes) -- non-Windows only; the Windows
+        // GUI is read-only and the service owns index hygiene (§3.3).
+        #[cfg(not(target_os = "windows"))]
         {
             let hk_app = app_handle.clone();
             let hk_state = state.clone();
@@ -7365,7 +7561,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
         #[cfg(target_os = "windows")]
         {
-            win::start_windows_indexing(app_handle.clone(), state.clone());
+            // Read-only reader (§3.3): no indexing — the service owns it. Mark
+            // ready from the service's DB and poll the service for status/health.
+            win::start_windows_readonly(app_handle.clone(), state.clone());
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -7472,7 +7670,8 @@ pub fn run() {
             open_privacy_settings,
             open_pathignore,
             open_pathindexing,
-            restart_app
+            restart_app,
+            register_service_elevated
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -7482,6 +7681,28 @@ fn main() {
     // `--mcp` / `--register-mcp` run headless and must not boot the GUI.
     if mcp_server::handle_cli_args() {
         return;
+    }
+    // Windows: headless service commands run before any Tauri/WebView init.
+    #[cfg(target_os = "windows")]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        // The SCM-managed indexer service.
+        if args.iter().any(|a| a == "--service") {
+            win::service::run();
+            return;
+        }
+        // Self-recovery: (re)register the installed service, elevated (D5). The
+        // GUI banner invokes this via ShellExecute(runas).
+        if args.iter().any(|a| a == "--register-service") {
+            match win::service::register_service() {
+                Ok(()) => eprintln!("[register-service] EverythingIndexer registered and started"),
+                Err(e) => {
+                    eprintln!("[register-service] failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
     }
     run();
 }
@@ -7564,6 +7785,7 @@ mod tests {
             path_ignore_patterns: Arc::new(Vec::new()),
             db_ready: Arc::new(AtomicBool::new(true)),
             indexing_active: Arc::new(AtomicBool::new(false)),
+            cancel_index: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(IndexStatus::default())),
             recent_ops: Arc::new(Mutex::new(Vec::new())),
             icon_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -7574,9 +7796,15 @@ mod tests {
             mem_index: Arc::new(RwLock::new(None)),
             watcher_stop: Arc::new(AtomicBool::new(false)),
             watcher_active: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            watcher_lost_events: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            config_dirty: Arc::new(AtomicBool::new(false)),
             frontend_ready: Arc::new(AtomicBool::new(true)),
+            #[cfg(target_os = "macos")]
             pathindexing_active: Arc::new(AtomicBool::new(false)),
             search_conn_pool: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(target_os = "macos")]
             watcher_conn: Arc::new(Mutex::new(None)),
         }
     }
@@ -7931,6 +8159,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale, 0, "confirmed NotFound subtree must be removed");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelled_catchup_returns_err_and_skips_deletions() {
+        // With cancel_index set, a catchup pass must unwind before persisting
+        // last_run_id and before any worker emits leftover deletions. A row
+        // whose file is gone under a still-present directory — which a normal
+        // catchup would sweep — must therefore survive, and the run is left
+        // "incomplete". This is the safety contract behind the daemon yielding
+        // the writer to the GUI mid-build.
+        let root = temp_case_dir("cancelled_catchup");
+        let scan_root = root.join("home");
+        let present_dir = scan_root.join("present-dir");
+        fs::create_dir_all(&present_dir).unwrap();
+        // In the DB but not on disk: a normal catchup sweeps this as a leftover
+        // once its parent directory is walked.
+        let gone = present_dir.join("gone.txt");
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        let conn = db_connection(&db_path).unwrap();
+        insert_test_entry(&conn, &scan_root, true, 1);
+        insert_test_entry(&conn, &present_dir, true, 1);
+        insert_test_entry(&conn, &gone, false, 1);
+        set_meta(&conn, "last_run_id", "1").unwrap();
+        drop(conn);
+
+        let state = test_state_for(db_path.clone(), scan_root, root.clone());
+        state.cancel_index.store(true, AtomicOrdering::Release);
+
+        let error = run_incremental_index(None, &state)
+            .err()
+            .expect("a cancelled pass must return an error");
+        assert!(error.contains("cancelled"), "unexpected error: {error}");
+
+        let conn = db_connection(&db_path).unwrap();
+        let gone_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entries WHERE path = ?1",
+                params![gone.to_string_lossy().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone_rows, 1, "cancel must skip the leftover deletion");
+        assert_eq!(
+            get_meta(&conn, "last_run_id").as_deref(),
+            Some("1"),
+            "a cancelled pass must not bump last_run_id",
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -8519,6 +8798,10 @@ mod tests {
     /// BENCH_TREE=/path/to/tree cargo test --release --manifest-path src-tauri/Cargo.toml \
     ///   -- --ignored bench_index_speed --nocapture
     /// ```
+    ///
+    /// macOS-only: step 4 measures the watcher path through `apply_path_changes`,
+    /// which is itself `#[cfg(target_os = "macos")]`.
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore]
     fn bench_index_speed() {

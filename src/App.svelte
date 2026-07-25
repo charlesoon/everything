@@ -129,6 +129,7 @@
   let showFdaBanner = false;
   let showPathignoreBanner = false;
   let showPathindexingBanner = false;
+  let serviceHealth = { ok: true, state: '' };
   let fdaSettingsOpened = false;
   const FDA_DISMISSED_KEY = 'everything-fda-dismissed';
   const appWindow = getCurrentWindow();
@@ -1667,7 +1668,16 @@
       })
     );
 
-    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenCtxMenuAction, unlistenPathignore, unlistenPathindexing, unlistenResized].filter(Boolean);
+    // Windows: the read-only GUI polls the indexer service; this event carries
+    // its health so a banner can appear when it's missing/stopped/broken (D5).
+    const unlistenServiceHealth = await step(
+      'listen(service_health)',
+      () => listen('service_health', (event) => {
+        serviceHealth = event.payload || { ok: true, state: '' };
+      })
+    );
+
+    unlistenFns = [unlistenProgress, unlistenState, unlistenUpdated, unlistenCtxMenuAction, unlistenPathignore, unlistenPathindexing, unlistenServiceHealth, unlistenResized].filter(Boolean);
     startupLog(`[startup/fe] +${ms()}ms all listeners registered`);
 
     // Fetch backend state IMMEDIATELY after listeners are registered.
@@ -1868,6 +1878,29 @@
     <span class="fda-banner-text">인덱싱 경로(.pathindexing)가 변경되어 반영되었습니다.</span>
     <div class="fda-banner-actions">
       <button class="fda-btn-dismiss" on:click={() => showPathindexingBanner = false}>닫기</button>
+    </div>
+  </div>
+  {/if}
+
+  {#if !serviceHealth.ok}
+  <div class="fda-banner" role="alert">
+    <span class="fda-banner-text">
+      {#if serviceHealth.state === 'not_installed'}
+        인덱스 서비스가 설치되어 있지 않습니다. 등록하려면 관리자 권한이 필요합니다.
+      {:else if serviceHealth.state === 'stopped' || serviceHealth.state === 'starting'}
+        인덱스 서비스를 시작하는 중입니다...
+      {:else if serviceHealth.state === 'unresponsive'}
+        인덱스 서비스가 응답하지 않습니다. 재등록이 필요할 수 있습니다.
+      {:else if serviceHealth.state === 'version_mismatch'}
+        인덱스 서비스가 이전 버전으로 실행 중입니다. 재시작(재등록)이 필요합니다.
+      {:else}
+        인덱스 서비스 상태를 확인하는 중입니다...
+      {/if}
+    </span>
+    <div class="fda-banner-actions">
+      {#if serviceHealth.state === 'not_installed' || serviceHealth.state === 'unresponsive' || serviceHealth.state === 'version_mismatch'}
+        <button class="fda-btn-open" on:click={() => invoke('register_service_elevated')}>서비스 등록</button>
+      {/if}
     </div>
   </div>
   {/if}

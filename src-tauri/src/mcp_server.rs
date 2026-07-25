@@ -77,7 +77,12 @@ const APP_BUNDLE_ID: &str = "com.everything.app";
 /// fallback for entries or invocations without that pin.
 pub(crate) fn default_db_path() -> PathBuf {
     if let Ok(p) = std::env::var("EVERYTHING_MCP_DB") {
-        return PathBuf::from(p);
+        let pinned = PathBuf::from(p);
+        // Fall back to the default location if the pinned DB no longer exists —
+        // e.g. an old per-user path removed by migration to ProgramData (§3.4).
+        if pinned.exists() {
+            return pinned;
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -88,10 +93,15 @@ pub(crate) fn default_db_path() -> PathBuf {
     }
     #[cfg(target_os = "windows")]
     {
-        let roaming = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| resolve_home_dir().join("AppData").join("Roaming"));
-        roaming.join(APP_BUNDLE_ID).join(DB_FILE_NAME)
+        // The admin service writes the machine-global index under ProgramData
+        // (D1); fall back to the legacy per-user roaming path only if it can't
+        // be resolved.
+        crate::win::service_paths::db_path().unwrap_or_else(|| {
+            let roaming = std::env::var("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| resolve_home_dir().join("AppData").join("Roaming"));
+            roaming.join(APP_BUNDLE_ID).join(DB_FILE_NAME)
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -113,11 +123,13 @@ fn open_search_connection(db_path: &Path) -> AppResult<Connection> {
             db_path.display()
         ));
     }
-    // Same tuning as the app's pooled search connections, plus: pinned
-    // read-only (the watcher/indexer own all writes) and a longer busy
-    // timeout since no keystroke latency is at stake here.
-    let conn = db_connection_for_search(db_path)?;
-    conn.execute_batch("PRAGMA query_only=ON; PRAGMA busy_timeout=2000;")
+    // The read-only open (SQLITE_OPEN_READ_ONLY, not RW + `query_only`) is
+    // governed process-wide by DB_READONLY, set at MCP startup — so this shares
+    // the one connection opener (§3.4) instead of re-deriving the flags. Layer on
+    // the search-tuning pragmas; a 2s busy_timeout is more patient than the GUI's,
+    // for CLI use against a live writer.
+    let conn = crate::db_connection_with_timeout(db_path, 2000)?;
+    conn.execute_batch("PRAGMA mmap_size=1073741824; PRAGMA cache_size=-16000;")
         .map_err(|e| e.to_string())?;
     Ok(conn)
 }
@@ -440,6 +452,10 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 /// Blocking stdio loop: one JSON-RPC message per line in, one per line out.
 /// Exits when stdin closes (the client owns the server's lifetime).
 pub fn run_stdio_server() {
+    // The MCP process is a pure reader (§3.4): open the index read-only so a
+    // stray write errors instead of corrupting, and (on Windows) it reads the
+    // service-owned, Users-read-only ProgramData DB.
+    crate::set_db_readonly();
     let db_path = default_db_path();
     eprintln!(
         "[mcp] everything MCP server v{} serving {}",
@@ -449,6 +465,10 @@ pub fn run_stdio_server() {
     // Ensure a resident indexer daemon exists so the index gets built (first
     // run) and stays fresh without the GUI. Idempotent: a duplicate daemon
     // self-exits, and it outlives this MCP session.
+    //
+    // Windows: the SCM-managed service is the guaranteed writer (§3.4), so the
+    // MCP process never spawns a daemon there.
+    #[cfg(not(target_os = "windows"))]
     crate::daemon::spawn_detached();
     let mut server = McpServer::new(db_path, resolve_home_dir());
     let stdin = std::io::stdin();

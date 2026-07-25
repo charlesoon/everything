@@ -19,10 +19,15 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "windows"))]
 use std::process::{Command, Stdio};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(not(target_os = "windows"))]
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
 use fs2::FileExt;
 
@@ -42,11 +47,14 @@ const GUI_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// watcher) — kept coarse; only the GUI-yield check needs to be fast.
 #[cfg(target_os = "macos")]
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
-/// Non-macOS reconcile cadence (no live watcher there).
-#[cfg(not(target_os = "macos"))]
+/// Linux fallback reconcile cadence (no live watcher there).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const CATCHUP_INTERVAL: Duration = Duration::from_secs(60);
 /// How long the GUI waits for a resident daemon to exit before it starts
 /// writing (the GUI half of the handshake). Bounded so startup can't hang.
+/// Non-Windows only — on Windows the SCM service is the sole writer, so there
+/// is no GUI↔daemon handshake (D6).
+#[cfg(not(target_os = "windows"))]
 const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
@@ -79,11 +87,12 @@ fn try_acquire(path: &Path) -> Option<File> {
     }
 }
 
-fn try_acquire_daemon_lock(db_path: &Path) -> Option<File> {
+pub(crate) fn try_acquire_daemon_lock(db_path: &Path) -> Option<File> {
     try_acquire(&daemon_lock_path(db_path))
 }
 
 /// Whether a daemon is already resident (holds `daemon.lock`).
+#[cfg(not(target_os = "windows"))]
 fn daemon_running(db_path: &Path) -> bool {
     try_acquire_daemon_lock(db_path).is_none()
 }
@@ -95,12 +104,14 @@ pub(crate) fn gui_is_running(db_path: &Path) -> bool {
     try_acquire(&gui_lock_path(db_path)).is_none()
 }
 
+#[cfg(not(target_os = "windows"))]
 static GUI_BEACON: OnceLock<File> = OnceLock::new();
 
 /// Called once on GUI startup: hold `gui.lock` for the process lifetime so any
 /// daemon defers to the GUI as the single writer. Returns whether the beacon
 /// was acquired — a failure means a resident daemon won't see the GUI and won't
 /// yield, so the caller should surface it rather than silently overlapping.
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn hold_gui_beacon(db_path: &Path) -> bool {
     match try_acquire(&gui_lock_path(db_path)) {
         Some(file) => {
@@ -122,6 +133,7 @@ pub(crate) fn hold_gui_beacon(db_path: &Path) -> bool {
 /// resident daemon has observed it and exited (released `daemon.lock`) so the
 /// GUI can start writing without overlapping the daemon. Bounded — if a daemon
 /// lingers past the deadline we proceed anyway (WAL keeps writes safe).
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
     let started = Instant::now();
     let mut waited = false;
@@ -148,6 +160,7 @@ pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
 
 /// Whether the last index pass ran to completion (`index_complete=1`). Used by
 /// the supervisory loop to decide whether a failed build needs healing.
+#[cfg(target_os = "macos")]
 fn index_complete(db_path: &Path) -> bool {
     db_connection(db_path)
         .ok()
@@ -180,9 +193,36 @@ fn fresh_and_dirty(db_path: &Path) -> (bool, bool) {
 /// finalizing thread. `indexing_active` is held for the whole pass so a live
 /// watcher stands down instead of racing this writer.
 fn build_index(db_path: &Path, state: &AppState) {
+    // Clear any cancel signal a previously-yielded pass may have left set.
+    state.cancel_index.store(false, Ordering::Release);
     state.indexing_active.store(true, Ordering::Release);
     let (is_fresh, fts_dirty) = fresh_and_dirty(db_path);
+
+    // Watch for the GUI while this (possibly minutes-long) pass runs. The
+    // resident loop can't poll the beacon until the pass returns, and the GUI's
+    // wait_for_daemon_exit is bounded to DAEMON_EXIT_WAIT, so a long fresh build
+    // would otherwise overlap the GUI as a second writer. Setting cancel_index
+    // makes run_incremental_index unwind within ~1-2s (index left incomplete).
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let monitor = {
+        let cancel = Arc::clone(&state.cancel_index);
+        let stop = Arc::clone(&monitor_stop);
+        let db_path = db_path.to_path_buf();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if gui_is_running(&db_path) {
+                    cancel.store(true, Ordering::Release);
+                    return;
+                }
+                std::thread::sleep(GUI_POLL_INTERVAL);
+            }
+        })
+    };
+
     let result = run_incremental_index(None, state);
+
+    monitor_stop.store(true, Ordering::Release);
+    let _ = monitor.join();
     // Ensure the guard is cleared even on error (the Ok path also clears it).
     state.indexing_active.store(false, Ordering::Release);
     match result {
@@ -219,6 +259,10 @@ fn build_index(db_path: &Path, state: &AppState) {
 /// Spawn `everything --daemon` as a detached background process that outlives
 /// the caller. Skips when the GUI (writer owner) or another daemon is already
 /// running, so repeated MCP sessions don't churn short-lived processes.
+///
+/// Not compiled on Windows: there the SCM-managed service is the guaranteed
+/// writer, so the MCP process never spawns a daemon (§3.4).
+#[cfg(not(target_os = "windows"))]
 pub fn spawn_detached() {
     let db_path = default_db_path();
     if gui_is_running(&db_path) {
@@ -304,12 +348,22 @@ pub fn run_daemon() {
     // Startup reconcile: a fresh build if the DB is empty, otherwise a catchup
     // covering everything changed while no daemon was running.
     build_index(&db_path, &state);
-    eprintln!("[daemon] index ready; entering resident mode");
+    if gui_is_running(&db_path) {
+        eprintln!("[daemon] GUI appeared during startup build; yielding writes");
+    } else {
+        eprintln!("[daemon] index ready; entering resident mode");
+    }
 
     #[cfg(target_os = "macos")]
     run_macos_resident(db_path, state);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     run_polling_resident(db_path, state);
+    // Windows: the SCM-managed indexer service is the sole writer (Q3). A stray
+    // `--daemon` already self-exited above when it couldn't take daemon.lock, and
+    // the ProgramData data dir is read-only to a non-SYSTEM process, so there is
+    // no Windows resident fallback.
+    #[cfg(target_os = "windows")]
+    let _ = (db_path, state);
 }
 
 /// Yield to the GUI: stop the watcher and wait for it to actually exit before
@@ -386,10 +440,11 @@ fn stored_event_id(db_path: &Path) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// Non-macOS: no headless live watcher yet, so reconcile on `CATCHUP_INTERVAL`.
+
+/// Linux fallback: no headless live watcher, so reconcile on `CATCHUP_INTERVAL`.
 /// The GUI beacon is still polled on the fast `GUI_POLL_INTERVAL` so the daemon
 /// yields promptly (handshake). `build_index` also heals a dirty FTS.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn run_polling_resident(db_path: PathBuf, state: AppState) {
     let mut last_catchup = Instant::now();
     loop {

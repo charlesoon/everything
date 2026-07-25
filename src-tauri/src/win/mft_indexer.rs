@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ use crate::{
     AppState, IgnorePattern, IndexRow, IndexState, BUILTIN_SKIP_NAMES,
 };
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::FSCTL_ENUM_USN_DATA;
 
@@ -58,7 +59,48 @@ struct MftFileEntry {
     timestamp: Option<i64>,
 }
 
-pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, String> {
+/// GUI-only progressive Ready (R5 / D4): publish a partial MemIndex built from
+/// the directories scanned so far so the app can search immediately while files
+/// finish loading, and report Ready. Returns the partial index (held until the
+/// background pass swaps in the full one). The service skips this — it has no
+/// searcher and must not report Ready mid-scan.
+fn publish_progressive_ready(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    dir_results: &[CompactEntry],
+    scanned: u64,
+    indexed: u64,
+) -> Arc<crate::mem_search::MemIndex> {
+    let early_cap = super::EARLY_MEM_INDEX_LIMIT.min(dir_results.len());
+    let early_entries: Vec<CompactEntry> = dir_results.iter().take(early_cap).cloned().collect();
+    let early_idx = Arc::new(crate::mem_search::MemIndex::build(early_entries));
+    *state.mem_index.write() = Some(Arc::clone(&early_idx));
+    {
+        let mut status = state.status.lock();
+        status.state = IndexState::Ready;
+        status.permission_errors = 0;
+        status.scanned = scanned;
+        status.indexed = indexed;
+        status.message = None;
+        status.entries_count = indexed;
+        status.last_updated = Some(now_epoch());
+    }
+    if let Some(app) = app {
+        emit_index_progress(app, scanned, indexed, String::new());
+        emit_index_updated(app, indexed, now_epoch(), 0);
+        emit_index_state(app, "Ready", None);
+    }
+    early_idx
+}
+
+/// Full MFT scan. `build_mem_index` controls the GUI-only MemIndex (progressive
+/// Ready + the full in-memory searcher): the GUI passes `true`; the service
+/// passes `false` and upserts straight from the raw entries (R5).
+pub fn scan_mft(
+    state: &AppState,
+    app: Option<&AppHandle>,
+    build_mem_index: bool,
+) -> Result<MftScanResult, String> {
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     let started = Instant::now();
@@ -70,6 +112,14 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     // leaves index_complete and status untouched.
     let vol = volume::open_volume('C')?;
     eprintln!("[win/mft +{}] volume opened", ts());
+
+    // S5: capture the USN journal position BEFORE enumerating the MFT. The
+    // watcher resumes from here and replays every change made during the
+    // (multi-minute) scan; idempotent upserts absorb the overlap. The old code
+    // captured this in finalize (after the scan), leaving a change-loss window
+    // for the scan's whole duration. `None` when the journal can't be queried;
+    // the caller then falls back to starting the watcher at the current tip.
+    let start_journal = volume::query_usn_journal(&vol).ok();
 
     state
         .indexing_active
@@ -88,7 +138,9 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         status.indexed = 0;
         status.current_path.clear();
     }
-    emit_index_state(app, "Indexing", None);
+    if let Some(app) = app {
+        emit_index_state(app, "Indexing", None);
+    }
 
     // ── Pass 1: Enumerate MFT — dirs into resolver, files into Vec ──
     let pass1_started = Instant::now();
@@ -99,7 +151,7 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     let mut file_entries: Vec<MftFileEntry> = Vec::with_capacity(2_500_000);
     let mut pass1_last_emit = Instant::now();
 
-    enumerate_mft(vol.raw(), |record| {
+    enumerate_mft(vol.raw(), &state.cancel_index, |record| {
         total_records += 1;
         let is_dir = (record.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
@@ -118,7 +170,9 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         if pass1_last_emit.elapsed() >= EMIT_INTERVAL {
             let msg = format!("Reading MFT... ({total_records} records)");
             set_progress(state, 0, 0, &msg);
-            emit_index_progress(app, 0, 0, msg);
+            if let Some(app) = app {
+                emit_index_progress(app, 0, 0, msg);
+            }
             pass1_last_emit = Instant::now();
         }
     })?;
@@ -230,7 +284,7 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
             };
             if name.is_empty() { return None; }
             Some(CompactEntry {
-                name: name.to_string(), dir: dir.to_string(),
+                name: name.to_string(), dir: Arc::from(dir),
                 is_dir: true, ext: None, mtime: *timestamp, size: None,
             })
         })
@@ -248,35 +302,17 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         ts(), pass2_started.elapsed().as_millis()
     );
 
-    // ── Progressive Ready: build partial MemIndex from dirs only ──
-    let early_cap = super::EARLY_MEM_INDEX_LIMIT.min(dir_results.len());
-    eprintln!(
-        "[win/mft +{}] building partial MemIndex ({} of {} dirs)...",
-        ts(),
-        early_cap,
-        dir_results.len()
-    );
-    let early_entries: Vec<CompactEntry> = dir_results.iter().take(early_cap).cloned().collect();
-    let early_idx = Arc::new(crate::mem_search::MemIndex::build(early_entries));
-    eprintln!("[win/mft +{}] partial MemIndex built", ts());
-    *state.mem_index.write() = Some(Arc::clone(&early_idx));
-    {
-        let mut status = state.status.lock();
-        status.state = IndexState::Ready;
-        status.permission_errors = 0;
-        status.scanned = scanned;
-        status.indexed = indexed;
-        status.message = None;
-        status.entries_count = indexed;
-        status.last_updated = Some(now_epoch());
-    }
-    emit_index_progress(app, scanned, indexed, String::new());
-    emit_index_updated(app, indexed, now_epoch(), 0);
-    emit_index_state(app, "Ready", None);
-    eprintln!(
-        "[win/mft +{}] progressive Ready emitted ({indexed} dirs)",
-        ts()
-    );
+    // Progressive Ready is a GUI-only accelerator (partial searcher + early
+    // Ready). The service skips it: it has no searcher and reporting Ready
+    // mid-scan would mislead the pipe `status` consumers (R5 / D4).
+    let early_idx = if build_mem_index {
+        eprintln!("[win/mft +{}] building partial MemIndex...", ts());
+        let idx = publish_progressive_ready(state, app, &dir_results, scanned, indexed);
+        eprintln!("[win/mft +{}] progressive Ready emitted ({indexed} dirs)", ts());
+        Some(idx)
+    } else {
+        None
+    };
 
     let mut mem_entries: Vec<CompactEntry> = Vec::with_capacity(dir_subtree.len() + file_entries.len());
     mem_entries.extend(dir_results);
@@ -284,11 +320,18 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     // --- Process files (parallel + stat) ---
     let pass2_files_started = Instant::now();
 
+    // Interned parent paths: sibling files share one Arc<str> per directory
+    // instead of each entry holding its own copy of the full parent path.
+    let arc_dir_cache: HashMap<u64, Arc<str>> = path_cache
+        .iter()
+        .map(|(frn, path)| (*frn, Arc::from(path.as_str())))
+        .collect();
+
     let file_results: Vec<CompactEntry> = file_entries
         .par_iter()
         .filter(|entry| dir_subtree.contains(&entry.parent_frn))
         .filter_map(|entry| {
-            let parent_path = path_cache.get(&entry.parent_frn)?;
+            let parent_path = arc_dir_cache.get(&entry.parent_frn)?;
             if should_skip_file_in_pruned_subtree(
                 parent_path, &entry.name, &glob_patterns,
             ) {
@@ -305,7 +348,7 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
 
             Some(CompactEntry {
                 name: entry.name.clone(),
-                dir: parent_path.clone(),
+                dir: Arc::clone(parent_path),
                 is_dir: false,
                 ext,
                 mtime: entry.timestamp,
@@ -361,13 +404,15 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
         status.entries_count = indexed;
         status.last_updated = Some(now_epoch());
     }
-    emit_index_progress(app, scanned, indexed, String::new());
-    emit_index_updated(app, indexed, now_epoch(), 0);
+    if let Some(app) = app {
+        emit_index_progress(app, scanned, indexed, String::new());
+        emit_index_updated(app, indexed, now_epoch(), 0);
+    }
 
     // ── Background: MemIndex build + DB upsert + USN watcher start ──
     let bg_state = state.clone();
-    let bg_app = app.clone();
-    let bg_vol = vol;
+    let bg_app = app.cloned();
+    let bg_start_journal = start_journal;
 
     eprintln!(
         "[win/mft +{}] passing {} FRN path entries + {} outside-scan FRNs to USN watcher",
@@ -375,28 +420,54 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
     );
 
     let bg_started = started;
+    let bg_build_mem = build_mem_index;
     std::thread::spawn(move || {
         let ts = || format!("{:.1}s", bg_started.elapsed().as_secs_f32());
 
-        // Build full MemIndex (rayon-parallelized) in background
         drop(early_idx);
-        eprintln!("[win/mft/bg +{}] building full MemIndex ({entry_count} entries)...", ts());
-        let mem_idx = Arc::new(crate::mem_search::MemIndex::build(mem_entries));
-        eprintln!("[win/mft/bg +{}] full MemIndex built", ts());
-        *bg_state.mem_index.write() = Some(Arc::clone(&mem_idx));
 
-        // DB upsert
+        // GUI builds a searchable MemIndex so the app can search while the DB
+        // fills (freed once the DB name index is ready). The service has no
+        // searcher (R5), so it upserts straight from the raw entries and never
+        // builds or publishes a MemIndex. Exactly one owner is built, so an enum
+        // models the choice and ties both variants to a single `drop`.
+        enum ScanEntries {
+            Searchable(Arc<crate::mem_search::MemIndex>),
+            Raw(Vec<CompactEntry>),
+        }
+        impl ScanEntries {
+            fn entries(&self) -> &[CompactEntry] {
+                match self {
+                    ScanEntries::Searchable(m) => m.entries(),
+                    ScanEntries::Raw(v) => v,
+                }
+            }
+        }
+        let scan = if bg_build_mem {
+            eprintln!("[win/mft/bg +{}] building full MemIndex ({entry_count} entries)...", ts());
+            let idx = Arc::new(crate::mem_search::MemIndex::build(mem_entries));
+            eprintln!("[win/mft/bg +{}] full MemIndex built", ts());
+            *bg_state.mem_index.write() = Some(Arc::clone(&idx));
+            ScanEntries::Searchable(idx)
+        } else {
+            ScanEntries::Raw(mem_entries)
+        };
+
+        // DB upsert — entries come from whichever owner we built above.
         eprintln!("[win/mft/bg +{}] starting DB upsert ({entry_count} entries)", ts());
-        let bulk_result = background_db_bulk_insert(&bg_state, mem_idx.entries(), bg_started);
+        let bulk_result = background_db_bulk_insert(&bg_state, scan.entries(), bg_started);
 
         let bg_ok = match bulk_result {
             Ok((conn, current_run_id)) => {
                 if let Err(e) = background_db_finalize(
-                    conn, &bg_state, &bg_app, &bg_vol, current_run_id, entry_count > 0, bg_started,
+                    conn, &bg_state, bg_app.as_ref(), bg_start_journal.clone(), current_run_id, entry_count > 0, bg_started,
                     || {
-                        drop(mem_idx);
+                        // Free the scan's in-memory entries once the DB name
+                        // index is ready (the mem_index clear is a no-op for the
+                        // service, which never published one).
                         *bg_state.mem_index.write() = None;
-                        eprintln!("[win/mft/bg +{}] MemIndex freed (name index ready, building remaining)", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
+                        drop(scan);
+                        eprintln!("[win/mft/bg +{}] scan entries freed (name index ready)", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
                     },
                 ) {
                     eprintln!("[win/mft/bg +{}] DB finalize FAILED: {e}", ts());
@@ -407,8 +478,8 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
             }
             Err(e) => {
                 eprintln!("[win/mft/bg +{}] DB bulk insert FAILED: {e}", ts());
-                drop(mem_idx);
                 *bg_state.mem_index.write() = None;
+                drop(scan);
                 false
             }
         };
@@ -422,15 +493,38 @@ pub fn scan_mft(state: &AppState, app: &AppHandle) -> Result<MftScanResult, Stri
                 let mut status = bg_state.status.lock();
                 status.state = IndexState::Ready;
             }
-            emit_index_state(&bg_app, "Ready", None);
+            if let Some(a) = &bg_app {
+                emit_index_state(a, "Ready", None);
+            }
         } else {
             let msg = "Background DB operation failed".to_string();
             set_state(&bg_state, IndexState::Error, Some(msg.clone()));
-            emit_index_state(&bg_app, "Error", Some(msg));
+            if let Some(a) = &bg_app {
+                emit_index_state(a, "Error", Some(msg));
+            }
         }
         eprintln!("[win/mft/bg +{}] background work done (ok={})", ts(), bg_ok);
 
-        if let Err(e) = super::usn_watcher::start(bg_app.clone(), bg_state.clone(), frn_cache, outside_scan_frns) {
+        // S5: resume the watcher from the pre-scan journal position so changes
+        // made during the scan are replayed (idempotent upserts absorb the
+        // overlap). Fall back to the current tip if the pre-scan capture failed.
+        let watcher_result = match bg_start_journal {
+            Some(journal) => super::usn_watcher::start_at(
+                bg_app.clone(),
+                bg_state.clone(),
+                journal.next_usn,
+                journal.journal_id,
+                frn_cache,
+                outside_scan_frns,
+            ),
+            None => super::usn_watcher::start(
+                bg_app.clone(),
+                bg_state.clone(),
+                frn_cache,
+                outside_scan_frns,
+            ),
+        };
+        if let Err(e) = watcher_result {
             eprintln!("[win/mft/bg +{}] USN watcher failed ({e}), trying RDCW fallback", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
             if let Err(e2) = super::rdcw_watcher::start(bg_app, bg_state) {
                 eprintln!("[win/mft/bg] RDCW watcher also failed ({e2}), no live updates");
@@ -460,7 +554,7 @@ fn build_dir_stat_cache(
     let unique_dirs: HashSet<&str> = entries
         .iter()
         .filter(|e| !e.is_dir)
-        .map(|e| e.dir.as_str())
+        .map(|e| &*e.dir)
         .collect();
 
     let dir_list: Vec<&str> = unique_dirs.into_iter().collect();
@@ -555,13 +649,19 @@ fn background_db_bulk_insert(
     let upsert_started = Instant::now();
 
     for chunk in entries.chunks(MFT_BATCH_SIZE) {
+        // S7: cooperative cancellation between batches (service STOP / journal-
+        // loss rescan preemption). Err leaves index_complete unset; the caller
+        // heals the incomplete build on the next pass.
+        if state.cancel_index.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("index upsert cancelled".to_string());
+        }
         let chunk_rows: Vec<IndexRow> = chunk
             .par_iter()
             .map(|entry| {
                 let (size, mtime) = if entry.is_dir {
                     // Dirs: use USN timestamp (already set in mtime)
                     (None, entry.mtime)
-                } else if let Some(dir_cache) = dir_stat_cache.get(&entry.dir) {
+                } else if let Some(dir_cache) = dir_stat_cache.get(&*entry.dir) {
                     // Files: lookup from FindFirstFileW cache
                     if let Some(&(sz, mt)) = dir_cache.get(&entry.name.to_lowercase()) {
                         (Some(sz), Some(mt))
@@ -576,7 +676,7 @@ fn background_db_bulk_insert(
                 IndexRow {
                     path: entry.path(),
                     name: entry.name.clone(),
-                    dir: entry.dir.clone(),
+                    dir: entry.dir.to_string(),
                     is_dir: if entry.is_dir { 1 } else { 0 },
                     ext: entry.ext.clone(),
                     mtime,
@@ -599,8 +699,8 @@ fn background_db_bulk_insert(
 fn background_db_finalize(
     conn: rusqlite::Connection,
     state: &AppState,
-    app: &AppHandle,
-    vol: &volume::VolumeHandle,
+    app: Option<&AppHandle>,
+    start_journal: Option<volume::UsnJournalData>,
     current_run_id: i64,
     has_entries: bool,
     scan_started: Instant,
@@ -654,8 +754,10 @@ fn background_db_finalize(
         eprintln!("[win/mft/bg] gc cleanup error: {e}");
     }
 
-    // Save USN journal position for future resume
-    if let Ok(journal) = volume::query_usn_journal(vol) {
+    // S5: persist the PRE-scan journal position captured before enumeration
+    // (not a fresh post-scan query), so a restart resumes from before the scan
+    // and replays everything that changed during it.
+    if let Some(journal) = start_journal {
         let _ = set_meta(&conn, "win_last_usn", &journal.next_usn.to_string());
         let _ = set_meta(&conn, "win_journal_id", &journal.journal_id.to_string());
     }
@@ -674,7 +776,9 @@ fn background_db_finalize(
         let _ = set_meta(&conn, "cached_last_updated", &lu.to_string());
     }
     let updated_at = last_updated.unwrap_or_else(now_epoch);
-    emit_index_updated(app, entries_count, updated_at, 0);
+    if let Some(app) = app {
+        emit_index_updated(app, entries_count, updated_at, 0);
+    }
     let _ = refresh_and_emit_status_counts(app, state);
 
     Ok(())
@@ -761,6 +865,7 @@ fn should_skip_file_in_pruned_subtree(
 
 fn enumerate_mft(
     handle: HANDLE,
+    cancel: &AtomicBool,
     mut callback: impl FnMut(MftRecord),
 ) -> Result<(), String> {
     let mut med = MftEnumDataV0 {
@@ -772,6 +877,13 @@ fn enumerate_mft(
     let mut buffer: Vec<u8> = vec![0u8; 64 * 1024];
 
     loop {
+        // S7: cooperative cancellation — a service STOP or journal-loss rescan
+        // can preempt a multi-minute enumeration. Leaving via Err keeps
+        // index_complete unset so a preempted scan is never confirmed.
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("index scan cancelled".to_string());
+        }
+
         let mut bytes_returned: u32 = 0;
 
         let result = unsafe {
@@ -787,8 +899,15 @@ fn enumerate_mft(
             )
         };
 
-        if result.is_err() {
-            break;
+        // S1: only ERROR_HANDLE_EOF means the enumeration finished. Any other
+        // failure must propagate as Err so a partial scan is never confirmed
+        // (index_complete stays unset and the stale-row delete phase is skipped
+        // by the early return up the call chain).
+        if let Err(e) = &result {
+            if e.code() == ERROR_HANDLE_EOF.to_hresult() {
+                break;
+            }
+            return Err(format!("FSCTL_ENUM_USN_DATA failed: {e}"));
         }
 
         if bytes_returned < 8 {
