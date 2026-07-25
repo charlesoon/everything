@@ -25,6 +25,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use std::os::windows::process::CommandExt;
 mod fd_search;
 mod daemon;
+mod diag;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mcp_server;
@@ -432,6 +433,11 @@ pub(crate) struct AppState {
     /// Persistent write connection for watcher-driven incremental updates.
     /// Opening a connection per event batch dominated single-file update cost.
     pub(crate) watcher_conn: Arc<Mutex<Option<Connection>>>,
+    /// Whether this process owns index writes. True only for the GUI instance
+    /// that acquired the `gui.lock` beacon (single-writer invariant). A second
+    /// GUI instance that lost the race runs read-only: it never starts the
+    /// watcher / indexer / purge, so two GUIs can't write the same WAL DB.
+    pub(crate) is_writer: Arc<AtomicBool>,
 }
 
 /// Construct `AppState` from resolved paths, without Tauri. Shared by GUI
@@ -479,6 +485,9 @@ pub(crate) fn build_app_state(db_path: PathBuf, home_dir: PathBuf, app_data_dir:
         pathindexing_active: Arc::new(AtomicBool::new(false)),
         search_conn_pool: Arc::new(Mutex::new(Vec::new())),
         watcher_conn: Arc::new(Mutex::new(None)),
+        // Default false; the GUI sets it from the beacon result in setup_app.
+        // The headless daemon builds via its own path and never consults this.
+        is_writer: Arc::new(AtomicBool::new(false)),
     }
 }
 
@@ -639,7 +648,7 @@ fn pooled_search_connection(state: &AppState) -> AppResult<PooledSearchConn> {
         Some(conn) => {
             // A time-budget progress handler must never leak across borrows: a
             // stale handler would interrupt every future query on this conn.
-            conn.progress_handler(0, None::<fn() -> bool>);
+            let _ = conn.progress_handler(0, None::<fn() -> bool>);
             conn
         }
         None => db_connection_for_search(&state.db_path)?,
@@ -2368,6 +2377,11 @@ fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) 
     if let Ok(c) = db_connection(&state.db_path) {
         let _ = set_meta(&c, "index_complete", "0");
     }
+    // Attribution trail: index_complete=0 is what the daemon's supervisory
+    // loop keys its heals on, so record every writer of that state. If this
+    // process dies before the pass succeeds, the flag stays 0 and the next
+    // daemon will (correctly) rebuild — this line explains why.
+    diag::log("full index pass requested (index_complete=0 until it succeeds)");
 
     if !silent {
         {
@@ -2732,6 +2746,13 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
     let fts_dirty: bool = get_meta(&conn, "fts_dirty")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // One line per pass boundary in the diag log (start + ok/FAILED below):
+    // enough to reconstruct pass frequency and duration after a field
+    // incident, without perf_log's env-gated verbosity.
+    diag::log(format!(
+        "index pass start (fresh={is_fresh_run} fts_dirty={fts_dirty} extra_roots={})",
+        state.extra_roots.lock().len()
+    ));
     if fts_dirty && !is_fresh_run {
         state.fts_ready.store(false, AtomicOrdering::Release);
     }
@@ -2835,12 +2856,24 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
                 snapshot.permission_errors,
                 snapshot.message,
             ));
+            diag::log(format!(
+                "index pass ok in {:.1}s (scanned={} indexed={} entries={} permission_errors={})",
+                started.elapsed().as_secs_f32(),
+                snapshot.scanned,
+                snapshot.indexed,
+                snapshot.entries_count,
+                snapshot.permission_errors,
+            ));
         }
         Err(err) => {
             perf_log(format!(
                 "index_run_error elapsed_ms={} err={}",
                 started.elapsed().as_millis(),
                 err,
+            ));
+            diag::log(format!(
+                "index pass FAILED after {:.1}s: {err}",
+                started.elapsed().as_secs_f32()
             ));
         }
     }
@@ -3803,6 +3836,13 @@ const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(target_os = "macos")]
 const DB_BUSY_RETRY_DELAY: Duration = Duration::from_secs(3);
 
+/// Consecutive SQLITE_BUSY watcher batches before a diag ALERT: ~30s of
+/// blocked writes means another writer (daemon overlap, second instance) is
+/// holding the DB — exactly the single-writer violation the handshake is
+/// supposed to prevent, and worth a post-mortem record when it happens.
+#[cfg(target_os = "macos")]
+const WATCHER_BUSY_ALERT_STREAK: u32 = 10;
+
 #[cfg(target_os = "macos")]
 const FS_OBSERVATION_RETRY_DELAY: Duration = Duration::from_secs(3);
 
@@ -3814,6 +3854,7 @@ fn process_watcher_paths(
     deadline: &mut Option<Instant>,
     last_status_emit: &mut Instant,
     pending_status_emit: &mut bool,
+    busy_streak: &mut u32,
 ) {
     if pending.is_empty() {
         return;
@@ -3828,6 +3869,13 @@ fn process_watcher_paths(
 
     match apply_path_changes(state, &batch) {
         Ok(outcome) => {
+            if *busy_streak >= WATCHER_BUSY_ALERT_STREAK {
+                diag::log(format!(
+                    "watcher writes unblocked after {} busy retries",
+                    *busy_streak
+                ));
+            }
+            *busy_streak = 0;
             let PathChangeOutcome {
                 changed,
                 count_delta,
@@ -3864,6 +3912,15 @@ fn process_watcher_paths(
         Err(err) => {
             let is_busy = err.contains("locked") || err.contains("busy") || err.contains("unable to open");
             if is_busy {
+                *busy_streak += 1;
+                if *busy_streak == WATCHER_BUSY_ALERT_STREAK {
+                    diag::log(format!(
+                        "ALERT: watcher writes blocked ~{}s by another writer (SQLITE_BUSY x{}) — \
+                         single-writer violation (daemon/GUI overlap?): {err}",
+                        u64::from(WATCHER_BUSY_ALERT_STREAK) * DB_BUSY_RETRY_DELAY.as_secs(),
+                        WATCHER_BUSY_ALERT_STREAK
+                    ));
+                }
                 eprintln!(
                     "[watcher] DB busy, will retry in {}s: {} | batch_size={}",
                     DB_BUSY_RETRY_DELAY.as_secs(),
@@ -3876,12 +3933,17 @@ fn process_watcher_paths(
                 *deadline = Some(Instant::now() + DB_BUSY_RETRY_DELAY);
                 return;
             }
+            *busy_streak = 0;
             eprintln!(
                 "[watcher] process_watcher_paths ERROR: {} | batch_size={} indexing_active={}",
                 err,
                 batch.len(),
                 state.indexing_active.load(AtomicOrdering::Acquire)
             );
+            diag::log(format!(
+                "watcher update error (batch={}): {err}",
+                batch.len()
+            ));
             *deadline = None;
             if state.indexing_active.load(AtomicOrdering::Acquire) {
                 return;
@@ -3904,6 +3966,12 @@ const EVENT_ID_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[cfg(target_os = "macos")]
 fn persist_event_id(db_path: &Path, event_id: u64) -> AppResult<()> {
+    // Never persist the `kFSEventStreamEventIdSinceNow` sentinel (u64::MAX): a
+    // stored MAX makes the next launch replay "since now" (skipping the offline
+    // gap) and re-pins the tracker. Its presence means no real event was seen yet.
+    if event_id == u64::MAX {
+        return Ok(());
+    }
     let conn = db_connection(db_path)?;
     set_meta(&conn, "last_event_id", &event_id.to_string())
 }
@@ -4101,6 +4169,16 @@ fn spawn_due_subtree_rescan(
                     deleted,
                     started.elapsed().as_millis()
                 );
+                // Routine rescans stay out of the diag log; a minutes-long one
+                // (e.g. all of $HOME after a kernel queue overflow) is exactly
+                // the kind of unexplained CPU burn worth a post-mortem record.
+                if started.elapsed() >= Duration::from_secs(60) {
+                    diag::log(format!(
+                        "slow MustScanSubDirs rescan: {} took {:.0}s (upserted={upserted} deleted={deleted})",
+                        path.display(),
+                        started.elapsed().as_secs_f32()
+                    ));
+                }
                 if upserted + deleted > 0 {
                     invalidate_search_caches(&state);
                     touch_status_updated(&state);
@@ -4111,10 +4189,16 @@ fn spawn_due_subtree_rescan(
                     release_memory_to_os();
                 }
             }
-            Err(err) => eprintln!(
-                "[watcher] MustScanSubDirs rescan {} failed: {err}",
-                path.display()
-            ),
+            Err(err) => {
+                eprintln!(
+                    "[watcher] MustScanSubDirs rescan {} failed: {err}",
+                    path.display()
+                );
+                diag::log(format!(
+                    "MustScanSubDirs rescan FAILED for {}: {err}",
+                    path.display()
+                ));
+            }
         }
         let mut finished = finished.lock();
         // Only stamp the cooldown on success: a failed rescan left the subtree
@@ -4263,8 +4347,14 @@ fn run_fsevent_stream(
     let mut last_flush = Instant::now();
     let mut last_status_emit = Instant::now();
     let mut pending_status_emit = false;
+    // Consecutive SQLITE_BUSY batches (see WATCHER_BUSY_ALERT_STREAK).
+    let mut busy_streak: u32 = 0;
 
     let mut must_scan_count: usize = 0;
+    // ≥20 kernel event-queue overflows within 5min is a storm (super-churny
+    // watched root, e.g. /private/tmp under heavy tooling) — each one queues a
+    // subtree rescan, so record the storm once per window in the diag log.
+    let mut must_scan_storm = diag::RateAlert::new(Duration::from_secs(300), 20);
     let mut replay_phase = replay;
     let mut full_scan_triggered = false;
     let mut rebuild_requested = false;
@@ -4344,6 +4434,13 @@ fn run_fsevent_stream(
                                 eprintln!("[pathindexing] background scan starting...");
                                 let mut prev_roots = old_roots;
                                 let mut target_roots = bg_new_roots;
+                                let scan_started = Instant::now();
+                                diag::log(format!(
+                                    "pathindexing changed: extra-root scan start ({} -> {} roots; \
+                                     added roots are walked and re-upserted in full)",
+                                    prev_roots.len(),
+                                    target_roots.len()
+                                ));
                                 loop {
                                     let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&bg_state);
                                     match pathindexing::handle_pathindexing_change(
@@ -4351,6 +4448,10 @@ fn run_fsevent_stream(
                                     ) {
                                         Ok(()) => {
                                             eprintln!("[pathindexing] background scan done");
+                                            diag::log(format!(
+                                                "pathindexing change scan done in {:.0}s",
+                                                scan_started.elapsed().as_secs_f32()
+                                            ));
                                             if let Ok(c) = db_connection(&bg_state.db_path) {
                                                 let roots_str: Vec<String> = target_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
                                                 let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
@@ -4359,6 +4460,10 @@ fn run_fsevent_stream(
                                         }
                                         Err(e) => {
                                             eprintln!("[pathindexing] change handling error: {e}");
+                                            diag::log(format!(
+                                                "pathindexing change scan FAILED after {:.0}s: {e}",
+                                                scan_started.elapsed().as_secs_f32()
+                                            ));
                                         }
                                     }
                                     // Check if extra_roots changed while we were scanning
@@ -4390,6 +4495,13 @@ fn run_fsevent_stream(
             }
             Ok(mac::fsevent_watcher::FsEvent::MustScanSubDirs(path)) => {
                 must_scan_count += 1;
+                if let Some(n) = must_scan_storm.record() {
+                    diag::log(format!(
+                        "ALERT: FSEvents overflow storm — {n} MustScanSubDirs events within \
+                         5min (last={}); subtree rescans will churn until the source calms down",
+                        path.display()
+                    ));
+                }
                 if replay_phase
                     && must_scan_count >= MUST_SCAN_THRESHOLD
                     && !full_scan_triggered
@@ -4397,6 +4509,10 @@ fn run_fsevent_stream(
                     perf_log(format!(
                         "conditional_startup: MustScanSubDirs={} >= threshold, triggering full scan",
                         must_scan_count
+                    ));
+                    diag::log(format!(
+                        "startup replay: MustScanSubDirs={must_scan_count} ≥ {MUST_SCAN_THRESHOLD} \
+                         → escalating to a full index pass"
                     ));
                     full_scan_triggered = true;
                     if let Some(app) = app {
@@ -4421,6 +4537,7 @@ fn run_fsevent_stream(
                     &mut deadline,
                     &mut last_status_emit,
                     &mut pending_status_emit,
+                    &mut busy_streak,
                 );
                 if replay_phase {
                     replay_phase = false;
@@ -4448,6 +4565,7 @@ fn run_fsevent_stream(
                     &mut deadline,
                     &mut last_status_emit,
                     &mut pending_status_emit,
+                    &mut busy_streak,
                 );
             }
         }
@@ -4493,6 +4611,7 @@ fn run_fsevent_stream(
         &mut deadline,
         &mut last_status_emit,
         &mut pending_status_emit,
+        &mut busy_streak,
     );
 
     if rebuild_requested && !state.watcher_stop.load(AtomicOrdering::Acquire) {
@@ -4775,6 +4894,11 @@ fn restart_app(app: AppHandle) {
 
 #[tauri::command]
 fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    if !state.is_writer.load(AtomicOrdering::Acquire) {
+        return Err(
+            "Another Everything instance owns the index; this window is read-only.".to_string(),
+        );
+    }
     #[cfg(target_os = "windows")]
     {
         win::start_windows_indexing(app, state.inner().clone());
@@ -4788,6 +4912,11 @@ fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()>
 
 #[tauri::command]
 async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    if !state.is_writer.load(AtomicOrdering::Acquire) {
+        return Err(
+            "Another Everything instance owns the index; this window is read-only.".to_string(),
+        );
+    }
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if state.indexing_active.load(AtomicOrdering::Acquire) {
@@ -5265,7 +5394,7 @@ fn run_db_search(
                 // Phase 2 fallback (query < 3 chars or FTS rebuilding):
                 // contains-match (LIKE '%q%') with tight time budget.
                 let phase2_start = Instant::now();
-                conn.progress_handler(
+                let _ = conn.progress_handler(
                     2_000,
                     Some(move || phase2_start.elapsed().as_millis() > 5),
                 );
@@ -5298,7 +5427,7 @@ fn run_db_search(
                     }
                 }
 
-                conn.progress_handler(0, None::<fn() -> bool>);
+                let _ = conn.progress_handler(0, None::<fn() -> bool>);
             }
 
             } // end sort_by == "name" branch
@@ -5552,7 +5681,7 @@ fn run_db_search(
                     // Phase B: time-budgeted contains fallback if prefix found too few
                     if results.len() < effective_limit as usize {
                         let path_start = Instant::now();
-                        conn.progress_handler(
+                        let _ = conn.progress_handler(
                             2_000,
                             Some(move || path_start.elapsed().as_millis() > 5),
                         );
@@ -5587,7 +5716,7 @@ fn run_db_search(
                             }
                         }
 
-                        conn.progress_handler(0, None::<fn() -> bool>);
+                        let _ = conn.progress_handler(0, None::<fn() -> bool>);
 
                         // Deduplicate (Phase A prefix results overlap with Phase B contains)
                         let mut seen = std::collections::HashSet::new();
@@ -7097,6 +7226,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
+    // Post-mortem diagnostics (shared with --daemon/--mcp): rebuild loops,
+    // writer overlap, and event storms self-report to logs/everything.log —
+    // field incidents are otherwise unreproducible, and a Finder-launched
+    // process has no visible stderr.
+    diag::init(&app_data_dir, "gui");
+
     let db_path = app_data_dir.join(DB_FILE_NAME);
     let home_dir = resolve_home_dir();
 
@@ -7110,9 +7245,18 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     }
     // The GUI owns index writes while it runs; hold the beacon for the process
     // lifetime so the headless MCP-spawned daemon defers to us (single writer).
-    daemon::hold_gui_beacon(&db_path);
+    // A second GUI instance that loses this race becomes read-only (below), so
+    // two GUIs never write the same WAL DB.
+    let beacon_held = daemon::hold_gui_beacon(&db_path);
     eprintln!("[startup] +{}ms building AppState (pathignore + pathindexing)...", setup_started.elapsed().as_millis());
     let state = build_app_state(db_path, home_dir, &app_data_dir);
+    state.is_writer.store(beacon_held, AtomicOrdering::Release);
+    if !beacon_held {
+        eprintln!(
+            "[startup] gui.lock beacon not acquired -- another instance owns index \
+             writes; this GUI runs READ-ONLY (no watcher / indexer / purge)"
+        );
+    }
     eprintln!("[startup] +{}ms AppState created ({} extra roots)", setup_started.elapsed().as_millis(), state.extra_roots.lock().len());
     app.manage(state.clone());
     // Context menu item IDs use the "ctx_" prefix by convention.
@@ -7177,8 +7321,49 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         // through (WAL-safe: the daemon skips VACUUM while the beacon is held).
         daemon::wait_for_daemon_exit(&state.db_path);
 
+        // Single-writer gate. Only the beacon-holding GUI starts the index
+        // writers below (watcher / indexer / purge); a second GUI instance runs
+        // read-only — search still works via the read connection pool — so two
+        // GUIs can never write the same WAL DB concurrently.
+        let gui_is_writer = state.is_writer.load(AtomicOrdering::Acquire);
+        if gui_is_writer {
+            // Never overlap a resident daemon that is still mid-build: keep
+            // waiting here (this runs on the init thread only; the UI already
+            // searches read-only) until the daemon observes our beacon, yields,
+            // and releases daemon.lock — then we take over as sole writer.
+            // Generously capped so a wedged daemon can't park the GUI indexer
+            // forever (fallback: proceed anyway — WAL keeps writes safe).
+            let deferral_started = std::time::Instant::now();
+            const DAEMON_YIELD_CAP: Duration = Duration::from_secs(300);
+            let mut logged = false;
+            while daemon::daemon_running(&state.db_path) {
+                if deferral_started.elapsed() >= DAEMON_YIELD_CAP {
+                    eprintln!(
+                        "[startup] daemon still resident after {}s; proceeding as writer (fallback)",
+                        DAEMON_YIELD_CAP.as_secs()
+                    );
+                    diag::log(format!(
+                        "ALERT: daemon did not yield within {}s; GUI proceeding as writer \
+                         (dual-writer risk — expect SQLITE_BUSY on one side)",
+                        DAEMON_YIELD_CAP.as_secs()
+                    ));
+                    break;
+                }
+                if !logged {
+                    eprintln!("[startup] daemon still building the index; GUI stays read-only until it yields");
+                    diag::log("daemon mid-build at GUI launch; GUI defers index writes until it yields");
+                    logged = true;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        } else {
+            eprintln!("[startup] read-only instance; not starting index writers (watcher / indexer / purge)");
+            diag::log("read-only GUI instance (gui.lock beacon lost): watcher/indexer disabled");
+            emit_index_state(&app_handle, "Ready", None);
+        }
+
         // Deferred housekeeping -- purge + status counts run in background
-        {
+        if gui_is_writer {
             let hk_app = app_handle.clone();
             let hk_state = state.clone();
             std::thread::spawn(move || {
@@ -7223,7 +7408,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         }
 
         #[cfg(target_os = "macos")]
-        {
+        if gui_is_writer {
             if bench_mode {
                 let _ = start_full_index_worker(app_handle.clone(), state.clone());
             } else {
@@ -7232,7 +7417,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         .ok()
                         .map(|c| {
                             let eid = get_meta(&c, "last_event_id")
-                                .and_then(|v| v.parse::<u64>().ok());
+                                .and_then(|v| v.parse::<u64>().ok())
+                                // Legacy DBs may hold u64::MAX (the SinceNow
+                                // sentinel) from the old max-tracker bug; treat
+                                // it as "no prior id" so we don't replay from
+                                // "since now" and miss the offline gap.
+                                .filter(|&id| id != u64::MAX);
                             let complete = get_meta(&c, "index_complete")
                                 .map(|v| v == "1")
                                 .unwrap_or(false);
@@ -7252,6 +7442,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 let effective_complete = index_complete && !entries_empty;
 
                 if stored_event_id.is_some() && effective_complete {
+                    diag::log(format!(
+                        "startup: conditional (event-id replay; full pass only on \
+                         MustScanSubDirs ≥ {MUST_SCAN_THRESHOLD})"
+                    ));
                     // Seed status counts from the cached meta (read above on
                     // the same connection) before the watcher starts, so its
                     // incremental count updates build on the last known total
@@ -7330,6 +7524,13 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                                 added.len(),
                                 removed.len()
                             );
+                            diag::log(format!(
+                                "startup pathindexing diff: +{} added -{} removed → full extra-root \
+                                 scan (an interrupted scan repeats in full on the next launch)",
+                                added.len(),
+                                removed.len()
+                            ));
+                            let scan_started = Instant::now();
                             // Wait for initial watcher replay to finish
                             while scan_state.indexing_active.load(std::sync::atomic::Ordering::Acquire) {
                                 std::thread::sleep(Duration::from_secs(1));
@@ -7340,6 +7541,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                             ) {
                                 Ok(()) => {
                                     eprintln!("[pathindexing] startup scan done");
+                                    diag::log(format!(
+                                        "startup pathindexing scan done in {:.0}s",
+                                        scan_started.elapsed().as_secs_f32()
+                                    ));
                                     // Update stored roots
                                     if let Ok(c) = db_connection(&scan_state.db_path) {
                                         let roots_str: Vec<String> = current_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
@@ -7348,7 +7553,13 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                                     let _ = refresh_and_emit_status_counts(Some(&scan_app), &scan_state);
                                     scan_app.emit("pathindexing_changed", ()).ok();
                                 }
-                                Err(e) => eprintln!("[pathindexing] startup scan error: {e}"),
+                                Err(e) => {
+                                    eprintln!("[pathindexing] startup scan error: {e}");
+                                    diag::log(format!(
+                                        "startup pathindexing scan FAILED after {:.0}s: {e}",
+                                        scan_started.elapsed().as_secs_f32()
+                                    ));
+                                }
                             }
                             scan_state.pathindexing_active.store(false, AtomicOrdering::Release);
                         });
@@ -7357,6 +7568,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                     if !effective_complete {
                         eprintln!("[mac] index incomplete or entries empty; starting full index");
                     }
+                    diag::log(format!(
+                        "startup: full index (stored_event_id={stored_event_id:?} \
+                         index_complete={index_complete} entries_empty={entries_empty})"
+                    ));
                     let _ = start_full_index_worker(app_handle.clone(), state.clone());
                     start_fsevent_watcher_worker(Some(app_handle.clone()), state.clone(), None, false);
                 }
@@ -7364,16 +7579,16 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         }
 
         #[cfg(target_os = "windows")]
-        {
+        if gui_is_writer {
             win::start_windows_indexing(app_handle.clone(), state.clone());
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
+        if gui_is_writer {
             let _ = start_full_index_worker(app_handle.clone(), state.clone());
         }
 
-        if bench_mode {
+        if gui_is_writer && bench_mode {
             start_bench_runner(app_handle.clone(), state.clone());
         }
 
@@ -7560,6 +7775,7 @@ mod tests {
             home_dir: home_dir.clone(),
             scan_root: home_dir.clone(),
             cwd,
+            is_writer: Arc::new(AtomicBool::new(true)),
             path_ignores: Arc::new(Vec::new()),
             path_ignore_patterns: Arc::new(Vec::new()),
             db_ready: Arc::new(AtomicBool::new(true)),

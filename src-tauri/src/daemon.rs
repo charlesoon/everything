@@ -17,6 +17,8 @@
 //! runs MCP still gets a resident, self-healing indexer that outlives the MCP
 //! session.
 
+#[cfg(target_os = "macos")]
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 
+use crate::diag;
 use crate::mcp_server::default_db_path;
 use crate::{
     build_app_state, cleanup_entries_gc_tables, db_connection, ensure_db_indexes,
@@ -83,8 +86,9 @@ fn try_acquire_daemon_lock(db_path: &Path) -> Option<File> {
     try_acquire(&daemon_lock_path(db_path))
 }
 
-/// Whether a daemon is already resident (holds `daemon.lock`).
-fn daemon_running(db_path: &Path) -> bool {
+/// Whether a daemon is already resident (holds `daemon.lock`). Exposed so the
+/// GUI can defer starting its own writers until a resident daemon has yielded.
+pub(crate) fn daemon_running(db_path: &Path) -> bool {
     try_acquire_daemon_lock(db_path).is_none()
 }
 
@@ -113,6 +117,10 @@ pub(crate) fn hold_gui_beacon(db_path: &Path) -> bool {
                  daemon may not yield index writes to the GUI",
                 gui_lock_path(db_path).display()
             );
+            diag::log(format!(
+                "WARNING: gui.lock beacon not acquired ({}) — another GUI instance owns index writes",
+                gui_lock_path(db_path).display()
+            ));
             false
         }
     }
@@ -133,12 +141,19 @@ pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
                  daemon skips VACUUM while the GUI beacon is held)",
                 DAEMON_EXIT_WAIT.as_secs()
             );
+            diag::log(format!(
+                "ALERT: daemon still resident after {}s wait — GUI proceeding \
+                 (dual-writer window: the daemon is likely mid-build and passes can \
+                 now fail with SQLITE_BUSY on either side)",
+                DAEMON_EXIT_WAIT.as_secs()
+            ));
             return;
         }
         std::thread::sleep(GUI_POLL_INTERVAL);
     }
     if waited {
         eprintln!("[gui] daemon yielded; GUI now owns index writes");
+        diag::log("daemon yielded; GUI owns index writes");
     }
 }
 
@@ -178,14 +193,16 @@ fn fresh_and_dirty(db_path: &Path) -> (bool, bool) {
 /// finalization the `app:None` path skips: secondary indexes, FTS rebuild, GC,
 /// and storage maintenance (VACUUM / WAL truncate) — mirroring the GUI's
 /// finalizing thread. `indexing_active` is held for the whole pass so a live
-/// watcher stands down instead of racing this writer.
-fn build_index(db_path: &Path, state: &AppState) {
+/// watcher stands down instead of racing this writer. Returns the pass result
+/// so the supervisory loops can count consecutive failures (rebuild-loop
+/// detection in the diag log).
+fn build_index(db_path: &Path, state: &AppState) -> Result<(), String> {
     state.indexing_active.store(true, Ordering::Release);
     let (is_fresh, fts_dirty) = fresh_and_dirty(db_path);
     let result = run_incremental_index(None, state);
     // Ensure the guard is cleared even on error (the Ok path also clears it).
     state.indexing_active.store(false, Ordering::Release);
-    match result {
+    match &result {
         Ok(()) => {
             if is_fresh || fts_dirty {
                 finalize_fresh_index(state);
@@ -210,6 +227,7 @@ fn build_index(db_path: &Path, state: &AppState) {
         }
         Err(e) => eprintln!("[daemon] index pass failed: {e}"),
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -223,23 +241,34 @@ pub fn spawn_detached() {
     let db_path = default_db_path();
     if gui_is_running(&db_path) {
         eprintln!("[daemon] GUI owns index writes; not spawning a daemon");
+        diag::log("bootstrap: GUI owns index writes; not spawning a daemon");
         return;
     }
     if daemon_running(&db_path) {
+        diag::log("bootstrap: daemon already resident");
         return; // one is already resident
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[daemon] spawn skipped: current_exe failed: {e}");
+            diag::log(format!("daemon spawn skipped: current_exe failed: {e}"));
             return;
         }
     };
+    // The detached daemon has no terminal, so its stderr (every existing
+    // eprintln! diagnostic) goes to the shared diag log instead of /dev/null —
+    // field incidents (rebuild loops, failed passes) stay reconstructible.
+    let stderr = db_path
+        .parent()
+        .and_then(diag::append_handle)
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
     let mut cmd = Command::new(exe);
     cmd.arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     // Detach from the caller's process group so the daemon survives the caller
     // (e.g. an MCP session) exiting or being group-killed.
     #[cfg(unix)]
@@ -256,8 +285,14 @@ pub fn spawn_detached() {
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     match cmd.spawn() {
-        Ok(_) => eprintln!("[daemon] spawned detached indexer daemon"),
-        Err(e) => eprintln!("[daemon] spawn failed: {e}"),
+        Ok(_) => {
+            eprintln!("[daemon] spawned detached indexer daemon");
+            diag::log("spawned detached indexer daemon");
+        }
+        Err(e) => {
+            eprintln!("[daemon] spawn failed: {e}");
+            diag::log(format!("daemon spawn FAILED: {e}"));
+        }
     }
 }
 
@@ -270,6 +305,13 @@ pub fn spawn_detached() {
 pub fn run_daemon() {
     let db_path = default_db_path();
     let home_dir = resolve_home_dir();
+    let app_data_dir = db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    // Structured post-mortem trail alongside raw stderr (which spawn_detached
+    // already points at the same file): timestamps + pass boundaries + ALERTs.
+    diag::init(&app_data_dir, "daemon");
     eprintln!(
         "[daemon] everything indexer daemon v{} db={}",
         env!("CARGO_PKG_VERSION"),
@@ -279,32 +321,34 @@ pub fn run_daemon() {
     // Defer to the GUI, which owns all writes while it runs.
     if gui_is_running(&db_path) {
         eprintln!("[daemon] GUI is running; it owns index writes — exiting");
+        diag::log("GUI is running; exiting (it owns index writes)");
         return;
     }
     let Some(_lock) = try_acquire_daemon_lock(&db_path) else {
         eprintln!("[daemon] another daemon already running; exiting");
+        diag::log("another daemon already resident; exiting");
         return;
     };
 
-    let app_data_dir = db_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
     if let Err(e) = fs::create_dir_all(&app_data_dir) {
         eprintln!("[daemon] create data dir failed: {e}");
+        diag::log(format!("FATAL: create data dir failed: {e}"));
         return;
     }
     if let Err(e) = init_db_tables(&db_path) {
         eprintln!("[daemon] init_db_tables failed: {e}");
+        diag::log(format!("FATAL: init_db_tables failed: {e}"));
         return;
     }
 
     let state = build_app_state(db_path.clone(), home_dir, &app_data_dir);
 
     // Startup reconcile: a fresh build if the DB is empty, otherwise a catchup
-    // covering everything changed while no daemon was running.
-    build_index(&db_path, &state);
+    // covering everything changed while no daemon was running. A failure is
+    // not fatal — the supervisory loop below heals it (and logs the loop).
+    let _ = build_index(&db_path, &state);
     eprintln!("[daemon] index ready; entering resident mode");
+    diag::log("entering resident mode");
 
     #[cfg(target_os = "macos")]
     run_macos_resident(db_path, state);
@@ -320,6 +364,7 @@ pub fn run_daemon() {
 #[cfg(target_os = "macos")]
 fn yield_to_gui(state: &AppState) {
     eprintln!("[daemon] GUI now running; yielding writes and exiting");
+    diag::log("GUI appeared; yielding index writes and exiting");
     state.watcher_stop.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(3);
     while state.watcher_active.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -338,6 +383,14 @@ fn run_macos_resident(db_path: PathBuf, state: AppState) {
     // `None` => supervise on the first loop iteration, so a failed startup build
     // is healed immediately rather than after one SUPERVISE_INTERVAL.
     let mut last_supervise: Option<Instant> = None;
+    // Self-diagnosis: a healthy daemon heals at most once (after a failed
+    // startup build), so repeated heals or watcher restarts are the signature
+    // of the field pathologies we can't reproduce on demand — a rebuild loop
+    // (every heal rescans all roots at full parallelism = sustained multi-core
+    // CPU) or a flapping FSEvents worker. Count them and ALERT in the diag log.
+    let mut heal_times: VecDeque<Instant> = VecDeque::new();
+    let mut consecutive_failed_builds: u32 = 0;
+    let mut watcher_restarts = diag::RateAlert::new(Duration::from_secs(3600), 5);
     loop {
         if gui_is_running(&db_path) {
             yield_to_gui(&state);
@@ -348,12 +401,59 @@ fn run_macos_resident(db_path: PathBuf, state: AppState) {
             // Heal an incomplete/failed build so MCP never stays stuck.
             if !index_complete(&db_path) {
                 eprintln!("[daemon] index incomplete; (re)building");
-                build_index(&db_path, &state);
+                heal_times.push_back(Instant::now());
+                while heal_times
+                    .front()
+                    .map_or(false, |t| t.elapsed() > Duration::from_secs(3600))
+                {
+                    heal_times.pop_front();
+                }
+                diag::log(format!(
+                    "supervise heal #{} this hour: index_complete != 1 → full index pass \
+                     (consecutive failures so far: {})",
+                    heal_times.len(),
+                    consecutive_failed_builds
+                ));
+                if heal_times.len() == 3 {
+                    diag::log(
+                        "ALERT: 3 supervise heals within an hour — rebuild loop: index_complete \
+                         never sticks (persistently failing pass, or another writer clearing it); \
+                         every heal rescans all roots at full parallelism",
+                    );
+                }
+                match build_index(&db_path, &state) {
+                    Ok(()) => {
+                        consecutive_failed_builds = 0;
+                        if !index_complete(&db_path) {
+                            diag::log(
+                                "ALERT: index pass succeeded but index_complete is still != 1 — \
+                                 the meta write was lost or clobbered; the next supervise tick \
+                                 will rebuild again",
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        consecutive_failed_builds += 1;
+                        if consecutive_failed_builds == 3 {
+                            diag::log(format!(
+                                "ALERT: {consecutive_failed_builds} consecutive index passes \
+                                 failed; daemon keeps retrying every {}s (error details above)",
+                                SUPERVISE_INTERVAL.as_secs()
+                            ));
+                        }
+                    }
+                }
             }
             // Restart the watcher if it died (e.g. FSEvents init failure left
             // the worker thread dead).
             if !state.watcher_active.load(Ordering::Acquire) {
                 eprintln!("[daemon] watcher not active; restarting");
+                if let Some(n) = watcher_restarts.record() {
+                    diag::log(format!(
+                        "ALERT: FSEvents watcher restarted {n} times in the last hour \
+                         (stream init failing or the worker thread keeps dying)"
+                    ));
+                }
                 start_watcher(&db_path, &state);
             }
         }
@@ -384,6 +484,10 @@ fn stored_event_id(db_path: &Path) -> Option<u64> {
         .ok()
         .and_then(|c| get_meta(&c, "last_event_id"))
         .and_then(|v| v.parse::<u64>().ok())
+        // Legacy DBs may hold u64::MAX (the SinceNow sentinel) from the old
+        // max-tracker bug; treat it as "no prior id" rather than replaying from
+        // "since now" (which would skip everything changed while we were down).
+        .filter(|&id| id != u64::MAX)
 }
 
 /// Non-macOS: no headless live watcher yet, so reconcile on `CATCHUP_INTERVAL`.
@@ -392,14 +496,28 @@ fn stored_event_id(db_path: &Path) -> Option<u64> {
 #[cfg(not(target_os = "macos"))]
 fn run_polling_resident(db_path: PathBuf, state: AppState) {
     let mut last_catchup = Instant::now();
+    let mut consecutive_failed_builds: u32 = 0;
     loop {
         if gui_is_running(&db_path) {
             eprintln!("[daemon] GUI now running; exiting");
+            diag::log("GUI appeared; yielding index writes and exiting");
             return;
         }
         if last_catchup.elapsed() >= CATCHUP_INTERVAL {
             last_catchup = Instant::now();
-            build_index(&db_path, &state);
+            match build_index(&db_path, &state) {
+                Ok(()) => consecutive_failed_builds = 0,
+                Err(_) => {
+                    consecutive_failed_builds += 1;
+                    if consecutive_failed_builds == 3 {
+                        diag::log(format!(
+                            "ALERT: {consecutive_failed_builds} consecutive index passes failed; \
+                             daemon keeps retrying every {}s (error details above)",
+                            CATCHUP_INTERVAL.as_secs()
+                        ));
+                    }
+                }
+            }
         }
         std::thread::sleep(GUI_POLL_INTERVAL);
     }
