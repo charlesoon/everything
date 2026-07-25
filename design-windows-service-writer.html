@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>설계 v4: Windows 관리자 서비스 writer 전환 — 설치형 서비스 + read-only GUI/MCP</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a2e; --muted: #5c6470;
+    --accent: #2563eb; --border: #e2e8f0; --code-bg: #f1f5f9;
+    --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+    --ok-bg: #f0fdf4; --warn-bg: #fffbeb; --bad-bg: #fef2f2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1117; --fg: #e5e9f0; --muted: #9aa4b2;
+      --accent: #60a5fa; --border: #2a3140; --code-bg: #1a2030;
+      --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+      --ok-bg: #10241a; --warn-bg: #272013; --bad-bg: #2a1518;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 24px; background: var(--bg); color: var(--fg);
+    font-family: "Segoe UI", "Malgun Gothic", system-ui, sans-serif;
+    font-size: 15px; line-height: 1.75;
+  }
+  main { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 25px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 32px; font-size: 14px; }
+  h2 { font-size: 20px; margin: 48px 0 16px; padding-bottom: 8px; border-bottom: 2px solid var(--border); }
+  h3 { font-size: 16px; margin: 26px 0 10px; }
+  code {
+    font-family: "Cascadia Code", Consolas, monospace; font-size: 13px;
+    background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 14px; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  .ref { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+  .goal {
+    border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    background: var(--code-bg); padding: 14px 18px; border-radius: 0 8px 8px 0; margin: 16px 0;
+  }
+  .badge {
+    display: inline-block; font-size: 12px; font-weight: 700; padding: 1px 10px;
+    border-radius: 999px; margin-right: 8px; vertical-align: 1px;
+  }
+  .b-ok   { background: var(--ok-bg);   color: var(--ok);   border: 1px solid var(--ok); }
+  .b-warn { background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn); }
+  .b-bad  { background: var(--bad-bg);  color: var(--bad);  border: 1px solid var(--bad); }
+  .b-info { background: var(--code-bg); color: var(--accent); border: 1px solid var(--accent); }
+  .card {
+    border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin: 14px 0;
+  }
+  .card h4 { margin: 0 0 6px; font-size: 15px; }
+  .card p { margin: 6px 0; }
+  .flow {
+    background: var(--code-bg); border-radius: 10px; padding: 18px 20px;
+    font-family: "Cascadia Code", Consolas, monospace; font-size: 13px;
+    line-height: 1.9; overflow-x: auto; white-space: pre;
+  }
+  ul, ol { padding-left: 24px; }
+  li { margin: 4px 0; }
+  .decision {
+    border: 2px solid var(--accent); border-radius: 10px; padding: 16px 20px; margin: 20px 0;
+    background: var(--code-bg);
+  }
+  .decision h4 { margin: 0 0 8px; font-size: 15px; }
+</style>
+</head>
+<body>
+<main>
+<h1>설계 v4: Windows 관리자 서비스 writer 전환</h1>
+<p class="subtitle">설치형 관리자 서비스가 index.db 쓰기를 전담하고, GUI·MCP는 read-only가 되는 구조 — Everything v0.5.1 코드 분석 기반 설계안 (2026-07-23) · Q1–Q4 확정 · v2: 1차 리뷰 25건(§9) · v3: 2차 리뷰 19건(§10) · <b>v4: 3차 리뷰 — 신규 P1 4·P2 6 및 잔여 부분해결 반영(§11)</b></p>
+
+<div class="goal">
+<b>목표 (요구사항)</b>
+<ol style="margin:8px 0 0">
+  <li>Windows에서 <b>설치 시점에 관리자 권한 서비스를 등록</b>한다</li>
+  <li>서비스로 등록된 프로세스가 <b>index.db 쓰기를 전담</b>한다</li>
+  <li>인스톨러가 <b>설치 시 관리자 권한(UAC)을 받아 서비스를 등록</b>한다</li>
+  <li>인스톨러를 <b>백그라운드(silent)로 실행해도</b> 서비스가 자동 등록된다 — 승격 경로는 두 가지로 정의: (a) 이미 승격된 배포 채널(SCCM/Intune/관리자 콘솔)은 완전 무인, (b) 대화형 세션은 UAC 동의 1회. <b>비대화형·비승격 세션에서는 승격이 불가능하므로 실패가 정상 동작</b>이며 종료 코드로 보고한다.</li>
+  <li>GUI 프로세스와 <code>--mcp</code> 프로세스는 <b>모두 DB read만</b> 수행한다</li>
+</ol>
+</div>
+
+<!-- ============================================================ -->
+<h2>1. 현행 구조 vs 목표 구조</h2>
+
+<p>현행(v0.5.x)은 <b>"writer가 상황에 따라 바뀌는" 모델</b>입니다: GUI가 떠 있으면 GUI가 writer, 없으면 비관리자 daemon이 writer. 그래서 <code>gui.lock</code>/<code>daemon.lock</code> 핸드셰이크, 인덱싱 패스 협조적 취소, GUI 감시 스레드 같은 <b>writer 인계 장치</b>가 필요했습니다 <span class="ref">daemon.rs:36-61, 194-252 / main.rs:7170, 7235</span>.</p>
+
+<p>목표 구조는 <b>"writer가 영원히 하나로 고정되는" 모델</b>입니다. 설치 시 등록된 관리자 서비스가 유일한 writer이고, GUI·MCP는 언제나 reader입니다. writer 인계 자체가 사라지므로 핸드셰이크 계열 장치가 Windows에서 전부 불필요해지고, 관리자 권한이 상시 보장되므로 MFT 스캔 + USN 저널 체인을 항상 사용할 수 있습니다.</p>
+
+<div class="flow">■ 현행 (v0.5.x)                             ■ 목표
+
+ GUI 실행 중 ──────────────┐                 ┌─ EverythingIndexer 서비스 ────────────┐
+   GUI = writer            │                 │  (LocalSystem, 설치 시 등록, 상시 상주)  │
+   (MFT/USN은 관리자일 때만) │                 │  · 유일한 index.db WRITER              │
+                           │  writer가       │  · MFT fresh 스캔 + USN 실시간 감시     │
+ GUI 없음 ─────────────────┤  수시로         │  · 인덱싱 트리거 단일 큐(§3.1)          │
+   daemon = writer         │  바뀜           │  · named pipe (status/reset/migrate)   │
+   (비관리자 RDCW 감시)      │                 └────────────────┬───────────────────────┘
+                           │                        write     │
+ MCP = reader ─────────────┘                                  ▼
+                                                 ┌─ ProgramData\com.everything.app ─┐
+ 조정 장치: gui.lock / daemon.lock               │  data\index.db  (Users: 읽기 전용) │
+   취소 플래그 / GUI 감시 스레드                   │  config\ 사이드카 (Users: 수정 가능)│
+   wait_for_daemon_exit(10s) …                   └──────┬──────────────┬────────────┘
+                                             READ_ONLY  │  READ_ONLY   │
+                                                        ▼              ▼
+                                                  GUI (read-only)  --mcp (read-only)
+                                                  검색·파일조작·UI    검색 전용
+                                                        │
+                                                        └─ 명령·상태는 named pipe로 서비스와 통신</div>
+
+<table>
+  <tr><th style="width:22%">항목</th><th style="width:39%">현행 (v0.5.x)</th><th>목표</th></tr>
+  <tr><td>index.db writer</td><td>GUI(실행 중) ↔ daemon(부재 시) — 수시 교대</td><td><b>서비스 하나로 고정</b> (교대 없음)</td></tr>
+  <tr><td>쓰기 권한</td><td>사용자 권한 (GUI를 관리자로 띄웠을 때만 MFT/USN)</td><td><b>LocalSystem 상시</b> → MFT/USN 항상 가용</td></tr>
+  <tr><td>인덱싱 범위</td><td colspan="2"><b>변경 없음: <code>C:\</code> 단일 볼륨</b> (시스템 볼륨 = NTFS는 Windows 요구사항). 타 드라이브·mount point·ReFS는 현행에도 미지원이며 이번 설계의 비범위. <code>.pathindexing</code> extra root도 <b>C:\ 볼륨 내로 제한</b>(비-C는 거부, D1·R7)</td></tr>
+  <tr><td>감시(watcher)</td><td>GUI: USN(관리자)/RDCW(비관리자) · daemon: RDCW + 1시간 reconcile</td><td><b>USN 저널</b> (C:\, 유실·랩 시 재스캔) + <b>서비스 내 최후 폴백</b>: USN 기동 실패 시 주기 reconcile 재스캔</td></tr>
+  <tr><td>writer 조정</td><td><code>gui.lock</code>·<code>daemon.lock</code>·취소 플래그·GUI 감시 스레드</td><td><b>불필요 (Windows)</b> — 프로세스 간은 구조적 single-writer, 프로세스 내부는 단일 인덱서 큐 + watcher 정지 장벽(§3.1)</td></tr>
+  <tr><td>DB 위치</td><td><code>%APPDATA%\com.everything.app\index.db</code> (사용자별) <span class="ref">mcp_server.rs:78-95</span></td><td><code>&lt;ProgramData&gt;\com.everything.app\data\index.db</code> (머신 전역, Known Folder API로 해석 — 하드코딩 금지)</td></tr>
+  <tr><td>GUI 첫 실행</td><td>GUI가 직접 MFT 스캔 (MemIndex로 임시 대응)</td><td>서비스가 설치 직후 선-인덱싱 → 평시 GUI는 열자마자 검색 가능 (부팅 직후 등 서비스보다 GUI가 먼저 뜨는 창은 §4-2에 정의)</td></tr>
+  <tr><td>관리자 권한 요구 시점</td><td>MFT를 쓰려면 GUI 자체를 관리자로 실행해야 함</td><td><b>설치 시 1회(UAC)</b> — 이후 GUI/MCP는 영원히 일반 권한</td></tr>
+  <tr><td>macOS</td><td colspan="2">변경 없음 — 기존 GUI↔daemon 핸드셰이크 모델 유지 (<code>#[cfg]</code>로 격리)</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. 핵심 설계 결정</h2>
+
+<div class="decision">
+<h4>D1. DB를 <code>&lt;ProgramData&gt;\com.everything.app\</code>로 이동하고, <b>data/config를 ACL로 분리</b>한다</h4>
+<p><b>이유</b>: 서비스는 LocalSystem으로 실행되어 사용자별 <code>%APPDATA%</code>를 자연스럽게 가리킬 수 없고, 인덱스 대상 자체가 <code>C:\</code> 전체(머신 전역)이므로 사용자마다 사본을 두는 것이 원래 낭비였습니다. 경로는 Rust에서 <code>SHGetKnownFolderPath(FOLDERID_ProgramData)</code>(또는 <code>%ProgramData%</code> 환경변수)로 해석 — <code>C:\ProgramData</code> 문자열 하드코딩 금지.</p>
+<p><b>디렉터리 구조와 ACL</b> (최소 권한):</p>
+<ul style="margin:6px 0">
+  <li><code>data\</code> — index.db·<code>-wal</code>·<code>-shm</code>·<code>usn.cursor</code>·이관 마커·로그. <b>Users: 읽기 전용(RX)</b>, SYSTEM/Administrators: Full. 일반 사용자의 DB·마커 훼손 벡터를 원천 제거.</li>
+  <li><code>config\</code> — <code>.pathignore</code>·<code>.pathindexing</code> 사이드카. <b>Users: Modify</b> — GUI(일반 권한)가 설정을 편집해야 하므로. 현행 코드는 사이드카를 DB와 같은 디렉터리에 두므로 <span class="ref">main.rs:453-468</span> <code>build_app_state</code>가 config 경로를 별도 인자로 받도록 수정.</li>
+</ul>
+<p><b>생성 주체와 선점(planting) 방지</b>: 디렉터리 생성·소유권·ACL 설정은 <b>인스톨러(승격 컨텍스트)가 서비스 시작 전에</b> 수행합니다(§3.2 훅 0단계) — 기존에 같은 이름으로 선점된 디렉터리·junction이 있으면 소유권·ACL을 재설정. 서비스는 시작 시 <b>handle 기반 검증</b>을 추가로 수행: <code>FILE_FLAG_OPEN_REPARSE_POINT</code>로 열어 reparse point가 아님을 확인하고 owner가 SYSTEM/Administrators인지 검사 — 불일치 시 <b>기동 거부 + 이벤트 로그</b>(LocalSystem이 심긴 junction을 따라가 임의 위치에 쓰는 공격 차단).</p>
+<p><b>config는 비신뢰 입력이자 제한된 채널</b>:</p>
+<ul style="margin:6px 0">
+  <li><b><code>.pathindexing</code> root는 C:\ 볼륨 내로 제한</b> — canonicalize 후 볼륨 검증, 비-C·비존재·reparse 경유 경로는 <b>무시 + 로그 + status 경고</b>. LocalSystem이 임의 위치를 스캔하도록 유도하는 confused-deputy를 차단.</li>
+  <li><b>절대경로 전용 규약</b>: 머신 전역 config에서 <code>~</code>/홈 상대 규칙은 <b>거부 + 로그</b> — 현행 해석은 실행 계정의 home이라 <span class="ref">main.rs:1187-1219</span> LocalSystem에서는 systemprofile이 되어 사용자 의도와 어긋나기 때문. 이관 시 GUI가 자기 홈 기준 절대경로로 정규화해 전송(§5).</li>
+  <li>크기·항목 수 상한, 파싱 오류 무시. <code>.pathignore</code>로 인덱스를 사실상 비우는 가용성 공격은 <b>R9 수용 리스크</b>(변경 사실 로그 + 힐링).</li>
+  <li><b>서비스와 Windows GUI는 기본 사이드카 파일을 생성하지 않습니다</b>(파일 부재 = 내장 기본 규칙). 현행의 기본 템플릿 생성 <span class="ref">main.rs:1305 / pathindexing.rs:26-31</span>은 Windows에서 "편집 UI를 열 때 온디맨드 생성"으로 변경.</li>
+</ul>
+<p><b>read-only WAL reader의 성립 조건 (정직한 서술)</b>: SQLite 3.22+는 <code>-wal</code>/<code>-shm</code>이 존재하고 읽을 수 있으면 read-only 연결로 WAL DB를 읽을 수 있습니다 — 상주 서비스가 RW 연결을 유지해 <code>-shm</code>을 살려두는 정상 상태에서 항상 성립합니다. <b>예외</b>: 서비스 크래시 직후 등 <code>-shm</code> 복구가 필요한 순간에는 read-only 연결이 <code>SQLITE_READONLY_RECOVERY</code>/<code>CANTINIT</code>로 실패할 수 있습니다. reader(GUI/MCP)는 이 오류를 <b>일시 상태로 처리</b>: 백오프 재시도 + "인덱스 서비스 상태 확인" 배너(§D5). 복구 자체는 SCM이 서비스를 재시작하면 서비스의 RW 오픈이 수행합니다. Users에 디렉터리 Modify를 주는 방식은 채택하지 않습니다(불필요한 훼손 표면).</p>
+</div>
+
+<div class="decision">
+<h4>D2. 서비스는 <code>everything --service</code> — SCM 디스패처를 갖춘 진짜 Windows 서비스</h4>
+<p>SCM이 시작한 프로세스는 서비스 디스패처에 연결해 상태를 보고해야 하며, 일반 콘솔 프로세스를 그대로 등록할 수 없습니다. <code>windows-service</code> crate로 <b>새 진입점을 새 파일에</b> 만들고(<code>win/service.rs</code>), 인덱싱 코어는 기존 daemon의 빌드·힐링 루프를 재사용합니다.</p>
+<p><b>상태 보고 규약 (정확한 SCM 의미론)</b>: 시작 즉시 <code>START_PENDING</code> 보고 → <b>빠른 준비만</b> 수행(락 획득, 데이터 디렉터리 handle 검증(D1), 파이프 서버 오픈) → <code>RUNNING</code> 보고. <b><code>RUNNING</code> = "제어 가능한 상태"이지 "인덱스 준비 완료"가 아닙니다</b> — 인덱싱(수 분)은 RUNNING 이후 백그라운드로 수행하고, 인덱스 준비 여부는 파이프 <code>status</code>/meta로 별도 노출합니다. STOP 처리 중에는 <code>STOP_PENDING</code>을 checkpoint 증가와 함께 주기 갱신하며 진행 중 패스를 취소(§3.0 S7)합니다.</p>
+<p>감시 체인은 GUI의 관리자 경로와 동일: <b>USN resume → 실패 시 MFT 풀 스캔</b> <span class="ref">win/mod.rs:66-95 미러링</span>. RDCW·WalkDir 폴백은 서비스에서 제거하되, <b>USN 자체가 기동 불가한 엣지</b>(저널 생성 실패 등)에서는 서비스 내 주기 reconcile 재스캔(기존 daemon 폴링 모델 재사용)으로 강등 — 감시 공백을 남기지 않습니다.</p>
+<p><b>서비스 객체 DACL — 서비스가 스스로 부여</b>: 일반 사용자 GUI가 중지된 서비스를 UAC 없이 조회·시작할 수 있도록, 서비스가 <b>첫 시작 시 자기 서비스 객체의 기존 DACL에 ACE를 추가</b>합니다: <code>GetNamedSecurityInfo</code>/<code>SetNamedSecurityInfo</code>(SE_SERVICE)로 <b>INTERACTIVE(S-1-5-4)</b>에 <code>SERVICE_START | SERVICE_QUERY_STATUS</code> 부여 — 기존 DACL 보존, 멱등(이미 있으면 no-op). <code>sc sdset</code>은 DACL 전체를 교체해 위험하고 AU는 원격 인증 사용자까지 포함하므로 사용하지 않습니다. stop/삭제 권한은 부여하지 않습니다.</p>
+</div>
+
+<div class="decision">
+<h4>D3. GUI·MCP의 쓰기성 명령·상태 질의는 named pipe로 서비스에 위임한다 — <b>명시적 보안 모델 포함</b></h4>
+<p>서비스가 <code>\\.\pipe\EverythingIndexer</code> 파이프 서버(JSON 라인 프로토콜)를 엽니다.</p>
+<ul style="margin:6px 0">
+  <li><b>명령 집합</b>: <code>status</code>(상태·진행률·카운트·버전·<code>sidecarMigrated</code> 플래그), <code>reset_index</code>(전체 재인덱스), <code>migrate_sidecars</code>(1회성 사이드카 이관 — §5, 마커로 멱등) — 끝. <code>reindex_path</code>는 confused-deputy 벡터라 제공하지 않습니다.</li>
+  <li><b>파이프 보안</b>: 생성 시 <code>PIPE_REJECT_REMOTE_CLIENTS</code>. DACL은 SYSTEM/Administrators Full + <b>INTERACTIVE</b> connect(read/write)만. 연결 수락 시 <code>GetNamedPipeClientProcessId</code> + 클라이언트 토큰 검사로 로컬 대화형 세션의 프로세스인지 확인.</li>
+  <li><b>slow-client 방어</b>: 연결별 read/idle 타임아웃(예: 5초 — newline 미전송 연결은 끊음), 파이프 인스턴스 동시 N개(예: 4), 세션당 동시 1연결 — 연결 하나가 status/reset 채널을 봉쇄하지 못하게 함.</li>
+  <li><b>DoS 방어와 잔여 수용</b>: <code>reset_index</code>는 쿨다운(전역 10분 1회) — 초과 요청은 거부 응답. 잘못된 JSON·과대 페이로드(줄 길이 상한)는 즉시 연결 종료, 요청은 순차 처리. 잔여("어떤 로컬 사용자든 10분마다 전역 reset 가능")는 <b>R9 수용 리스크</b>.</li>
+  <li><b>감사의 정확한 범위</b>: 파이프 명령(reset·migrate)은 호출 PID·세션을 기록합니다. <b>config 파일 직접 편집은 변경 사실·시각만 기록 가능</b> — USN은 작성 프로세스를 제공하지 않으므로 <span class="ref">usn_watcher.rs:256-264</span> 행위자 식별을 주장하지 않습니다(R9).</li>
+  <li><b>실행 의미론</b>: 파이프 스레드는 요청을 검증·기록 후 <b>인덱서 큐에 enqueue만</b> 하고 즉시 접수 응답 — 실행·경합 규칙은 §3.1의 단일 인덱서 큐가 담당.</li>
+</ul>
+</div>
+
+<div class="decision">
+<h4>D4. 상태·진행률은 <b>파이프 일원화</b>, <code>data_version</code>은 Ready 상태에서만 사용한다</h4>
+<p>서비스는 Tauri <code>AppHandle</code>이 없어 <code>index_progress</code>/<code>index_state</code>/<code>index_updated</code> 이벤트를 emit할 수 없습니다. 대체 설계:</p>
+<ul style="margin:6px 0">
+  <li><b>진행률/상태 = 파이프 <code>status</code></b>: GUI가 인덱싱 중 500ms~1s 폴링 → 백엔드가 기존 이벤트 이름(<code>index_state</code>/<code>index_progress</code>)으로 재-emit → 프런트엔드(App.svelte) 무변경. 진행률을 meta 테이블에 고빈도 커밋하지 않습니다(<code>data_version</code> 자기 교란 방지). meta에는 전이 시점의 최종 상태(<code>svc_state</code>=Ready/Error)만 기록(파이프 부재 시 폴백·MCP 안내용).</li>
+  <li><b><code>index_updated</code> 대체 = <code>PRAGMA data_version</code></b>: <b>Ready 상태에서만</b> 전용 장기 read 커넥션으로 1–2s 주기 확인(<code>data_version</code>은 연결별 값이므로 전용 커넥션 필수). 값이 바뀌면 현재 검색 재실행. 인덱싱 중에는 status 폴링이 주기 갱신을 겸하므로 data_version 폴링은 끕니다. <b>유휴 시 무시-이벤트 cursor 저장은 DB 밖(파일)으로 분리</b>(§3.0 S4)되어 data_version을 건드리지 않습니다.</li>
+  <li><b>서비스 생존 판정은 meta가 아니라 SCM</b>: 서비스가 죽어도 meta에는 마지막 <code>svc_state=Ready</code>가 남으므로, GUI의 헬스 판단은 SCM 상태 질의(<code>QueryServiceStatus</code>) + 파이프 연결성 + 버전 대조로 하고 meta는 보조로만 씁니다(§D5).</li>
+</ul>
+</div>
+
+<div class="decision">
+<h4>D5. 서비스 등록은 인스톨러가 전담. 앱은 SCM 기준으로 헬스를 판단하고, 자가 복구는 <b>검증된 설치 바이너리만</b> 등록한다</h4>
+<p>GUI는 시작 시·주기적으로 SCM을 질의해 상태를 구분 처리합니다:</p>
+<ul style="margin:6px 0">
+  <li><b>미설치</b> → "인덱스 서비스가 없습니다 — 등록" 배너. 등록 버튼은 <code>ShellExecute(runas)</code>로 <code>everything --register-service</code> 실행(UAC). <b>이 복구 명령은 최초 릴리스(Phase 3)에 포함</b> — 설치 실패 잔여 상태(§3.2 실패 의미론)의 복구 경로가 릴리스 시점부터 존재해야 하므로.</li>
+  <li><b>설치됨·중지</b> → D2에서 부여한 <code>SERVICE_START</code> 권한으로 <b>UAC 없이 자동 시작 시도</b> → 실패 시 안내 배너.</li>
+  <li><b>실행 중·파이프 무응답 / 버전 불일치</b>(status 응답의 버전 ≠ GUI 버전) → 오류 배너 + 재시작 유도. crash-loop은 SCM 복구 정책(§3.2)이 감독.</li>
+</ul>
+<p><b>권한 상승 방지 (필수 불변식)</b>: <code>--register-service</code>는 <b>자기 자신의 경로를 그대로 등록하지 않습니다.</b> 등록 대상 exe는 관리자만 쓰기 가능한 설치 디렉터리(Program Files 설치본, 레지스트리 설치 정보로 확인)의 바이너리로 한정하고, 경로 ACL을 검증해 사용자 쓰기 가능 위치(portable/dev 실행본)면 <b>등록을 거부하고 인스톨러 설치를 안내</b>합니다. 같은 원칙이 마이그레이션에도 적용됩니다: <b>승격 컨텍스트에서 사용자 쓰기 가능 위치의 실행 파일(구 per-user 언인스톨러 포함)을 실행하지 않습니다</b>(§5). dev 환경은 문서화된 수동 절차로만 등록합니다.</p>
+<p><b>서비스 부재 시 GUI가 writer로 되돌아가는 폴백은 두지 않습니다</b>(요구사항 ⑤ 위반이며 dual-mode 복잡성의 근원). read-only GUI는 기존 DB로 검색은 계속 동작합니다.</p>
+</div>
+
+<div class="decision">
+<h4>D6. Windows에서 writer 핸드셰이크 계열 장치를 제거한다</h4>
+<p>구조적으로 writer가 하나뿐이므로 다음이 Windows에서 불필요해집니다: GUI beacon <span class="ref">main.rs:7170</span>, <code>wait_for_daemon_exit</code> <span class="ref">main.rs:7235</span>, <code>build_index</code>의 GUI 감시·취소 스레드 <span class="ref">daemon.rs:200-224</span>, <code>run_windows_resident</code>의 yield 루프 <span class="ref">daemon.rs:442-488</span>, MCP의 daemon spawn <span class="ref">mcp_server.rs:452</span>. 단 <code>daemon.lock</code>은 서비스가 계속 보유합니다 — 실수로 띄운 <code>--daemon</code>이 자진 종료하는 안전망(기존 로직 그대로). macOS 경로는 전부 유지됩니다. <b>제거는 반드시 §7의 릴리스 규칙(Phase 0–3 일괄 배포)과 함께</b> — 부분 배포 시 dual-writer가 부활합니다.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. 컴포넌트별 설계</h2>
+
+<h3>3.0 선행 정비 (Phase 0) — 기존 인덱싱 코드의 결함 수정</h3>
+<p>설계 v1이 기존 MFT/USN 코드가 갖췄다고 가정한 능력 일부는 실제로 없습니다. 아래는 <b>서비스 전환과 무관하게 현행 관리자 GUI 경로에도 유익한 결함 수정</b>이며, 서비스가 이 코드 위에 서므로 선행 조건입니다.</p>
+<table>
+  <tr><th style="width:6%">#</th><th>결함 (코드 근거)</th><th style="width:42%">수정</th></tr>
+  <tr>
+    <td>S1</td>
+    <td>MFT 열거에서 <code>DeviceIoControl</code>의 <b>모든</b> 오류를 EOF처럼 <code>break</code> 후 <code>Ok(())</code> 반환 → 부분 스캔이 <code>index_complete=1</code>로 확정될 수 있음 <span class="ref">mft_indexer.rs:769-826</span></td>
+    <td><code>ERROR_HANDLE_EOF</code>(정상 종료)와 그 외 오류를 구분 — 실패 시 <code>Err</code> 전파, <code>index_complete</code> 미설정, 삭제 단계 진입 금지</td>
+  </tr>
+  <tr>
+    <td>S2</td>
+    <td>USN read 오류를 빈 결과로 취급해 영구 재시도 <span class="ref">usn_watcher.rs:208</span></td>
+    <td>오류 분류: <code>ERROR_JOURNAL_ENTRY_DELETED</code>/<code>JOURNAL_DELETE_IN_PROGRESS</code>(랩·삭제) → 풀 재스캔 요청 enqueue / 그 외 → 한도 있는 재시도 후 watcher 종료(감독 루프가 재시작·재스캔 판단)</td>
+  </tr>
+  <tr>
+    <td>S3</td>
+    <td>반환 버퍼 첫 8바이트의 next-USN을 버림 <span class="ref">usn_watcher.rs:345</span></td>
+    <td>버퍼 헤더의 next-USN을 다음 읽기 시작점으로 사용</td>
+  </tr>
+  <tr>
+    <td>S4</td>
+    <td>DB 반영 성공과 무관하게 USN 위치 저장 → 크래시 시 변경 영구 누락 <span class="ref">usn_watcher.rs:506</span>. (v3의 "cursor-only 커밋 스로틀"은 빈도만 줄일 뿐 <code>data_version</code> 교란을 없애지 못함)</td>
+    <td><b>cursor 저장 이원화</b>: (a) 콘텐츠 배치가 있는 커밋 — 같은 DB 트랜잭션에서 meta(<code>win_last_usn</code>) 갱신(at-least-once + 멱등 upsert), (b) <b>무시된 이벤트만으로 전진한 cursor — DB가 아니라 <code>data\usn.cursor</code> 파일에 원자적(temp+rename) 저장</b>(30초 스로틀). 유휴 cursor가 DB를 건드리지 않으므로 Ready GUI의 <code>data_version</code> 폴링이 깨지 않음. 재개 시작점 = max(meta, cursor 파일) — 두 값 사이 구간은 무시 이벤트뿐이라 유실 없음</td>
+  </tr>
+  <tr>
+    <td>S5</td>
+    <td>MFT 스캔 전 USN 시작점을 캡처하지 않음 → 스캔 중 변경 유실 창 <span class="ref">mft_indexer.rs:102, 664</span></td>
+    <td>MFT 열거 <b>시작 전</b> (journal_id, next_usn) 캡처 → 스캔·upsert 완료 후 그 지점부터 USN 재생 (멱등 upsert가 중복 흡수)</td>
+  </tr>
+  <tr>
+    <td>S6</td>
+    <td>USN 디렉터리 rename이 old 경로 삭제 + 새 디렉터리 <b>한 행</b> upsert만 수행 — 하위 항목 경로 미갱신 <span class="ref">usn_watcher.rs:287, 402 / main.rs:6421</span>. <code>rescan_subtree(new)</code>만으로는 old prefix 하위 행이 잔존 <span class="ref">rescan.rs:168</span></td>
+    <td>디렉터리 rename/이동 감지 시 <b>old·new 두 prefix 모두</b> <code>rescan_subtree</code> 큐잉: old root는 FS에서 사라졌으므로 rescan이 하위 행을 일괄 삭제하고, new root는 하위를 재삽입 — 한 메커니즘으로 양방향 정정. 단일 비행 + 경로별 쿨다운(macOS MustScanSubDirs 패턴 재사용). GUI 쓰기 제거 후 모든 rename이 USN 경유가 되므로 필수</td>
+  </tr>
+  <tr>
+    <td>S7</td>
+    <td>MFT 열거 루프에 취소 지점이 없음 — 서비스 STOP(업그레이드의 30초 정지 창)·저널 유실 재스캔 선점이 불가능</td>
+    <td>MFT 열거·배치 upsert 루프에 <b>협조적 취소</b>(<code>cancel_index</code>를 N레코드/배치마다 확인) 추가 — 기존 jwalk 워커의 4096건 체크와 동일 패턴. STOP 처리 중 SCM에 <code>STOP_PENDING</code> checkpoint 주기 갱신(D2)</td>
+  </tr>
+</table>
+
+<h3>3.1 인덱서 서비스 (<code>everything --service</code>) — 신규 <code>win/service.rs</code></h3>
+
+<div class="flow">SCM start
+  │
+  ├─ 디스패처 연결 → START_PENDING 보고
+  ├─ 빠른 준비: daemon.lock 획득 · 데이터 디렉터리 handle 검증(reparse/owner, D1)
+  │             · 서비스 DACL ACE(D2) · 파이프 서버 오픈 · 인덱서 워커(단일 큐) 기동
+  ├─ RUNNING 보고  ("제어 가능" — 인덱스 준비와 무관, 준비 여부는 status로 노출)
+  │
+  ├─ 인덱서 워커 (요청 큐 — 유일한 build_index 실행자) ──────────
+  │    큐 소스: 시작 빌드 / 힐링(supervise) / 저널 유실 재스캔
+  │             / 파이프 reset_index / config 변경 reconcile / 주기 reconcile
+  │    실행 규칙: 단일 비행 · 동종 코얼레싱 · reset이 reconcile 흡수
+  │             · STOP은 cancel_index로 선점 + 큐 폐기
+  │    패스 전 장벽: watcher pause 신호 → watcher flush → ack 대기 → 패스 실행
+  │    패스 내용: (journal_id, next_usn) 캡처(S5) → USN resume 또는
+  │             MFT 풀 스캔(S1·S7) → finalize
+  │
+  ├─ 상주 감시 ────────────────────────────────────────────────
+  │    · USN 실시간 감시 (S2–S4, 디렉터리 rename → old·new subtree rescan(S6))
+  │    · supervise 5s: index_complete 힐링 요청 enqueue, 죽은 watcher 재시작
+  │    · USN 기동 불가 → 주기 reconcile 폴백(D2)
+  │    · config\ 변경(USN으로 자체 감지) → 규칙 재로드 + reconcile enqueue
+  │    · 파이프: status / reset_index / migrate_sidecars(§5)
+  │
+  └─ SERVICE_CONTROL_STOP / SHUTDOWN
+       → STOP_PENDING(checkpoint 갱신) → cancel_index + watcher_stop
+       → 마지막 배치 flush → wal_checkpoint → STOPPED 보고</div>
+
+<ul>
+  <li><b>인덱싱 트리거 단일화 (내부 상태 머신)</b>: 인덱스 패스를 유발하는 트리거 6종(위 큐 소스)이 각자의 스레드에서 <code>build_index</code>를 직접 부르면 한 프로세스 안에서도 논리적 동시 writer가 됩니다. 따라서 <b>모든 트리거는 enqueue만 하고, 실행은 단일 인덱서 워커가 전담</b>합니다 — 실행 규칙은 위 flow에 명시(단일 비행·코얼레싱·reset 우선·STOP 선점).</li>
+  <li><b>watcher 정지 장벽 (패스 ↔ watcher 직렬화)</b>: USN watcher는 자기 <code>watcher_conn</code>으로 직접 DB에 쓰므로 <span class="ref">usn_watcher.rs:171-172, 330-350</span>, 큐만으로는 "패스 실행 중 watcher 쓰기"가 남습니다. 워커는 패스 시작 전 watcher에 <b>pause를 신호하고, watcher가 진행 중 배치를 flush한 뒤 ack할 때까지 대기</b>합니다(기존 <code>indexing_active</code> 규약을 신호→flush→ack 계약으로 공식화). watcher의 직접 쓰기는 이 장벽 밖에서만 발생 — 프로세스 내부 동시 writer 제거의 나머지 절반.</li>
+  <li><b>계정/시작 유형</b>: LocalSystem(<code>\\.\C:</code> raw 볼륨 열기에 관리자 필요 <span class="ref">win/volume.rs:44-61</span>), <b>Automatic (Delayed Start)</b> — 부팅 경합 회피. delayed start는 시작 시점을 보장하지 않으므로 "부팅 직후 GUI가 서비스보다 먼저 뜨는" 창이 존재합니다 — GUI는 read-only라 기존 DB로 즉시 검색 가능(약간 stale)하고, D5의 자동 시작 시도 + USN resume이 따라잡습니다(§4-2).</li>
+  <li><b>수명주기 재작업 (headless화의 실제 범위)</b>: <code>Option&lt;AppHandle&gt;</code> 시그니처 완화만으로는 부족합니다 — <code>scan_mft</code>는 DB finalize·watcher 기동을 분리 스레드에 던지고 즉시 반환하며 <span class="ref">mft_indexer.rs:374</span>, USN watcher는 <code>JoinHandle</code>·<code>watcher_active</code> 게시·정지 시 pending flush가 없습니다 <span class="ref">usn_watcher.rs:137</span>. 서비스가 요구하는 계약: <b>(a)</b> 스캔 파이프라인을 join 가능하게(또는 완료 통지) 재구성 — 인덱서 워커가 패스 종료를 알 수 있어야 큐가 성립, <b>(b)</b> USN watcher가 <code>watcher_active</code>를 게시하고 pause/stop 신호에 flush 후 ack/종료로 응답, <b>(c)</b> MFT 협조적 취소(S7), <b>(d)</b> graceful stop에서 (a)–(c)를 순서대로 대기.</li>
+  <li><b>MemIndex 불필요</b>: 서비스 모델에서는 사용자가 GUI를 열기 전에 인덱싱이 끝나 있는 것이 정상 상태 — 서비스는 MemIndex를 만들지 않습니다.</li>
+  <li><b>로그</b>: Session 0에는 콘솔이 없으므로 <code>data\logs\service.log</code>(크기 롤오버) + 치명 오류는 Windows 이벤트 로그에도 기록(SCM 복구 진단용). 파이프 명령(reset·migrate)은 호출 PID·세션과 함께 감사 기록(D3).</li>
+  <li><b>UI API 금지</b>: Session 0 격리 — 아이콘·컨텍스트 메뉴 등 셸 UI는 서비스에서 사용하지 않음(GUI 소관).</li>
+</ul>
+
+<h3>3.2 인스톨러 (NSIS) — 요구사항 ①·③·④</h3>
+
+<p>현재 NSIS 설정은 <code>installMode</code> 미지정 = per-user 설치(무권한)입니다 <span class="ref">tauri.conf.json:55-64</span>. <code>bundle.windows.nsis.installMode: "perMachine"</code> + <code>installerHooks: "./windows/hooks.nsh"</code>를 추가합니다.</p>
+
+<p><b>훅 설계 원칙</b>:</p>
+<ul>
+  <li><code>sc stop</code>은 비동기 → <b>SERVICE_STOPPED 폴링(타임아웃 30초)</b>. 미설치 판정은 <b><code>sc query</code> 종료 코드 1060만</b> "중지됨"으로 간주 — 그 외 비정상(Access Denied, SCM 장애 등)은 <b>Abort</b>(모든 실패를 미설치로 뭉개지 않음).</li>
+  <li><b><code>sc start</code> 성공 ≠ 기동 성공</b> → start 후 <b>SERVICE_RUNNING 폴링(타임아웃 30초)</b>으로 확인(치명). D2 규약상 RUNNING 도달은 빠릅니다(인덱싱은 RUNNING 이후). 복구 정책(<code>sc failure</code>/<code>failureflag</code>)은 <b>start 전에</b> 설정 — 첫 기동 크래시도 복구 대상.</li>
+  <li><b>치명/비치명 구분</b>: 디렉터리 준비·<code>sc create/config</code>·<code>sc start</code>+RUNNING 확인은 치명 — 실패 시 <code>Abort</code>. <code>sc failure</code>/<code>failureflag</code>는 강화 단계 — 실패 시 <code>DetailPrint</code> 경고만. 언인스톨의 <code>sc delete</code>는 종료 코드 검사 + <b>삭제 완료 폴링</b>(query가 1060이 될 때까지, 타임아웃 시 경고 — marked-for-delete는 재부팅 시 해소됨을 안내).</li>
+  <li><b>실패 의미론 (Abort ≠ 롤백)</b>: 파괴적 단계(구 설치 정리)는 모든 치명 단계가 성공한 뒤에만 수행합니다. 치명 단계 실패 시 남는 상태는 "새 파일 복사됨 + 서비스 미등록/미기동"이며, <b>같은 릴리스에 포함된</b>(D5) <code>--register-service</code> 배너로 복구 가능 — 구 설치는 그대로 보존됩니다.</li>
+  <li><b>프로세스 종료는 이름이 아니라 경로 매칭</b>: Tauri NSIS 기본 템플릿은 <code>everything.exe</code>를 <b>이름으로</b> 종료합니다 <span class="ref">target/…/nsis/utils.nsh:33-47</span> — perMachine에서는 타 사용자 세션은 물론 <b>동명의 원조 Everything(voidtools)까지 오폭</b>합니다. 인스톨러 템플릿을 오버라이드해 <b>실행 모듈 경로가 자사 설치 경로($INSTDIR·알려진 구 per-user 설치 경로)와 일치하는 프로세스만</b> 종료하도록 커스터마이즈합니다.</li>
+</ul>
+
+<div class="flow">!macro WAIT_SERVICE_STOPPED            ; 폴링 500ms × 60 = 30s. 레이블은 구현 시 ${__LINE__} 유니크화
+  StrCpy $R1 0
+  wait_loop:
+    nsExec::Exec 'cmd /c sc query EverythingIndexer'
+    Pop $0
+    ${If} $0 == 1060                   ; ERROR_SERVICE_DOES_NOT_EXIST → 중지로 간주 (최초 설치)
+      Goto wait_done
+    ${ElseIf} $0 != 0                  ; Access Denied·SCM 장애 등 — 미설치로 뭉개지 않음
+      Abort "SCM 질의 실패 (sc query exit=$0)"
+    ${EndIf}
+    nsExec::Exec 'cmd /c sc query EverythingIndexer | findstr /C:"STOPPED"'
+    Pop $0
+    ${If} $0 == 0
+      Goto wait_done
+    ${EndIf}
+    IntOp $R1 $R1 + 1
+    ${If} $R1 &gt; 60
+      Abort "EverythingIndexer 서비스가 30초 내에 중지되지 않았습니다"
+    ${EndIf}
+    Sleep 500
+    Goto wait_loop
+  wait_done:
+!macroend
+
+!macro WAIT_SERVICE_RUNNING            ; sc start 후 RUNNING 도달 확인 (치명)
+  StrCpy $R1 0
+  run_loop:
+    nsExec::Exec 'cmd /c sc query EverythingIndexer | findstr /C:"RUNNING"'
+    Pop $0
+    ${If} $0 == 0
+      Goto run_done
+    ${EndIf}
+    IntOp $R1 $R1 + 1
+    ${If} $R1 &gt; 60
+      Abort "서비스가 30초 내에 RUNNING에 도달하지 못했습니다"
+    ${EndIf}
+    Sleep 500
+    Goto run_loop
+  run_done:
+!macroend
+
+!macro NSIS_HOOK_PREINSTALL
+  ; 서비스 정지만 수행. 구 설치 정리는 POSTINSTALL 성공 후로 미룸 (실패 시 구 설치 보존)
+  nsExec::Exec 'sc stop EverythingIndexer'      ; 미설치면 실패해도 무방
+  !insertmacro WAIT_SERVICE_STOPPED
+!macroend
+
+!macro NSIS_HOOK_POSTINSTALL
+  ; ── 0) 데이터 루트 사전 생성 + 소유권/ACL (planting 방지 — 승격 컨텍스트, 서비스 시작 전) ──
+  ;    &lt;ProgramData&gt;\com.everything.app{,\data,\config} 생성,
+  ;    icacls로 소유자(SYSTEM)·상속 재설정: data=Users RX, config=Users M (D1)
+  ;    기존 선점 디렉터리/junction은 소유권 재설정 — 실패 시 Abort (치명)
+  ; ── 1) 등록 (치명) ─────────────────────────────────────────
+  nsExec::Exec 'sc create EverythingIndexer binPath= "\"$INSTDIR\Everything.exe\" --service" \
+      start= delayed-auto DisplayName= "Everything Indexer"'
+  Pop $0
+  ${If} $0 != 0                                 ; 이미 존재(업그레이드) → binPath 갱신으로 대체
+    nsExec::Exec 'sc config EverythingIndexer binPath= "\"$INSTDIR\Everything.exe\" --service"'
+    Pop $0
+    ${If} $0 != 0
+      Abort "서비스 등록 실패 (sc create/config exit=$0)"
+    ${EndIf}
+  ${EndIf}
+  ; ── 2) 복구 정책 — start 전에 설정 (첫 기동 크래시도 복구 대상. 비치명) ──
+  nsExec::Exec 'sc failure EverythingIndexer reset= 86400 actions= restart/5000/restart/30000/restart/60000'
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "경고: 서비스 복구 정책 설정 실패 (exit=$0)"
+  ${EndIf}
+  nsExec::Exec 'sc failureflag EverythingIndexer 1'
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "경고: failureflag 설정 실패 (exit=$0)"
+  ${EndIf}
+  ; ── 3) 시작 + RUNNING 확인 (치명) ──────────────────────────
+  nsExec::Exec 'sc start EverythingIndexer'
+  Pop $0
+  ${If} $0 != 0
+    Abort "서비스 시작 실패 (sc start exit=$0)"
+  ${EndIf}
+  !insertmacro WAIT_SERVICE_RUNNING
+  ; ── 4) 성공 후 정리: 구 per-user 설치 파일 삭제 (실행 없음 — §5) ──
+  ;    자사 구 프로세스를 경로 매칭으로 종료 후,
+  ;    각 프로필의 구 설치 바이너리(%LOCALAPPDATA% 설치 경로)와
+  ;    구 데이터(%APPDATA%\com.everything.app)를 파일 삭제.
+  ;    구 언인스톨러는 어떤 컨텍스트에서도 실행하지 않음 (권한 상승 방지 — D5)
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  nsExec::Exec 'sc stop EverythingIndexer'
+  !insertmacro WAIT_SERVICE_STOPPED
+  nsExec::Exec 'sc delete EverythingIndexer'
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "경고: 서비스 삭제 실패 (exit=$0)"
+  ${EndIf}
+  ; 삭제 완료 폴링: sc query가 1060이 될 때까지 (≤10s). 타임아웃 시 경고 —
+  ; marked-for-delete 상태는 재부팅 시 해소됨을 안내
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ; Q1 범위 명확화(v4): 파생 데이터(data\ = 인덱스·cursor·로그)만 삭제,
+  ; 사용자 규칙(config\)은 보존 — 재설치 시 규칙 유지
+  RMDir /r /REBOOTOK "$APPDATA\com.everything.app\data"
+  RMDir "$APPDATA\com.everything.app"    ; config가 남아 있으면 실패 — 의도된 보존
+!macroend</div>
+
+<p><b>백그라운드(silent) 설치 — 요구사항 ④의 정확한 경계</b>: <code>/S</code>는 UI만 숨길 뿐 <b>승격을 자동 획득하지 않습니다</b>. perMachine 인스톨러의 승격 요구는 다음과 같이 귀결됩니다:</p>
+<ul>
+  <li>이미 승격된 컨텍스트(관리자 셸, SCCM/Intune 등 SYSTEM 배포, 관리자 작업 스케줄러) → <b>완전 무인</b> 설치 + 서비스 등록. 사내/자동 배포의 정상 경로.</li>
+  <li>대화형 세션의 일반 사용자 → <b>UAC 동의창 1회</b> 후 무인 진행 (Windows 보안 모델상 생략 불가).</li>
+  <li><b>비대화형·비승격 세션 → 승격 불가로 설치 실패가 정상 동작</b> — 종료 코드로 실패를 보고하며, 이 경우를 "자동 등록"이 커버한다고 주장하지 않습니다. 인앱 업데이터의 승격 처리·재시도·롤백은 별도 설계(Q4).</li>
+</ul>
+
+<h3>3.3 GUI — read-only 전환 (요구사항 ⑤)</h3>
+
+<table>
+  <tr><th style="width:30%">영역</th><th>변경</th></tr>
+  <tr>
+    <td>DB 연결 — <b>진짜 read-only</b></td>
+    <td>현행 코드는 RW로 열고(<code>Connection::open</code>) <code>journal_mode=WAL</code>까지 실행한 뒤 <code>query_only</code>를 겁니다 <span class="ref">main.rs:586-615 / mcp_server.rs:109-120</span> — 이는 read-only가 아닙니다. Windows의 GUI/MCP 연결은 전부 <b><code>SQLITE_OPEN_READ_ONLY</code> 플래그로 오픈</b>하고, WAL pragma·스키마 초기화를 실행하지 않습니다. <code>init_db_tables</code>는 Windows GUI 경로에서 제거(서비스 전담) — DB 부재 시(서비스 첫 스캔 전) "준비 중" 상태로 대기. <code>SQLITE_READONLY_RECOVERY</code>/<code>CANTINIT</code>는 D1의 일시 상태 처리.</td>
+  </tr>
+  <tr>
+    <td>인덱싱 진입점</td>
+    <td><code>start_windows_indexing</code> 호출 제거 <span class="ref">win/mod.rs:26</span>. MFT/USN/RDCW/WalkDir·catchup 전부 GUI에서 미기동. <code>reset_index</code>·<code>start_full_index</code> 커맨드는 파이프로 위임.</td>
+  </tr>
+  <tr>
+    <td>상태/진행률 UI</td>
+    <td>파이프 <code>status</code> 폴링(D4) → 기존 이벤트 이름으로 재-emit — 프런트엔드 무변경. 헬스 판단은 SCM 질의 + 파이프 연결성(D5).</td>
+  </tr>
+  <tr>
+    <td>파일 조작 (rename/trash/open)</td>
+    <td>파일시스템 작업은 사용자 권한으로 그대로 수행, <b>DB 반영 코드만 제거</b>. 디렉터리 rename의 하위 경로 정정은 서비스의 S6(old·new 양쪽 subtree rescan)이 담당 — <b>S6 없이는 이 행을 배포할 수 없음</b>. GUI가 쓰지 않으므로 recent-ops 캐시도 Windows에서 불필요. UI 즉시성은 낙관적 표시 갱신 + 조작 직후 status/data_version 폴링 일시 단축.</td>
+  </tr>
+  <tr>
+    <td>잔여 쓰기 전수 감사</td>
+    <td><code>hold_gui_beacon</code>·<code>wait_for_daemon_exit</code>·housekeeping purge·meta 캐시 기록·<code>win_last_active_ts</code> 등 모든 쓰기 지점을 <code>#[cfg(windows)]</code>에서 제거하거나 서비스로 이전. READ_ONLY 오픈이 누락분을 런타임에 강제 검출(쓰기 시도 = 즉시 오류).</td>
+  </tr>
+  <tr>
+    <td>설정 편집·이관</td>
+    <td>사이드카는 <code>config\</code>(Users Modify)에서 GUI가 직접 편집(편집 UI를 열 때 온디맨드 템플릿 생성 — D1, 절대경로 규약 안내). 이관은 파이프 <code>migrate_sidecars</code>로 서비스 중재(§5). 구 per-user 설치 잔재(HKCU Uninstall 키·바로가기)는 GUI 첫 실행 시 직접 삭제 — <b>구 언인스톨러를 실행하지 않으므로</b>(§5) 자기 종료·권한 문제 없음. 서비스가 USN으로 config 변경을 감지해 규칙 재로드 + reconcile enqueue(§3.1).</td>
+  </tr>
+  <tr>
+    <td>관리자 UX</td>
+    <td>"MFT를 쓰려면 관리자로 실행" 계열 안내 삭제 — GUI는 영원히 일반 권한. 대신 D5의 상태별 배너(미설치/중지/무응답) 추가.</td>
+  </tr>
+</table>
+
+<h3>3.4 MCP (<code>everything --mcp</code>)</h3>
+<ul>
+  <li>검색 연결을 <code>SQLITE_OPEN_READ_ONLY</code>로 전환(§3.3과 동일 — 현행 <code>query_only</code>는 RW 오픈 후 pragma라 불충분).</li>
+  <li>Windows에서 <code>spawn_detached()</code> 제거 — writer는 SCM이 보장 <span class="ref">mcp_server.rs:452</span>. macOS는 유지.</li>
+  <li><code>default_db_path()</code>의 Windows 분기를 ProgramData(<code>data\index.db</code>)로 변경 <span class="ref">mcp_server.rs:89-95</span>. 방어 로직: <code>EVERYTHING_MCP_DB</code> 핀 경로의 파일이 존재하지 않으면 새 기본 경로로 폴백.</li>
+  <li><b>기존 등록의 처리 (전제 복원)</b>: 등록 항목은 exe·DB 경로를 명시적으로 고정합니다 <span class="ref">mcp_server.rs:494, 572</span>. v4에서는 인스톨러가 <b>모든 프로필의 구 per-user 바이너리·데이터 파일을 삭제</b>하므로(§5 — 실행이 아닌 파일 삭제), 구 등록은 <b>exe 부재로 첫 호출에서 명시적으로 스폰 실패</b>합니다 — "구 daemon이 구 DB를 조용히 재구축·서비스"하는 경로 <span class="ref">mcp_server.rs:452</span>가 물리적으로 제거됨. 이후 복구: (a) GUI 사용자 — 첫 실행 재등록(기존 self-healing), (b) 에이전트 전용 사용자 — 릴리스 노트에 <code>everything --register-mcp</code> 1회 실행 명시. perMachine 설치 경로(Program Files)는 이후 업데이트에도 불변이라 같은 문제가 재발하지 않음.</li>
+  <li>인덱스 미완성 시 "준비 중" 응답은 기존 로직 유지 — meta <code>svc_state</code>로 메시지 구체화(선택).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>4. 동작 시나리오</h2>
+<ol>
+  <li><b>최초 설치</b>: 인스톨러 실행 → UAC 승격 → 파일 복사 → 훅: 데이터 루트 생성+ACL → 서비스 등록 → 복구 정책 → 시작 + <b>RUNNING 확인</b> → (성공 후) 구 per-user 설치 파일 정리 → 서비스가 즉시 MFT 풀 스캔. 사용자가 나중에 GUI를 열면 검색 즉시 동작, 설치 직후 수 분 내에 열면 진행바(파이프 status). <b>등록/시작 실패 시</b>: 구 설치 보존 + 새 GUI 배너의 <code>--register-service</code>(동일 릴리스 포함)로 복구.</li>
+  <li><b>부팅</b>: delayed-auto로 서비스 시작 → USN resume. GUI가 서비스보다 먼저 뜨면: read-only라 기존 DB로 즉시 검색 가능(직전 세션까지 반영), 서비스가 뒤이어 올라오며 오프라인 변경분을 수 초 내 흡수. 중지 상태로 판정되면 부여된 <code>SERVICE_START</code> 권한으로 직접 시작 시도(D5).</li>
+  <li><b>일상 사용</b>: 파일 생성/삭제/rename → USN 이벤트 → 서비스가 upsert/delete, <b>디렉터리 rename은 old·new 양쪽 subtree rescan(S6)으로 하위 경로까지 정정</b> → GUI는 data_version 변화 감지 시 현재 검색 재실행(~1–2초 반영).</li>
+  <li><b>GUI에서 재인덱스</b>: 파이프로 <code>reset_index</code> 전송(쿨다운 10분, 감사 로그) → 인덱서 큐 enqueue → 워커가 watcher 정지 장벽 후 실행, GUI가 status 폴링으로 진행바 표시.</li>
+  <li><b>업데이트(백그라운드)</b>: 새 인스톨러를 <code>/S</code>로 실행 → 승격(§3.2의 세 경로) → 훅: 서비스 정지 확인(폴링, 진행 중 스캔은 S7 취소로 수 초 내 중단) → 파일 교체 → 서비스 재시작 + RUNNING 확인 → USN resume으로 정지 구간 흡수.</li>
+  <li><b>서비스 이상</b>: 미설치 → 등록 배너(검증된 설치 바이너리만, D5) / 중지 → 무권한 자동 시작 시도 / 무응답·버전 불일치 → 안내 배너. 크래시는 SCM 복구 정책이 재시작, 재시작 후 힐링이 미완성 빌드를 복구.</li>
+  <li><b>언인스톨</b>: 훅이 서비스 정지(폴링)+삭제(완료 확인) → 파일 제거 → <b><code>data\</code>(인덱스·로그)만 삭제, <code>config\</code>(사용자 규칙) 보존</b> — 열린 핸들로 실패 시 <code>/REBOOTOK</code>로 재부팅 시 삭제 예약 (Q1 범위 명확화).</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>5. 마이그레이션 (기존 v0.5.x 사용자)</h2>
+<ul>
+  <li><b>구 per-user 설치 제거 — 실행 없는 파일 정리 (권한 상승 벡터 제거)</b>: 구 per-user 언인스톨러(사용자 쓰기 가능 exe)를 <b>어떤 컨텍스트에서도 실행하지 않습니다</b> — 승격 실행은 exe 교체만으로 관리자 코드 실행이 되는 전형적 escalation이기 때문(D5 불변식). 대신:
+    <ul>
+      <li>① POSTINSTALL(승격, 치명 단계 성공 후): 자사 구 프로세스를 <b>경로 매칭</b>으로 종료(§3.2 — 원조 Everything 보호) → 모든 프로필의 구 설치 바이너리(구 per-user 설치 경로)와 구 데이터(<code>C:\Users\*\AppData\Roaming\com.everything.app</code>)를 <b>파일 삭제</b>. 파일 삭제는 코드 실행이 아니므로 안전하며, 자사 앱 데이터 정리는 표준 관행. → 구 MCP 등록·daemon spawn이 <b>exe 부재로 명시적 실패</b>(§3.4).</li>
+      <li>② GUI 첫 실행(각 사용자 컨텍스트): 잔여 HKCU Uninstall 키·바로가기를 <b>직접 삭제</b>(레지스트리·파일 삭제만, 실행 없음) — "다른 관리자 계정으로 승격 설치"한 경우의 사용자별 잔재까지 정리. 타 사용자의 HKCU 잔재는 그 사용자의 첫 GUI 실행이 정리(그 전까지는 외관상 잔재일 뿐 동작 없음 — 바이너리는 ①에서 이미 삭제됨).</li>
+    </ul>
+  </li>
+  <li><b>DB</b>: 기존 index.db는 이관하지 않고 새 위치에서 fresh 재구축(MFT 스캔 수 분). 구 %APPDATA% DB는 위 ①에서 정리.</li>
+  <li><b>설정 사이드카 — 서비스 중재 이관 (원자적, Phase 3 포함)</b>: GUI 첫 실행 시 파이프 <code>status</code>의 <code>sidecarMigrated</code>가 false면, 자기 사용자의 구 사이드카 내용을 읽어 <b><code>migrate_sidecars</code>로 서비스에 전송</b>(각 64KB 상한). 서비스가 검증(절대경로·C: 볼륨·비reparse, <code>~</code> 규칙 거부 — D1) 후 <code>config\</code>에 기록하고 <b>마커를 보호된 <code>data\</code>에 저장</b>(Users 읽기 전용 — 변조·삭제 불가), 즉시 규칙 재로드 + reconcile. 파이프 요청은 순차 처리라 <b>first-wins가 원자적</b> — 두 사용자가 동시에 보내도 1회만 적용되고 나머지는 <code>already_migrated</code> 응답. 병합은 하지 않으며 "먼저 실행한 사용자의 규칙이 전역이 된다"를 스펙에 명시.</li>
+  <li><b>이관 전 노출 창 (정직한 서술)</b>: 서비스의 첫 스캔은 이관 전에 기본 규칙으로 수행되므로, <b>기존 사용자의 <code>.pathignore</code>가 아직 적용되지 않는 기간</b>이 존재하고 GUI를 실행하지 않는 에이전트 전용 사용자는 영구히 기본 규칙입니다. 이는 별도의 신규 노출이 아니라 <b>R1에서 수용한 전역 인덱싱 노출의 부분집합</b>입니다(ignore 규칙은 접근통제가 아니라 인덱스 하이진 도구) — 다만 체감 변화이므로 릴리스 노트에 명시.</li>
+  <li><b>MCP 등록</b>: 앱 첫 실행 시 재등록이 exe·DB 경로를 새 값으로 갱신(기존 self-healing). 에이전트 전용 사용자는 구 exe 삭제(위 ①)로 첫 호출이 명시적으로 실패 → 릴리스 노트의 <code>everything --register-mcp</code> 1회로 복구. 과도기 방어로 pinned DB 부재 시 신 경로 폴백(§3.4).</li>
+  <li><b>DB 스키마</b>: 변경 없음 — <code>user_version</code> 유지. 위치만 이동.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>6. 리스크 / 트레이드오프</h2>
+
+<div class="card">
+<h4><span class="badge b-warn">R1</span> 관리자 인덱스의 정보 노출 — 정확한 범위 (수용 리스크)</h4>
+<p>LocalSystem 서비스는 ACL로 보호된 경로(다른 사용자 프로필 포함)까지 인덱싱하며, DB에는 파일명만이 아니라 <b>전체 경로·사용자명·디렉터리 구조·크기·mtime</b>이 들어가고 <span class="ref">mft_indexer.rs:583</span> 이것이 모든 로컬 사용자에게 읽힙니다(내용은 제외). 이는 접근통제가 아니라 <b>명시적으로 수용한 리스크</b>입니다(Q2 확정): 지배적 사용 사례가 단일 사용자 데스크톱이고, 원조 Everything의 서비스 모델과 동일한 트레이드오프. 다중 사용자 머신 관리자를 위해 스펙·설치 문서에 이 특성을 명시하고, <code>C:\Users\&lt;타 사용자&gt;</code> 제외 옵션을 후속 릴리스 과제로 등록합니다.</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-ok">R2</span> DB 훼손 표면 — v2에서 대폭 축소</h4>
+<p><code>data\</code>가 읽기 전용으로 잠겨(D1) 일반 사용자의 DB·WAL·이관 마커 훼손 벡터가 제거됐습니다. 남는 표면은 <code>config\</code> 사이드카(Users Modify)뿐이며, 서비스는 이를 비신뢰 입력으로 파싱(크기·항목 상한, C:\ 볼륨 제한, 절대경로 전용, 잘못된 규칙 무시)합니다. 관리자 권한 사용자의 훼손은 힐링 루프 + 오픈 실패 시 재생성으로 복구.</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-warn">R3</span> 이벤트 → 폴링 전환에 따른 반영 지연</h4>
+<p>watcher가 GUI 프로세스 밖으로 나가므로 <code>index_updated</code> 즉시 emit이 사라지고 data_version 폴링(Ready 상태, 1–2s)으로 대체됩니다. rename 직후 재검색에 이전 이름이 잠깐 보일 수 있음. 완화: 낙관적 표시 갱신 + 파일 조작 직후 폴링 주기 일시 단축. 인덱싱 중 상태는 파이프 status가 담당하고 유휴 cursor는 DB 밖 파일에 저장(S4)되므로 폴링 자기 교란이 없습니다.</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-warn">R4</span> UAC 필수화 — 설치 장벽</h4>
+<p>per-user 설치(무권한)가 사라지므로 관리자 권한이 없는 사용자는 설치 불가. 요구사항 ①·③의 의도된 트레이드오프 — 관리자 권한을 "설치 시 1회"로 집중시키는 대가로 상시 MFT/USN·GUI 무권한 실행을 얻습니다.</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-info">R5</span> GUI 첫 실행 즉시검색(MemIndex) 소멸</h4>
+<p>MemIndex는 GUI-스캔 모델의 보완 장치였고, 서비스 모델에서는 설치 직후 서비스가 선-인덱싱하므로 필요 자체가 사라집니다. "설치 직후 수 분 내 GUI를 연" 경우에만 진행바를 보게 됨 — 현행과 동일한 체감.</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-info">R6</span> 코드 복잡도</h4>
+<p>새로 드는 것: 서비스 디스패처·인덱서 큐·파이프 서버(보안 검사 포함)·NSIS 훅·Phase 0 견고화. 사라지는 것: Windows writer 인계 핸드셰이크 전부, GUI 4단 폴백 체인 기동, MemIndex(win), recent-ops 캐시(win), MCP daemon spawn(win). 신규 작업의 상당 부분은 <b>현행 코드에도 존재하던 결함의 수정</b>(Phase 0)이며, dual-writer 버그 클래스 소멸이라는 이득은 그대로입니다.</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-warn">R7</span> 볼륨 가정</h4>
+<p>인덱싱 범위는 현행과 동일한 <code>C:\</code> 단일 볼륨이며, 시스템 볼륨은 NTFS(Windows 요구사항)라 MFT/USN이 성립합니다. USN 저널이 비활성/삭제된 엣지에서는 서비스가 저널을 생성(<code>FSCTL_CREATE_USN_JOURNAL</code>, 관리자라 가능)하고, 그래도 기동 불가하면 주기 reconcile 폴백으로 강등(D2) — 감시 공백은 없되 반영 지연이 커집니다. <code>.pathindexing</code>의 비-C root는 v1 범위에서 거부(무시+경고, D1). 다중 볼륨·mount point·ReFS 지원은 명시적 비범위(후속 과제).</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-info">R8</span> 단일 바이너리 유지 (전용 서비스 exe 채택 보류)</h4>
+<p>인덱싱 코어를 lib으로 분리해 작은 전용 서비스 exe를 두는 안(공격면·수명주기 단순화)은 타당하나, 현재 코어가 바이너리 크레이트의 <code>main.rs</code>(~4,800줄)에 있어 lib 추출이 대규모 리팩터링입니다. <code>--service</code> 경로는 CLI 분기가 Tauri 초기화 전에 일어나므로 <span class="ref">main.rs:7538-7543 패턴</span> Tauri/WebView 런타임을 <b>초기화하지 않으며</b>, 단일 바이너리를 유지하고 lib 분리는 후속 리팩터링 과제로 등록합니다. (리뷰 재확인: 바이너리 결합 자체는 남는다는 점을 인지한 <b>의도적 보류</b> — 3차 리뷰에서 타당 판정.)</p>
+</div>
+
+<div class="card">
+<h4><span class="badge b-warn">R9</span> 로컬 사용자에 의한 인덱스 가용성 공격(DoS) — 수용 리스크 + 신뢰 모델 선언</h4>
+<p><b>스펙 선언</b>: 본 제품은 <b>로컬 사용자 간 보안 경계를 제공하지 않습니다</b>(single trust domain — R1의 전역 메타데이터 노출과 동일한 모델, 원조 Everything과 동일). 로컬 사용자 간 보안 경계가 필요한 환경(공용 PC·멀티테넌트)은 v1 지원 대상이 아니며 설치 문서에 명시합니다. 이 선언 하에서: 어떤 로컬 대화형 사용자든 (a) 파이프 <code>reset_index</code>를 쿨다운 한도(전역 10분 1회) 내에서 반복하거나 (b) <code>config\.pathignore</code>를 광범위 규칙으로 채워 전역 인덱스를 사실상 비울 수 있습니다 — 기밀성 침해가 아닌 <b>가용성</b> 문제로, 수용합니다. <b>감사의 한계를 정확히</b>: 파이프 명령은 호출 PID·세션이 기록되지만, config 파일 직접 편집은 변경 사실·시각만 기록됩니다(USN은 작성자를 제공하지 않음 — D3). 힐링·reconcile이 정상 설정 복원 시 자동 복구하며, config를 Administrators-write로 잠그는 설치 스위치는 후속 옵션 과제(설정 편집 UX 훼손 때문에 v1 기본이 아님).</p>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. 구현 단계 / 릴리스 규칙 / 변경 파일</h2>
+
+<div class="card" style="border-left:4px solid var(--bad)">
+<h4><span class="badge b-bad">릴리스 규칙 (필수)</span> Phase 0–3은 <b>하나의 릴리스로만</b> 배포한다</h4>
+<p>Phase는 구현·리뷰 단위이지 배포 단위가 아닙니다. 서비스를 설치·기동하는 빌드(Phase 2)와 GUI 쓰기를 제거한 빌드(Phase 3)가 분리 배포되면 그 중간 버전이 <b>서비스+GUI 동시 writer</b>가 됩니다 — GUI는 여전히 스키마 초기화·purge·reset·rename 반영을 수행하고 <code>wait_for_daemon_exit</code>는 10초 후 쓰기를 강행하기 때문 <span class="ref">main.rs:7208-7270, 4847, 6360 / daemon.rs:132</span>. 따라서 <b>서비스 자동 시작을 포함한 인스톨러는 read-only GUI가 포함된 빌드와 반드시 동봉</b>합니다. 복구 명령 <code>--register-service</code>도 같은 릴리스에 포함(D5). Phase 4만 후속 릴리스 가능.</p>
+</div>
+
+<table>
+  <tr><th style="width:10%">Phase</th><th style="width:35%">내용</th><th>파일</th></tr>
+  <tr>
+    <td><b>0</b><br>선행 정비</td>
+    <td>§3.0 S1–S7: MFT 오류 전파·협조적 취소, USN 오류 분류·next-USN·커밋 결합(+유휴 cursor 파일 분리)·사전 캡처, 디렉터리 rename old·new subtree rescan. 현행 관리자 GUI 경로에서 먼저 검증 가능(서비스 없이 테스트).</td>
+    <td><code>mft_indexer.rs</code>, <code>usn_watcher.rs</code>, <code>rescan.rs</code>(재사용)</td>
+  </tr>
+  <tr>
+    <td><b>1</b><br>서비스 골격</td>
+    <td>ProgramData(Known Folder) 경로 + handle 기반 디렉터리 검증(D1), <code>--service</code> 진입점(START_PENDING→RUNNING, STOP checkpoint, graceful stop), <b>인덱서 단일 큐 + watcher 정지 장벽</b>(§3.1), 수명주기 재작업(§3.1 a–d), 파이프 서버(보안 모델·slow-client 방어·감사 로그·migrate_sidecars), 서비스 객체 DACL 자체 부여(D2), 기본 사이드카 미생성·절대경로 규약·config 변경 감지→재로드, 파일 로그+이벤트 로그. <code>sc create</code> 수동 등록으로 전체 흐름 검증.</td>
+    <td><code>win/service.rs</code>(신규), <code>win/service_pipe.rs</code>(신규), <code>mft_indexer.rs</code>, <code>usn_watcher.rs</code>, <code>main.rs</code>(CLI 분기·build_app_state config 경로·템플릿 온디맨드화), <code>mcp_server.rs</code>(경로), <code>Cargo.toml</code>(+windows-service)</td>
+  </tr>
+  <tr>
+    <td><b>2</b><br>인스톨러</td>
+    <td>perMachine 전환 + 견고화된 NSIS 훅(§3.2: 데이터 루트 사전 생성+ACL, 1060 한정 미설치 판정, 복구 정책→start 순서, RUNNING 폴링, delete 완료 확인, 구 설치 파일 정리(실행 없음), data\만 삭제). <b>프로세스 종료 경로 매칭 커스터마이즈</b>(원조 Everything 보호). silent 세 경로(§3.2) 검증.</td>
+    <td><code>tauri.conf.json</code>, <code>src-tauri/windows/hooks.nsh</code>(신규), NSIS 템플릿 오버라이드</td>
+  </tr>
+  <tr>
+    <td><b>3</b><br>read-only 전환</td>
+    <td><code>SQLITE_OPEN_READ_ONLY</code> 오픈, <code>init_db_tables</code>·인덱싱·잔여 쓰기 제거(<code>#[cfg(windows)]</code> 전수 감사), 파이프 클라이언트(status/reset/<b>migrate_sidecars</b>), SCM 헬스 판단+상태 배너, data_version(Ready 한정, 전용 커넥션), GUI 첫 실행 잔재 정리(HKCU 키·바로가기 직접 삭제), <b><code>--register-service</code>(경로 ACL 검증, D5 — 복구 경로로서 동일 릴리스 필수)</b>, MCP 폴백·spawn 제거, <code>run_windows_resident</code> 등 daemon win 분기 삭제(Q3).</td>
+    <td><code>main.rs</code>, <code>win/mod.rs</code>, <code>daemon.rs</code>, <code>mcp_server.rs</code>, <code>App.svelte</code>(배너)</td>
+  </tr>
+  <tr>
+    <td><b>4</b><br>후속 옵션<br><span class="ref">(후속 릴리스 가능)</span></td>
+    <td>config 관리자 잠금 옵션(R9)·타 사용자 프로필 제외 옵션(R1) 검토, 인덱싱 코어 lib 분리(R8), 다중 볼륨 지원(R7) 검토.</td>
+    <td><code>main.rs</code>, <code>App.svelte</code>, <code>hooks.nsh</code></td>
+  </tr>
+</table>
+
+<p><b>비변경</b>: macOS 전 경로(FSEvents·daemon·핸드셰이크), <code>query.rs</code>·검색 코어, DB 스키마, 프런트엔드 검색/렌더 로직(상태 이벤트 이름 유지 덕분).</p>
+
+<h3>검증 계획</h3>
+<ul>
+  <li><b>단위</b>: 파이프 프로토콜 파서(잘못된 JSON·과대 페이로드·연속 요청·쿨다운·idle 타임아웃), 인덱서 큐(코얼레싱·reset 흡수·STOP 선점·watcher 장벽), USN 오류 분류(S2)·next-USN(S3)·cursor 이원화(S4), MFT 오류 전파(S1)·취소(S7), 디렉터리 rename old·new rescan(S6), <code>.pathindexing</code> 비-C·<code>~</code> 규칙 거부, <code>default_db_path</code> 분기·핀 폴백, migrate_sidecars 검증·멱등.</li>
+  <li><b>수동 시나리오 (기본)</b>: ① 클린 설치 → 서비스 자동 시작(RUNNING 확인) → 인덱스 완성, ② <code>/S</code> 세 경로(승격 무인 / 대화형 UAC 1회 / 비대화형 실패 종료코드), ③ GUI 재인덱스 → 파이프 경유 + 쿨다운, ④ 파일 rename → 2초 내 반영, 디렉터리 rename → <b>old prefix 행 잔존 없음 + new 하위 반영</b>, ⑤ 서비스 강제 kill → SCM 재시작 + 힐링 + reader의 READONLY_RECOVERY 재시도, ⑥ 업그레이드 설치 → 정지 폴링(스캔 중이면 S7 취소로 수 초 내)/교체/재시작, ⑦ 언인스톨 → 서비스 삭제(완료 확인) + <b>data\ 삭제·config\ 보존</b>, ⑧ GUI/MCP 쓰기 시도 → READ_ONLY 오픈 오류로 강제 검출, ⑨ 포터블 실행 → 배너 + <code>--register-service</code>가 사용자 쓰기 가능 경로 등록을 거부.</li>
+  <li><b>수동 시나리오 (실패 모드)</b>: ⑩ 다중 사용자/RDP 동시 세션 검색·파이프 명령, ⑪ USN 저널 삭제·랩 강제(<code>fsutil usn deletejournal</code>) → 풀 재스캔, ⑫ MFT 스캔 중 강제 종료/재부팅 → 힐링·부분 DB 미확정(S1), ⑬ disk-full·DB corruption 주입 → 재생성, ⑭ 표준 사용자에서 data\ 쓰기 거부·config\ 편집 허용, ⑮ 파이프 악성 입력·원격 연결 거부, ⑯ per-user 구버전 위 업그레이드(같은 계정/다른 관리자 계정 승격 — 바이너리 삭제·잔재 정리 확인), ⑰ UAC 취소 시 설치 중단·구 설치 보존, ⑱ 서비스 stop 30초 초과(인위 지연) 시 설치 Abort.</li>
+  <li><b>수동 시나리오 (v3–v4 추가)</b>: ⑲ 최초 설치(서비스 미설치)에서 PREINSTALL 폴링 즉시 통과(1060) + SCM 장애 주입 시 Abort, ⑳ POSTINSTALL 등록/시작 실패 주입 → 구 설치 보존 + <code>--register-service</code> 복구 동작, ㉑ 유휴 상태(무시 이벤트만)에서 data_version 불변 — cursor 파일만 갱신(S4), ㉒ <code>.pathindexing</code>에 D:\ 경로·<code>~</code> 규칙 기입 → 거부 로그 + status 경고, ㉓ config 변경·reset·저널 유실 동시 발생 → 큐 코얼레싱 단일 패스, ㉔ 사이드카 이관 경쟁(두 사용자 동시 첫 실행) → 파이프 순차 처리로 1회만 적용·나머지 already_migrated, ㉕ 서비스 기동 지연 주입 → WAIT_SERVICE_RUNNING 타임아웃 Abort, ㉖ ProgramData 위치에 사전 junction 심기 → 인스톨러 소유권 재설정 또는 서비스 기동 거부+이벤트 로그, ㉗ newline 없는 파이프 연결 → idle 타임아웃 후 다른 클라이언트 정상 동작, ㉘ 구 설치(타 계정) 위 설치 → 구 exe 삭제 확인 → 구 MCP 등록 첫 호출이 명시적 스폰 실패, ㉙ <b>원조 Everything(voidtools) 실행 중 설치 → 종료되지 않음</b>(경로 매칭 확인).</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2>8. 확정 사항 (Q1–Q4)</h2>
+<p>아래 4건은 권장안대로 확정 (2026-07-23). 각 결정은 해당 섹션(§3.2·§4·§6·§7)에 반영되어 있습니다.</p>
+<table>
+  <tr><th style="width:8%">#</th><th>질문</th><th style="width:38%">결정</th></tr>
+  <tr>
+    <td>Q1</td>
+    <td>언인스톨 시 ProgramData 인덱스를 지울 것인가?</td>
+    <td><span class="badge b-ok">확정</span>파생 데이터(<code>data\</code> = 인덱스·cursor·로그)는 삭제, <b>사용자 규칙(<code>config\</code>)은 보존</b> — v4에서 범위 명확화(Q1이 승인한 것은 재생성 가능한 인덱스 삭제까지). 재설치 시 MFT 스캔이 빠르므로 인덱스 잔존물은 남기지 않음 (POSTUNINSTALL 훅, /REBOOTOK)</td>
+  </tr>
+  <tr>
+    <td>Q2</td>
+    <td>다른 사용자 프로필(<code>C:\Users\*</code>) 인덱싱 제외 옵션을 둘 것인가? (R1)</td>
+    <td><span class="badge b-ok">확정</span>1차 릴리스는 전체 인덱싱(원조 Everything 동일) — R1에 노출 범위를 정확히 서술하고 수용 리스크로 명시, 제외 옵션은 후속</td>
+  </tr>
+  <tr>
+    <td>Q3</td>
+    <td><code>--daemon</code>의 Windows 분기(<code>run_windows_resident</code>)를 삭제할 것인가 유지할 것인가?</td>
+    <td><span class="badge b-ok">확정</span>Phase 3에서 삭제 — 서비스 부재 폴백을 두지 않기로 했으므로(D5) 죽은 코드를 남기지 않음</td>
+  </tr>
+  <tr>
+    <td>Q4</td>
+    <td>인앱 업데이터가 인스톨러를 직접 <code>/S</code> 실행하는 흐름까지 이번 범위인가?</td>
+    <td><span class="badge b-ok">확정</span>범위 밖 — 업데이터의 승격 처리·재시도·롤백은 별도 설계로 분리 (§3.2에 silent 경계 명시)</td>
+  </tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>9. v2 개정 — 1차 리뷰 반영 매핑</h2>
+<p>1차 리뷰(2026-07-23, 코드 대조 검증) 25건의 반영 매핑. 2차 리뷰에서 부분/미해결로 재판정된 항목은 §10, 3차 재판정분은 §11에서 종결.</p>
+<table>
+  <tr><th style="width:6%">심각도</th><th>지적 요지</th><th style="width:34%">반영</th></tr>
+  <tr><td>P1</td><td>Phase 순서 역전 — 서비스 설치(P2)와 GUI 쓰기 제거(P3) 사이 배포 시 dual-writer</td><td>§7 릴리스 규칙 신설: Phase 0–3 일괄 배포 필수</td></tr>
+  <tr><td>P1</td><td><code>query_only</code>는 RW 오픈 후 pragma라 read-only가 아님; GUI가 <code>init_db_tables</code> 실행</td><td>§3.3/§3.4: <code>SQLITE_OPEN_READ_ONLY</code> 오픈, 스키마 초기화 서비스 전담</td></tr>
+  <tr><td>P1</td><td>"WAL reader는 Users Modify 필수"는 오류 — read-only WAL 가능</td><td>D1 재작성: data\ 읽기 전용 + <code>READONLY_RECOVERY</code> 예외 처리 (2·3차 리뷰에서 rationale 성립 인정)</td></tr>
+  <tr><td>P1</td><td>USN 유실/랩 처리 미구현(오류 무시·next-USN 폐기·무조건 위치 저장)</td><td>§3.0 S2–S4 선행 정비</td></tr>
+  <tr><td>P1</td><td>MFT→USN 인계에 스캔 중 변경 유실 창</td><td>§3.0 S5: 스캔 전 USN 시작점 캡처</td></tr>
+  <tr><td>P1</td><td>MFT 열거 오류가 <code>Ok</code>로 둔갑 → 부분 스캔 확정 위험</td><td>§3.0 S1: EOF/오류 구분·Err 전파</td></tr>
+  <tr><td>P1</td><td><code>Option&lt;AppHandle&gt;</code>만으로 headless화 불성립(수명주기 부재)</td><td>§3.1 수명주기 재작업 + S7 — 3차에서 RESOLVED</td></tr>
+  <tr><td>P1</td><td>GUI DB 반영 제거 시 디렉터리 rename 하위 경로 깨짐</td><td>§3.0 S6 old·new 양쪽 rescan — 3차에서 RESOLVED</td></tr>
+  <tr><td>P1</td><td>"볼륨 전체·항상 MFT/USN" 과장; C: 하드코딩·폴백 제거</td><td>§1·R7·D1 — 3차에서 RESOLVED(의도적 범위 제한 인정)</td></tr>
+  <tr><td>P1</td><td>파이프 권한 모델 부재(전역 reset DoS·<code>reindex_path</code> confused-deputy)</td><td>D3 재작성 — 잔여 reset DoS는 §11(R9 신뢰 모델 선언)로 종결</td></tr>
+  <tr><td>P1</td><td><code>runas --register-service</code>가 사용자 쓰기 가능 exe를 SYSTEM 등록 — 권한 상승</td><td>D5: 등록 대상을 관리자만 쓰기 가능한 설치 바이너리로 한정, ACL 검증·거부</td></tr>
+  <tr><td>P1</td><td>NSIS 훅 비신뢰(비동기 stop에 고정 Sleep, 종료코드 무시)</td><td>§3.2 — v3·v4에 걸쳐 종결(§10·§11)</td></tr>
+  <tr><td>P1</td><td>사이드카 사용자별→전역 충돌·이관이 Phase 4로 늦음</td><td>§5 — v4의 서비스 중재 이관으로 종결(§11)</td></tr>
+  <tr><td>P1</td><td>R1이 노출 범위 축소 서술("파일명"만)</td><td>R1 재작성 — 3차에서 "위험 수용 절차로 충분" 판정</td></tr>
+  <tr><td>P2</td><td>per-user→perMachine 업그레이드 미처리(병존)</td><td>§5·§3.2 — v4의 파일 직접 삭제 + 사용자별 잔재 정리로 종결(§11)</td></tr>
+  <tr><td>P2</td><td>MCP 등록 자동 치유 안 됨(핀 고정)</td><td>§3.4 — v4에서 구 exe 삭제로 "명시적 실패" 전제 복원, 종결(§11)</td></tr>
+  <tr><td>P2</td><td>meta 진행률 커밋이 data_version 교란; 연결별 값 미명시</td><td>D4 재작성: 진행률 파이프 일원화, data_version은 Ready 한정·전용 커넥션</td></tr>
+  <tr><td>P2</td><td>meta는 생존 상태가 아님(stopped/crash-loop/버전 불일치 미처리)</td><td>D4·D5: 헬스 판단 = SCM 질의+파이프 연결성+버전 검사</td></tr>
+  <tr><td>P2</td><td>SCM 30초 서술 부정확·조기 RUNNING 문제</td><td>D2: START_PENDING→빠른 RUNNING("제어 가능" 의미), 인덱스 준비는 status로 분리</td></tr>
+  <tr><td>P2</td><td>delayed start와 "항상 상주·열자마자 Ready" 충돌</td><td>§3.1·§4-2: 창 존재 명시, read-only GUI의 stale 검색 + <code>SERVICE_START</code> 부여</td></tr>
+  <tr><td>P2</td><td><code>sc failure</code> 불완전(failureflag 등)</td><td>§3.2 — v4에서 start 전 설정 + 종료코드 검사로 종결</td></tr>
+  <tr><td>P2</td><td>/S가 승격을 자동 획득한다는 오해; 비대화형 실패 미정의</td><td>목표 ④ 재정의 + §3.2: 세 경로(무인/UAC 1회/실패=정상 보고)</td></tr>
+  <tr><td>P2</td><td>ProgramData 하드코딩·$APPDATA 의존·RMDir 실패</td><td>D1: Known Folder API, §3.2: /REBOOTOK</td></tr>
+  <tr><td>P2</td><td>검증 계획의 실패 모드 누락</td><td>§7 검증 계획 ⑩–⑱ (v3–v4: ⑲–㉙) 추가</td></tr>
+  <tr><td>P3</td><td>단일 exe에 Tauri 의존 탑재 — 전용 서비스 exe 권고</td><td>R8 — 의도적 보류(3차에서 타당 판정), 후속 과제 등록</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>10. v3 개정 — 2차 리뷰 반영 매핑</h2>
+<p>2차 리뷰(v2 재검증)의 신규 지적 10건과 부분/미해결 재판정 9건의 반영 내역. 3차 리뷰에서 재차 부분/미해결로 판정된 항목은 §11에서 종결.</p>
+<table>
+  <tr><th style="width:10%">항목</th><th>지적 요지</th><th style="width:40%">v3 반영 (3차 판정)</th></tr>
+  <tr><td>NEW P1</td><td><code>WAIT_SERVICE_STOPPED</code>가 미설치를 STOPPED로 취급하지 않아 최초 설치가 30초 후 Abort</td><td>미설치=중지 간주 — 3차 PARTIALLY(모든 실패를 미설치로 뭉갬) → §11에서 1060 한정으로 종결</td></tr>
+  <tr><td>NEW P1</td><td>Abort ≠ 롤백 — 구버전 선제거 후 실패 시 반파 상태</td><td>파괴적 단계를 성공 후로 이동 — 3차 PARTIALLY(복구 명령이 Phase 4) → §11에서 <code>--register-service</code> Phase 3 이동으로 종결</td></tr>
+  <tr><td>NEW P1</td><td>sc 호출 종료코드 미검사 — 문서와 스니펫 모순</td><td>치명/비치명 정책 — 3차 PARTIALLY(start≠RUNNING·delete 미확인) → §11에서 RUNNING·delete 폴링으로 종결</td></tr>
+  <tr><td>NEW P1</td><td>Users-Modify config가 privileged channel(.pathindexing 임의 경로·.pathignore 비우기)</td><td>비-C/reparse 거부 — 3차 PARTIALLY(신뢰 모델 미선언) → §11에서 R9 신뢰 모델 선언으로 종결</td></tr>
+  <tr><td>NEW P1</td><td>내부 단일 상태 머신 부재</td><td>인덱서 단일 큐 — 3차 PARTIALLY(watcher 직접 쓰기 장벽 부재) → §11에서 pause/ack/flush 장벽으로 종결</td></tr>
+  <tr><td>NEW P1</td><td>서비스가 만든 기본 사이드카가 이관을 막음</td><td>기본 파일 미생성 + 마커 — <span class="badge b-ok">3차 RESOLVED</span> (마커 원자성은 별도 신규 지적 → §11)</td></tr>
+  <tr><td>NEW P2</td><td>MFT 취소 부재</td><td>S7 — <span class="badge b-ok">3차 RESOLVED</span></td></tr>
+  <tr><td>NEW P2</td><td>cursor-only 커밋의 data_version 교란</td><td>30초 스로틀 — 3차 PARTIALLY(빈도만 감소) → §11에서 cursor 파일 분리로 종결</td></tr>
+  <tr><td>NEW P2</td><td><code>sc sdset</code>은 DACL 교체·AU는 원격 포함</td><td>서비스 자체 ACE 추가(INTERACTIVE) — <span class="badge b-ok">3차 RESOLVED</span></td></tr>
+  <tr><td>NEW P2</td><td>C: 전용 선언과 <code>.pathindexing</code>의 모순</td><td>비-C root 거부 — <span class="badge b-ok">3차 RESOLVED</span></td></tr>
+  <tr><td>잔여 5건</td><td>P1-07 수명주기 · P1-08 rename · P1-09 단일 볼륨 · P2-07 sc 검사 · 수용 3건(P1-14·P3-01·WAL)</td><td><span class="badge b-ok">3차 RESOLVED</span> (수용 리스크 3건은 "수용 절차로 충분" 판정)</td></tr>
+  <tr><td>잔여 4건</td><td>P1-10 reset DoS · P1-12 NSIS · P1-13 이관 · P2-01/P2-02 구 설치·MCP</td><td>3차 PARTIALLY/NOT → §11에서 종결</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>11. v4 개정 — 3차 리뷰 반영 매핑</h2>
+<p>3차 리뷰(v3 재검증)의 신규 지적 10건과 잔여 재판정의 종결 내역.</p>
+<table>
+  <tr><th style="width:10%">항목</th><th>지적 요지</th><th style="width:42%">v4 반영</th></tr>
+  <tr><td>NEW P1</td><td><b>승격 컨텍스트에서 구 per-user 언인스톨러 실행 — 권한 상승</b> (사용자 쓰기 가능 exe)</td><td>§5 재설계: 구 언인스톨러를 <b>어떤 컨텍스트에서도 실행하지 않음</b>(D5 불변식 확장). 인스톨러는 구 바이너리·데이터를 <b>파일 삭제만</b>(코드 실행 없음), GUI 첫 실행이 자기 HKCU 키·바로가기를 <b>직접 삭제</b> — 실행 없는 2단계 정리로 escalation·자기 종료 문제 동시 제거</td></tr>
+  <tr><td>NEW P1</td><td><code>sc start</code> 성공 ≠ RUNNING; 구버전 제거·failure policy 순서 오류</td><td>§3.2: <code>WAIT_SERVICE_RUNNING</code> 폴링(치명), 복구 정책을 start <b>전</b>으로, 구 설치 정리는 RUNNING 확인 <b>후</b>로</td></tr>
+  <tr><td>NEW P1</td><td>ProgramData path planting — 서비스가 처음 생성 시 선점 junction 추종 가능</td><td>D1·§3.2: 인스톨러(승격)가 루트+data+config를 <b>사전 생성·소유권(SYSTEM)·ACL 설정</b>(치명 단계), 서비스는 시작 시 <b>handle 기반 검증</b>(FILE_FLAG_OPEN_REPARSE_POINT·owner 검사) — 불일치 시 기동 거부+이벤트 로그</td></tr>
+  <tr><td>NEW P1</td><td>copy→CREATE_NEW 마커 이관은 비원자적·마커가 Users-Modify</td><td>§5·D3: 이관을 <b>파이프 <code>migrate_sidecars</code>로 서비스 중재화</b> — 순차 처리로 first-wins 원자성, 마커는 <b>보호된 data\에 서비스가 저장</b>(변조 불가), 페이로드는 D1 규칙으로 검증</td></tr>
+  <tr><td>NEW P2</td><td>이관 전 기본 규칙 인덱싱 = 기존 privacy ignore 무시 기간(agent-only 영구)</td><td>§5에 정직 서술 추가: R1 수용 노출의 부분집합(ignore는 접근통제가 아님)임을 명시 + 릴리스 노트 항목화</td></tr>
+  <tr><td>NEW P2</td><td>언인스톨 <code>RMDir /r</code>이 config까지 삭제 — Q1 승인 범위 초과</td><td>§3.2·§8 Q1 명확화: <b><code>data\</code>만 삭제, <code>config\</code> 보존</b></td></tr>
+  <tr><td>NEW P2</td><td>전역 config의 <code>~</code> 의미 미정의(LocalSystem home ≠ 사용자 home)</td><td>D1: <b>절대경로 전용 규약</b> — <code>~</code> 규칙 거부+로그, 이관 시 GUI가 절대경로로 정규화</td></tr>
+  <tr><td>NEW P2</td><td>config 변경 감사(PID/세션) 주장은 USN으로 구현 불가</td><td>D3·R9 문구 정정: 행위자 식별은 <b>파이프 명령에만</b> 해당, config 직접 편집은 변경 사실·시각만</td></tr>
+  <tr><td>NEW P2</td><td>Tauri NSIS의 이름 기반 프로세스 종료 — 타 사용자·<b>원조 Everything 오폭</b>, GUI 자기 종료</td><td>§3.2: 템플릿 오버라이드로 <b>실행 모듈 경로 매칭 종료</b>(자사 설치 경로만). GUI의 구 언인스톨러 실행 자체가 사라져 자기 종료 문제도 소멸(§5)</td></tr>
+  <tr><td>NEW P2</td><td>파이프 slow-client DoS(newline 미전송 연결이 채널 봉쇄)</td><td>D3: 연결별 read/idle 타임아웃(5s), 인스턴스 N=4, 세션당 동시 1연결</td></tr>
+  <tr><td>NEW-P1-01 잔여</td><td>sc query 모든 실패를 미설치로 간주</td><td>§3.2: <b>1060만</b> 미설치 간주, 그 외 Abort</td></tr>
+  <tr><td>NEW-P1-02 잔여</td><td>복구 명령이 Phase 4라 초기 릴리스에 복구 경로 부재</td><td>D5·§7: <code>--register-service</code>를 <b>Phase 3(동일 릴리스)</b>로 이동</td></tr>
+  <tr><td>NEW-P1-03 잔여</td><td>RUNNING 미확인·delete 미완료</td><td>§3.2: RUNNING 폴링(치명) + delete 완료 폴링(1060 확인, 타임아웃 시 재부팅 안내)</td></tr>
+  <tr><td>NEW-P1-04·P1-10 잔여</td><td>"다중 사용자 신뢰" 가정이 Windows 보안 경계와 불일치 — 미지원 선언 또는 잠금 필요</td><td>R9: <b>스펙 선언 "로컬 사용자 간 보안 경계 미제공(single trust domain)"</b> + 지원 대상 제외 명시 — 리뷰가 요구한 명시적 선언 채택, 관리자 잠금은 Phase 4 옵션</td></tr>
+  <tr><td>NEW-P1-05 잔여</td><td>watcher 직접 쓰기와 패스의 내부 동시성</td><td>§3.1: <b>watcher pause→flush→ack 장벽</b>을 패스 전 필수 절차로 공식화</td></tr>
+  <tr><td>NEW-P2-02 잔여</td><td>스로틀은 빈도만 감소 — 테스트 ㉑ 불성립</td><td>S4 재설계: 유휴 cursor를 <b><code>data\usn.cursor</code> 파일</b>(원자적 temp+rename)로 분리 — DB 무접촉, 테스트 ㉑ 성립. 재개 = max(meta, 파일)</td></tr>
+  <tr><td>P1-12 잔여</td><td>NSIS 설치 건전성</td><td>위 NEW-P1-01·02·03 반영으로 종결</td></tr>
+  <tr><td>P1-13 잔여</td><td>이관 경쟁·마커 변조</td><td>위 NEW P1(서비스 중재 이관) 반영으로 종결</td></tr>
+  <tr><td>P2-01 잔여</td><td>다른 관리자 계정 설치의 agent-only 사용자 잔존</td><td>§5 ①: 인스톨러가 <b>전 프로필의 구 바이너리·데이터를 파일 삭제</b> — 계정 무관하게 정리(HKCU 잔재는 외관상 항목일 뿐 동작 없음, 각 사용자 GUI 첫 실행이 정리)</td></tr>
+  <tr><td>P2-02 잔여</td><td>구 exe 잔존 시 구 daemon이 구 DB를 조용히 재구축·서비스</td><td>§3.4·§5: 구 exe 자체를 삭제하므로 스폰이 <b>명시적으로 실패</b> — "조용한 오동작" 경로 물리적 제거, <code>--register-mcp</code> 1회로 복구</td></tr>
+</table>
+
+</main>
+</body>
+</html>
