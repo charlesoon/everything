@@ -8,7 +8,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 parking_lot = "0.12"
-rusqlite = { version = "0.32", features = ["bundled", "chrono", "hooks"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml_edit = "0.22"
@@ -21,6 +21,9 @@ tauri-plugin-window-state = "2"
 ignore = "0.4.25"
 tauri-plugin-decorum = "1.1.1"
 fs2 = "0.4"
+# Timestamps for the post-mortem diag log (already in-tree via rusqlite's
+# "chrono" feature, so this adds no new transitive dependency).
+chrono = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4"

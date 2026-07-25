@@ -100,7 +100,13 @@ impl FsEventWatcher {
             return Err("no watch roots given".to_string());
         }
         let since_when = since_event_id.unwrap_or(fs::kFSEventStreamEventIdSinceNow);
-        let last_event_id = Arc::new(AtomicU64::new(since_when));
+        // The max-tracker must start *below* any real event id so incoming events
+        // advance it. Seeding it with `since_when` would be wrong when there is no
+        // prior id: that value is `kFSEventStreamEventIdSinceNow` (u64::MAX), which
+        // no real id ever exceeds, so the `event_id > prev` update below could
+        // never fire and we'd persist u64::MAX forever (breaking history replay on
+        // the next launch). Seed with the real prior id, or 0 when starting fresh.
+        let last_event_id = Arc::new(AtomicU64::new(since_event_id.unwrap_or(0)));
 
         // Validate all roots in safe code before any raw allocation exists, so
         // early returns below need no manual cleanup.

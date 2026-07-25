@@ -320,7 +320,7 @@ fn run_search(conn: &Connection, query: &str, limit: u32) -> SearchResult {
             // Phase 2: contains-match with tight time budget (single pass)
             if names.is_empty() {
                 let phase2_start = Instant::now();
-                conn.progress_handler(
+                let _ = conn.progress_handler(
                     2_000,
                     Some(move || phase2_start.elapsed().as_millis() > 5),
                 );
@@ -348,7 +348,7 @@ fn run_search(conn: &Connection, query: &str, limit: u32) -> SearchResult {
                     }
                 }
 
-                conn.progress_handler(0, None::<fn() -> bool>);
+                let _ = conn.progress_handler(0, None::<fn() -> bool>);
             }
         }
         SearchMode::GlobName { name_like } => {
@@ -494,7 +494,7 @@ fn run_search(conn: &Connection, query: &str, limit: u32) -> SearchResult {
                     // Phase B: time-budgeted contains fallback if prefix found too few
                     if (names.len() as i64) < effective_limit as i64 {
                         let path_start = Instant::now();
-                        conn.progress_handler(
+                        let _ = conn.progress_handler(
                             2_000,
                             Some(move || path_start.elapsed().as_millis() > 5),
                         );
@@ -519,7 +519,7 @@ fn run_search(conn: &Connection, query: &str, limit: u32) -> SearchResult {
                             }
                         }
 
-                        conn.progress_handler(0, None::<fn() -> bool>);
+                        let _ = conn.progress_handler(0, None::<fn() -> bool>);
 
                         let mut seen = std::collections::HashSet::new();
                         names.retain(|n| seen.insert(n.clone()));

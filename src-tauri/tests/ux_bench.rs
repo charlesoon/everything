@@ -332,7 +332,7 @@ fn run_search_sorted(
             // Phase 2a: quick existence probe (tight budget)
             if names.is_empty() {
                 let probe_start = Instant::now();
-                conn.progress_handler(5_000, Some(move || probe_start.elapsed().as_millis() > 8));
+                let _ = conn.progress_handler(5_000, Some(move || probe_start.elapsed().as_millis() > 8));
 
                 let probe_sql =
                     "SELECT 1 FROM entries
@@ -346,12 +346,12 @@ fn run_search_sorted(
                         s.query_row(params![name_like, exact_query, prefix_like], |_| Ok(true))
                     })
                     .unwrap_or(false);
-                conn.progress_handler(0, None::<fn() -> bool>);
+                let _ = conn.progress_handler(0, None::<fn() -> bool>);
 
                 // Phase 2b: full fetch only when probe found a match
                 if has_match {
                     let start = Instant::now();
-                    conn.progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
+                    let _ = conn.progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
 
                     let sql = format!(
                         "SELECT name FROM entries
@@ -373,7 +373,7 @@ fn run_search_sorted(
                             }
                         }
                     }
-                    conn.progress_handler(0, None::<fn() -> bool>);
+                    let _ = conn.progress_handler(0, None::<fn() -> bool>);
                 }
             }
         }
@@ -508,7 +508,7 @@ fn run_search_sorted(
                     // Phase B: time-budgeted contains fallback if prefix found too few
                     if (names.len() as i64) < effective_limit as i64 {
                         let start = Instant::now();
-                        conn.progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
+                        let _ = conn.progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
 
                         let sql = format!(
                             "SELECT e.name FROM entries e \
@@ -529,7 +529,7 @@ fn run_search_sorted(
                                 }
                             }
                         }
-                        conn.progress_handler(0, None::<fn() -> bool>);
+                        let _ = conn.progress_handler(0, None::<fn() -> bool>);
 
                         let mut seen = std::collections::HashSet::new();
                         names.retain(|n| seen.insert(n.clone()));

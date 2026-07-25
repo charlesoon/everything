@@ -9,6 +9,7 @@
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -24,6 +25,14 @@ const SERVER_NAME: &str = "everything";
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const MCP_DEFAULT_LIMIT: u32 = 100;
+/// A search opens a fresh read connection and retries once on a transient
+/// failure. The index writer (daemon/GUI) can VACUUM or rebuild the FTS shadow
+/// tables underneath a reader; a long-lived connection's cached pages/prepared
+/// statements then read as SQLITE_CORRUPT ("database disk image is malformed").
+/// Reconnecting from scratch — new page cache, new statements — sidesteps that,
+/// and the per-call open cost is negligible for an MCP tool (no keystroke SLO).
+const MCP_SEARCH_ATTEMPTS: usize = 2;
+const MCP_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 const SERVER_INSTRUCTIONS: &str = "Instant file/folder name search over the \
 local filesystem index built by the Everything app. Results come from a \
@@ -58,6 +67,24 @@ pub fn handle_cli_args() -> bool {
     }
     if args.iter().any(|a| a == "--register-mcp") {
         register_all_and_log(None);
+        return true;
+    }
+    // Intercept the common informational flags. Without this they fall through
+    // and boot the full Tauri GUI — e.g. `everything --version` would silently
+    // launch a second GUI window (and, holding gui.lock, evict the daemon).
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("everything {}", env!("CARGO_PKG_VERSION"));
+        return true;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "everything {}\n\nUSAGE:\n  everything            Launch the GUI\n  \
+             everything --mcp      Run the MCP stdio server (index reader)\n  \
+             everything --daemon   Run the headless indexer daemon\n  \
+             everything --register-mcp   Register the MCP server into Claude Code / Codex\n  \
+             everything --version  Print the version and exit",
+            env!("CARGO_PKG_VERSION")
+        );
         return true;
     }
     false
@@ -259,31 +286,11 @@ fn format_results(args: &SearchArgs, label: &str, results: &[EntryDto]) -> Strin
 struct McpServer {
     db_path: PathBuf,
     home_dir: PathBuf,
-    conn: Option<Connection>,
 }
 
 impl McpServer {
     fn new(db_path: PathBuf, home_dir: PathBuf) -> Self {
-        McpServer {
-            db_path,
-            home_dir,
-            conn: None,
-        }
-    }
-
-    /// Ensure a usable index exists before a search runs. Building/refreshing is
-    /// the resident daemon's job (spawned at startup), so this only opens a read
-    /// connection once one is ready and otherwise returns a "being prepared"
-    /// notice for the caller to retry.
-    fn ensure_index_ready(&mut self) -> Result<(), String> {
-        if self.conn.is_some() {
-            return Ok(());
-        }
-        if index_is_usable(&self.db_path) {
-            self.conn = Some(open_search_connection(&self.db_path)?);
-            return Ok(());
-        }
-        Err(INDEX_BUILDING_MSG.to_string())
+        McpServer { db_path, home_dir }
     }
 
     /// Handles one incoming JSON-RPC message; `None` means nothing to send
@@ -335,39 +342,54 @@ impl McpServer {
         })
     }
 
-    fn do_search(&mut self, args: &SearchArgs) -> Result<String, String> {
-        self.ensure_index_ready()?;
-        let conn = self
-            .conn
-            .as_ref()
-            .expect("connection opened by ensure_index_ready");
-        let mode = parse_query(&args.query);
-        let fts_ready = fts_usable(conn);
-        let searched = run_db_search(
-            conn,
-            &self.home_dir,
-            fts_ready,
-            &mode,
-            &args.query,
-            args.limit,
-            args.offset,
-            &args.sort_by,
-            &args.sort_dir,
-        );
-        let mut results = match searched {
-            Ok(r) => r,
-            Err(e) => {
-                // Drop the cached connection so a transient failure (index
-                // rebuild, DB replaced by reset_index) heals on the next call.
-                self.conn = None;
-                return Err(format!("Search failed: {e}"));
-            }
-        };
-        if args.offset == 0 && args.sort_by == "name" {
-            sort_entries_with_relevance(&mut results, &args.query, &args.sort_by, &args.sort_dir);
+    fn do_search(&self, args: &SearchArgs) -> Result<String, String> {
+        // Readiness (building/refreshing) is the resident daemon's job, spawned
+        // at startup; until it has produced a usable index, tell the caller to
+        // retry rather than serving a half-built DB.
+        if !index_is_usable(&self.db_path) {
+            return Err(INDEX_BUILDING_MSG.to_string());
         }
-        Ok(format_results(args, mode.label(), &results))
+        // Fresh connection per call + one retry (see MCP_SEARCH_ATTEMPTS): a
+        // transient SQLITE_CORRUPT from a concurrent VACUUM / FTS rebuild heals
+        // on reconnect instead of poisoning a cached connection for the session.
+        let mut last_err = String::new();
+        for attempt in 0..MCP_SEARCH_ATTEMPTS {
+            match open_search_connection(&self.db_path)
+                .and_then(|conn| run_search_on(&conn, &self.home_dir, args))
+            {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < MCP_SEARCH_ATTEMPTS {
+                        std::thread::sleep(MCP_RETRY_BACKOFF);
+                    }
+                }
+            }
+        }
+        Err(format!("Search failed: {last_err}"))
     }
+}
+
+/// Run one search on a freshly opened read connection. Kept free-standing (not a
+/// method) so `do_search` can open, use, and drop the connection per attempt.
+fn run_search_on(conn: &Connection, home_dir: &Path, args: &SearchArgs) -> Result<String, String> {
+    let mode = parse_query(&args.query);
+    let fts_ready = fts_usable(conn);
+    let mut results = run_db_search(
+        conn,
+        home_dir,
+        fts_ready,
+        &mode,
+        &args.query,
+        args.limit,
+        args.offset,
+        &args.sort_by,
+        &args.sort_dir,
+    )?;
+    if args.offset == 0 && args.sort_by == "name" {
+        sort_entries_with_relevance(&mut results, &args.query, &args.sort_by, &args.sort_dir);
+    }
+    Ok(format_results(args, mode.label(), &results))
 }
 
 fn handle_initialize(params: &Value) -> Value {
@@ -457,6 +479,11 @@ pub fn run_stdio_server() {
     // service-owned, Users-read-only ProgramData DB.
     crate::set_db_readonly();
     let db_path = default_db_path();
+    // Join the shared post-mortem log: MCP session starts and daemon-spawn
+    // decisions timestamp the "who kicked off indexing when" timeline.
+    if let Some(dir) = db_path.parent() {
+        crate::diag::init(dir, "mcp");
+    }
     eprintln!(
         "[mcp] everything MCP server v{} serving {}",
         env!("CARGO_PKG_VERSION"),
@@ -849,13 +876,13 @@ mod tests {
     fn search_without_usable_index_reports_not_ready() {
         let root = temp_case_dir("index_not_ready");
         let db = root.join("index.db"); // never built
-        let mut server = McpServer::new(db, root.clone());
+        let mut server = McpServer::new(db.clone(), root.clone());
         // Pure reader: no index yet -> a "being prepared, retry" tool error,
         // and (unlike the old build-on-demand path) nothing is written.
         let (text, is_error) = call_search(&mut server, json!({ "query": "x" }));
         assert!(is_error);
         assert!(text.to_lowercase().contains("retry"), "got: {text}");
-        assert!(server.conn.is_none());
+        assert!(!db.exists(), "pure reader must not create the DB");
     }
 
     #[test]
