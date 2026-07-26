@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -2031,6 +2031,7 @@ fn filter_ignored_entries(
         .collect()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn find_search(
     home_dir: &Path,
     ignored_roots: &[PathBuf],
@@ -2040,6 +2041,7 @@ fn find_search(
     sort_by: &str,
     sort_dir: &str,
 ) -> Vec<EntryDto> {
+    use std::io::{BufRead, BufReader};
     let trimmed = query.trim();
     if trimmed.is_empty() || limit == 0 {
         return Vec::new();
@@ -2158,6 +2160,23 @@ fn find_search(
 
     sort_entries_with_relevance(&mut entries, trimmed, sort_by, sort_dir);
     entries
+}
+
+/// Windows has no Unix `find`; `Command::new("find")` there launches find.exe
+/// (a text filter) which errors on these args, returns nothing, and pops a
+/// console window per call. The service keeps a complete index and the
+/// fd_search (jwalk) path covers live scans, so this fallback is a no-op here.
+#[cfg(target_os = "windows")]
+fn find_search(
+    _home_dir: &Path,
+    _ignored_roots: &[PathBuf],
+    _ignored_patterns: &[IgnorePattern],
+    _query: &str,
+    _limit: usize,
+    _sort_by: &str,
+    _sort_dir: &str,
+) -> Vec<EntryDto> {
+    Vec::new()
 }
 
 /// Bulk insert for the fresh-index path: every path is new, so the upsert
@@ -2562,10 +2581,11 @@ fn run_db_maintenance(state: &AppState) {
     let _ = conn.execute_batch("PRAGMA shrink_memory;");
 }
 
-/// Ask macOS malloc to hand freed-but-retained regions back to the OS. Without
-/// this a large indexing pass leaves hundreds of MB of empty malloc regions
-/// resident until system memory pressure reclaims them.
-fn release_memory_to_os() {
+/// Hand an indexing pass's freed-but-retained memory back to the OS. Without
+/// this a large pass leaves hundreds of MB resident until system memory
+/// pressure reclaims it. macOS: malloc pressure relief. Windows: trim the
+/// process working set (pages fault back in on demand).
+pub(crate) fn release_memory_to_os() {
     #[cfg(target_os = "macos")]
     unsafe {
         extern "C" {
@@ -2575,6 +2595,12 @@ fn release_memory_to_os() {
             ) -> usize;
         }
         malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+        // (SIZE_T)-1 for both bounds trims the working set to the minimum.
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
     }
 }
 
@@ -4992,6 +5018,7 @@ fn open_pathignore(state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     Command::new("cmd")
         .args(["/C", "start", "", &path.to_string_lossy().to_string()])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: no console flash on Win11
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -6286,7 +6313,8 @@ async fn open(paths: Vec<String>) -> AppResult<()> {
             #[cfg(target_os = "windows")]
             {
                 let mut cmd = Command::new("cmd");
-                cmd.raw_arg(format!("/C start \"\" \"{}\"", path.replace('"', "")));
+                cmd.raw_arg(format!("/C start \"\" \"{}\"", path.replace('"', "")))
+                    .creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash on Win11
                 let status = cmd.status().map_err(|e| e.to_string())?;
                 if !status.success() {
                     return Err(format!("Failed to open: {path}"));

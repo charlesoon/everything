@@ -781,6 +781,14 @@ fn background_db_finalize(
     }
     let _ = refresh_and_emit_status_counts(app, state);
 
+    // Mirror the macOS finalize: free SQLite's page cache, drop the writer
+    // connection, then hand the full-index pass's high-water memory back to the
+    // OS (Windows trims the process working set) so the idle service doesn't sit
+    // on hundreds of MB left over from the one-time build.
+    let _ = conn.execute_batch("PRAGMA shrink_memory;");
+    drop(conn);
+    crate::release_memory_to_os();
+
     Ok(())
 }
 

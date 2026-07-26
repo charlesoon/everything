@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use crate::AppResult;
 
@@ -115,6 +117,7 @@ pub(crate) fn open_pathindexing_file(path: &Path) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     Command::new("cmd")
         .args(["/C", "start", "", &path.to_string_lossy().to_string()])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: no console flash on Win11
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
