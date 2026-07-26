@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned because libsqlite3-sys 0.38.1 (via rusqlite "bundled") uses the
+# cfg_select! macro, stabilized after 1.93. 1.97.1 is the validated toolchain.
+channel = "1.97.1"
