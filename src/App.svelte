@@ -1774,6 +1774,21 @@
 
     await step('runSearch()', () => runSearch());
 
+    // Virtual-scroll rows populated during startup can fail to paint in WebView2
+    // until a reflow (exposed by the flex shell layout): the rows are in the DOM
+    // and correctly sized, but not composited until the scroll offset changes.
+    // Nudge OverlayScrollbars + the scroll position once the first frame settles
+    // so the initial results are visible without requiring user interaction.
+    requestAnimationFrame(() => {
+      try { osInstance?.update?.(true); } catch {}
+      updateViewportHeight();
+      const el = getScrollEl();
+      if (el) {
+        el.scrollTop = 1;
+        requestAnimationFrame(() => { el.scrollTop = 0; });
+      }
+    });
+
     startupLog(`[startup/fe] +${ms()}ms onMount complete`);
     if (DEBUG_STARTUP) console.log(`[startup/fe] +${ms()}ms onMount complete`);
     } catch (err) {
@@ -2302,8 +2317,8 @@
   }
 
   .app-shell {
-    display: grid;
-    grid-template-rows: auto auto 1fr auto;
+    display: flex;
+    flex-direction: column;
     height: 100%;
     min-width: 0;
   }
@@ -2489,6 +2504,7 @@
   .table-area {
     display: grid;
     grid-template-rows: auto 1fr;
+    flex: 1;
     min-height: 0;
     min-width: 0;
   }
