@@ -20,6 +20,13 @@ use super::service_pipe::PIPE_NAME;
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+// The service impersonates the pipe client to confirm INTERACTIVE membership
+// (service_security::inspect_client, D3). That requires the connection to carry
+// SecurityImpersonation QOS; without SECURITY_SQOS_PRESENT the impersonation
+// level is too low, so the service rejects us as "not a local interactive
+// client" and the GUI shows a false "service unresponsive" banner.
+const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+const SECURITY_IMPERSONATION: u32 = 0x0002_0000;
 const MAX_RESPONSE: usize = 1024 * 1024;
 
 /// Send one JSON request and read one JSON-line response. `None` if the service
@@ -33,7 +40,7 @@ fn send(request: &str) -> Option<String> {
             FILE_SHARE_MODE(0),
             None,
             OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
+            FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION),
             None,
         )
     }
