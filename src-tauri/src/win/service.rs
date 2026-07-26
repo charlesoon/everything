@@ -485,8 +485,6 @@ fn index_complete(state: &AppState) -> bool {
 /// (portable/dev) — registering such an exe as LocalSystem is a
 /// privilege-escalation vector. Updates the binPath if the service exists.
 pub fn register_service() -> Result<(), String> {
-    use std::process::Command;
-
     let exe = std::env::current_exe().map_err(|e| format!("current_exe failed: {e}"))?;
     if !is_admin_only_install_path(&exe) {
         return Err(format!(
@@ -497,7 +495,7 @@ pub fn register_service() -> Result<(), String> {
     }
     let bin = format!("\"{}\" --service", exe.display());
 
-    let create = Command::new("sc")
+    let create = super::sc_command()
         .args([
             "create",
             SERVICE_NAME,
@@ -512,7 +510,7 @@ pub fn register_service() -> Result<(), String> {
         .map_err(|e| format!("failed to run sc create: {e}"))?;
     if !create.status.success() {
         // Likely already exists (upgrade) — update the binPath instead.
-        let cfg = Command::new("sc")
+        let cfg = super::sc_command()
             .args([
                 "config",
                 SERVICE_NAME,
@@ -532,7 +530,7 @@ pub fn register_service() -> Result<(), String> {
     }
 
     // Recovery policy (best-effort) then start.
-    let _ = Command::new("sc")
+    let _ = super::sc_command()
         .args([
             "failure",
             SERVICE_NAME,
@@ -542,11 +540,11 @@ pub fn register_service() -> Result<(), String> {
             "restart/5000/restart/30000/restart/60000",
         ])
         .output();
-    let _ = Command::new("sc")
+    let _ = super::sc_command()
         .args(["failureflag", SERVICE_NAME, "1"])
         .output();
 
-    let start = Command::new("sc")
+    let start = super::sc_command()
         .args(["start", SERVICE_NAME])
         .output()
         .map_err(|e| format!("failed to run sc start: {e}"))?;

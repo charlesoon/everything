@@ -38,7 +38,6 @@ pub fn start_windows_readonly(app: AppHandle, state: AppState) {
     set_ready_with_cached_counts(&app, &state);
 
     std::thread::spawn(move || {
-        use std::process::Command;
         use std::time::Instant;
         // §5 ②: clear this user's leftover per-user uninstall entry + shortcuts
         // once (idempotent; short-circuits after the first run).
@@ -141,7 +140,7 @@ pub fn start_windows_readonly(app: AppHandle, state: AppState) {
                             // once per episode, not every tick.
                             if !start_requested {
                                 start_requested = true;
-                                let _ = Command::new("sc")
+                                let _ = sc_command()
                                     .args(["start", service::SERVICE_NAME])
                                     .output();
                             }
@@ -163,11 +162,22 @@ pub fn start_windows_readonly(app: AppHandle, state: AppState) {
     });
 }
 
+/// A `sc.exe` command that spawns no console window. The read-only GUI is a
+/// windowed process, so a bare `Command::new("sc")` pops a Windows Terminal
+/// window per call on Windows 11; CREATE_NO_WINDOW keeps the health-poll's
+/// `sc query` / `sc start` invisible (matches win/context_menu.rs).
+fn sc_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new("sc");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// Classify the service for the GUI health banner (D5) via SCM. `sc query`
 /// exit 1060 = not installed; otherwise parse the reported state.
 fn classify_service_health() -> &'static str {
-    use std::process::Command;
-    match Command::new("sc")
+    match sc_command()
         .args(["query", service::SERVICE_NAME])
         .output()
     {
