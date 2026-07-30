@@ -400,7 +400,7 @@ Rename/Trash/Open 등 앱이 직접 수행한 작업은 watcher 이벤트로도 
 - `copy_files(paths: Vec<String>)` (macOS 전용 — NSPasteboard 클립보드)
 - `move_to_trash(paths: Vec<String>) -> Result`
 - `rename(path: String, new_name: String) -> Result<EntryDTO>`
-- `get_file_icon(ext: String, path: Option<String>) -> Option<Vec<u8>>` (확장자/경로별 시스템 아이콘)
+- `get_file_icons(requests: Vec<{ ext: String, path: Option<String> }>) -> Vec<Vec<u8>>` (여러 행의 시스템 아이콘을 위치 대응으로 일괄 반환, 빈 값 = 아이콘 없음)
 - `show_context_menu(paths: Vec<String>, x: f64, y: f64)` (네이티브 컨텍스트 메뉴)
 - `quick_look(path: String)` (macOS 전용)
 - `check_full_disk_access() -> bool` (macOS 전용)

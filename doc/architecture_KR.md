@@ -542,7 +542,7 @@ RDCW watcher (fallback — USN 사용 불가 시)
 | `copy_files` | FE→BE | 파일 클립보드 복사 (macOS 전용, NSPasteboard) |
 | `move_to_trash` | FE→BE | 휴지통 이동 + DB 삭제 |
 | `rename` | FE→BE | 이름 변경 + DB 갱신 → 새 EntryDto 반환 |
-| `get_file_icon` | FE→BE | 확장자/경로별 시스템 아이콘 PNG 반환 |
+| `get_file_icons` | FE→BE | 여러 행의 시스템 아이콘 PNG를 한 번에 위치 대응으로 반환 |
 | `show_context_menu` | FE→BE | 네이티브 컨텍스트 메뉴 (Windows: Explorer Shell API, macOS: 커스텀) |
 | `quick_look` | FE→BE | Quick Look 미리보기 (macOS 전용) |
 | `check_full_disk_access` | FE→BE | 전체 디스크 접근 권한 확인 (macOS 전용) |
@@ -662,13 +662,18 @@ DOM:
 
 ```
 visibleRows 변경
-  → ensureIcon(entry) 호출
+  → queueIcon(entry) 호출
   → iconCache에 있으면 즉시 반환 (최대 500개)
-  → 없으면 invoke('get_file_icon', { ext, path })
+  → 없으면 캐시 키를 큐에 넣고, 뷰포트의 미스 전체를
+      invoke('get_file_icons', { requests: [{ ext, path }, ...] }) 한 번으로 요청
+      (동시 인플라이트 배치는 1개, 이후 미스는 다음 배치로 합류)
 
 macOS:
-  → swift -e NSWorkspace 16x16 PNG (확장자 기반)
-  → 시작 시 20개 주요 확장자 프리워밍
+  → swift -e NSWorkspace → 32x32 PNG (16pt@2x) — 아이콘당이 아니라
+      배치당 프로세스 1개 (swift -e 한 번이 Swift 컴파일러 풀 실행, 약 1초)
+  → 배치 항목은 argv에 `f:<경로>` / `t:<타입>`으로 태깅해 전달,
+      .app 번들의 경로 기반 아이콘도 확장자 아이콘과 같은 프로세스에서 렌더
+  → 인덱싱이 끝난 뒤 20개 주요 확장자 프리워밍
 
 Windows:
   → 실행 파일 전용 아이콘: exe, lnk, ico, url, scr, appx

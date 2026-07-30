@@ -400,7 +400,7 @@ Without this, "flickering" or "duplicate delete/upsert" frequently occurs after 
 - `copy_files(paths: Vec<String>)` (macOS only — NSPasteboard clipboard)
 - `move_to_trash(paths: Vec<String>) -> Result`
 - `rename(path: String, new_name: String) -> Result<EntryDTO>`
-- `get_file_icon(ext: String, path: Option<String>) -> Option<Vec<u8>>` (system icon per extension/path)
+- `get_file_icons(requests: Vec<{ ext: String, path: Option<String> }>) -> Vec<Vec<u8>>` (system icons for a batch of rows, positional; empty = none available)
 - `show_context_menu(paths: Vec<String>, x: f64, y: f64)` (native context menu)
 - `quick_look(path: String)` (macOS only)
 - `check_full_disk_access() -> bool` (macOS only)

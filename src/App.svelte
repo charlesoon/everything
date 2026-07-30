@@ -149,8 +149,10 @@
   const iconCache = new Map();
   const iconLoading = new Set();
   const iconRetry = new Map();
+  const iconQueue = new Map();
   let iconVersion = 0;
   let iconRetryTick = 0;
+  let iconFlushScheduled = false;
 
   const HIGHLIGHT_CACHE_MAX = 300;
   let highlightCache = new Map();
@@ -189,7 +191,7 @@
   $: {
     iconRetryTick;
     for (const entry of visibleRows) {
-      void ensureIcon(entry);
+      queueIcon(entry);
     }
   }
 
@@ -305,33 +307,76 @@
     iconVersion += 1;
   }
 
-  async function ensureIcon(entry) {
+  // Icons are fetched in batches. On macOS every distinct icon the backend has
+  // to render costs its own `swift -e` — a full compiler run, ~1s — so asking
+  // row by row meant a screen of unseen extensions spawned one process each,
+  // right while the first index was still running. One viewport pass now
+  // collects its misses here and the backend renders the whole group together.
+  function queueIcon(entry) {
     const key = iconKey(entry);
-    if (iconCache.has(key) || iconLoading.has(key)) {
+    if (iconCache.has(key) || iconLoading.has(key) || iconQueue.has(key)) {
       return;
     }
     const retry = iconRetry.get(key);
     if (retry && Date.now() < retry.at) {
       return;
     }
+    iconQueue.set(key, entry);
+    scheduleIconFlush();
+  }
 
-    iconLoading.add(key);
+  function scheduleIconFlush() {
+    // One batch in flight at a time — `iconLoading` holds exactly that batch's
+    // keys, so a non-empty set means one is running. This is what keeps the
+    // batches big: a scroll during a render coalesces into the next request
+    // instead of sending its own one-key batch.
+    if (iconFlushScheduled || iconLoading.size > 0 || iconQueue.size === 0) {
+      return;
+    }
+    iconFlushScheduled = true;
+    // A microtask rather than requestAnimationFrame: the visible-rows scan
+    // enqueues the whole viewport synchronously, so this already batches it,
+    // and rAF would stall icons whenever the window is occluded.
+    queueMicrotask(flushIconQueue);
+  }
+
+  async function flushIconQueue() {
+    iconFlushScheduled = false;
+    if (iconQueue.size === 0) {
+      return;
+    }
+    const batch = [...iconQueue];
+    iconQueue.clear();
+    for (const [key] of batch) {
+      iconLoading.add(key);
+    }
     try {
-      const bytes = await invoke('get_file_icon', {
-        path: entry.path,
-        ext: isAppBundle(entry) ? 'app' : entry.isDir ? 'folder' : entry.ext || '',
+      // Positional: icons[i] belongs to batch[i], empty when nothing rendered.
+      const icons = await invoke('get_file_icons', {
+        requests: batch.map(([, entry]) => ({
+          path: entry.path,
+          ext: isAppBundle(entry) ? 'app' : entry.isDir ? 'folder' : entry.ext || '',
+        })),
       });
-      if (Array.isArray(bytes) && bytes.length > 0) {
-        const image = `data:image/png;base64,${bytesToBase64(Uint8Array.from(bytes))}`;
-        iconRetry.delete(key);
-        setIconCache(key, image);
-      } else {
+      batch.forEach(([key, entry], i) => {
+        const bytes = Array.isArray(icons) ? icons[i] : null;
+        if (bytes && bytes.length > 0) {
+          const image = `data:image/png;base64,${bytesToBase64(Uint8Array.from(bytes))}`;
+          iconRetry.delete(key);
+          setIconCache(key, image);
+        } else {
+          scheduleIconRetry(key, entry);
+        }
+      });
+    } catch {
+      for (const [key, entry] of batch) {
         scheduleIconRetry(key, entry);
       }
-    } catch {
-      scheduleIconRetry(key, entry);
     } finally {
-      iconLoading.delete(key);
+      for (const [key] of batch) {
+        iconLoading.delete(key);
+      }
+      scheduleIconFlush();
     }
   }
 

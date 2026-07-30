@@ -2,9 +2,10 @@
 //!
 //! `everything --mcp` runs a standalone MCP server over stdin/stdout serving a
 //! `search` tool straight from the SQLite index, so agents get results even
-//! when the GUI app is not running. On normal app startup `register_all`
-//! writes the server entry into Claude Code (`~/.claude.json`) and Codex
-//! (`~/.codex/config.toml`) so both agents pick it up automatically.
+//! when the GUI app is not running. `everything --register-mcp` writes the
+//! server entry into Claude Code (`~/.claude.json`) and Codex
+//! (`~/.codex/config.toml`); this is opt-in only — app startup never touches
+//! those configs.
 
 use std::fs;
 use std::io::{BufRead, Write};
@@ -531,7 +532,7 @@ enum RegisterOutcome {
 /// agent CLI found on this machine, logging one line per agent. Best-effort
 /// and idempotent. `db_path` is the app-resolved index path to pin into the
 /// entries (via `EVERYTHING_MCP_DB`); `None` falls back to the derived
-/// default. Called in the background on app startup and by `--register-mcp`.
+/// default. Only invoked by the explicit `--register-mcp` flag.
 pub fn register_all_and_log(db_path: Option<PathBuf>) {
     for line in register_all(db_path) {
         eprintln!("[mcp] {line}");

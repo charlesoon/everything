@@ -542,7 +542,7 @@ RDCW watcher (fallback — when USN unavailable)
 | `copy_files` | FE→BE | Copy files to clipboard (macOS only, NSPasteboard) |
 | `move_to_trash` | FE→BE | Move to trash + delete from DB |
 | `rename` | FE→BE | Rename + DB update → return new EntryDto |
-| `get_file_icon` | FE→BE | Return system icon PNG per extension/path |
+| `get_file_icons` | FE→BE | Return system icon PNGs for a batch of rows, positionally |
 | `show_context_menu` | FE→BE | Native context menu (Windows: Explorer Shell API, macOS: custom) |
 | `quick_look` | FE→BE | Quick Look preview (macOS only) |
 | `check_full_disk_access` | FE→BE | Check Full Disk Access permission (macOS only) |
@@ -662,13 +662,18 @@ DOM:
 
 ```
 visibleRows change
-  → call ensureIcon(entry)
+  → call queueIcon(entry)
   → if in iconCache, return immediately (max 500 entries)
-  → if not, invoke('get_file_icon', { ext, path })
+  → if not, queue the cache key and flush the whole viewport's misses
+      in one invoke('get_file_icons', { requests: [{ ext, path }, ...] })
+      (one batch in flight at a time; later misses coalesce into the next)
 
 macOS:
-  → swift -e NSWorkspace 16x16 PNG (extension-based only)
-  → Prewarm 20 common extensions at startup
+  → swift -e NSWorkspace → 32x32 PNG (16pt@2x) — one process per batch,
+      not per icon (each `swift -e` is a full compiler run, ~1s)
+  → Batch entries ride argv tagged `f:<path>` / `t:<type>`; .app bundles
+      render from their path in the same process as the extension icons
+  → Prewarm 20 common extensions once indexing settles
 
 Windows:
   → Per-file icons for: exe, lnk, ico, url, scr, appx

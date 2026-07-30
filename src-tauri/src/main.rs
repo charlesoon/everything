@@ -19,7 +19,7 @@ use parking_lot::{Mutex, RwLock};
 use rusqlite::{
     params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -177,6 +177,7 @@ fn builtin_skip_path_checks() -> &'static [(String, String)] {
 static SEARCH_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static PERF_LOG_ENABLED: OnceLock<bool> = OnceLock::new();
 static BENCH_MODE_ENABLED: OnceLock<bool> = OnceLock::new();
+static INDEX_FULL_SPEED: OnceLock<bool> = OnceLock::new();
 static STARTUP_T0: OnceLock<Instant> = OnceLock::new();
 
 fn startup_elapsed_ms() -> u128 {
@@ -585,6 +586,14 @@ fn bench_mode_enabled() -> bool {
 
 fn perf_log_enabled() -> bool {
     *PERF_LOG_ENABLED.get_or_init(|| env_truthy("FASTFIND_PERF_LOG") || bench_mode_enabled())
+}
+
+/// Escape hatch restoring the pre-0.5.3 indexing behavior: cores oversubscribed
+/// 2x and no QoS downgrade. Fastest wall-clock at the cost of pinning the whole
+/// fan-out to performance cores, so it is opt-in (and implied by bench mode,
+/// which measures throughput rather than power).
+fn index_full_speed() -> bool {
+    *INDEX_FULL_SPEED.get_or_init(|| env_truthy("EVERYTHING_INDEX_FULL_SPEED") || bench_mode_enabled())
 }
 
 /// Unique per-test scratch directory (not created). Shared by the main.rs and
@@ -1791,6 +1800,79 @@ pub(crate) fn should_skip_path(
     false
 }
 
+/// Per-child form of [`should_skip_path`], for jwalk's `process_read_dir` where
+/// the parent directory has **already** cleared `should_skip_path`. Callers
+/// must uphold that invariant — see the `root_vetted` guards at the walker call
+/// sites.
+///
+/// `should_skip_path` re-derives the answer from the whole path on every entry:
+/// a string allocation, a segment split checked against every builtin name, and
+/// a substring search per multi-segment rule — roughly O(depth) work repeated
+/// for each of ~1M files, even though only the leaf is ever new. The invariant
+/// collapses each check to its leaf case:
+///
+///   * builtin names/suffixes are per-segment, and every segment but the leaf
+///     belongs to the parent;
+///   * the multi-segment builtin paths and `AnySegment` patterns each test an
+///     `infix` (`/pat/`) and a `suffix` (`/pat`). An `infix` hit on the child
+///     lies either wholly inside the parent (already false) or across the join
+///     slash — which is exactly a parent `suffix` hit, also false. Only the
+///     child's own `suffix` arm can newly fire;
+///   * `ignored_roots` matches with `starts_with`, and any strict-ancestor hit
+///     would already have matched the parent, leaving only equality;
+///   * `matches_ignore_pattern` walks a glob up through every ancestor, all of
+///     which the parent cleared, leaving only the child itself.
+///
+/// `dir_str` is the parent path, slash-normalized once per directory rather
+/// than once per child. `scratch` is a caller-owned buffer reused across one
+/// directory's children so building the joined path costs a memcpy rather than
+/// an allocation.
+fn should_skip_child(
+    dir_str: &str,
+    name: &str,
+    child: &Path,
+    scratch: &mut String,
+    ignored_roots: &[PathBuf],
+    ignored_patterns: &[IgnorePattern],
+) -> bool {
+    // A literal backslash in a macOS file name becomes a separator once
+    // normalized, so the leaf would really be several segments. Those names are
+    // vanishingly rare; hand them to the general check rather than reasoning
+    // about them here (on Windows a single component never contains one).
+    if name.contains('\\') {
+        return should_skip_path(child, ignored_roots, ignored_patterns);
+    }
+
+    if BUILTIN_SKIP_NAMES.contains(&name)
+        || BUILTIN_SKIP_SUFFIXES.iter().any(|suf| name.ends_with(suf))
+    {
+        return true;
+    }
+
+    scratch.clear();
+    scratch.push_str(dir_str);
+    if !scratch.ends_with('/') {
+        scratch.push('/');
+    }
+    scratch.push_str(name);
+
+    if builtin_skip_path_checks()
+        .iter()
+        .any(|(_, suffix)| scratch.ends_with(suffix.as_str()))
+    {
+        return true;
+    }
+
+    if ignored_roots.iter().any(|root| child == root) {
+        return true;
+    }
+
+    ignored_patterns.iter().any(|pattern| match pattern {
+        IgnorePattern::AnySegment { segment, .. } => name == segment,
+        IgnorePattern::Glob(glob) => glob_match_path(glob, scratch),
+    })
+}
+
 
 fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
     if is_dir {
@@ -2604,6 +2686,154 @@ pub(crate) fn release_memory_to_os() {
     }
 }
 
+/// How urgent an indexing pass is, which decides how far its threads step out
+/// of the foreground's way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanPriority {
+    /// The user is waiting on this work — a fresh index (the app has nothing to
+    /// search until it lands) or the FTS rebuild that follows it. Gets the
+    /// gentler of the two background classes.
+    Awaited,
+    /// Restart catchup: the index is already usable and nothing is blocked on
+    /// the pass, so it can be pushed all the way down.
+    Idle,
+}
+
+/// Step the calling thread out of the foreground's way for the rest of an
+/// indexing pass.
+///
+/// macOS only: sets the thread's QoS class. Without this every scan thread
+/// inherits the Tauri main thread's `USER_INTERACTIVE` class, which pins the
+/// whole fan-out to performance cores at full clock — the direct cause of the
+/// 400%+ CPU and fan spin-up during a first-run index on Apple Silicon. Must be
+/// called *from* the thread it should affect.
+///
+/// No-op elsewhere: on Windows the indexer already lives in a separate service
+/// process that the SCM runs at a lower priority.
+#[allow(unused_variables)]
+pub(crate) fn apply_scan_scheduling(priority: ScanPriority) {
+    #[cfg(target_os = "macos")]
+    {
+        if index_full_speed() {
+            return;
+        }
+        use mac::sched::{Pressure, Qos};
+        // A hot or battery-saving machine gets the stricter class no matter how
+        // urgent the pass is: finishing sooner is not worth being throttled.
+        let qos = match (priority, mac::sched::pressure()) {
+            (ScanPriority::Awaited, Pressure::None | Pressure::Elevated) => Qos::Utility,
+            _ => Qos::Background,
+        };
+        let errno = mac::sched::apply(qos);
+        if errno != 0 {
+            // Survivable (the thread keeps its inherited class) but it means the
+            // CPU spike this whole path exists to prevent is back, so leave a
+            // trail instead of failing silently. Once per process: this runs on
+            // every scan thread.
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, AtomicOrdering::Relaxed) {
+                diag::log(format!(
+                    "WARNING: could not lower indexing QoS to {qos:?} (errno={errno}); \
+                     indexing will run at the inherited priority"
+                ));
+            }
+        }
+    }
+}
+
+/// One-line description of the scheduling actually in force on the calling
+/// thread, for the scan-start log. Makes a silently-failed QoS downgrade (the
+/// difference between quiet fans and not) visible in a field log instead of
+/// something only a profiler would catch.
+pub(crate) fn scan_scheduling_label() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return format!(
+            "qos={}{}",
+            mac::sched::current_class_name(),
+            if index_full_speed() {
+                " full_speed=1"
+            } else {
+                ""
+            }
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    "qos=n/a".to_string()
+}
+
+/// Divisor applied to the scan fan-out when the machine is already hot or in
+/// Low Power Mode. Always 1 where there is no thermal signal to read, or when
+/// the full-speed escape hatch is set.
+fn scan_pressure_divisor() -> usize {
+    #[cfg(target_os = "macos")]
+    if !index_full_speed() {
+        return match mac::sched::pressure() {
+            mac::sched::Pressure::None => 1,
+            mac::sched::Pressure::Elevated => 2,
+            mac::sched::Pressure::High => 4,
+        };
+    }
+    1
+}
+
+/// Duty-cycle limiter for the walk loops.
+///
+/// Thread count and QoS are both fixed when a pass starts, so if the machine
+/// heats up mid-run this is the only lever left. Rather than guessing a fixed
+/// nap it sleeps for a multiple of the time just spent working, which
+/// self-calibrates to whatever a walk actually costs on this machine.
+pub(crate) struct ScanThrottle {
+    last_tick: Instant,
+    enabled: bool,
+}
+
+impl ScanThrottle {
+    /// Longest single nap. Bounds the damage when the gap between ticks is
+    /// dominated by something other than CPU — a slow network mount, or a
+    /// laptop that was asleep across the interval.
+    const MAX_NAP: Duration = Duration::from_millis(250);
+
+    pub(crate) fn new() -> Self {
+        Self {
+            last_tick: Instant::now(),
+            enabled: !index_full_speed(),
+        }
+    }
+
+    /// Call from a scan worker on a coarse counter (every few thousand
+    /// entries). Cheap when the machine is cool: the pressure probe is cached
+    /// for 2s and returns without sleeping.
+    pub(crate) fn tick(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let busy = self.last_tick.elapsed();
+        let ratio = Self::backoff_ratio();
+        if ratio > 0.0 {
+            std::thread::sleep(busy.mul_f32(ratio).min(Self::MAX_NAP));
+        }
+        self.last_tick = Instant::now();
+    }
+
+    /// Sleep time as a multiple of time worked: 0.5 holds the walk near a 2/3
+    /// duty cycle, 2.0 near 1/3.
+    #[cfg(target_os = "macos")]
+    fn backoff_ratio() -> f32 {
+        match mac::sched::pressure() {
+            mac::sched::Pressure::None => 0.0,
+            mac::sched::Pressure::Elevated => 0.5,
+            mac::sched::Pressure::High => 2.0,
+        }
+    }
+
+    /// No thermal signal to act on outside macOS.
+    #[cfg(not(target_os = "macos"))]
+    fn backoff_ratio() -> f32 {
+        0.0
+    }
+}
+
 /// Remove `row`'s path from the direct-children preload map, returning true
 /// when it was present AND unchanged (same mtime + size). Paths left in the
 /// map after the scan are only reconciliation candidates; callers must confirm
@@ -2801,22 +3031,48 @@ fn stage_direct_child(
     }
 }
 
-/// Build the shared rayon thread pool for a parallel filesystem scan. Scanning
-/// is I/O-bound (stat() blocks on disk), so we oversubscribe cores. Returns the
-/// pool, its thread count, and the CPU count (callers derive worker count from
-/// it differently). Shared by the fresh and catchup scan branches.
-fn build_scan_pool() -> (Arc<jwalk::rayon::ThreadPool>, usize, usize) {
+/// Build the shared rayon thread pool for a parallel filesystem scan. Returns
+/// the pool, its thread count, and the number of walk workers callers should
+/// spawn against it. Shared by the fresh and catchup scan branches.
+///
+/// This used to oversubscribe cores 2x on the theory that scanning is I/O-bound
+/// and `stat()` blocks on disk. On an SSD that premise does not hold: `readdir`
+/// + `lstat` against APFS is dominated by in-kernel b-tree work, so the extra
+/// threads bought almost no throughput while keeping every core busy. On an M2
+/// Pro the old sizing produced ~20 pool threads plus ~10 walk workers plus the
+/// writer, all at the inherited `USER_INTERACTIVE` QoS — 400%+ CPU with the
+/// fans audible throughout a first-run index.
+///
+/// The pool is now a fraction of the machine and every thread drops to a
+/// background QoS via `start_handler`, which is the only hook that runs on a
+/// rayon worker before it picks up work.
+fn build_scan_pool(priority: ScanPriority) -> (Arc<jwalk::rayon::ThreadPool>, usize, usize) {
     let n_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let pool_threads = (n_cpus * 2).max(8);
+
+    let (pool_threads, workers) = if index_full_speed() {
+        ((n_cpus * 2).max(8), n_cpus)
+    } else {
+        // Walk work (pool) outweighs row-building work (workers) roughly 2:1.
+        let pool = (n_cpus / 2).clamp(2, 6);
+        (pool, (pool / 2).clamp(2, 4))
+    };
+
+    // Already hot or saving power: shrink the fan-out rather than add to it.
+    let divisor = scan_pressure_divisor();
+    let pool_threads = (pool_threads / divisor).max(2);
+    let workers = (workers / divisor).max(1);
+
     let pool = Arc::new(
         jwalk::rayon::ThreadPoolBuilder::new()
             .num_threads(pool_threads)
+            .thread_name(|i| format!("everything-scan-{i}"))
+            .start_handler(move |_| apply_scan_scheduling(priority))
             .build()
             .expect("failed to build rayon pool for parallel scan"),
     );
-    (pool, pool_threads, n_cpus)
+    (pool, pool_threads, workers)
 }
 
 /// `app: None` runs the index pipeline without UI event emission and without
@@ -2853,6 +3109,13 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
         "index pass start (fresh={is_fresh_run} fts_dirty={fts_dirty} extra_roots={})",
         state.extra_roots.lock().len()
     ));
+    // This thread is the pass's SQLite writer for the whole run; drop it out of
+    // the foreground's way alongside the scan workers spawned below.
+    apply_scan_scheduling(if is_fresh_run {
+        ScanPriority::Awaited
+    } else {
+        ScanPriority::Idle
+    });
     if fts_dirty && !is_fresh_run {
         state.fts_ready.store(false, AtomicOrdering::Release);
     }
@@ -2906,6 +3169,11 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
                         }
                     }
                     let _guard = IndexingGuard(Arc::clone(&fin_state.indexing_active));
+                    // Single-threaded, but CREATE INDEX + FTS rebuild + ANALYZE
+                    // over ~1M rows is minutes of sustained work; search runs on
+                    // LIKE fallbacks until it lands, so it is awaited rather
+                    // than idle.
+                    apply_scan_scheduling(ScanPriority::Awaited);
 
                     // 1. Transition to Ready: update state and emit event
                     // (index_updated already emitted by run_incremental_index_inner)
@@ -3211,14 +3479,15 @@ fn run_incremental_index_inner(
             batch.clear();
         }
 
-        // Shared rayon pool: all workers share one pool sized for maximum I/O throughput.
-        let (shared_pool, pool_threads, n_cpus) = build_scan_pool();
-        let n_workers = n_cpus.min(roots.len().max(1));
+        // Shared rayon pool: all workers share one background-QoS pool.
+        let (shared_pool, pool_threads, max_workers) = build_scan_pool(ScanPriority::Awaited);
+        let n_workers = max_workers.min(roots.len().max(1));
         eprintln!(
-            "[index] fresh parallel scan: {} workers, {} pool threads, {} roots",
+            "[index] fresh parallel scan: {} workers, {} pool threads, {} roots, {}",
             n_workers,
             pool_threads,
-            roots.len()
+            roots.len(),
+            scan_scheduling_label(),
         );
 
         type ScanMsg = (Vec<IndexRow>, u64, u64, u64, String);
@@ -3241,6 +3510,8 @@ fn run_incremental_index_inner(
                 let cancel = Arc::clone(&state.cancel_index);
 
                 scope.spawn(move || {
+                    apply_scan_scheduling(ScanPriority::Awaited);
+                    let mut throttle = ScanThrottle::new();
                     let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
                     let mut local_scanned = 0u64;
                     let mut local_indexed = 0u64;
@@ -3258,6 +3529,14 @@ fn run_incremental_index_inner(
 
                         let s_roots = skip_roots.clone();
                         let s_patterns = skip_patterns.clone();
+                        // `should_skip_child` assumes the parent already cleared
+                        // `should_skip_path`. jwalk guarantees that for every
+                        // subdirectory it descends into, and
+                        // `observe_direct_children` guarantees it for the roots
+                        // under $HOME — but an extra `.pathindexing` root is
+                        // scanned as configured without passing that filter, so
+                        // such a root falls back to the full per-entry check.
+                        let root_vetted = !should_skip_path(root, &skip_roots, &skip_patterns);
                         let walker =
                             jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
                                 .follow_links(false)
@@ -3267,14 +3546,27 @@ fn run_incremental_index_inner(
                                     busy_timeout: None,
                                 })
                                 .process_read_dir(move |_depth, path, _state, children| {
+                                    // Normalize the parent once per directory
+                                    // instead of the whole path once per child.
+                                    let dir_str =
+                                        normalize_slashes(path.to_string_lossy().to_string());
+                                    let mut scratch = String::with_capacity(dir_str.len() + 64);
                                     children.retain_mut(|entry_result| match entry_result {
                                         Ok(entry) => {
                                             let full_path = path.join(&entry.file_name);
-                                            if should_skip_path(
-                                                &full_path,
-                                                &s_roots,
-                                                &s_patterns,
-                                            ) {
+                                            let skip = if root_vetted {
+                                                should_skip_child(
+                                                    &dir_str,
+                                                    &entry.file_name.to_string_lossy(),
+                                                    &full_path,
+                                                    &mut scratch,
+                                                    &s_roots,
+                                                    &s_patterns,
+                                                )
+                                            } else {
+                                                should_skip_path(&full_path, &s_roots, &s_patterns)
+                                            };
+                                            if skip {
                                                 return false;
                                             }
                                             entry.client_state =
@@ -3289,10 +3581,13 @@ fn run_incremental_index_inner(
                             // Cooperative cancel (daemon yielding to the GUI):
                             // break the whole worker so no further roots are
                             // walked; the pass returns Err and is discarded.
-                            if local_scanned % 4096 == 0
-                                && cancel.load(AtomicOrdering::Acquire)
-                            {
-                                break 'roots;
+                            // The same coarse counter paces the thermal
+                            // duty-cycle check.
+                            if local_scanned % 4096 == 0 {
+                                if cancel.load(AtomicOrdering::Acquire) {
+                                    break 'roots;
+                                }
+                                throttle.tick();
                             }
                             match result {
                                 Ok(entry) => {
@@ -3302,7 +3597,12 @@ fn run_incremental_index_inner(
                                     }
                                     local_scanned += 1;
                                     root_scanned += 1;
-                                    local_path = path.to_string_lossy().to_string();
+                                    // Overwrite the buffer in place: to_string_lossy
+                                    // borrows for valid UTF-8, so after warmup this
+                                    // is a memcpy rather than the ~1M short-lived
+                                    // Strings the old assignment allocated.
+                                    local_path.clear();
+                                    local_path.push_str(&path.to_string_lossy());
 
                                     let metadata = match entry.client_state {
                                         Some(m) => m,
@@ -3427,15 +3727,18 @@ fn run_incremental_index_inner(
             batch.clear();
         }
 
-        let (shared_pool, pool_threads, n_cpus) = build_scan_pool();
-        // Each worker holds one root's preload map in memory; cap workers to
-        // bound peak memory when several large roots are processed at once.
-        let n_workers = n_cpus.min(roots.len().max(1)).min(8);
+        let (shared_pool, pool_threads, max_workers) = build_scan_pool(ScanPriority::Idle);
+        // Each worker holds one root's preload map in memory, so the worker cap
+        // also bounds peak memory when several large roots run at once. The 8
+        // that used to be spelled out here is now subsumed by build_scan_pool's
+        // own ceiling, which is lower still.
+        let n_workers = max_workers.min(roots.len().max(1));
         eprintln!(
-            "[index] catchup parallel scan: {} workers, {} pool threads, {} roots",
+            "[index] catchup parallel scan: {} workers, {} pool threads, {} roots, {}",
             n_workers,
             pool_threads,
-            roots.len()
+            roots.len(),
+            scan_scheduling_label(),
         );
 
         // (rows to upsert, vanished paths to delete, scanned, indexed, perm_errors, current path)
@@ -3459,6 +3762,8 @@ fn run_incremental_index_inner(
                 let cancel = Arc::clone(&state.cancel_index);
 
                 scope.spawn(move || {
+                    apply_scan_scheduling(ScanPriority::Idle);
+                    let mut throttle = ScanThrottle::new();
                     let worker_conn = db_connection(&worker_db).ok();
                     let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
                     let mut local_scanned = 0u64;
@@ -3485,6 +3790,9 @@ fn run_incremental_index_inner(
 
                         let s_roots = skip_roots.clone();
                         let s_patterns = skip_patterns.clone();
+                        // See the fresh branch: the fast per-child check needs a
+                        // parent that already cleared `should_skip_path`.
+                        let root_vetted = !should_skip_path(root, &skip_roots, &skip_patterns);
                         let walker =
                             jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
                                 .follow_links(false)
@@ -3494,14 +3802,25 @@ fn run_incremental_index_inner(
                                     busy_timeout: None,
                                 })
                                 .process_read_dir(move |_depth, path, _state, children| {
+                                    let dir_str =
+                                        normalize_slashes(path.to_string_lossy().to_string());
+                                    let mut scratch = String::with_capacity(dir_str.len() + 64);
                                     children.retain_mut(|entry_result| match entry_result {
                                         Ok(entry) => {
                                             let full_path = path.join(&entry.file_name);
-                                            if should_skip_path(
-                                                &full_path,
-                                                &s_roots,
-                                                &s_patterns,
-                                            ) {
+                                            let skip = if root_vetted {
+                                                should_skip_child(
+                                                    &dir_str,
+                                                    &entry.file_name.to_string_lossy(),
+                                                    &full_path,
+                                                    &mut scratch,
+                                                    &s_roots,
+                                                    &s_patterns,
+                                                )
+                                            } else {
+                                                should_skip_path(&full_path, &s_roots, &s_patterns)
+                                            };
+                                            if skip {
                                                 return false;
                                             }
                                             entry.client_state =
@@ -3519,11 +3838,13 @@ fn run_incremental_index_inner(
                             // Cooperative cancel (daemon yielding to the GUI):
                             // break the whole worker. Breaking 'roots skips this
                             // root's leftover-delete step, so a partially-walked
-                            // root never has its unseen rows deleted.
-                            if local_scanned % 4096 == 0
-                                && cancel.load(AtomicOrdering::Acquire)
-                            {
-                                break 'roots;
+                            // root never has its unseen rows deleted. The same
+                            // coarse counter paces the thermal duty-cycle check.
+                            if local_scanned % 4096 == 0 {
+                                if cancel.load(AtomicOrdering::Acquire) {
+                                    break 'roots;
+                                }
+                                throttle.tick();
                             }
                             match result {
                                 Ok(entry) => {
@@ -3533,7 +3854,9 @@ fn run_incremental_index_inner(
                                     }
                                     local_scanned += 1;
                                     root_scanned += 1;
-                                    local_path = path.to_string_lossy().to_string();
+                                    // In-place overwrite; see the fresh branch.
+                                    local_path.clear();
+                                    local_path.push_str(&path.to_string_lossy());
 
                                     let metadata = match entry.client_state {
                                         Some(m) => m,
@@ -4811,87 +5134,150 @@ fn safe_file_type(ext: &str) -> String {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn load_system_icon_png(ext: &str) -> Option<Vec<u8>> {
-    let file_type = safe_file_type(ext);
-    let script = format!(
-        r#"import AppKit
-import Foundation
-let image = NSWorkspace.shared.icon(forFileType: "{file_type}")
-image.size = NSSize(width: 16, height: 16)
-if let tiff = image.tiffRepresentation,
-   let rep = NSBitmapImageRep(data: tiff),
-   let png = rep.representation(using: .png, properties: [:]) {{
-  FileHandle.standardOutput.write(png)
-}} else {{
-  exit(1)
-}}
-"#
-    );
+/// What a batch entry renders its icon from: the file itself (bundles and
+/// executables carry their own) or its type.
+enum IconSource<'a> {
+    File(&'a str),
+    Type(&'a str),
+}
 
-    run_swift_png(&script, None)
+/// Render a whole batch of icons, positionally (`None` where the platform
+/// produced nothing).
+///
+/// macOS renders the batch in **one** `swift -e`. That matters because `swift -e`
+/// is not a script interpreter — it runs the Swift frontend and LLVM, about a
+/// second of wall time per invocation — so resolving a screen of results one
+/// icon at a time piled compiler runs onto a machine that was already busy
+/// building the first index. Windows' Shell API is in-process, so there is
+/// nothing to amortize and the batch is just a loop.
+#[cfg(target_os = "macos")]
+fn render_icon_pngs(sources: &[IconSource<'_>]) -> Vec<Option<Vec<u8>>> {
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    // Requests ride argv, one `f:`/`t:`-tagged argument each: paths are
+    // arbitrary user data that may contain newlines (so a newline-joined env
+    // payload could not carry them), and the tag also keeps a path that starts
+    // with a dash from being read as a compiler flag by the Swift driver.
+    //
+    // Icons are drawn into an explicit 32x32 bitmap — 16pt at 2x, the small
+    // Retina representation Finder uses. Serializing the NSImage's own
+    // tiffRepresentation instead would emit its *largest* representation:
+    // 1024x1024, up to 200KB of PNG, to paint a 26px row.
+    let script = r#"import AppKit
+import Foundation
+
+func renderIcon(_ image: NSImage) -> Data? {
+  let sidePixels = 32
+  let sidePoints: CGFloat = 16
+  guard let rep = NSBitmapImageRep(
+    bitmapDataPlanes: nil, pixelsWide: sidePixels, pixelsHigh: sidePixels,
+    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+  ) else {
+    return nil
+  }
+  rep.size = NSSize(width: sidePoints, height: sidePoints)
+  NSGraphicsContext.saveGraphicsState()
+  guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
+    NSGraphicsContext.restoreGraphicsState()
+    return nil
+  }
+  context.imageInterpolation = .high
+  NSGraphicsContext.current = context
+  image.draw(
+    in: NSRect(x: 0, y: 0, width: sidePoints, height: sidePoints),
+    from: .zero, operation: .copy, fraction: 1.0
+  )
+  NSGraphicsContext.restoreGraphicsState()
+  return rep.representation(using: .png, properties: [:])
+}
+
+let workspace = NSWorkspace.shared
+let out = FileHandle.standardOutput
+for spec in CommandLine.arguments.dropFirst() {
+  let value = String(spec.dropFirst(2))
+  let image = spec.hasPrefix("f:")
+    ? workspace.icon(forFile: value)
+    : workspace.icon(forFileType: value)
+  let payload = renderIcon(image) ?? Data()
+  var len = UInt32(payload.count).littleEndian
+  out.write(Data(bytes: &len, count: 4))
+  out.write(payload)
+}
+"#;
+
+    let args: Vec<String> = sources
+        .iter()
+        .map(|source| match source {
+            IconSource::File(path) => format!("f:{path}"),
+            IconSource::Type(ext) => format!("t:{}", safe_file_type(ext)),
+        })
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(stream) = run_swift_png(script, &args) else {
+        return vec![None; sources.len()];
+    };
+    parse_icon_frames(&stream, sources.len())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn render_icon_pngs(sources: &[IconSource<'_>]) -> Vec<Option<Vec<u8>>> {
+    sources
+        .iter()
+        .map(|source| match source {
+            IconSource::File(path) => load_icon_from_path(path),
+            IconSource::Type(ext) => load_system_icon_png(ext),
+        })
+        .collect()
+}
+
+/// Split a batched render's stdout into `count` positional icons.
+///
+/// Frames are length-prefixed: a little-endian `u32` byte count followed by that
+/// many PNG bytes, in request order. A zero-length frame means AppKit had no
+/// icon for that request; a truncated stream (subprocess killed mid-write)
+/// leaves the tail unfilled.
+#[cfg(target_os = "macos")]
+fn parse_icon_frames(stream: &[u8], count: usize) -> Vec<Option<Vec<u8>>> {
+    let mut icons = Vec::with_capacity(count);
+    let mut cursor = 0usize;
+    while icons.len() < count {
+        let Some(header) = stream.get(cursor..cursor + 4) else {
+            break;
+        };
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        cursor += 4;
+        let Some(payload) = len
+            .checked_add(cursor)
+            .and_then(|end| stream.get(cursor..end))
+        else {
+            break;
+        };
+        cursor += len;
+        icons.push((!payload.is_empty()).then(|| payload.to_vec()));
+    }
+    icons.resize(count, None);
+    icons
 }
 
 #[cfg(target_os = "macos")]
-fn run_swift_png(script: &str, env: Option<(&str, &str)>) -> Option<Vec<u8>> {
+fn run_swift_png(script: &str, args: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("swift");
-    cmd.arg("-e").arg(script);
-    if let Some((key, value)) = env {
-        cmd.env(key, value);
-    }
+    cmd.arg("-e").arg(script).args(args);
+    // Serialize spawns: each `swift -e` is a full compiler run (~1s of CPU), so
+    // overlapping them just multiplies a spike that already competes with
+    // indexing. Renders are batched, so this only orders whole batches against
+    // each other — never one icon against the next.
+    static SPAWN_GUARD: Mutex<()> = Mutex::new(());
+    let _guard = SPAWN_GUARD.lock();
     let output = cmd.output().ok()?;
     if output.status.success() && !output.stdout.is_empty() {
         Some(output.stdout)
     } else {
         None
     }
-}
-
-#[cfg(target_os = "macos")]
-fn load_path_icon_png(path: &str) -> Option<Vec<u8>> {
-    // Path is delivered via env var so it never touches the Swift source (no escaping issues).
-    // Render at 16pt/2x so AppKit selects the small Retina representation used by Finder.
-    // A 32pt/1x context selects different artwork that looks soft when scaled down in the UI.
-    let script = r#"import AppKit
-import Foundation
-guard let path = ProcessInfo.processInfo.environment["EVERYTHING_ICON_PATH"] else {
-  exit(1)
-}
-let image = NSWorkspace.shared.icon(forFile: path)
-let sidePixels = 32
-let sidePoints: CGFloat = 16
-guard let rep = NSBitmapImageRep(
-  bitmapDataPlanes: nil, pixelsWide: sidePixels, pixelsHigh: sidePixels,
-  bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-  colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-) else {
-  exit(1)
-}
-rep.size = NSSize(width: sidePoints, height: sidePoints)
-NSGraphicsContext.saveGraphicsState()
-guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
-  NSGraphicsContext.restoreGraphicsState()
-  exit(1)
-}
-context.imageInterpolation = .high
-NSGraphicsContext.current = context
-image.draw(
-  in: NSRect(x: 0, y: 0, width: sidePoints, height: sidePoints),
-  from: .zero, operation: .copy, fraction: 1.0
-)
-NSGraphicsContext.restoreGraphicsState()
-if let png = rep.representation(using: .png, properties: [:]) {
-  FileHandle.standardOutput.write(png)
-} else {
-  exit(1)
-}
-"#;
-
-    // Serialize spawns: each `swift -e` is a full compiler run, and a screen of
-    // .app results would otherwise launch dozens of them at once.
-    static SPAWN_GUARD: Mutex<()> = Mutex::new(());
-    let _guard = SPAWN_GUARD.lock();
-    run_swift_png(script, Some(("EVERYTHING_ICON_PATH", path)))
 }
 
 #[cfg(target_os = "windows")]
@@ -4901,6 +5287,16 @@ fn load_system_icon_png(ext: &str) -> Option<Vec<u8>> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn load_system_icon_png(_ext: &str) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn load_icon_from_path(path: &str) -> Option<Vec<u8>> {
+    win::icon::load_icon_png(path)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn load_icon_from_path(_path: &str) -> Option<Vec<u8>> {
     None
 }
 
@@ -4920,23 +5316,23 @@ fn is_per_file_icon_ext(_ext: &str) -> bool {
     false
 }
 
+/// Whether a row's icon should be rendered from the file itself rather than from
+/// its type. Windows' Shell API returns better artwork for any real file, so it
+/// always consults the path; macOS only does for the bundle types that carry
+/// their own icon, and other platforms have no per-file source at all.
 #[cfg(target_os = "windows")]
-fn load_icon_from_path(path: &str, _ext: &str) -> Option<Vec<u8>> {
-    win::icon::load_icon_png(path)
+fn renders_from_file(_ext: &str) -> bool {
+    true
 }
 
 #[cfg(target_os = "macos")]
-fn load_icon_from_path(path: &str, ext: &str) -> Option<Vec<u8>> {
-    if is_per_file_icon_ext(ext) {
-        load_path_icon_png(path)
-    } else {
-        None
-    }
+fn renders_from_file(ext: &str) -> bool {
+    is_per_file_icon_ext(ext)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn load_icon_from_path(_path: &str, _ext: &str) -> Option<Vec<u8>> {
-    None
+fn renders_from_file(_ext: &str) -> bool {
+    false
 }
 
 #[tauri::command]
@@ -7016,60 +7412,179 @@ async fn set_native_theme(theme: String, app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-#[tauri::command]
-async fn get_file_icon(
+/// One row's icon request. `path` comes along for every row so the formats whose
+/// icon lives inside the file (`.app` bundles, `.exe`) can be rendered from it;
+/// everything else resolves by extension.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IconRequest {
+    #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
     ext: String,
+}
+
+/// A normalized request: `key` is what `icon_cache` is keyed by, `ext` the type
+/// to fall back to when the file itself yields no icon.
+struct IconJob {
+    key: String,
+    ext: String,
+    path: Option<String>,
+}
+
+fn icon_job(request: &IconRequest) -> IconJob {
+    let ext = if request.ext.trim().is_empty() {
+        "__default__".to_string()
+    } else {
+        request.ext.to_lowercase()
+    };
+    let path = request
+        .path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let key = if is_per_file_icon_ext(&ext) {
+        path.clone().unwrap_or_else(|| ext.clone())
+    } else {
+        ext.clone()
+    };
+    IconJob { key, ext, path }
+}
+
+/// One cache miss and every row waiting on it.
+struct IconMiss<'a> {
+    job: &'a IconJob,
+    rows: Vec<usize>,
+    png: Option<Vec<u8>>,
+}
+
+/// Resolve a batch of icon requests, rendering everything the cache misses in a
+/// single pass — one subprocess on macOS, where a `swift -e` is a full compiler
+/// run (roughly a second of CPU) and resolving a screen of results one row at a
+/// time therefore cost one process per distinct icon, right while the first
+/// index was running.
+///
+/// Results are positional: `requests[i]` → `icons[i]`. An empty entry means no
+/// icon could be produced, and those are deliberately not cached so a later
+/// retry can still succeed (e.g. an `.app` bundle still being written).
+fn resolve_file_icons(
+    cache: &Mutex<HashMap<String, Vec<u8>>>,
+    requests: &[IconRequest],
+) -> Vec<Vec<u8>> {
+    let started = Instant::now();
+    let jobs: Vec<IconJob> = requests.iter().map(icon_job).collect();
+    let mut icons: Vec<Vec<u8>> = vec![Vec::new(); jobs.len()];
+
+    // Cache misses, deduplicated by key: a screen full of .txt renders once and
+    // the result lands on every row that asked for it.
+    let mut misses: Vec<IconMiss> = Vec::new();
+    {
+        let cache = cache.lock();
+        let mut slot_of: HashMap<&str, usize> = HashMap::new();
+        for (row, job) in jobs.iter().enumerate() {
+            if let Some(hit) = cache.get(&job.key) {
+                icons[row] = hit.clone();
+            } else if let Some(&slot) = slot_of.get(job.key.as_str()) {
+                misses[slot].rows.push(row);
+            } else {
+                slot_of.insert(job.key.as_str(), misses.len());
+                misses.push(IconMiss { job, rows: vec![row], png: None });
+            }
+        }
+    }
+    if misses.is_empty() {
+        return icons;
+    }
+
+    // One render for the whole batch: rows whose icon lives in the file render
+    // from their path, the rest from their type.
+    let sources: Vec<IconSource> = misses
+        .iter()
+        .map(|miss| match &miss.job.path {
+            Some(path) if renders_from_file(&miss.job.ext) => IconSource::File(path),
+            _ => IconSource::Type(&miss.job.ext),
+        })
+        .collect();
+    for (miss, png) in misses.iter_mut().zip(render_icon_pngs(&sources)) {
+        miss.png = png;
+    }
+    let from_file = misses
+        .iter()
+        .zip(&sources)
+        .filter(|(miss, source)| miss.png.is_some() && matches!(source, IconSource::File(_)))
+        .count();
+
+    // A file that yielded no icon of its own (an .app bundle still being written,
+    // say) falls back to its type icon, which is stored under the type key too so
+    // the next such file costs nothing. This is rare enough that it is worth a
+    // second render rather than pre-rendering every fallback up front.
+    let fallbacks: Vec<usize> = (0..misses.len())
+        .filter(|&slot| misses[slot].png.is_none() && matches!(sources[slot], IconSource::File(_)))
+        .collect();
+    if !fallbacks.is_empty() {
+        let mut pending: Vec<(&str, Vec<usize>)> = Vec::new();
+        {
+            let cache = cache.lock();
+            let mut slot_of: HashMap<&str, usize> = HashMap::new();
+            for slot in fallbacks {
+                let ext = misses[slot].job.ext.as_str();
+                if let Some(hit) = cache.get(ext) {
+                    misses[slot].png = Some(hit.clone());
+                } else if let Some(&pos) = slot_of.get(ext) {
+                    pending[pos].1.push(slot);
+                } else {
+                    slot_of.insert(ext, pending.len());
+                    pending.push((ext, vec![slot]));
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let sources: Vec<IconSource> =
+                pending.iter().map(|(ext, _)| IconSource::Type(ext)).collect();
+            let pngs = render_icon_pngs(&sources);
+            let mut cache = cache.lock();
+            for ((ext, slots), png) in pending.iter().zip(pngs) {
+                let Some(png) = png else { continue };
+                cache.insert((*ext).to_string(), png.clone());
+                for &slot in slots {
+                    misses[slot].png = Some(png.clone());
+                }
+            }
+        }
+    }
+
+    // A batch only gets here when it had to render, so this stays quiet once the
+    // cache is warm — and it reports a batch that resolved nothing, which is the
+    // shape a missing Swift toolchain takes in the field.
+    eprintln!(
+        "[icons] batch: {} row(s), {} miss(es) in {}ms ({} rendered from the file itself, \
+         {} unresolved)",
+        jobs.len(),
+        misses.len(),
+        started.elapsed().as_millis(),
+        from_file,
+        misses.iter().filter(|miss| miss.png.is_none()).count(),
+    );
+
+    let mut cache = cache.lock();
+    for miss in &misses {
+        let Some(png) = &miss.png else { continue };
+        cache.insert(miss.job.key.clone(), png.clone());
+        for &row in &miss.rows {
+            icons[row] = png.clone();
+        }
+    }
+    icons
+}
+
+#[tauri::command]
+async fn get_file_icons(
+    requests: Vec<IconRequest>,
     state: State<'_, AppState>,
-) -> AppResult<Vec<u8>> {
+) -> AppResult<Vec<Vec<u8>>> {
     let state = state.inner().clone();
     Ok(tauri::async_runtime::spawn_blocking(move || {
-        let ext_lower = if ext.trim().is_empty() {
-            "__default__".to_string()
-        } else {
-            ext.to_lowercase()
-        };
-
-        let cache_key = if is_per_file_icon_ext(&ext_lower) {
-            path.as_deref().unwrap_or(&ext_lower).to_string()
-        } else {
-            ext_lower.clone()
-        };
-
-        if let Some(cached) = state.icon_cache.lock().get(&cache_key).cloned() {
-            return cached;
-        }
-
-        let per_path_key = cache_key != ext_lower;
-        let icon = path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .and_then(|p| load_icon_from_path(p, &ext_lower))
-            .or_else(|| {
-                // Per-path miss: serve the generic ext icon from the ext-keyed
-                // cache (prewarmed for common exts) instead of regenerating it
-                // for every path, and store it back under the ext key.
-                if per_path_key {
-                    if let Some(cached) = state.icon_cache.lock().get(&ext_lower).cloned() {
-                        return Some(cached);
-                    }
-                }
-                let system = load_system_icon_png(&ext_lower);
-                if per_path_key {
-                    if let Some(png) = &system {
-                        state.icon_cache.lock().insert(ext_lower.clone(), png.clone());
-                    }
-                }
-                system
-            });
-
-        let icon = icon.unwrap_or_default();
-        // Don't cache failures: a transient miss (e.g. an .app bundle still being
-        // written) would otherwise block every future retry for this key.
-        if !icon.is_empty() {
-            state.icon_cache.lock().insert(cache_key, icon.clone());
-        }
-        icon
+        resolve_file_icons(&state.icon_cache, &requests)
     })
     .await
     .unwrap_or_default())
@@ -7452,12 +7967,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         (db_path, state)
     };
 
-    // Register this binary as an MCP server for Claude Code / Codex so agents
-    // pick it up automatically, serving exactly this index. Best-effort.
-    {
-        let mcp_db_path = db_path.clone();
-        std::thread::spawn(move || mcp_server::register_all_and_log(Some(mcp_db_path)));
-    }
+    // MCP registration is opt-in: app startup never touches agent CLI configs.
+    // Run `everything --register-mcp` to write the entry into Claude Code /
+    // Codex explicitly.
+    //
     // Non-Windows: the GUI owns index writes while running, so hold the beacon
     // (single-writer handshake with the daemon) and record whether we won it —
     // a second instance that loses the race runs read-only. On Windows the SCM
@@ -7823,23 +8336,63 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             start_bench_runner(app_handle.clone(), state.clone());
         }
 
+        // Prime the extension→PNG cache for the extensions a first screen of
+        // results is most likely to show. This used to spawn one `swift -e` per
+        // extension — twenty Swift compiler runs, ~1s each — concurrently with
+        // the first-run index, which is a meaningful slice of the startup CPU
+        // spike on its own. Now it waits for indexing to settle and renders the
+        // whole set in a single process. `start_full_index_worker` above sets
+        // indexing_active synchronously, so this observes it without a race.
         #[cfg(not(target_os = "windows"))]
         if !bench_mode {
             let icon_cache = state.icon_cache.clone();
+            let indexing_active = state.indexing_active.clone();
             std::thread::spawn(move || {
-                let exts = [
+                const PREWARM_EXTS: [&str; 20] = [
                     "txt", "pdf", "png", "jpg", "md", "json", "swift", "rs", "js", "ts", "html",
                     "css", "py", "zip", "dmg", "app", "doc", "xls", "ppt", "mov",
                 ];
-                for ext in &exts {
-                    let key = ext.to_string();
-                    if icon_cache.lock().contains_key(&key) {
-                        continue;
-                    }
-                    if let Some(icon) = load_system_icon_png(ext) {
-                        icon_cache.lock().insert(key, icon);
+                // Bounded so a wedged pass can never strand the cache empty;
+                // icons fall back to per-request rendering until then.
+                const INDEX_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+                let wait_started = Instant::now();
+                while indexing_active.load(AtomicOrdering::Acquire)
+                    && wait_started.elapsed() < INDEX_WAIT_TIMEOUT
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+
+                let waited = wait_started.elapsed();
+                let pending: Vec<&str> = {
+                    let cache = icon_cache.lock();
+                    PREWARM_EXTS
+                        .iter()
+                        .copied()
+                        .filter(|ext| !cache.contains_key(*ext))
+                        .collect()
+                };
+                let render_started = Instant::now();
+                let sources: Vec<IconSource> =
+                    pending.iter().map(|ext| IconSource::Type(ext)).collect();
+                let pngs = render_icon_pngs(&sources);
+                let mut rendered = 0usize;
+                {
+                    let mut cache = icon_cache.lock();
+                    for (ext, png) in pending.iter().zip(pngs) {
+                        if let Some(png) = png {
+                            cache.insert((*ext).to_string(), png);
+                            rendered += 1;
+                        }
                     }
                 }
+                eprintln!(
+                    "[icons] prewarm: waited {}ms for indexing, rendered {}/{} ext(s) \
+                     in one swift process in {}ms",
+                    waited.as_millis(),
+                    rendered,
+                    pending.len(),
+                    render_started.elapsed().as_millis(),
+                );
             });
         }
     });
@@ -7908,7 +8461,7 @@ pub fn run() {
             copy_files,
             move_to_trash,
             rename,
-            get_file_icon,
+            get_file_icons,
             get_platform,
             show_context_menu,
             set_native_theme,
@@ -8092,6 +8645,246 @@ mod tests {
         );
 
         assert!(should_skip_path(target, &ignored, &[]));
+    }
+
+    /// Mirror of the walker's invariant: descend from `root` along `segments`,
+    /// checking at every level that the fast per-child check agrees with the
+    /// full-path check, and stopping at the first skip exactly as jwalk's
+    /// `process_read_dir` prunes. Returns the depth at which the walk stopped,
+    /// or `None` when every segment was kept.
+    fn walk_child_checks(
+        root: &str,
+        segments: &[&str],
+        roots: &[PathBuf],
+        patterns: &[IgnorePattern],
+    ) -> Option<usize> {
+        assert!(
+            !should_skip_path(Path::new(root), roots, patterns),
+            "test root {root} must itself be vetted"
+        );
+        let mut dir = root.to_string();
+        let mut scratch = String::new();
+        for (depth, name) in segments.iter().enumerate() {
+            let child = Path::new(&dir).join(name);
+            let fast = should_skip_child(&dir, name, &child, &mut scratch, roots, patterns);
+            let full = should_skip_path(&child, roots, patterns);
+            assert_eq!(
+                fast,
+                full,
+                "should_skip_child disagreed with should_skip_path at {}",
+                child.display()
+            );
+            if fast {
+                return Some(depth);
+            }
+            dir = child.to_string_lossy().to_string();
+        }
+        None
+    }
+
+    #[test]
+    fn should_skip_child_matches_should_skip_path_for_builtin_rules() {
+        // Single-segment name, deep below the root.
+        assert_eq!(
+            walk_child_checks("/Users/u", &["work", "proj", "node_modules", "a"], &[], &[]),
+            Some(2)
+        );
+        // Suffix rule (*.build) on the leaf.
+        assert_eq!(
+            walk_child_checks("/Users/u", &["work", "MyApp.build", "Objects"], &[], &[]),
+            Some(1)
+        );
+        // Multi-segment rule: only fires once both segments are present, which
+        // is the case the leaf-only fast path must not lose.
+        assert_eq!(
+            walk_child_checks("/Users/u", &["Library", "Caches", "pip"], &[], &[]),
+            Some(1)
+        );
+        // Lookalikes that must survive: prefix of a builtin name, and a
+        // multi-segment rule whose first half matches but second does not.
+        assert_eq!(
+            walk_child_checks("/Users/u", &["Library", "CachesX", "keep"], &[], &[]),
+            None
+        );
+        assert_eq!(
+            walk_child_checks("/Users/u", &["node_modules_old", "src", "a.rs"], &[], &[]),
+            None
+        );
+        // "Caches" alone, not under Library.
+        assert_eq!(
+            walk_child_checks("/Users/u", &["work", "Caches", "x"], &[], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn should_skip_child_matches_should_skip_path_for_ignored_roots() {
+        let roots = vec![PathBuf::from("/Users/u/work/secret")];
+        // Skips at the root itself, so descendants are never asked — the
+        // equality that matters is that `starts_with` collapsing to `==` does
+        // not change the pruning depth.
+        assert_eq!(
+            walk_child_checks("/Users/u", &["work", "secret", "deep", "f"], &roots, &[]),
+            Some(1)
+        );
+        assert_eq!(
+            walk_child_checks("/Users/u", &["work", "secretive", "f"], &roots, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn should_skip_child_matches_should_skip_path_for_patterns() {
+        let any_segment = vec![IgnorePattern::any_segment("target")];
+        assert_eq!(
+            walk_child_checks("/Users/u", &["rust", "target", "debug"], &[], &any_segment),
+            Some(1)
+        );
+        assert_eq!(
+            walk_child_checks("/Users/u", &["rust", "targets", "debug"], &[], &any_segment),
+            None
+        );
+
+        // Globs are matched against every ancestor by should_skip_path; the
+        // fast path only tests the child, which relies on the parent already
+        // having been cleared.
+        let globs = vec![
+            IgnorePattern::Glob("/Users/u/Library/Application Support/*/Cache*".to_string()),
+            IgnorePattern::Glob("/Users/u/.pyenv/versions/*/lib".to_string()),
+        ];
+        assert_eq!(
+            walk_child_checks(
+                "/Users/u",
+                &["Library", "Application Support", "Slack", "Cache", "v1"],
+                &[],
+                &globs,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            walk_child_checks(
+                "/Users/u",
+                &[".pyenv", "versions", "3.12.1", "lib", "site-packages"],
+                &[],
+                &globs,
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            walk_child_checks(
+                "/Users/u",
+                &["Library", "Application Support", "Slack", "Logs"],
+                &[],
+                &globs,
+            ),
+            None
+        );
+    }
+
+    /// Guards the framing and the argv tagging of the batched renderer: a
+    /// misframed stream or a swallowed argument would silently put one row's
+    /// icon on another row, which no other test would notice. Also pins the
+    /// output size — serializing an NSImage's own representation instead of
+    /// drawing into the 32x32 context yields 1024x1024 PNGs, ~100x the bytes,
+    /// to paint a 26px row.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "spawns the Swift toolchain; run explicitly with --ignored"]
+    fn batched_icons_stay_aligned_with_their_requests() {
+        let terminal = "/System/Applications/Utilities/Terminal.app";
+        let calculator = "/System/Applications/Calculator.app";
+        // This path does not exist and holds a newline: AppKit still returns the
+        // generic icon for it, but a newline-joined payload would have split it
+        // into two requests and shifted every frame after it.
+        let missing = "/nope\nnewline.app";
+        let sources = [
+            IconSource::File(terminal),
+            IconSource::Type("txt"),
+            IconSource::File(calculator),
+            IconSource::Type("zip"),
+            IconSource::File(missing),
+            IconSource::Type("folder"),
+        ];
+        let icons = render_icon_pngs(&sources);
+
+        assert_eq!(icons.len(), sources.len(), "results must be positional");
+        for (slot, icon) in icons.iter().enumerate() {
+            let png = icon
+                .as_ref()
+                .unwrap_or_else(|| panic!("no icon rendered for source {slot}"));
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "source {slot} is not a PNG");
+            // IHDR width/height, big-endian, right after the 8-byte magic and
+            // the 8-byte chunk header.
+            assert_eq!(
+                (&png[16..20], &png[20..24]),
+                (&[0, 0, 0, 32][..], &[0, 0, 0, 32][..]),
+                "source {slot} is not 32x32 — the oversized representation is back"
+            );
+        }
+        // Neither distinct paths nor distinct types may collapse onto one frame.
+        assert_ne!(icons[0], icons[2], "Terminal and Calculator should differ");
+        assert_ne!(icons[1], icons[3], "txt and zip should differ");
+        // And a one-entry batch must reproduce exactly the frame a longer batch
+        // put at that position.
+        assert_eq!(
+            render_icon_pngs(&[IconSource::File(terminal)]),
+            vec![icons[0].clone()]
+        );
+        assert_eq!(
+            render_icon_pngs(&[IconSource::Type("zip")]),
+            vec![icons[3].clone()]
+        );
+    }
+
+    fn icon_request(path: Option<&str>, ext: &str) -> IconRequest {
+        IconRequest {
+            path: path.map(str::to_string),
+            ext: ext.to_string(),
+        }
+    }
+
+    /// A batch is positional and deduplicated by cache key: rows that share an
+    /// icon must all receive it, and none of them may render a second time. Only
+    /// cached keys are used here, so nothing spawns a renderer.
+    #[test]
+    fn resolve_file_icons_serves_every_row_sharing_a_cache_key() {
+        let cache = Mutex::new(HashMap::new());
+        {
+            let mut warm = cache.lock();
+            warm.insert("txt".to_string(), vec![1u8]);
+            warm.insert("folder".to_string(), vec![2u8]);
+            warm.insert("__default__".to_string(), vec![3u8]);
+        }
+
+        let requests = vec![
+            icon_request(Some("/u/a.txt"), "txt"),
+            icon_request(Some("/u/docs"), "folder"),
+            // Same key as the first row, reached through a different case.
+            icon_request(Some("/u/b.TXT"), "TXT"),
+            // No extension falls back to the default key, not to the path.
+            icon_request(Some("/u/README"), ""),
+            icon_request(None, "txt"),
+        ];
+
+        assert_eq!(
+            resolve_file_icons(&cache, &requests),
+            vec![vec![1], vec![2], vec![1], vec![3], vec![1]]
+        );
+    }
+
+    #[test]
+    fn should_skip_child_defers_backslash_names_to_the_full_check() {
+        // A macOS file name may contain a literal backslash, which
+        // should_skip_path turns into a separator when it normalizes. The fast
+        // path must hand those to the general check rather than treat the whole
+        // string as one segment.
+        let dir = "/Users/u/work";
+        let child = Path::new(dir).join("a\\node_modules");
+        let mut scratch = String::new();
+        assert_eq!(
+            should_skip_child(dir, "a\\node_modules", &child, &mut scratch, &[], &[]),
+            should_skip_path(&child, &[], &[]),
+        );
     }
 
     #[test]
