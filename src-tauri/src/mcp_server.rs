@@ -244,6 +244,24 @@ couple of minutes on first use (it covers the whole home directory). Please \
 retry the search shortly. If it never becomes ready, launch the Everything app \
 once to build the index (the background indexer may lack filesystem access).";
 
+/// The daemon is holding in its first-install onboarding gate (§5.4/G8):
+/// nothing gets indexed until the user decides, so tell the agent exactly how
+/// to unblock instead of an endless "being prepared".
+#[cfg(target_os = "macos")]
+const ONBOARDING_PENDING_MSG: &str = "The file index has not been built yet: \
+Everything is waiting for its first-run setup. Launch the Everything app once \
+and complete (or skip) the Full Disk Access onboarding — the background \
+indexer then builds the index automatically and this tool starts returning \
+results.";
+
+/// Appended to results while the daemon reports no Full Disk Access (D6):
+/// the index exists but protected locations may be missing from it.
+#[cfg(target_os = "macos")]
+const DEGRADED_HINT: &str = "Note: Everything's background indexer does not \
+have Full Disk Access, so files in protected locations (Desktop, Documents, \
+Downloads, Mail, etc.) may be missing from these results. Grant Full Disk \
+Access to Everything in System Settings > Privacy & Security to index them.";
+
 /// A usable index means the last build ran to completion (`index_complete=1`)
 /// and left rows behind — the same readiness rule the GUI uses at startup.
 /// Anything else (missing DB, half-built, empty) means the daemon is still
@@ -410,10 +428,26 @@ impl McpServer {
     }
 
     fn do_search(&self, args: &SearchArgs) -> Result<String, String> {
-        // Readiness (building/refreshing) is the resident daemon's job, spawned
-        // at startup; until it has produced a usable index, tell the caller to
-        // retry rather than serving a half-built DB.
+        // Q7: record that an MCP user is actively searching, so the daemon's
+        // onboarding gate can eventually release for GUI-less installs.
+        self.note_mcp_activity();
+        // The daemon's live status (macOS, one sub-ms UDS round-trip):
+        // distinguishes "waiting for onboarding" from "still building" and
+        // flags degraded (no-FDA) results.
+        #[cfg(target_os = "macos")]
+        let daemon_status = self.db_path.parent().and_then(crate::daemon_ipc::status);
+        // Readiness (building/refreshing) is the resident daemon's job; until
+        // it has produced a usable index, tell the caller to retry rather than
+        // serving a half-built DB.
         if !index_is_usable(&self.db_path) {
+            #[cfg(target_os = "macos")]
+            if daemon_status
+                .as_ref()
+                .map(|s| s.state == "WaitingOnboarding")
+                .unwrap_or(false)
+            {
+                return Err(ONBOARDING_PENDING_MSG.to_string());
+            }
             return Err(INDEX_BUILDING_MSG.to_string());
         }
         // Fresh connection per call + one retry (see MCP_SEARCH_ATTEMPTS): a
@@ -424,7 +458,19 @@ impl McpServer {
             match open_search_connection(&self.db_path)
                 .and_then(|conn| run_search_on(&conn, &self.home_dir, args))
             {
-                Ok(text) => return Ok(text),
+                Ok(text) => {
+                    // Degraded (no Full Disk Access): say so instead of
+                    // pretending the results are complete (D6/G8).
+                    #[cfg(target_os = "macos")]
+                    if daemon_status
+                        .as_ref()
+                        .map(|s| s.degraded || !s.fda_ok)
+                        .unwrap_or(false)
+                    {
+                        return Ok(format!("{text}\n\n{DEGRADED_HINT}"));
+                    }
+                    return Ok(text);
+                }
                 Err(e) => {
                     last_err = e;
                     if attempt + 1 < MCP_SEARCH_ATTEMPTS {
@@ -435,6 +481,29 @@ impl McpServer {
         }
         Err(format!("Search failed: {last_err}"))
     }
+
+    /// Touch `<data dir>/mcp.activity` (throttled to once an hour) — the
+    /// signal the daemon's Q7 escape hatch watches for.
+    #[cfg(target_os = "macos")]
+    fn note_mcp_activity(&self) {
+        let Some(dir) = self.db_path.parent() else {
+            return;
+        };
+        let marker = dir.join("mcp.activity");
+        let fresh = std::fs::metadata(&marker)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age < std::time::Duration::from_secs(3600))
+            .unwrap_or(false);
+        if !fresh {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(&marker, b"");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn note_mcp_activity(&self) {}
 }
 
 /// Run one search on a freshly opened read connection. Kept free-standing (not a
@@ -557,13 +626,29 @@ pub fn run_stdio_server() {
         db_path.display()
     );
     // Ensure a resident indexer daemon exists so the index gets built (first
-    // run) and stays fresh without the GUI. Idempotent: a duplicate daemon
-    // self-exits, and it outlives this MCP session.
+    // run) and stays fresh without the GUI. Goes through the §4 single revival
+    // rule (registered → kickstart, opt-out/OS-off → lease spawn, otherwise
+    // detached spawn); idempotent — a duplicate daemon self-exits, and it
+    // outlives this MCP session.
     //
     // Windows: the SCM-managed service is the guaranteed writer (§3.4), so the
     // MCP process never spawns a daemon there.
     #[cfg(not(target_os = "windows"))]
-    crate::daemon::spawn_detached();
+    crate::daemon::ensure_daemon_running("mcp-startup");
+    // While the user has auto-start off, the daemon runs in lease mode and
+    // lives only as long as its users keep renewing — keep it alive for this
+    // MCP session (G6). Cheap no-op when the daemon isn't in lease mode.
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = db_path.parent().map(Path::to_path_buf) {
+        std::thread::spawn(move || loop {
+            if let Some(status) = crate::daemon_ipc::status(&dir) {
+                if status.lease_mode {
+                    let _ = crate::daemon_ipc::attach_lease(&dir);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+    }
     let mut server = McpServer::new(db_path, resolve_home_dir());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

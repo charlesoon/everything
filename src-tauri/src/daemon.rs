@@ -480,23 +480,18 @@ fn build_cancel_probe(_db_path: &Path, control: &Arc<DaemonControl>) -> CancelPr
 // ---------------------------------------------------------------------------
 
 /// Spawn `everything --daemon` as a detached background process that outlives
-/// the caller. Skips when the GUI (writer owner) or another daemon is already
-/// running, so repeated MCP sessions don't churn short-lived processes.
-///
-/// Not compiled on Windows: there the SCM-managed service is the guaranteed
-/// writer, so the MCP process never spawns a daemon (§3.4).
-#[cfg(not(target_os = "windows"))]
+/// the caller (Linux legacy bootstrap — macOS goes through
+/// `ensure_daemon_running`, and on Windows the SCM-managed service is the
+/// guaranteed writer, §3.4). Skips when the GUI (writer owner) or another
+/// daemon is already running, so repeated MCP sessions don't churn
+/// short-lived processes.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn spawn_detached() {
-    // Linux keeps the legacy gate: the GUI owns writes while it runs. On
-    // macOS the GUI is a reader (D4) and never blocks a daemon spawn.
-    #[cfg(not(target_os = "macos"))]
-    {
-        let db_path = default_db_path();
-        if gui_is_running(&db_path) {
-            eprintln!("[daemon] GUI owns index writes; not spawning a daemon");
-            diag::log("bootstrap: GUI owns index writes; not spawning a daemon");
-            return;
-        }
+    let db_path = default_db_path();
+    if gui_is_running(&db_path) {
+        eprintln!("[daemon] GUI owns index writes; not spawning a daemon");
+        diag::log("bootstrap: GUI owns index writes; not spawning a daemon");
+        return;
     }
     spawn_detached_with(&[], "bootstrap", true);
 }

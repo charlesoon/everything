@@ -48,6 +48,7 @@ pub(crate) const BATCH_SIZE: usize = 10_000;
 /// block (backpressure) instead of queueing unbounded row batches in memory
 /// when SQLite falls behind the filesystem walk.
 const SCAN_CHANNEL_CAP: usize = 8;
+#[cfg(not(target_os = "macos"))]
 const RECENT_OP_TTL: Duration = Duration::from_secs(2);
 pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -355,6 +356,7 @@ impl Default for IndexStatus {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct RecentOp {
@@ -415,6 +417,7 @@ pub(crate) struct AppState {
     /// concurrent-writer window. Never set on the GUI's own index path.
     pub(crate) cancel_index: Arc<AtomicBool>,
     pub(crate) status: Arc<Mutex<IndexStatus>>,
+    #[cfg(not(target_os = "macos"))]
     pub(crate) recent_ops: Arc<Mutex<Vec<RecentOp>>>,
     pub(crate) icon_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub(crate) fd_search_cache: Arc<Mutex<Option<FdSearchCache>>>,
@@ -517,6 +520,7 @@ pub(crate) fn build_app_state_with_config(
         indexing_active: Arc::new(AtomicBool::new(false)),
         cancel_index: Arc::new(AtomicBool::new(false)),
         status: Arc::new(Mutex::new(IndexStatus::default())),
+        #[cfg(not(target_os = "macos"))]
         recent_ops: Arc::new(Mutex::new(Vec::new())),
         icon_cache: Arc::new(Mutex::new(HashMap::new())),
         fd_search_cache: Arc::new(Mutex::new(None)),
@@ -4112,6 +4116,7 @@ fn run_incremental_index_inner(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn trim_recent_ops(ops: &mut Vec<RecentOp>) {
     let now = Instant::now();
     ops.retain(|op| now.duration_since(op.at) <= RECENT_OP_TTL);
@@ -4138,7 +4143,7 @@ fn remember_op(
     });
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub(crate) fn is_recently_touched(state: &AppState, path: &str) -> bool {
     let mut ops = state.recent_ops.lock();
     trim_recent_ops(&mut ops);
@@ -4183,7 +4188,7 @@ struct PreparedPathChanges {
 
 #[cfg(target_os = "macos")]
 fn prepare_path_changes<Metadata>(
-    state: &AppState,
+    _state: &AppState,
     paths: &[PathBuf],
     ignored_roots: &[PathBuf],
     ignored_patterns: &[IgnorePattern],
@@ -4201,8 +4206,11 @@ where
             continue;
         }
 
+        // (Pre-flip this also consulted the recent-ops cache; the macOS GUI no
+        // longer writes, so the daemon's watcher is the only reflector and
+        // every event is authoritative — D4/D7/V1.)
         let path_str = path.to_string_lossy().to_string();
-        if path_str.is_empty() || is_recently_touched(state, &path_str) {
+        if path_str.is_empty() {
             continue;
         }
 
@@ -8800,6 +8808,7 @@ mod tests {
             indexing_active: Arc::new(AtomicBool::new(false)),
             cancel_index: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(IndexStatus::default())),
+            #[cfg(not(target_os = "macos"))]
             recent_ops: Arc::new(Mutex::new(Vec::new())),
             icon_cache: Arc::new(Mutex::new(HashMap::new())),
             fd_search_cache: Arc::new(Mutex::new(None)),
