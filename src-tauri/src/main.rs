@@ -4637,15 +4637,21 @@ fn remap_event_path(path: PathBuf, remaps: &[(PathBuf, PathBuf)]) -> PathBuf {
 }
 
 /// Earliest instant `path` may be rescanned, given each overlapping finished
-/// rescan's own cooldown class. `Instant::now()` when nothing overlaps.
+/// rescan's own cooldown class. `None` when nothing overlaps — callers must
+/// treat that as "no constraint", NOT as "now": returning a freshly taken
+/// `Instant::now()` here made the spawn-time recheck (`not_before > now`,
+/// with `now` captured a few µs earlier) defer every queued rescan forever.
 #[cfg(target_os = "macos")]
-fn rescan_not_before(path: &Path, finished: &Mutex<Vec<(PathBuf, Instant, Duration)>>) -> Instant {
-    let mut not_before = Instant::now();
+fn rescan_not_before(
+    path: &Path,
+    finished: &Mutex<Vec<(PathBuf, Instant, Duration)>>,
+) -> Option<Instant> {
+    let mut not_before: Option<Instant> = None;
     for (done, at, cooldown) in finished.lock().iter() {
         if path.starts_with(done) || done.starts_with(path) {
             let earliest = *at + *cooldown;
-            if earliest > not_before {
-                not_before = earliest;
+            if not_before.map_or(true, |nb| earliest > nb) {
+                not_before = Some(earliest);
             }
         }
     }
@@ -4674,7 +4680,7 @@ fn queue_subtree_rescan(
         entry.cooldown = entry.cooldown.max(cooldown);
         return;
     }
-    let due = rescan_not_before(&path, finished);
+    let due = rescan_not_before(&path, finished).unwrap_or_else(Instant::now);
     // Queued descendants are covered by this wider rescan.
     let mut cooldown = cooldown;
     queued.retain(|q, entry| {
@@ -4685,6 +4691,12 @@ fn queue_subtree_rescan(
             true
         }
     });
+    eprintln!(
+        "[watcher] subtree rescan queued: {} (cooldown {}s, due in {}ms)",
+        path.display(),
+        cooldown.as_secs(),
+        due.saturating_duration_since(Instant::now()).as_millis()
+    );
     queued.insert(path, QueuedRescan { due, cooldown });
 }
 
@@ -4719,12 +4731,13 @@ fn spawn_due_subtree_rescan(
     // overlapping rescan may have finished since this path was queued (e.g. the
     // just-completed inflight rescan of the same subtree). If still cooling
     // down, push the due time out and leave it queued for a later tick.
-    let not_before = rescan_not_before(&path, finished);
-    if not_before > now {
-        if let Some(entry) = queued.get_mut(&path) {
-            entry.due = not_before;
+    if let Some(not_before) = rescan_not_before(&path, finished) {
+        if not_before > now {
+            if let Some(entry) = queued.get_mut(&path) {
+                entry.due = not_before;
+            }
+            return;
         }
-        return;
     }
     let cooldown = queued
         .remove(&path)
@@ -4767,7 +4780,7 @@ fn spawn_due_subtree_rescan(
         match result {
             Ok((upserted, deleted)) => {
                 eprintln!(
-                    "[watcher] MustScanSubDirs rescan {}: upserted={} deleted={} {}ms",
+                    "[watcher] subtree rescan {}: upserted={} deleted={} {}ms",
                     path.display(),
                     upserted,
                     deleted,
@@ -4778,7 +4791,7 @@ fn spawn_due_subtree_rescan(
                 // the kind of unexplained CPU burn worth a post-mortem record.
                 if started.elapsed() >= Duration::from_secs(60) {
                     diag::log(format!(
-                        "slow MustScanSubDirs rescan: {} took {:.0}s (upserted={upserted} deleted={deleted})",
+                        "slow subtree rescan: {} took {:.0}s (upserted={upserted} deleted={deleted})",
                         path.display(),
                         started.elapsed().as_secs_f32()
                     ));
@@ -4795,11 +4808,11 @@ fn spawn_due_subtree_rescan(
             }
             Err(err) => {
                 eprintln!(
-                    "[watcher] MustScanSubDirs rescan {} failed: {err}",
+                    "[watcher] subtree rescan {} failed: {err}",
                     path.display()
                 );
                 diag::log(format!(
-                    "MustScanSubDirs rescan FAILED for {}: {err}",
+                    "subtree rescan FAILED for {}: {err}",
                     path.display()
                 ));
             }
