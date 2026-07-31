@@ -4152,12 +4152,16 @@ pub(crate) fn is_recently_touched(state: &AppState, path: &str) -> bool {
 /// Result of one watcher batch: `changed` mirrors the old rows-touched count,
 /// `count_delta` is the exact net change in `entries` row count (inserted
 /// minus deleted), so callers can maintain `entries_count` incrementally
-/// instead of re-running `COUNT(*)` over the whole table.
+/// instead of re-running `COUNT(*)` over the whole table. `rescan_candidates`
+/// are freshly inserted directories that have children on disk but no
+/// descendants in the DB — subtrees that arrived without per-child events
+/// (S5 trigger (b)) and need a streaming subtree rescan.
 #[cfg(target_os = "macos")]
 struct PathChangeOutcome {
     changed: usize,
     count_delta: i64,
     retry_paths: Vec<PathBuf>,
+    rescan_candidates: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -4218,26 +4222,87 @@ where
     }
 }
 
-/// How many of `rows` already exist in `entries`, checked in chunks that stay
+/// Which of `rows` already exist in `entries`, checked in chunks that stay
 /// under SQLite's bound-parameter limit. Point lookups on the UNIQUE path
 /// index — cheap even for large watcher batches.
 #[cfg(target_os = "macos")]
-fn count_existing_paths(conn: &Connection, rows: &[IndexRow]) -> AppResult<usize> {
-    let mut existing: i64 = 0;
+fn select_existing_paths(conn: &Connection, rows: &[IndexRow]) -> AppResult<HashSet<String>> {
+    let mut existing = HashSet::new();
     for chunk in rows.chunks(500) {
         let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!("SELECT COUNT(*) FROM entries WHERE path IN ({placeholders})");
-        existing += conn
-            .query_row(&sql, params_from_iter(chunk.iter().map(|r| &r.path)), |row| {
-                row.get::<_, i64>(0)
-            })
+        let sql = format!("SELECT path FROM entries WHERE path IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut found = stmt
+            .query(params_from_iter(chunk.iter().map(|r| &r.path)))
             .map_err(|e| e.to_string())?;
+        while let Some(row) = found.next().map_err(|e| e.to_string())? {
+            existing.insert(row.get::<_, String>(0).map_err(|e| e.to_string())?);
+        }
     }
-    Ok(existing.max(0) as usize)
+    Ok(existing)
+}
+
+/// Cap on per-batch S5 trigger-(b) probes. Mass-created directories (git
+/// clone, npm install) deliver their children as their own events, so
+/// skipping the tail of a huge batch costs nothing; the cap only bounds the
+/// readdir+EXISTS work a single watcher batch can incur.
+#[cfg(target_os = "macos")]
+const NEW_DIR_RESCAN_PROBE_CAP: usize = 32;
+
+/// S5 trigger (b): among freshly inserted directory rows, find ones that have
+/// at least one child on disk but no descendants in the DB — the signature of
+/// a subtree that arrived without per-child events (a directory rename the
+/// kernel delivered unflagged, or a tree moved in from an unwatched root).
+/// Runs after the batch upsert, so children that arrived in the same batch
+/// already count as DB descendants and suppress the rescan.
+#[cfg(target_os = "macos")]
+fn collect_new_dir_rescan_candidates(
+    conn: &Connection,
+    upserted: &[IndexRow],
+    existing: &HashSet<String>,
+) -> AppResult<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    let mut probed = 0usize;
+    for row in upserted {
+        if row.is_dir == 0 || existing.contains(&row.path) {
+            continue;
+        }
+        if probed >= NEW_DIR_RESCAN_PROBE_CAP {
+            eprintln!(
+                "[watcher] new-dir rescan probe cap ({NEW_DIR_RESCAN_PROBE_CAP}) reached; \
+                 remaining new dirs rely on their own child events"
+            );
+            break;
+        }
+        probed += 1;
+        let path = Path::new(&row.path);
+        let has_child_on_disk = fs::read_dir(path)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false);
+        if !has_child_on_disk {
+            continue;
+        }
+        let (lo, hi) = subtree_range_bounds(&row.path);
+        let has_db_descendant: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE path >= ?1 AND path < ?2)",
+                params![lo, hi],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !has_db_descendant {
+            candidates.push(path.to_path_buf());
+        }
+    }
+    Ok(candidates)
 }
 
 #[cfg(target_os = "macos")]
-fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<PathChangeOutcome> {
+fn apply_path_changes(
+    state: &AppState,
+    paths: &[PathBuf],
+    collect_rescan_candidates: bool,
+) -> AppResult<PathChangeOutcome> {
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
     let PreparedPathChanges {
         to_upsert,
@@ -4256,6 +4321,7 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<PathChan
             changed: 0,
             count_delta: 0,
             retry_paths,
+            rescan_candidates: Vec::new(),
         });
     }
 
@@ -4279,13 +4345,19 @@ fn apply_path_changes(state: &AppState, paths: &[PathBuf]) -> AppResult<PathChan
     let conn = conn_slot.as_mut().expect("watcher connection present");
 
     let result: AppResult<PathChangeOutcome> = (|| {
-        let existing = count_existing_paths(conn, &to_upsert)?;
+        let existing = select_existing_paths(conn, &to_upsert)?;
         let up = upsert_rows(conn, &to_upsert)?;
         let del = delete_paths(conn, &to_delete)?;
+        let rescan_candidates = if collect_rescan_candidates {
+            collect_new_dir_rescan_candidates(conn, &to_upsert, &existing)?
+        } else {
+            Vec::new()
+        };
         Ok(PathChangeOutcome {
             changed: up + del,
-            count_delta: to_upsert.len() as i64 - existing as i64 - del as i64,
+            count_delta: to_upsert.len() as i64 - existing.len() as i64 - del as i64,
             retry_paths,
+            rescan_candidates,
         })
     })();
     if result.is_err() {
@@ -4313,6 +4385,7 @@ const WATCHER_BUSY_ALERT_STREAK: u32 = 10;
 const FS_OBSERVATION_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn process_watcher_paths(
     app: Option<&AppHandle>,
     state: &AppState,
@@ -4321,6 +4394,9 @@ fn process_watcher_paths(
     last_status_emit: &mut Instant,
     pending_status_emit: &mut bool,
     busy_streak: &mut u32,
+    queued_rescans: &mut HashMap<PathBuf, QueuedRescan>,
+    finished_rescans: &Mutex<Vec<(PathBuf, Instant, Duration)>>,
+    collect_rescan_candidates: bool,
 ) {
     if pending.is_empty() {
         return;
@@ -4333,7 +4409,7 @@ fn process_watcher_paths(
     let mut batch: Vec<PathBuf> = pending.drain().collect();
     batch.sort();
 
-    match apply_path_changes(state, &batch) {
+    match apply_path_changes(state, &batch, collect_rescan_candidates) {
         Ok(outcome) => {
             if *busy_streak >= WATCHER_BUSY_ALERT_STREAK {
                 diag::log(format!(
@@ -4346,7 +4422,11 @@ fn process_watcher_paths(
                 changed,
                 count_delta,
                 retry_paths,
+                rescan_candidates,
             } = outcome;
+            for dir in rescan_candidates {
+                queue_subtree_rescan(dir, RENAME_RESCAN_COOLDOWN, queued_rescans, finished_rescans);
+            }
             if retry_paths.is_empty() {
                 *deadline = None;
             } else {
@@ -4452,6 +4532,23 @@ const MUST_SCAN_THRESHOLD: usize = 10;
 #[cfg(target_os = "macos")]
 const RESCAN_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// Cooldown class for rename-triggered subtree rescans (S5). Much shorter
+/// than the MustScanSubDirs window: a rename rescan must land promptly or the
+/// renamed subtree stays unsearchable, and repeated renames of the same tree
+/// are the only churn this needs to absorb.
+#[cfg(target_os = "macos")]
+const RENAME_RESCAN_COOLDOWN: Duration = Duration::from_secs(7);
+
+/// A queued subtree rescan: earliest spawn time plus the cooldown class its
+/// completion stamps into the finished history (MustScanSubDirs 300s vs
+/// rename 7s). When triggers of both classes overlap, the stricter (longer)
+/// class wins so overflow storms stay rate-limited.
+#[cfg(target_os = "macos")]
+struct QueuedRescan {
+    due: Instant,
+    cooldown: Duration,
+}
+
 /// Watch roots for the FSEvents stream: `$HOME` plus canonicalized
 /// `.pathindexing` extra roots (FSEvents needs real paths — `/tmp` is a
 /// symlink to `/private/tmp`). Also returns (canonical → stored) prefix pairs
@@ -4491,10 +4588,13 @@ fn remap_fs_event(
         return event;
     }
     match event {
-        FsEvent::Paths(paths) => FsEvent::Paths(
-            paths
+        FsEvent::Paths(events) => FsEvent::Paths(
+            events
                 .into_iter()
-                .map(|p| remap_event_path(p, remaps))
+                .map(|mut ev| {
+                    ev.path = remap_event_path(ev.path, remaps);
+                    ev
+                })
                 .collect(),
         ),
         FsEvent::MustScanSubDirs(p) => FsEvent::MustScanSubDirs(remap_event_path(p, remaps)),
@@ -4518,14 +4618,14 @@ fn remap_event_path(path: PathBuf, remaps: &[(PathBuf, PathBuf)]) -> PathBuf {
     path
 }
 
-/// Earliest instant `path` may be rescanned, given the cooldown of recent
-/// overlapping rescans. `Instant::now()` when nothing overlaps.
+/// Earliest instant `path` may be rescanned, given each overlapping finished
+/// rescan's own cooldown class. `Instant::now()` when nothing overlaps.
 #[cfg(target_os = "macos")]
-fn rescan_not_before(path: &Path, finished: &Mutex<Vec<(PathBuf, Instant)>>) -> Instant {
+fn rescan_not_before(path: &Path, finished: &Mutex<Vec<(PathBuf, Instant, Duration)>>) -> Instant {
     let mut not_before = Instant::now();
-    for (done, at) in finished.lock().iter() {
+    for (done, at, cooldown) in finished.lock().iter() {
         if path.starts_with(done) || done.starts_with(path) {
-            let earliest = *at + RESCAN_COOLDOWN;
+            let earliest = *at + *cooldown;
             if earliest > not_before {
                 not_before = earliest;
             }
@@ -4539,20 +4639,35 @@ fn rescan_not_before(path: &Path, finished: &Mutex<Vec<(PathBuf, Instant)>>) -> 
 /// rescans. The stored due time is only a lower bound — `spawn_due_subtree_rescan`
 /// re-checks the cooldown when it selects a path, so a rescan that is still
 /// in flight when `path` is queued (and thus not yet in `finished`) is honored
-/// once it completes.
+/// once it completes. A covering entry absorbs the strictest (longest)
+/// cooldown class among the triggers it subsumes.
 #[cfg(target_os = "macos")]
 fn queue_subtree_rescan(
     path: PathBuf,
-    queued: &mut HashMap<PathBuf, Instant>,
-    finished: &Mutex<Vec<(PathBuf, Instant)>>,
+    cooldown: Duration,
+    queued: &mut HashMap<PathBuf, QueuedRescan>,
+    finished: &Mutex<Vec<(PathBuf, Instant, Duration)>>,
 ) {
-    if queued.keys().any(|q| path.starts_with(q)) {
-        return; // an equal or ancestor rescan is already queued
+    // An equal or ancestor rescan is already queued: it covers this subtree.
+    if let Some(entry) = queued
+        .iter_mut()
+        .find_map(|(q, entry)| path.starts_with(q).then_some(entry))
+    {
+        entry.cooldown = entry.cooldown.max(cooldown);
+        return;
     }
-    let not_before = rescan_not_before(&path, finished);
+    let due = rescan_not_before(&path, finished);
     // Queued descendants are covered by this wider rescan.
-    queued.retain(|q, _| !q.starts_with(&path));
-    queued.insert(path, not_before);
+    let mut cooldown = cooldown;
+    queued.retain(|q, entry| {
+        if q.starts_with(&path) {
+            cooldown = cooldown.max(entry.cooldown);
+            false
+        } else {
+            true
+        }
+    });
+    queued.insert(path, QueuedRescan { due, cooldown });
 }
 
 /// Spawn the next due queued subtree rescan on a background thread
@@ -4564,9 +4679,9 @@ fn queue_subtree_rescan(
 fn spawn_due_subtree_rescan(
     app: Option<&AppHandle>,
     state: &AppState,
-    queued: &mut HashMap<PathBuf, Instant>,
+    queued: &mut HashMap<PathBuf, QueuedRescan>,
     inflight: &Arc<AtomicBool>,
-    finished: &Arc<Mutex<Vec<(PathBuf, Instant)>>>,
+    finished: &Arc<Mutex<Vec<(PathBuf, Instant, Duration)>>>,
 ) {
     if queued.is_empty()
         || inflight.load(AtomicOrdering::Acquire)
@@ -4577,7 +4692,7 @@ fn spawn_due_subtree_rescan(
     let now = Instant::now();
     let Some(path) = queued
         .iter()
-        .find(|(_, due)| **due <= now)
+        .find(|(_, entry)| entry.due <= now)
         .map(|(path, _)| path.clone())
     else {
         return;
@@ -4588,10 +4703,15 @@ fn spawn_due_subtree_rescan(
     // down, push the due time out and leave it queued for a later tick.
     let not_before = rescan_not_before(&path, finished);
     if not_before > now {
-        queued.insert(path, not_before);
+        if let Some(entry) = queued.get_mut(&path) {
+            entry.due = not_before;
+        }
         return;
     }
-    queued.remove(&path);
+    let cooldown = queued
+        .remove(&path)
+        .map(|entry| entry.cooldown)
+        .unwrap_or(RESCAN_COOLDOWN);
     inflight.store(true, AtomicOrdering::Release);
 
     let app = app.cloned();
@@ -4670,9 +4790,9 @@ fn spawn_due_subtree_rescan(
         // Only stamp the cooldown on success: a failed rescan left the subtree
         // unreconciled, so it must not be blocked from a prompt retry.
         if succeeded {
-            finished.push((path, Instant::now()));
+            finished.push((path, Instant::now(), cooldown));
         }
-        finished.retain(|(_, at)| at.elapsed() < RESCAN_COOLDOWN);
+        finished.retain(|(_, at, cooldown)| at.elapsed() < *cooldown);
         inflight.store(false, AtomicOrdering::Release);
     });
 }
@@ -4696,12 +4816,12 @@ fn start_fsevent_watcher_worker(
         // Rescan bookkeeping outlives stream rebuilds: the cooldown history
         // and the single-flight guard for the background rescan thread.
         let rescan_inflight = Arc::new(AtomicBool::new(false));
-        let finished_rescans: Arc<Mutex<Vec<(PathBuf, Instant)>>> =
+        let finished_rescans: Arc<Mutex<Vec<(PathBuf, Instant, Duration)>>> =
             Arc::new(Mutex::new(Vec::new()));
         // Queued-but-not-yet-spawned rescans must also outlive stream rebuilds:
         // a .pathindexing edit rebuilds the stream, and a rescan deferred by
         // cooldown or the inflight guard would otherwise be silently dropped.
-        let mut queued_rescans: HashMap<PathBuf, Instant> = HashMap::new();
+        let mut queued_rescans: HashMap<PathBuf, QueuedRescan> = HashMap::new();
 
         // Each pass runs one FSEvents stream; the stream is rebuilt (with
         // event-id continuity) when .pathindexing roots change.
@@ -4803,8 +4923,8 @@ fn run_fsevent_stream(
     remaps: &[(PathBuf, PathBuf)],
     replay: bool,
     rescan_inflight: &Arc<AtomicBool>,
-    finished_rescans: &Arc<Mutex<Vec<(PathBuf, Instant)>>>,
-    queued_rescans: &mut HashMap<PathBuf, Instant>,
+    finished_rescans: &Arc<Mutex<Vec<(PathBuf, Instant, Duration)>>>,
+    queued_rescans: &mut HashMap<PathBuf, QueuedRescan>,
 ) -> WatcherExit {
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -4849,10 +4969,15 @@ fn run_fsevent_stream(
             None => Duration::from_secs(1),
         };
         match rx.recv_timeout(wait).map(|ev| remap_fs_event(ev, remaps)) {
-            Ok(mac::fsevent_watcher::FsEvent::Paths(paths)) => {
+            Ok(mac::fsevent_watcher::FsEvent::Paths(events)) => {
                 let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(&state);
                 let prev_len = pending_paths.len();
-                for path in paths {
+                for event in events {
+                    let mac::fsevent_watcher::PathEvent {
+                        path,
+                        renamed,
+                        is_dir,
+                    } = event;
                     if path == state.config_file_path {
                         let new_entries = pathignore_active_entries(
                             &fs::read_to_string(&state.config_file_path).unwrap_or_default(),
@@ -4951,9 +5076,30 @@ fn run_fsevent_stream(
                         }
                         continue;
                     }
-                    if !should_skip_path(&path, &ignored_roots, &ignored_patterns) {
-                        pending_paths.insert(path);
+                    if should_skip_path(&path, &ignored_roots, &ignored_patterns) {
+                        continue;
                     }
+                    // S5 trigger (a): an external directory rename delivers
+                    // only flagged events for the old and new dir paths — no
+                    // per-child events — so the new subtree must be walked
+                    // explicitly or it stays missing until the next full
+                    // catchup (the old subtree is range-deleted by the normal
+                    // batch when its path probes NotFound). Only the surviving
+                    // (new) path still exists as a directory on disk.
+                    if renamed
+                        && is_dir
+                        && fs::symlink_metadata(&path)
+                            .map(|m| m.file_type().is_dir())
+                            .unwrap_or(false)
+                    {
+                        queue_subtree_rescan(
+                            path.clone(),
+                            RENAME_RESCAN_COOLDOWN,
+                            queued_rescans,
+                            finished_rescans,
+                        );
+                    }
+                    pending_paths.insert(path);
                 }
                 if pending_paths.len() > prev_len {
                     deadline = Some(Instant::now() + WATCH_DEBOUNCE);
@@ -4988,7 +5134,7 @@ fn run_fsevent_stream(
                 // Dropped events mean this subtree must be reconciled with
                 // disk. Queue a streaming rescan (spawned from the loop
                 // tail): bounded memory, change-detected, and rate-limited.
-                queue_subtree_rescan(path, queued_rescans, finished_rescans);
+                queue_subtree_rescan(path, RESCAN_COOLDOWN, queued_rescans, finished_rescans);
             }
             Ok(mac::fsevent_watcher::FsEvent::HistoryDone) => {
                 eprintln!(
@@ -5004,6 +5150,9 @@ fn run_fsevent_stream(
                     &mut last_status_emit,
                     &mut pending_status_emit,
                     &mut busy_streak,
+                    queued_rescans,
+                    finished_rescans,
+                    !replay_phase,
                 );
                 if replay_phase {
                     replay_phase = false;
@@ -5032,6 +5181,9 @@ fn run_fsevent_stream(
                     &mut last_status_emit,
                     &mut pending_status_emit,
                     &mut busy_streak,
+                    queued_rescans,
+                    finished_rescans,
+                    !replay_phase,
                 );
             }
         }
@@ -5078,6 +5230,9 @@ fn run_fsevent_stream(
         &mut last_status_emit,
         &mut pending_status_emit,
         &mut busy_streak,
+        queued_rescans,
+        finished_rescans,
+        !replay_phase,
     );
 
     if rebuild_requested && !state.watcher_stop.load(AtomicOrdering::Acquire) {
@@ -8536,24 +8691,83 @@ mod tests {
     fn queue_subtree_rescan_collapses_covered_paths() {
         let finished = Mutex::new(Vec::new());
         let mut queued = HashMap::new();
-        queue_subtree_rescan(PathBuf::from("/h/a/b"), &mut queued, &finished);
-        queue_subtree_rescan(PathBuf::from("/h/a/b/c"), &mut queued, &finished);
+        queue_subtree_rescan(PathBuf::from("/h/a/b"), RESCAN_COOLDOWN, &mut queued, &finished);
+        queue_subtree_rescan(
+            PathBuf::from("/h/a/b/c"),
+            RENAME_RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
         assert_eq!(queued.len(), 1, "descendant is covered by queued ancestor");
-        queue_subtree_rescan(PathBuf::from("/h/a"), &mut queued, &finished);
+        queue_subtree_rescan(
+            PathBuf::from("/h/a"),
+            RENAME_RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
         assert_eq!(queued.len(), 1, "wider rescan replaces queued descendants");
-        assert!(queued.contains_key(Path::new("/h/a")));
+        let entry = queued.get(Path::new("/h/a")).expect("wider path queued");
+        assert_eq!(
+            entry.cooldown, RESCAN_COOLDOWN,
+            "covering entry absorbs the strictest cooldown class it subsumes"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn queue_subtree_rescan_defers_within_cooldown() {
-        let finished = Mutex::new(vec![(PathBuf::from("/h/a"), Instant::now())]);
+        let finished = Mutex::new(vec![(PathBuf::from("/h/a"), Instant::now(), RESCAN_COOLDOWN)]);
         let mut queued = HashMap::new();
-        queue_subtree_rescan(PathBuf::from("/h/a/x"), &mut queued, &finished);
-        let due = queued.get(Path::new("/h/a/x")).expect("queued");
+        queue_subtree_rescan(PathBuf::from("/h/a/x"), RESCAN_COOLDOWN, &mut queued, &finished);
+        let entry = queued.get(Path::new("/h/a/x")).expect("queued");
         assert!(
-            *due > Instant::now() + RESCAN_COOLDOWN - Duration::from_secs(60),
+            entry.due > Instant::now() + RESCAN_COOLDOWN - Duration::from_secs(60),
             "overlapping rescan must be deferred past the cooldown window"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_class_rescan_uses_short_cooldown() {
+        // A rename-triggered rescan defers only by its own short class — a
+        // finished rename rescan must not impose the 5-minute
+        // MustScanSubDirs window on the next rename of the same subtree.
+        let finished = Mutex::new(vec![(
+            PathBuf::from("/h/r"),
+            Instant::now(),
+            RENAME_RESCAN_COOLDOWN,
+        )]);
+        let mut queued = HashMap::new();
+        queue_subtree_rescan(
+            PathBuf::from("/h/r"),
+            RENAME_RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
+        let entry = queued.get(Path::new("/h/r")).expect("queued");
+        assert!(
+            entry.due <= Instant::now() + RENAME_RESCAN_COOLDOWN,
+            "rename-class rescan is due after its own short cooldown"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn queue_subtree_rescan_upgrades_cooldown_class() {
+        let finished = Mutex::new(Vec::new());
+        let mut queued = HashMap::new();
+        queue_subtree_rescan(
+            PathBuf::from("/h/a"),
+            RENAME_RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
+        queue_subtree_rescan(PathBuf::from("/h/a/b"), RESCAN_COOLDOWN, &mut queued, &finished);
+        assert_eq!(queued.len(), 1, "covered by the queued ancestor");
+        let entry = queued.get(Path::new("/h/a")).expect("ancestor entry");
+        assert_eq!(
+            entry.cooldown, RESCAN_COOLDOWN,
+            "a MustScanSubDirs trigger under a queued rename rescan upgrades its class"
         );
     }
 
@@ -9356,23 +9570,23 @@ mod tests {
         fs::write(&file_b, "b").unwrap();
 
         // Two new files → +2
-        let out = apply_path_changes(&state, &[file_a.clone(), file_b.clone()]).unwrap();
+        let out = apply_path_changes(&state, &[file_a.clone(), file_b.clone()], false).unwrap();
         assert_eq!(out.count_delta, 2);
         assert_eq!(out.changed, 2);
 
         // Re-upserting an existing path → no net change
-        let out = apply_path_changes(&state, &[file_a.clone()]).unwrap();
+        let out = apply_path_changes(&state, &[file_a.clone()], false).unwrap();
         assert_eq!(out.count_delta, 0);
 
         // Vanished file → -1
         fs::remove_file(&file_b).unwrap();
-        let out = apply_path_changes(&state, &[file_b.clone()]).unwrap();
+        let out = apply_path_changes(&state, &[file_b.clone()], false).unwrap();
         assert_eq!(out.count_delta, -1);
 
         // A vanished directory sweeps its remaining subtree rows: a.txt is
         // still in the DB and goes with the range delete → -1.
         fs::remove_dir_all(&docs).unwrap();
-        let out = apply_path_changes(&state, &[docs.clone()]).unwrap();
+        let out = apply_path_changes(&state, &[docs.clone()], false).unwrap();
         assert_eq!(out.count_delta, -1);
 
         // Accumulated deltas must equal the authoritative COUNT(*)
@@ -9381,6 +9595,48 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// S5 trigger (b): a directory that appears with children already on disk
+    /// but no descendants in the DB (external rename without per-child
+    /// events) must surface as a rescan candidate; once its children are in
+    /// the DB it must not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn apply_path_changes_flags_new_dir_with_unindexed_children() {
+        let root = temp_case_dir("rescan_candidate_new_dir");
+        let home = root.join("home");
+        let moved = home.join("moved-in");
+        fs::create_dir_all(moved.join("sub")).unwrap();
+        fs::write(moved.join("sub/child.txt"), "x").unwrap();
+
+        let db_path = root.join("index.db");
+        init_db_tables(&db_path).unwrap();
+        ensure_db_indexes(&db_path).unwrap();
+        let state = test_state_for(db_path, home, root.clone());
+
+        // Only the directory event arrives (no per-child events).
+        let out = apply_path_changes(&state, &[moved.clone()], true).unwrap();
+        assert_eq!(
+            out.rescan_candidates,
+            vec![moved.clone()],
+            "new dir with on-disk children and no DB descendants needs a rescan"
+        );
+
+        // After the subtree lands in the DB, the same event is quiet.
+        let out = apply_path_changes(
+            &state,
+            &[moved.clone(), moved.join("sub"), moved.join("sub/child.txt")],
+            true,
+        )
+        .unwrap();
+        assert!(
+            out.rescan_candidates.is_empty(),
+            "dir with DB descendants must not re-trigger: {:?}",
+            out.rescan_candidates
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -9952,7 +10208,7 @@ mod tests {
             fs::write(p, format!("touch_{i}_x")).unwrap();
             let batch = vec![p.clone()];
             let t = Instant::now();
-            apply_path_changes(&state, &batch).expect("watcher single");
+            apply_path_changes(&state, &batch, false).expect("watcher single");
             single_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         let mut burst_ms = Vec::new();
@@ -9965,7 +10221,7 @@ mod tests {
                 })
                 .collect();
             let t = Instant::now();
-            apply_path_changes(&state, &batch).expect("watcher burst");
+            apply_path_changes(&state, &batch, false).expect("watcher burst");
             burst_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         }
         let med = |v: &mut Vec<f64>| -> f64 {

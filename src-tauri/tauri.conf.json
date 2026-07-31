@@ -49,7 +49,7 @@
     "macOS": {
       "signingIdentity": null,
       "entitlements": "Entitlements.plist",
-      "minimumSystemVersion": "11.0",
+      "minimumSystemVersion": "13.0",
       "infoPlist": "Info.plist"
     },
     "windows": {

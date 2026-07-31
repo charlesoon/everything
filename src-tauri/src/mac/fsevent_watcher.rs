@@ -11,8 +11,18 @@ use std::thread;
 
 const LATENCY_SECONDS: cf::CFTimeInterval = 2.0;
 
+/// One non-special FSEvents entry: the affected path plus the two flags the
+/// watcher acts on. `renamed`/`is_dir` come from the kernel event, so a
+/// directory rename is detectable even though FSEvents delivers no per-child
+/// events for it (see the S5 subtree-rescan trigger in `run_fsevent_stream`).
+pub struct PathEvent {
+    pub path: PathBuf,
+    pub renamed: bool,
+    pub is_dir: bool,
+}
+
 pub enum FsEvent {
-    Paths(Vec<PathBuf>),
+    Paths(Vec<PathEvent>),
     MustScanSubDirs(PathBuf),
     HistoryDone,
 }
@@ -46,7 +56,7 @@ extern "C" fn stream_callback(
     unsafe {
         let info = &*(info as *const CallbackInfo);
         let paths_ptr = event_paths as *const *const std::os::raw::c_char;
-        let mut normal_paths: Vec<PathBuf> = Vec::new();
+        let mut normal_paths: Vec<PathEvent> = Vec::new();
 
         for i in 0..num_events {
             let flag = *event_flags.add(i);
@@ -78,7 +88,11 @@ extern "C" fn stream_callback(
                 continue;
             }
 
-            normal_paths.push(path);
+            normal_paths.push(PathEvent {
+                path,
+                renamed: flag & fs::kFSEventStreamEventFlagItemRenamed != 0,
+                is_dir: flag & fs::kFSEventStreamEventFlagItemIsDir != 0,
+            });
         }
 
         if !normal_paths.is_empty() {
