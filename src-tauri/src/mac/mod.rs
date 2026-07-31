@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod fsevent_watcher;
 pub mod launch_agent;
 pub mod prefs;

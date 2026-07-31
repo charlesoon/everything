@@ -20,9 +20,11 @@
 //!
 //! Single-writer coordination (WAL allows only one writer):
 //!   * daemon-vs-daemon — the `daemon.lock` advisory lock; a duplicate self-exits.
-//!   * daemon-vs-GUI — TRANSITIONAL until the P2 ownership flip: the GUI holds a
-//!     `gui.lock` beacon for its lifetime and the daemon defers to it (never
-//!     spawns / exits promptly when the GUI appears).
+//!   * daemon-vs-GUI — the macOS GUI is a hard read-only reader (D4): it never
+//!     writes, so there is nothing to hand over. Its `gui.lock` beacon remains
+//!     for second-instance detection, the lease-liveness check, and as the
+//!     yield signal pre-flip daemons still in the field honor (§7). On Linux
+//!     the GUI still owns writes while running and the daemon defers to it.
 //!
 //! Bootstrap: the MCP server (`--mcp`) spawns this detached on startup (unless
 //! a GUI or another daemon is already the writer), so an agent that only ever
@@ -77,9 +79,9 @@ const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
 const CATCHUP_INTERVAL: Duration = Duration::from_secs(60);
 /// How long the GUI waits for a resident daemon to exit before it starts
 /// writing (the GUI half of the handshake). Bounded so startup can't hang.
-/// Non-Windows only — on Windows the SCM service is the sole writer, so there
-/// is no GUI↔daemon handshake (D6).
-#[cfg(not(target_os = "windows"))]
+/// Linux only — on Windows/macOS the service/daemon is the sole writer, so
+/// there is no GUI↔daemon handshake (D6/D4).
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// While FDA is missing, re-probe on this cadence (not every supervise tick —
 /// each probe touches tccd; 60s keeps the rising edge ≤1min behind, G9).
@@ -172,11 +174,12 @@ pub(crate) fn hold_gui_beacon(db_path: &Path) -> bool {
     }
 }
 
-/// The GUI half of the handshake: after holding the beacon, block until any
-/// resident daemon has observed it and exited (released `daemon.lock`) so the
-/// GUI can start writing without overlapping the daemon. Bounded — if a daemon
-/// lingers past the deadline we proceed anyway (WAL keeps writes safe).
-#[cfg(not(target_os = "windows"))]
+/// The GUI half of the handshake (Linux only — see DAEMON_EXIT_WAIT): after
+/// holding the beacon, block until any resident daemon has observed it and
+/// exited (released `daemon.lock`) so the GUI can start writing without
+/// overlapping the daemon. Bounded — if a daemon lingers past the deadline we
+/// proceed anyway (WAL keeps writes safe).
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
     let started = std::time::Instant::now();
     let mut waited = false;
@@ -426,11 +429,15 @@ fn build_index(db_path: &Path, state: &AppState, should_cancel: CancelProbe) -> 
             }
             // Storage/GC maintenance only after a full (re)build, matching the
             // GUI finalizing thread; a plain catchup barely changes the file.
-            // Skip it once the GUI is coming up: run_db_maintenance's VACUUM
-            // takes an *exclusive* lock (not WAL-concurrent), so running it while
-            // the GUI falls through its wait and starts writing would hand the
-            // GUI a hard SQLITE_BUSY. The GUI's own finalize will reclaim later.
-            if (is_fresh || fts_dirty) && !gui_is_running(db_path) {
+            // macOS (D7): the GUI is a reader — VACUUM proceeds regardless and
+            // concurrent readers ride busy_timeout + the S2 retry. Linux still
+            // skips it while the writer-GUI is up: VACUUM's *exclusive* lock
+            // (not WAL-concurrent) would hand that GUI a hard SQLITE_BUSY.
+            #[cfg(target_os = "macos")]
+            let gui_blocks_maintenance = false;
+            #[cfg(not(target_os = "macos"))]
+            let gui_blocks_maintenance = gui_is_running(db_path);
+            if (is_fresh || fts_dirty) && !gui_blocks_maintenance {
                 if let Ok(conn) = db_connection(db_path) {
                     if let Err(e) = cleanup_entries_gc_tables(&conn) {
                         eprintln!("[daemon] gc cleanup failed: {e}");
@@ -456,15 +463,13 @@ fn run_build(db_path: &Path, state: &AppState, control: &Arc<DaemonControl>) -> 
     result
 }
 
-/// A pass must unwind when the GUI appears (transitional, pre-flip), when
-/// SIGTERM arrived, or when IPC asked for exit/reset.
+/// A pass must unwind when SIGTERM arrived or when IPC asked for exit/reset.
+/// (The GUI is a reader post-flip — it never takes writes over, D4.)
 #[cfg(target_os = "macos")]
-fn build_cancel_probe(db_path: &Path, control: &Arc<DaemonControl>) -> CancelProbe {
-    let db_path = db_path.to_path_buf();
+fn build_cancel_probe(_db_path: &Path, control: &Arc<DaemonControl>) -> CancelProbe {
     let control = Arc::clone(control);
     Arc::new(move || {
-        gui_is_running(&db_path)
-            || quiesce_signaled()
+        quiesce_signaled()
             || control.requested_exit().is_some()
             || control.reset_requested.load(Ordering::Acquire)
     })
@@ -482,12 +487,16 @@ fn build_cancel_probe(db_path: &Path, control: &Arc<DaemonControl>) -> CancelPro
 /// writer, so the MCP process never spawns a daemon (§3.4).
 #[cfg(not(target_os = "windows"))]
 pub fn spawn_detached() {
-    let db_path = default_db_path();
-    // Transitional (pre-flip): the GUI owns writes while it runs.
-    if gui_is_running(&db_path) {
-        eprintln!("[daemon] GUI owns index writes; not spawning a daemon");
-        diag::log("bootstrap: GUI owns index writes; not spawning a daemon");
-        return;
+    // Linux keeps the legacy gate: the GUI owns writes while it runs. On
+    // macOS the GUI is a reader (D4) and never blocks a daemon spawn.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let db_path = default_db_path();
+        if gui_is_running(&db_path) {
+            eprintln!("[daemon] GUI owns index writes; not spawning a daemon");
+            diag::log("bootstrap: GUI owns index writes; not spawning a daemon");
+            return;
+        }
     }
     spawn_detached_with(&[], "bootstrap", true);
 }
@@ -729,13 +738,6 @@ fn run_daemon_macos(db_path: PathBuf, home_dir: PathBuf, app_data_dir: PathBuf) 
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    // Transitional (until the P2 ownership flip): the GUI still owns writes
-    // while it runs, so a daemon starting under a live GUI goes dormant.
-    if gui_is_running(&db_path) {
-        eprintln!("[daemon] GUI is running; it owns index writes — dormant exit(0)");
-        diag::log("GUI is running; dormant exit(0) (it owns index writes)");
-        return 0;
-    }
     if let Err(e) = fs::create_dir_all(&app_data_dir) {
         eprintln!("[daemon] create data dir failed: {e}");
         diag::log(format!("FATAL: create data dir failed: {e}"));
@@ -950,22 +952,6 @@ fn reconcile_extra_roots(state: &AppState) {
     state.pathindexing_active.store(false, Ordering::Release);
 }
 
-/// Yield to the GUI: stop the watcher and wait for it to actually exit before
-/// the caller returns (which drops `_lock`, releasing `daemon.lock`). Without
-/// waiting, the GUI could acquire the freed lock and start writing while the
-/// watcher flushes one last batch — a brief concurrent-writer window. Bounded
-/// so a wedged watcher can't block the yield forever.
-#[cfg(target_os = "macos")]
-fn yield_to_gui(state: &AppState) {
-    eprintln!("[daemon] GUI now running; yielding writes and exiting");
-    diag::log("GUI appeared; yielding index writes and exiting");
-    state.watcher_stop.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while state.watcher_active.load(Ordering::Acquire) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// The shared graceful shutdown (§4): cancel a running pass (≤2s), stop and
 /// join the watcher (≤3s), checkpoint the WAL best-effort (G10 — an active
 /// reader can hold it off; the next writer's open recovers), and resolve the
@@ -1124,11 +1110,6 @@ fn run_macos_resident(
     let mut exe_missing_ticks: u32 = 0;
     let mut last_fda_probe = Instant::now();
     loop {
-        // Transitional (until the P2 flip): yield to a launching GUI.
-        if gui_is_running(&db_path) {
-            yield_to_gui(&state);
-            return 0;
-        }
         if quiesce_signaled() {
             diag::log("SIGTERM: quiescing (logout/shutdown/unregister — G4)");
             return finish_quiesce(&db_path, &state, &control, 0);

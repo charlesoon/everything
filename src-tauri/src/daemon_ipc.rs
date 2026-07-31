@@ -189,13 +189,14 @@ fn dispatch(line: &str, ctx: &IpcContext) -> String {
 }
 
 fn status_response(ctx: &IpcContext) -> String {
-    let (index_state, scanned, indexed, entries, message) = {
+    let (index_state, scanned, indexed, entries, permission_errors, message) = {
         let s = ctx.state.status.lock();
         (
             format!("{:?}", s.state),
             s.scanned,
             s.indexed,
             s.entries_count,
+            s.permission_errors,
             s.message.clone(),
         )
     };
@@ -206,6 +207,7 @@ fn status_response(ctx: &IpcContext) -> String {
         "scanned": scanned,
         "indexed": indexed,
         "entriesCount": entries,
+        "permissionErrors": permission_errors,
         "message": message,
         "version": env!("CARGO_PKG_VERSION"),
         "fdaOk": ctx.control.fda_ok.load(Ordering::Acquire),
@@ -277,6 +279,7 @@ pub(crate) struct DaemonStatus {
     pub(crate) scanned: u64,
     pub(crate) indexed: u64,
     pub(crate) entries_count: u64,
+    pub(crate) permission_errors: u64,
     pub(crate) message: Option<String>,
     pub(crate) version: Option<String>,
     pub(crate) fda_ok: bool,

@@ -454,6 +454,11 @@ pub(crate) struct AppState {
     /// Opening a connection per event batch dominated single-file update cost.
     #[cfg(target_os = "macos")]
     pub(crate) watcher_conn: Arc<Mutex<Option<Connection>>>,
+    /// Whether the daemon reports a build in progress (bridge-maintained).
+    /// Read-only GUI's substitute for `indexing_active`, e.g. to defer the
+    /// icon prewarm's Swift run out of the fresh-index CPU window.
+    #[cfg(target_os = "macos")]
+    pub(crate) daemon_building: Arc<AtomicBool>,
     /// Whether this process owns index writes. True only for the GUI instance
     /// that acquired the `gui.lock` beacon (single-writer invariant). A second
     /// GUI instance that lost the race runs read-only: it never starts the
@@ -531,6 +536,8 @@ pub(crate) fn build_app_state_with_config(
         search_conn_pool: Arc::new(Mutex::new(Vec::new())),
         #[cfg(target_os = "macos")]
         watcher_conn: Arc::new(Mutex::new(None)),
+        #[cfg(target_os = "macos")]
+        daemon_building: Arc::new(AtomicBool::new(false)),
         // Default false; the GUI sets it from the beacon result in setup_app.
         // The headless daemon builds via its own path and never consults this.
         is_writer: Arc::new(AtomicBool::new(false)),
@@ -2507,8 +2514,9 @@ fn emit_and_persist_cached_counts(app: Option<&AppHandle>, state: &AppState) {
 }
 
 /// Load cached entries count from meta table (instant) and emit Ready state + counts.
-/// Used on Windows startup paths where the index is already complete from a prior run.
-#[cfg(target_os = "windows")]
+/// Used on read-only-GUI startup paths (Windows service reader, macOS daemon
+/// reader) where the index is already complete from a prior writer run.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 pub(crate) fn set_ready_with_cached_counts(app: &AppHandle, state: &AppState) {
     let (count, last_updated) = db_connection(&state.db_path)
         .ok()
@@ -4110,10 +4118,10 @@ fn trim_recent_ops(ops: &mut Vec<RecentOp>) {
 }
 
 // The recent-ops cache suppresses the app's own writes from being re-processed
-// by its watcher. On Windows the watcher lives in the indexer service (a
-// separate process) and the GUI never writes, so nothing populates this cache
-// there — see `move_to_trash`/`rename`.
-#[cfg(not(target_os = "windows"))]
+// by its watcher. On Windows and macOS the watcher lives in the indexer
+// service/daemon (a separate process) and the GUI never writes, so nothing
+// populates this cache there — see `move_to_trash`/`rename`. Linux-only.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn remember_op(
     state: &AppState,
     op_type: &'static str,
@@ -5605,21 +5613,42 @@ fn register_service_elevated() -> AppResult<()> {
 
 #[tauri::command]
 fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
-    if !state.is_writer.load(AtomicOrdering::Acquire) {
-        return Err(
-            "Another Everything instance owns the index; this window is read-only.".to_string(),
-        );
-    }
-    #[cfg(target_os = "windows")]
+    // macOS read-only GUI (D4): a full re-index is the daemon's job — mapped
+    // to its reset_index (G15), same as the Windows service model.
+    #[cfg(target_os = "macos")]
     {
-        // Read-only GUI (§3.3): a full (re)index is the service's job — delegate.
-        let _ = (app, state);
-        win::service_client::reset_index()
+        let _ = app;
+        return daemon_ipc::reset_index(&daemon_data_dir(&state));
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(target_os = "macos"))]
     {
-        start_full_index_worker(app, state.inner().clone())
+        if !state.is_writer.load(AtomicOrdering::Acquire) {
+            return Err(
+                "Another Everything instance owns the index; this window is read-only."
+                    .to_string(),
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Read-only GUI (§3.3): a full (re)index is the service's job — delegate.
+            let _ = (app, state);
+            win::service_client::reset_index()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            start_full_index_worker(app, state.inner().clone())
+        }
     }
+}
+
+/// The daemon's data dir (UDS socket + sidecars live next to the DB).
+#[cfg(target_os = "macos")]
+fn daemon_data_dir(state: &AppState) -> PathBuf {
+    state
+        .db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[tauri::command]
@@ -5635,7 +5664,18 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
             .await
             .map_err(|e| e.to_string())?
     };
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let out: AppResult<()> = {
+        // Read-only GUI (D4/D5): the daemon owns the reset and its 600s
+        // cooldown. Blocking UDS I/O runs off the async runtime, mirroring
+        // the Windows arm.
+        let _ = app;
+        let data_dir = daemon_data_dir(&state);
+        tauri::async_runtime::spawn_blocking(move || daemon_ipc::reset_index(&data_dir))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let out: AppResult<()> = {
         // A second, non-writer GUI instance is read-only — refuse to reset it.
         if !state.is_writer.load(AtomicOrdering::Acquire) {
@@ -6598,7 +6638,7 @@ fn execute_search(
         Ok(conn) => {
             #[cfg(target_os = "macos")]
             { db_unavailable = false; }
-            results = run_db_search(
+            let outcome = run_db_search(
                 &conn,
                 &state.home_dir,
                 fts_ready,
@@ -6608,7 +6648,38 @@ fn execute_search(
                 offset,
                 &sort_by,
                 &sort_dir,
-            )?;
+            );
+            // S2 (macOS, read-only GUI): the daemon's VACUUM / FTS rebuild can
+            // surface as SQLITE_CORRUPT ("database disk image is malformed")
+            // on a long-lived pooled reader — a transient illusion, not real
+            // corruption. Discard every pooled connection and retry once on a
+            // fresh one (MCP precedent: mcp_server.rs fresh-conn-per-attempt).
+            // Hot-WAL open failures land in the Err(_) arm below instead:
+            // Spotlight covers the gap and the bridge revives the daemon.
+            #[cfg(target_os = "macos")]
+            let outcome = match outcome {
+                Err(e) if e.contains("malformed") => {
+                    perf_log(format!("search_corrupt_retry query={query:?} err={e}"));
+                    drop(conn);
+                    state.search_conn_pool.lock().clear();
+                    match pooled_search_connection(state) {
+                        Ok(fresh) => run_db_search(
+                            &fresh,
+                            &state.home_dir,
+                            fts_ready,
+                            &mode,
+                            &query,
+                            effective_limit,
+                            offset,
+                            &sort_by,
+                            &sort_dir,
+                        ),
+                        Err(open_err) => Err(open_err),
+                    }
+                }
+                other => other,
+            };
+            results = outcome?;
 
             if results.is_empty() && !query.is_empty() && offset == 0 && allow_find_fallback {
                 results = find_search(
@@ -7153,30 +7224,30 @@ async fn move_to_trash(
 ) -> AppResult<()> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        // Windows: the indexer service owns index.db (this process holds a
-        // read-only handle) and reflects the deletion through its USN watcher,
-        // so the GUI performs only the filesystem operation and keeps no
-        // recent-ops cache. Other platforms reflect the change in the DB here.
-        #[cfg(not(target_os = "windows"))]
+        // Windows/macOS (D4): the indexer service/daemon owns index.db (this
+        // process is read-only) and reflects the deletion through its own
+        // watcher, so the GUI performs only the filesystem operation and keeps
+        // no recent-ops cache. Linux still reflects the change in the DB here.
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let mut deleted_targets = Vec::new();
 
         for path in &paths {
             trash::delete(path).map_err(|e| e.to_string())?;
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             {
                 remember_op(&state, "trash", Some(path.clone()), None);
                 deleted_targets.push(path.clone());
             }
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let mut conn = db_connection(&state.db_path)?;
             let _ = delete_paths(&mut conn, &deleted_targets)?;
             invalidate_search_caches(&state);
             refresh_and_emit_status_counts(Some(&app), &state)?;
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let _ = (&app, &state);
 
         Ok(())
@@ -7235,11 +7306,11 @@ async fn rename(
         let original_is_dir = old_path.is_dir();
         fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
 
-        // Windows: index.db is owned by the indexer service and updated via its
-        // USN watcher — directory subtree fix-ups included (S6) — so the GUI
-        // does no DB reflection and keeps no recent-ops cache. Other platforms
-        // update the DB in place.
-        #[cfg(not(target_os = "windows"))]
+        // Windows/macOS (D4): index.db is owned by the indexer service/daemon
+        // and updated via its own watcher — directory subtree fix-ups included
+        // (Windows S6 / macOS S5) — so the GUI does no DB reflection and keeps
+        // no recent-ops cache. Linux updates the DB in place.
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let mut conn = db_connection(&state.db_path)?;
             let _ = delete_paths(&mut conn, &[path.clone()])?;
@@ -7268,7 +7339,7 @@ async fn rename(
 
             refresh_and_emit_status_counts(Some(&app), &state)?;
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let _ = (&app, &state);
 
         let new_meta = fs::symlink_metadata(&new_path).ok();
@@ -8164,12 +8235,31 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     #[cfg(not(target_os = "windows"))]
     {
         let beacon_held = daemon::hold_gui_beacon(&db_path);
-        state.is_writer.store(beacon_held, AtomicOrdering::Release);
-        if !beacon_held {
-            eprintln!(
-                "[startup] gui.lock beacon not acquired -- another instance owns index \
-                 writes; this GUI runs READ-ONLY (no watcher / indexer / purge)"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            // D4 ownership flip: the launchd daemon is the sole writer and the
+            // GUI is hard read-only regardless of the beacon. The beacon stays
+            // held anyway — it detects a second GUI instance and it is the
+            // yield signal pre-flip daemons still in the field react to (§7).
+            // Exception: bench mode measures the in-process indexer, so it
+            // keeps the legacy writer path.
+            if bench_mode {
+                state.is_writer.store(beacon_held, AtomicOrdering::Release);
+            } else {
+                set_db_readonly();
+                state.is_writer.store(false, AtomicOrdering::Release);
+                let _ = beacon_held;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            state.is_writer.store(beacon_held, AtomicOrdering::Release);
+            if !beacon_held {
+                eprintln!(
+                    "[startup] gui.lock beacon not acquired -- another instance owns index \
+                     writes; this GUI runs READ-ONLY (no watcher / indexer / purge)"
+                );
+            }
         }
     }
     eprintln!("[startup] +{}ms AppState created ({} extra roots)", setup_started.elapsed().as_millis(), state.extra_roots.lock().len());
@@ -8207,22 +8297,42 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         let thread_started = std::time::Instant::now();
         eprintln!("[startup/thread] init thread started");
 
-        // Non-Windows: the GUI may be the writer, so it initializes the schema.
-        // Windows: the service owns the schema and the GUI is a read-only reader
-        // (§3.3) — it can't create tables; it just waits for the service's DB.
+        // Linux: the GUI may be the writer, so it initializes the schema.
+        // Windows / macOS (D4): the service/daemon owns the schema and the GUI
+        // is a read-only reader — it can't create tables; it just waits for
+        // the writer's DB. macOS bench mode is the one in-process writer left.
         #[cfg(not(target_os = "windows"))]
         {
-            eprintln!("[startup/thread] +{}ms calling init_db_tables...", thread_started.elapsed().as_millis());
-            if let Err(err) = init_db_tables(&state.db_path) {
-                set_state(&state, IndexState::Error, Some(err.clone()));
-                emit_index_state(&app_handle, "Error", Some(err));
-                return;
+            #[cfg(target_os = "macos")]
+            let init_here = state.is_writer.load(AtomicOrdering::Acquire);
+            #[cfg(not(target_os = "macos"))]
+            let init_here = true;
+            if init_here {
+                eprintln!("[startup/thread] +{}ms calling init_db_tables...", thread_started.elapsed().as_millis());
+                if let Err(err) = init_db_tables(&state.db_path) {
+                    set_state(&state, IndexState::Error, Some(err.clone()));
+                    emit_index_state(&app_handle, "Error", Some(err));
+                    return;
+                }
+                eprintln!("[startup/thread] +{}ms init_db_tables done", thread_started.elapsed().as_millis());
             }
-            eprintln!("[startup/thread] +{}ms init_db_tables done", thread_started.elapsed().as_millis());
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            let usable = state.is_writer.load(AtomicOrdering::Acquire)
+                || mac::bridge::macos_db_usable(&state.db_path);
+            state.db_ready.store(usable, AtomicOrdering::Release);
+            if !usable {
+                eprintln!(
+                    "[startup/thread] daemon DB not readable yet; searches ride the \
+                     Spotlight fallback until the bridge sees it"
+                );
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         state.db_ready.store(true, AtomicOrdering::Release);
-        eprintln!("[startup/thread] +{}ms db_ready=true -- launching indexing immediately", thread_started.elapsed().as_millis());
+        eprintln!("[startup/thread] +{}ms db_ready set -- continuing startup", thread_started.elapsed().as_millis());
 
         // If a previous run crashed mid FTS rebuild, don't trust the FTS index
         // until the healing rebuild (finalize_fresh_index) completes.
@@ -8233,14 +8343,14 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             }
         }
 
-        // Handshake: the GUI beacon (gui.lock) is already held (setup_app). Before
-        // the GUI starts *writing* (housekeeping purge, indexing, watcher), wait
-        // for any resident daemon to observe the beacon and exit — releasing
-        // daemon.lock — so the two never overlap as WAL writers. init_db_tables /
-        // db_ready above already ran (idempotent, near-no-op on the daemon-built
-        // DB), so search is live immediately; only writes wait. Bounded — falls
-        // through (WAL-safe: the daemon skips VACUUM while the beacon is held).
-        #[cfg(not(target_os = "windows"))]
+        // Handshake (Linux only — macOS flipped to the daemon-writer model,
+        // D4/D7): the GUI beacon (gui.lock) is already held (setup_app).
+        // Before the GUI starts *writing* (housekeeping purge, indexing,
+        // watcher), wait for any resident daemon to observe the beacon and
+        // exit — releasing daemon.lock — so the two never overlap as WAL
+        // writers. Bounded — falls through (WAL-safe: the daemon skips VACUUM
+        // while the beacon is held).
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         daemon::wait_for_daemon_exit(&state.db_path);
 
         // Single-writer gate. Only the beacon-holding GUI starts the index
@@ -8249,6 +8359,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         // GUIs can never write the same WAL DB concurrently. On Windows the GUI
         // is always read-only (is_writer=false): the service is the sole writer.
         let gui_is_writer = state.is_writer.load(AtomicOrdering::Acquire);
+        // Linux keeps the writer handshake; on macOS the GUI is a reader (the
+        // bridge below seeds/streams state) and on Windows the same has always
+        // been true — neither should blind-emit Ready here.
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         if gui_is_writer {
             // Never overlap a resident daemon that is still mid-build: keep
             // waiting here (this runs on the init thread only; the UI already
@@ -8281,7 +8395,7 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             }
         } else {
             eprintln!("[startup] read-only instance; not starting index writers (watcher / indexer / purge)");
-            diag::log("read-only GUI instance: watcher/indexer disabled (Windows service reader, or lost gui.lock beacon)");
+            diag::log("read-only GUI instance: watcher/indexer disabled (lost gui.lock beacon)");
             emit_index_state(&app_handle, "Ready", None);
         }
 
@@ -8336,173 +8450,17 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
 
         #[cfg(target_os = "macos")]
         if gui_is_writer {
-            if bench_mode {
-                let _ = start_full_index_worker(app_handle.clone(), state.clone());
-            } else {
-                let (stored_event_id, index_complete, cached_count, cached_updated) =
-                    db_connection(&state.db_path)
-                        .ok()
-                        .map(|c| {
-                            let eid = get_meta(&c, "last_event_id")
-                                .and_then(|v| v.parse::<u64>().ok())
-                                // Legacy DBs may hold u64::MAX (the SinceNow
-                                // sentinel) from the old max-tracker bug; treat
-                                // it as "no prior id" so we don't replay from
-                                // "since now" and miss the offline gap.
-                                .filter(|&id| id != u64::MAX);
-                            let complete = get_meta(&c, "index_complete")
-                                .map(|v| v == "1")
-                                .unwrap_or(false);
-                            let (count, updated) = load_cached_counts(&c);
-                            (eid, complete, count, updated)
-                        })
-                        .unwrap_or((None, false, None, None));
-
-                let entries_empty = db_connection(&state.db_path)
-                    .ok()
-                    .map(|c| {
-                        c.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
-                            .unwrap_or(0) == 0
-                    })
-                    .unwrap_or(true);
-
-                let effective_complete = index_complete && !entries_empty;
-
-                if stored_event_id.is_some() && effective_complete {
-                    diag::log(format!(
-                        "startup: conditional (event-id replay; full pass only on \
-                         MustScanSubDirs ≥ {MUST_SCAN_THRESHOLD})"
-                    ));
-                    // Seed status counts from the cached meta (read above on
-                    // the same connection) before the watcher starts, so its
-                    // incremental count updates build on the last known total
-                    // instead of 0 (the HistoryDone full recount later corrects
-                    // any replay drift).
-                    if let Some(count) = cached_count {
-                        let mut status = state.status.lock();
-                        status.entries_count = count;
-                        status.last_updated = cached_updated;
-                    }
-                    // Conditional startup: try watcher replay first, skip full scan if OK
-                    start_fsevent_watcher_worker(
-                        Some(app_handle.clone()),
-                        state.clone(),
-                        stored_event_id,
-                        true,
-                    );
-                    // This path skips run_incremental_index, whose finalizing
-                    // thread is the only other ensure_db_indexes call site —
-                    // without this, indexes added to the schema after this DB
-                    // was created would never be built (e.g. a missing
-                    // idx_entries_indexed_at degrades MAX(indexed_at) to a
-                    // full-table scan on every status recount).
-                    {
-                        let idx_state = state.clone();
-                        std::thread::spawn(move || {
-                            // Let the startup replay settle first; if replay
-                            // escalated to a full scan, wait it out — its
-                            // finalizing thread ensures indexes itself and the
-                            // CREATE INDEX IF NOT EXISTS here just no-ops.
-                            std::thread::sleep(Duration::from_secs(5));
-                            while idx_state.indexing_active.load(AtomicOrdering::Acquire) {
-                                std::thread::sleep(Duration::from_secs(1));
-                            }
-                            if let Err(e) = ensure_db_indexes(&idx_state.db_path) {
-                                eprintln!("[startup] ensure_db_indexes error: {e}");
-                            }
-                        });
-                    }
-                    // Scan any extra roots added to .pathindexing while the app was not running
-                    {
-                        let scan_state = state.clone();
-                        let scan_app = app_handle.clone();
-                        std::thread::spawn(move || {
-                            let stored_roots: Vec<PathBuf> = db_connection(&scan_state.db_path)
-                                .ok()
-                                .and_then(|c| get_meta(&c, "indexed_extra_roots"))
-                                .map(|v| {
-                                    v.lines()
-                                        .filter(|l| !l.is_empty())
-                                        .map(PathBuf::from)
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let current_roots = scan_state.extra_roots.lock().clone();
-                            let stored_set: std::collections::HashSet<&PathBuf> = stored_roots.iter().collect();
-                            let added: Vec<PathBuf> = current_roots
-                                .iter()
-                                .filter(|r| !stored_set.contains(r))
-                                .cloned()
-                                .collect();
-                            let removed: Vec<PathBuf> = stored_roots
-                                .iter()
-                                .filter(|r| !current_roots.contains(r))
-                                .cloned()
-                                .collect();
-                            if added.is_empty() && removed.is_empty() {
-                                return;
-                            }
-                            if scan_state.pathindexing_active.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
-                                eprintln!("[pathindexing] scan already in progress, skipping startup diff");
-                                return;
-                            }
-                            eprintln!(
-                                "[pathindexing] startup diff: +{} added, -{} removed",
-                                added.len(),
-                                removed.len()
-                            );
-                            diag::log(format!(
-                                "startup pathindexing diff: +{} added -{} removed → full extra-root \
-                                 scan (an interrupted scan repeats in full on the next launch)",
-                                added.len(),
-                                removed.len()
-                            ));
-                            let scan_started = Instant::now();
-                            // Wait for initial watcher replay to finish
-                            while scan_state.indexing_active.load(std::sync::atomic::Ordering::Acquire) {
-                                std::thread::sleep(Duration::from_secs(1));
-                            }
-                            let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&scan_state);
-                            match pathindexing::handle_pathindexing_change(
-                                &scan_state, &stored_roots, &current_roots, &ign_roots, &ign_patterns,
-                            ) {
-                                Ok(()) => {
-                                    eprintln!("[pathindexing] startup scan done");
-                                    diag::log(format!(
-                                        "startup pathindexing scan done in {:.0}s",
-                                        scan_started.elapsed().as_secs_f32()
-                                    ));
-                                    // Update stored roots
-                                    if let Ok(c) = db_connection(&scan_state.db_path) {
-                                        let roots_str: Vec<String> = current_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
-                                        let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
-                                    }
-                                    let _ = refresh_and_emit_status_counts(Some(&scan_app), &scan_state);
-                                    scan_app.emit("pathindexing_changed", ()).ok();
-                                }
-                                Err(e) => {
-                                    eprintln!("[pathindexing] startup scan error: {e}");
-                                    diag::log(format!(
-                                        "startup pathindexing scan FAILED after {:.0}s: {e}",
-                                        scan_started.elapsed().as_secs_f32()
-                                    ));
-                                }
-                            }
-                            scan_state.pathindexing_active.store(false, AtomicOrdering::Release);
-                        });
-                    }
-                } else {
-                    if !effective_complete {
-                        eprintln!("[mac] index incomplete or entries empty; starting full index");
-                    }
-                    diag::log(format!(
-                        "startup: full index (stored_event_id={stored_event_id:?} \
-                         index_complete={index_complete} entries_empty={entries_empty})"
-                    ));
-                    let _ = start_full_index_worker(app_handle.clone(), state.clone());
-                    start_fsevent_watcher_worker(Some(app_handle.clone()), state.clone(), None, false);
-                }
-            }
+            // Bench mode (EVERYTHING_BENCH) is the only in-process writer left
+            // on macOS after the D4 flip — it measures the indexer itself.
+            let _ = start_full_index_worker(app_handle.clone(), state.clone());
+        } else {
+            // Read-only reader (D4): no indexing — the launchd daemon owns
+            // every write (schema, fresh/catchup passes, FSEvents watcher,
+            // .pathindexing reconcile, maintenance). Seed Ready from its DB
+            // and mirror its status/health over the UDS bridge; the legacy
+            // in-process fresh-vs-catchup startup decision lives in the
+            // daemon now (daemon.rs run_daemon_macos).
+            mac::bridge::start_macos_readonly(app_handle.clone(), state.clone());
         }
 
         #[cfg(target_os = "windows")]
@@ -8531,6 +8489,11 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         #[cfg(not(target_os = "windows"))]
         if !bench_mode {
             let icon_cache = state.icon_cache.clone();
+            // macOS reads the daemon's build state (bridge-maintained) — the
+            // read-only GUI never sets indexing_active itself.
+            #[cfg(target_os = "macos")]
+            let indexing_active = state.daemon_building.clone();
+            #[cfg(not(target_os = "macos"))]
             let indexing_active = state.indexing_active.clone();
             std::thread::spawn(move || {
                 const PREWARM_EXTS: [&str; 20] = [
@@ -8540,6 +8503,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 // Bounded so a wedged pass can never strand the cache empty;
                 // icons fall back to per-request rendering until then.
                 const INDEX_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+                // Let the first bridge status poll land (macOS) so a daemon
+                // mid-fresh-build is actually observed before we decide the
+                // coast is clear.
+                std::thread::sleep(Duration::from_secs(2));
                 let wait_started = Instant::now();
                 while indexing_active.load(AtomicOrdering::Acquire)
                     && wait_started.elapsed() < INDEX_WAIT_TIMEOUT
@@ -8852,6 +8819,8 @@ mod tests {
             search_conn_pool: Arc::new(Mutex::new(Vec::new())),
             #[cfg(target_os = "macos")]
             watcher_conn: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            daemon_building: Arc::new(AtomicBool::new(false)),
         }
     }
 
