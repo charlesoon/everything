@@ -759,3 +759,54 @@ On macOS, checks `check_full_disk_access()` at startup. If not granted, shows a 
 | `rowHeight` (FE) | 26px | Virtual scroll row height |
 | `ICON_CACHE_MAX` (FE) | 500 | Frontend icon cache limit |
 | `HIGHLIGHT_CACHE_MAX` (FE) | 300 | Frontend highlight cache limit |
+
+## macOS Daemon-Writer Architecture
+
+Design source: `design-macos-daemon-writer.html` (v3). Since this transition,
+macOS mirrors the Windows service model: a resident daemon is the **sole
+index.db writer** and the GUI/MCP are pure readers.
+
+- **Auto-start**: a launchd LaunchAgent registered via SMAppService (macOS 13+).
+  The plist ships inside the bundle (`Contents/Library/LaunchAgents/
+  com.everything.app.daemon.plist`, `RunAtLoad`, `KeepAlive.SuccessfulExit=false`,
+  `EVERYTHING_LAUNCHD=1`) and shows in System Settings > Login Items.
+  Registration self-heals at app start, re-registering only when the embedded
+  plist bytes differ from `agent_plist.marker`. `register()` starts the daemon
+  immediately, so it is gated on the recorded onboarding decision.
+- **Lifecycle** (`daemon.rs`): Starting → WaitingOnboarding (first install:
+  no build, no TCC access until the GUI records a decision; existing installs
+  auto-pass; MCP-only installs escape after 7 days of `mcp.activity`) →
+  Building → Ready → Quiescing. The exit code is the launchd contract:
+  0 = dormant until the next login/kickstart, 1 = relaunch from disk.
+  SIGTERM (logout/shutdown/unregister) quiesces: cancel pass ≤2s → watcher
+  join ≤3s → `wal_checkpoint(TRUNCATE)` best-effort. The 5s supervision tick
+  heals `index_complete`, restarts a dead watcher, probes FDA (1-byte TCC.db
+  read, 60s while missing; rising edge forces a catchup), and watches the
+  executable identity (update/rollback → exit 1; deleted 3 ticks → dormant).
+- **Control IPC** (`daemon_ipc.rs`): UDS `<data dir>/daemon.sock`, 0600 +
+  getpeereid, newline JSON, one request per connection. Commands: `status`,
+  `reset_index` (600s cooldown), `restart`, `disable`, `attach_lease`.
+  Opened before the startup build; long paths fall back to `$TMPDIR` with a
+  `daemon.sock.path` sidecar.
+- **Read-only GUI** (`mac/bridge.rs`): seeds Ready from cached counts, polls
+  status at 1Hz re-emitting `index_*` events on change (non-fresh Building →
+  `"Catchup: …"` = `isCatchup`), watches `PRAGMA data_version` on a dedicated
+  connection (invalidates caches, drops the search pool, re-derives
+  `fts_ready`), classifies outages into `service_health` states
+  (`starting`/`stopped`/`unresponsive`/`version_mismatch`/`not_registered`/
+  `approval_required`/`disabled`) and revives the daemon once per outage via
+  the single rule: registered → `launchctl kickstart`, opt-out/OS-off →
+  `--lease` spawn, dev builds → detached spawn. GUI rename/trash are
+  filesystem-only; the daemon's watcher reflects them.
+- **Opt-out lease mode**: turning auto-start off records the opt-out (checked
+  by the daemon's start gate alongside the SMAppService user-off state), stops
+  the daemon and unregisters. While off, the GUI bridge and MCP sessions keep
+  a `--lease` daemon alive with 60s `attach_lease` renewals (TTL 5min); it
+  retires when the last user ages out and `gui.lock` is free.
+- **S5 rename rescan**: external directory renames deliver no per-child
+  FSEvents, so the watcher queues a streaming subtree rescan (7s cooldown
+  class; MustScanSubDirs keeps 300s) for renamed dirs and for new dirs with
+  on-disk children but no DB descendants.
+- **Verification**: `scripts/verify_macos_daemon.sh` (automated subset) and
+  `docs/macos-daemon-writer-verification.md` (full 26-item checklist).
+  Releases must be signed/notarized via `scripts/build_dmg.sh`.

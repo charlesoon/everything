@@ -759,3 +759,50 @@ macOS에서 시작 시 `check_full_disk_access()` 확인. 미부여 시 개인�
 | `rowHeight` (FE) | 26px | 가상 스크롤 행 높이 |
 | `ICON_CACHE_MAX` (FE) | 500 | 프론트엔드 아이콘 캐시 제한 |
 | `HIGHLIGHT_CACHE_MAX` (FE) | 300 | 프론트엔드 하이라이트 캐시 제한 |
+
+## macOS 데몬-writer 아키텍처
+
+설계 문서: `design-macos-daemon-writer.html` (v3). 이 전환 이후 macOS는
+Windows 서비스 모델과 동일하게 동작한다: 상주 데몬이 **유일한 index.db
+writer**이고 GUI/MCP는 순수 reader다.
+
+- **자동 실행**: SMAppService(macOS 13+)로 등록되는 launchd LaunchAgent.
+  plist는 번들 내장(`Contents/Library/LaunchAgents/com.everything.app.daemon.plist`,
+  `RunAtLoad`, `KeepAlive.SuccessfulExit=false`, `EVERYTHING_LAUNCHD=1`)이며
+  시스템 설정 > 로그인 항목에 표시된다. 앱 시작 시 자가치유 등록 — 내장
+  plist 바이트가 `agent_plist.marker`와 다를 때만 재등록. `register()`는
+  즉시 기동이므로 온보딩 결정 기록에 게이트된다.
+- **생명주기** (`daemon.rs`): Starting → WaitingOnboarding(첫 설치: 결정
+  기록 전 빌드·TCC 접근 없음; 기존 설치는 자동 통과; MCP 전용 설치는
+  `mcp.activity` 7일 경과 시 탈출) → Building → Ready → Quiescing.
+  종료코드가 launchd 계약: 0 = 다음 로그인/kickstart까지 휴면, 1 = 디스크
+  바이너리로 재기동. SIGTERM(로그아웃·종료·등록해제)은 quiesce: 패스 취소
+  ≤2s → 워처 join ≤3s → `wal_checkpoint(TRUNCATE)` best-effort. 5초 감독
+  틱: `index_complete` 치유, 죽은 워처 재기동, FDA 프로브(TCC.db 1바이트
+  read, 미보유 시 60s 주기; rising edge → 강제 catchup), 실행 파일 identity
+  감시(교체 → exit 1, 3틱 소실 → 휴면).
+- **제어 IPC** (`daemon_ipc.rs`): UDS `<data dir>/daemon.sock`, 0600 +
+  getpeereid, 개행 JSON, 연결당 1건. 명령: `status`, `reset_index`(600s
+  쿨다운), `restart`, `disable`, `attach_lease`. 시작 빌드 전에 오픈;
+  경로가 길면 `$TMPDIR` 폴백 + `daemon.sock.path` 사이드카.
+- **read-only GUI** (`mac/bridge.rs`): 캐시 카운트로 즉시 Ready 시드, 1Hz
+  status 폴링으로 변화 시에만 `index_*` 재방출(비-fresh Building →
+  `"Catchup: …"` = `isCatchup`), 전용 커넥션으로 `PRAGMA data_version` 감시
+  (캐시 무효화 + 검색 풀 폐기 + `fts_ready` 재판정), 연결 실패를
+  `service_health` 상태로 분류(`starting`/`stopped`/`unresponsive`/
+  `version_mismatch`/`not_registered`/`approval_required`/`disabled`)하고
+  국면당 1회 단일 규칙으로 데몬을 살린다: 등록됨 → `launchctl kickstart`,
+  opt-out/OS OFF → `--lease` 스폰, dev 빌드 → detached 스폰. GUI의
+  rename/trash는 파일시스템 연산만 수행하고 데몬 워처가 반영한다.
+- **opt-out lease 모드**: 자동 실행을 끄면 opt-out 기록(데몬 시작 관문이
+  SMAppService 사용자 OFF 상태와 함께 검사) → 데몬 정지 → 등록 해제.
+  꺼진 동안 GUI 브리지와 MCP 세션이 60s `attach_lease` 갱신(TTL 5분)으로
+  `--lease` 데몬을 유지하고, 마지막 이용자가 소멸하고 `gui.lock`이 없으면
+  데몬이 스스로 종료한다.
+- **S5 rename rescan**: 외부 디렉터리 rename은 자식별 FSEvents가 없으므로,
+  rename 플래그가 붙은 디렉터리와 "디스크에 자식이 있는데 DB 자손이 없는"
+  신규 디렉터리에 대해 스트리밍 서브트리 rescan을 큐잉한다(전용 7s 쿨다운;
+  MustScanSubDirs는 300s 유지).
+- **검증**: `scripts/verify_macos_daemon.sh`(자동화 subset)와
+  `docs/macos-daemon-writer-verification.md`(26항목 체크리스트). 릴리스는
+  반드시 `scripts/build_dmg.sh`(서명+공증) 경유.

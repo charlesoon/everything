@@ -78,6 +78,10 @@ pub fn handle_cli_args() -> bool {
         unregister_daemon_cli();
         return true;
     }
+    if args.iter().any(|a| a == "--uninstall") {
+        uninstall_cli();
+        return true;
+    }
     // Intercept the common informational flags. Without this they fall through
     // and boot the full Tauri GUI — e.g. `everything --version` would silently
     // launch a second GUI window (and, holding gui.lock, evict the daemon).
@@ -93,6 +97,7 @@ pub fn handle_cli_args() -> bool {
              everything --register-mcp   Register the MCP server into Claude Code / Codex\n  \
              everything --register-daemon    Register the daemon as a login item (macOS; starts it immediately)\n  \
              everything --unregister-daemon  Remove the login-item registration (macOS)\n  \
+             everything --uninstall          Unregister the daemon and clean its runtime files (macOS; keeps the index DB)\n  \
              everything --version  Print the version and exit",
             env!("CARGO_PKG_VERSION")
         );
@@ -154,6 +159,52 @@ fn unregister_daemon_cli() {
 #[cfg(not(target_os = "macos"))]
 fn unregister_daemon_cli() {
     eprintln!("--unregister-daemon is macOS-only (Windows uses --register-service)");
+    std::process::exit(1);
+}
+
+/// `--uninstall` (G15): stop + unregister the login-item daemon and clean up
+/// its runtime files so deleting the .app leaves no live pieces behind. The
+/// index DB is kept (delete the data directory yourself to reclaim it) and a
+/// note covers the BTM ghost entry macOS may keep in Login Items.
+#[cfg(target_os = "macos")]
+fn uninstall_cli() {
+    use crate::mac::launch_agent;
+    let db_path = default_db_path();
+    let data_dir = db_path.parent().map(Path::to_path_buf);
+
+    if let Some(dir) = &data_dir {
+        // Ask a running daemon (registered or lease) to quiesce first.
+        let _ = crate::daemon_ipc::disable(dir);
+    }
+    match launch_agent::unregister() {
+        Ok(()) => println!("• login item unregistered"),
+        Err(e) => println!("• login item not unregistered ({e})"),
+    }
+    if let Some(dir) = &data_dir {
+        for name in ["agent_plist.marker", "daemon.sock", "daemon.sock.path", "mcp.activity"] {
+            let path = dir.join(name);
+            if path.exists() && std::fs::remove_file(&path).is_ok() {
+                println!("• removed {}", path.display());
+            }
+        }
+        println!(
+            "done. The index DB is kept at {} — delete that directory to reclaim the space.",
+            dir.display()
+        );
+    }
+    println!(
+        "If System Settings > Login Items still shows a ghost \"Everything\" entry after \
+         deleting the app, remove it there (macOS keeps the record until it is)."
+    );
+    println!(
+        "MCP registrations (~/.claude.json, ~/.codex/config.toml) are left in place; \
+         remove the \"everything\" entries manually if no longer wanted."
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall_cli() {
+    eprintln!("--uninstall is macOS-only");
     std::process::exit(1);
 }
 

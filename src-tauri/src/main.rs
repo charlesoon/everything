@@ -4573,8 +4573,18 @@ struct QueuedRescan {
 /// so event paths can be mapped back to the form rows are stored under.
 #[cfg(target_os = "macos")]
 fn fsevent_watch_roots(state: &AppState) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>) {
-    let mut roots = vec![state.home_dir.clone()];
+    // The home root gets the same canonicalize+remap treatment as extra
+    // roots: rows are stored under the configured form, but FSEvents always
+    // delivers canonical paths — with a symlinked $HOME (rare, but real: NFS
+    // homes, test rigs under /tmp) unmapped events would upsert duplicate
+    // canonical-form rows and range-deletes would miss the stored ones.
+    let home_canonical =
+        fs::canonicalize(&state.home_dir).unwrap_or_else(|_| state.home_dir.clone());
+    let mut roots = vec![home_canonical.clone()];
     let mut remaps: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if home_canonical != state.home_dir {
+        remaps.push((home_canonical.clone(), state.home_dir.clone()));
+    }
     for stored in state.extra_roots.lock().iter() {
         let canonical = fs::canonicalize(stored).unwrap_or_else(|_| stored.clone());
         // The remap is independent of watch selection: even a root watched by
@@ -4583,7 +4593,7 @@ fn fsevent_watch_roots(state: &AppState) -> (Vec<PathBuf>, Vec<(PathBuf, PathBuf
         if canonical != *stored {
             remaps.push((canonical.clone(), stored.clone()));
         }
-        if canonical.starts_with(&state.home_dir) || roots.contains(&canonical) {
+        if canonical.starts_with(&home_canonical) || roots.contains(&canonical) {
             continue; // already covered by another registered root
         }
         roots.push(canonical);
