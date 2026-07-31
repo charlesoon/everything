@@ -5573,7 +5573,10 @@ fn get_home_dir(state: State<'_, AppState>) -> String {
 fn check_full_disk_access() -> bool {
     #[cfg(target_os = "macos")]
     {
-        std::fs::metadata("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+        // D6: a real 1-byte read of TCC.db — fs::metadata can succeed without
+        // FDA. The failed attempt is also what lists the app (toggled off) in
+        // the FDA settings pane, so the user finds it there during onboarding.
+        mac::probe_full_disk_access()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -5588,6 +5591,175 @@ fn open_privacy_settings() {
         let _ = Command::new("open")
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
             .spawn();
+    }
+}
+
+/// System Settings → Login Items — the `approval_required` banner action.
+#[tauri::command]
+fn open_login_items_settings() {
+    #[cfg(target_os = "macos")]
+    mac::launch_agent::open_login_items_settings();
+}
+
+/// Everything the onboarding modal / auto-start toggle needs in one snapshot
+/// (macOS; other platforms report a completed state so no UI shows).
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct OnboardingStateDto {
+    recorded: bool,
+    decision: Option<String>,
+    fda_ok: bool,
+    opted_out: bool,
+    /// enabled | requires_approval | not_registered | not_found | unsupported
+    registration: String,
+    daemon_state: Option<String>,
+    daemon_degraded: bool,
+}
+
+#[tauri::command]
+fn get_onboarding_state(state: State<'_, AppState>) -> OnboardingStateDto {
+    #[cfg(target_os = "macos")]
+    {
+        use mac::launch_agent::{self, RegState};
+        let daemon = daemon_ipc::status(&daemon_data_dir(&state));
+        OnboardingStateDto {
+            recorded: mac::prefs::onboarding_recorded(),
+            decision: mac::prefs::onboarding_decision(),
+            fda_ok: mac::probe_full_disk_access(),
+            opted_out: mac::prefs::opted_out(),
+            registration: match launch_agent::agent_status() {
+                RegState::Enabled => "enabled",
+                RegState::RequiresApproval => "requires_approval",
+                RegState::NotRegistered => "not_registered",
+                RegState::NotFound => "not_found",
+                RegState::Unsupported => "unsupported",
+            }
+            .to_string(),
+            daemon_state: daemon.as_ref().map(|s| s.state.clone()),
+            daemon_degraded: daemon.map(|s| s.degraded || !s.fda_ok).unwrap_or(false),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        OnboardingStateDto {
+            recorded: true,
+            fda_ok: true,
+            registration: "unsupported".to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Record the first-run onboarding decision ("granted" | "skipped") and kick
+/// the registration self-heal — the recorded decision releases the daemon's
+/// gate, and the first registration starts it immediately (G3).
+#[tauri::command]
+fn record_onboarding_decision(decision: String, state: State<'_, AppState>) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if decision != "granted" && decision != "skipped" {
+            return Err(format!("invalid onboarding decision: {decision:?}"));
+        }
+        if !mac::prefs::record_onboarding_decision(&decision) {
+            return Err("failed to persist the onboarding decision".to_string());
+        }
+        let data_dir = daemon_data_dir(&state);
+        std::thread::spawn(move || {
+            let outcome = mac::launch_agent::self_heal(&data_dir);
+            diag::log(format!(
+                "onboarding: decision recorded ({decision}); registration self-heal: {outcome:?}"
+            ));
+        });
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (decision, state);
+        Ok(())
+    }
+}
+
+/// The `not_registered` banner action: register the login-item agent now
+/// (starts the daemon immediately — G3).
+#[tauri::command]
+fn register_daemon(state: State<'_, AppState>) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // The gate needs a decision on record before a daemon may build; a
+        // user registering from the banner without onboarding effectively
+        // skipped it (FDA state is whatever it is — the probe decides).
+        if !mac::prefs::onboarding_recorded() {
+            mac::prefs::record_onboarding_decision("skipped");
+        }
+        mac::prefs::set_opt_out(false);
+        mac::launch_agent::register()?;
+        mac::launch_agent::write_marker(&daemon_data_dir(&state));
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+        Ok(())
+    }
+}
+
+/// The auto-start toggle (§5.2). OFF: record opt-out FIRST (the start gate's
+/// final defense), stop the daemon (dormant), unregister. ON (G5): clear the
+/// opt-out, clear any lease/unmanaged daemon holding the lock, then
+/// kickstart/register — the user sees the daemon come up immediately.
+#[tauri::command]
+async fn set_daemon_autostart(enabled: bool, state: State<'_, AppState>) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use mac::launch_agent::{self, RegState};
+        let data_dir = daemon_data_dir(&state);
+        let db_path = state.db_path.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if enabled {
+                mac::prefs::set_opt_out(false);
+                // A lease/unmanaged daemon may hold daemon.lock; ask it to
+                // stand down so the launchd instance wins the lock (G5).
+                let _ = daemon_ipc::disable(&data_dir);
+                let deadline = std::time::Instant::now() + Duration::from_secs(6);
+                while daemon::daemon_running(&db_path) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                match launch_agent::agent_status() {
+                    RegState::Enabled => launch_agent::kickstart(),
+                    RegState::Unsupported => {
+                        // Dev build: no registration possible — plain revival.
+                        daemon::ensure_daemon_running("toggle-on");
+                        Ok(())
+                    }
+                    _ => {
+                        launch_agent::register()?;
+                        launch_agent::write_marker(&data_dir);
+                        Ok(())
+                    }
+                }
+            } else {
+                if !mac::prefs::set_opt_out(true) {
+                    return Err("failed to persist the auto-start opt-out".to_string());
+                }
+                let _ = daemon_ipc::disable(&data_dir);
+                if launch_agent::agent_status() == RegState::Enabled {
+                    // Best-effort: the opt-out record + start gate already
+                    // guarantee no full daemon returns even if this fails.
+                    if let Err(e) = launch_agent::unregister() {
+                        diag::log(format!("toggle-off: unregister failed (gate still holds): {e}"));
+                    }
+                }
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (enabled, state);
+        Ok(())
     }
 }
 
@@ -8642,6 +8814,11 @@ pub fn run() {
             mark_frontend_ready,
             check_full_disk_access,
             open_privacy_settings,
+            open_login_items_settings,
+            get_onboarding_state,
+            record_onboarding_decision,
+            register_daemon,
+            set_daemon_autostart,
             open_pathignore,
             open_pathindexing,
             restart_app,

@@ -132,6 +132,12 @@
   let serviceHealth = { ok: true, state: '' };
   let fdaSettingsOpened = false;
   const FDA_DISMISSED_KEY = 'everything-fda-dismissed';
+  // macOS daemon-writer onboarding/auto-start state (get_onboarding_state DTO).
+  let onboarding = null;
+  let showOnboarding = false;
+  let onboardingBusy = false;
+  let fdaPollTimer = null;
+  let autostartBusy = false;
   const appWindow = getCurrentWindow();
   let toast = '';
   let searchTimer;
@@ -1201,6 +1207,79 @@
     return selectedIndices.size > 1;
   }
 
+  // --- macOS daemon-writer onboarding / auto-start (design §5.4, §5.2) ---
+
+  // 1s FDA polling while the onboarding modal or the FDA banner waits for the
+  // user to flip the System Settings toggle — grants apply live, no restart.
+  function startFdaPoll() {
+    if (fdaPollTimer) return;
+    fdaPollTimer = setInterval(async () => {
+      const ok = await invoke('check_full_disk_access').catch(() => false);
+      if (onboarding) onboarding = { ...onboarding, fdaOk: ok };
+      if (ok) {
+        if (showFdaBanner) {
+          showFdaBanner = false;
+          showToast('전체 디스크 접근이 허용되었습니다. 인덱서가 곧 반영합니다.');
+        }
+        if (!showOnboarding) stopFdaPoll();
+      }
+    }, 1000);
+  }
+
+  function stopFdaPoll() {
+    if (fdaPollTimer) {
+      clearInterval(fdaPollTimer);
+      fdaPollTimer = null;
+    }
+  }
+
+  // Records the first-run decision; the daemon's gate releases within ~5s and
+  // the first registration starts it immediately (G3).
+  async function decideOnboarding(decision) {
+    if (onboardingBusy) return;
+    onboardingBusy = true;
+    try {
+      await invoke('record_onboarding_decision', { decision });
+      showOnboarding = false;
+      stopFdaPoll();
+      onboarding = await invoke('get_onboarding_state').catch(() => onboarding);
+      if (decision === 'skipped') {
+        showToast('제한된 인덱스로 시작합니다. 권한은 나중에 허용할 수 있습니다.');
+        if (onboarding && !onboarding.fdaOk && localStorage.getItem(FDA_DISMISSED_KEY) !== '1') {
+          showFdaBanner = true;
+        }
+      } else {
+        showToast('백그라운드 인덱서를 시작합니다.');
+      }
+    } catch (err) {
+      showToast(`온보딩 저장 실패: ${String(err)}`);
+    } finally {
+      onboardingBusy = false;
+    }
+  }
+
+  $: autostartOn =
+    onboarding && !onboarding.optedOut && onboarding.registration === 'enabled';
+
+  async function toggleAutostart() {
+    if (autostartBusy || !onboarding) return;
+    autostartBusy = true;
+    const enable = !autostartOn;
+    try {
+      await invoke('set_daemon_autostart', { enabled: enable });
+      onboarding = await invoke('get_onboarding_state').catch(() => onboarding);
+      showToast(
+        enable
+          ? '로그인 시 자동 실행이 켜졌습니다.'
+          : '자동 실행이 꺼졌습니다. 앱을 사용하는 동안에만 인덱스가 갱신됩니다.'
+      );
+    } catch (err) {
+      showToast(`자동 실행 설정 실패: ${String(err)}`);
+    } finally {
+      autostartBusy = false;
+    }
+  }
+
   async function startRename() {
     if (isMultiSelected()) {
       return;
@@ -1603,9 +1682,19 @@
     platform = await step('invoke(get_platform)', () => invoke('get_platform'));
 
     if (platform === 'macos') {
-      const hasAccess = await invoke('check_full_disk_access').catch(() => true);
-      const dismissed = localStorage.getItem(FDA_DISMISSED_KEY) === '1';
-      showFdaBanner = !hasAccess && !dismissed;
+      onboarding = await invoke('get_onboarding_state').catch(() => null);
+      if (onboarding && !onboarding.recorded) {
+        // First run: the daemon idles in WaitingOnboarding (no build, no TCC
+        // access) until a decision is recorded here (§5.4).
+        showOnboarding = true;
+        startFdaPoll();
+      } else {
+        const hasAccess = onboarding
+          ? onboarding.fdaOk
+          : await invoke('check_full_disk_access').catch(() => true);
+        const dismissed = localStorage.getItem(FDA_DISMISSED_KEY) === '1';
+        showFdaBanner = !hasAccess && !dismissed;
+      }
     }
 
     let unlistenResized = null;
@@ -1852,6 +1941,7 @@
     clearInterval(statusRefreshTimer);
     clearInterval(elapsedTimer);
     clearInterval(bgPollTimer);
+    stopFdaPoll();
     resizeCleanup?.();
 
     for (const unlisten of unlistenFns) {
@@ -1909,16 +1999,58 @@
     {/if}
   </div>
 
+  {#if showOnboarding}
+  <div class="onboarding-overlay">
+    <div class="onboarding-modal" role="dialog" aria-modal="true" aria-label="Everything 시작하기">
+      <h2>Everything 시작하기</h2>
+      <p>
+        백그라운드 인덱서가 로그인할 때 자동으로 실행되어 파일 인덱스를 항상
+        최신으로 유지합니다. 보호된 폴더(데스크탑·문서·다운로드 등)까지
+        검색하려면 <b>전체 디스크 접근</b> 권한이 필요합니다.
+      </p>
+      <div class="onboarding-fda">
+        {#if onboarding?.fdaOk}
+          <span class="onboarding-fda-ok">✓ 전체 디스크 접근 허용됨</span>
+        {:else}
+          <span class="onboarding-fda-missing">전체 디스크 접근이 아직 허용되지 않았습니다</span>
+          <button class="fda-btn-open" on:click={() => { invoke('open_privacy_settings'); startFdaPoll(); }}>설정 열기</button>
+        {/if}
+      </div>
+      <p class="onboarding-note">
+        시스템 설정 &gt; 개인정보 보호 및 보안 &gt; 전체 디스크 접근에서 Everything을
+        켜 주세요. 목록에 없으면 + 버튼으로 응용 프로그램에서 추가할 수 있습니다.
+        허용하면 이 창이 자동으로 감지합니다.
+      </p>
+      <div class="onboarding-actions">
+        <button
+          class="onboarding-primary"
+          disabled={onboardingBusy || !onboarding?.fdaOk}
+          on:click={() => decideOnboarding('granted')}
+        >
+          시작하기
+        </button>
+        <button
+          class="onboarding-secondary"
+          disabled={onboardingBusy}
+          on:click={() => decideOnboarding('skipped')}
+        >
+          나중에 (제한된 인덱스로 시작)
+        </button>
+      </div>
+    </div>
+  </div>
+  {/if}
+
   {#if showFdaBanner}
   <div class="fda-banner" role="alert">
     {#if fdaSettingsOpened}
-      <span class="fda-banner-text">Full Disk Access granted? Restart the app to apply.</span>
+      <span class="fda-banner-text">전체 디스크 접근을 허용하면 자동으로 반영됩니다 (인덱서가 1분 내 감지).</span>
     {:else}
-      <span class="fda-banner-text">Full Disk Access is required to avoid repeated permission prompts.</span>
+      <span class="fda-banner-text">전체 디스크 접근을 허용하면 보호된 폴더까지 검색할 수 있습니다.</span>
     {/if}
     <div class="fda-banner-actions">
-      <button class="fda-btn-open" on:click={() => { invoke('open_privacy_settings'); fdaSettingsOpened = true; }}>Open Settings</button>
-      <button class="fda-btn-dismiss" on:click={() => { showFdaBanner = false; localStorage.setItem(FDA_DISMISSED_KEY, '1'); }}>Dismiss</button>
+      <button class="fda-btn-open" on:click={() => { invoke('open_privacy_settings'); fdaSettingsOpened = true; startFdaPoll(); }}>설정 열기</button>
+      <button class="fda-btn-dismiss" on:click={() => { showFdaBanner = false; stopFdaPoll(); localStorage.setItem(FDA_DISMISSED_KEY, '1'); }}>닫기</button>
     </div>
   </div>
   {/if}
@@ -1953,13 +2085,30 @@
         인덱스 서비스가 응답하지 않습니다. 재등록이 필요할 수 있습니다.
       {:else if serviceHealth.state === 'version_mismatch'}
         인덱스 서비스가 이전 버전으로 실행 중입니다. 재시작(재등록)이 필요합니다.
+      {:else if serviceHealth.state === 'not_registered'}
+        백그라운드 인덱서가 로그인 항목으로 등록되어 있지 않습니다.
+      {:else if serviceHealth.state === 'approval_required'}
+        로그인 항목에서 Everything이 꺼져 있어 백그라운드 인덱서가 실행되지 않습니다.
+      {:else if serviceHealth.state === 'disabled'}
+        자동 실행이 꺼져 있습니다. 앱을 사용하는 동안에만 인덱스가 갱신됩니다.
       {:else}
         인덱스 서비스 상태를 확인하는 중입니다...
       {/if}
     </span>
     <div class="fda-banner-actions">
       {#if serviceHealth.state === 'not_installed' || serviceHealth.state === 'unresponsive' || serviceHealth.state === 'version_mismatch'}
-        <button class="fda-btn-open" on:click={() => invoke('register_service_elevated')}>서비스 등록</button>
+        {#if platform === 'windows'}
+          <button class="fda-btn-open" on:click={() => invoke('register_service_elevated')}>서비스 등록</button>
+        {/if}
+      {/if}
+      {#if serviceHealth.state === 'not_registered'}
+        <button class="fda-btn-open" on:click={() => invoke('register_daemon').then(() => showToast('로그인 항목으로 등록했습니다.')).catch((e) => showToast(String(e)))}>등록</button>
+      {/if}
+      {#if serviceHealth.state === 'approval_required'}
+        <button class="fda-btn-open" on:click={() => invoke('open_login_items_settings')}>로그인 항목 열기</button>
+      {/if}
+      {#if serviceHealth.state === 'disabled'}
+        <button class="fda-btn-open" disabled={autostartBusy} on:click={toggleAutostart}>다시 켜기</button>
       {/if}
     </div>
   </div>
@@ -2091,6 +2240,18 @@
       {/if}
     </div>
     <div class="status-right">
+      {#if platform === 'macos' && onboarding}
+        <button
+          class="status-btn"
+          on:click={toggleAutostart}
+          disabled={autostartBusy || onboarding.registration === 'unsupported'}
+          title={onboarding.registration === 'unsupported'
+            ? '개발 모드에서는 로그인 항목 등록을 사용할 수 없습니다.'
+            : '로그인 시 백그라운드 인덱서 자동 실행을 켜거나 끕니다.'}
+        >
+          자동 실행: {autostartOn ? '켜짐' : '꺼짐'}
+        </button>
+      {/if}
       <button class="status-btn" on:click={() => invoke('open_pathindexing')} title="추가 인덱싱 경로(.pathindexing) 열기">
         Add
       </button>
@@ -2504,6 +2665,98 @@
   }
   .fda-btn-dismiss:hover {
     color: #fff;
+  }
+
+  .onboarding-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .onboarding-modal {
+    width: 440px;
+    max-width: calc(100vw - 48px);
+    background: var(--bar-grad-bottom, #f2f2f2);
+    border: 1px solid var(--border-soft, #d0d0d0);
+    border-radius: 12px;
+    padding: 18px 20px 16px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+    font-size: 12.5px;
+    line-height: 1.65;
+  }
+  .onboarding-modal h2 {
+    margin: 0 0 8px;
+    font-size: 15px;
+  }
+  .onboarding-modal p {
+    margin: 0 0 10px;
+  }
+  .onboarding-note {
+    font-size: 11.5px;
+    opacity: 0.75;
+  }
+  .onboarding-fda {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(232, 160, 32, 0.18);
+    margin-bottom: 10px;
+  }
+  .onboarding-fda-ok {
+    color: #1f9d57;
+    font-weight: 600;
+  }
+  .onboarding-fda-missing {
+    font-weight: 500;
+  }
+  .onboarding-fda .fda-btn-open {
+    background: #e8a020;
+    color: #fff;
+  }
+  .onboarding-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 4px;
+  }
+  .onboarding-primary,
+  .onboarding-secondary {
+    padding: 5px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .onboarding-primary {
+    background: #2f6ede;
+    color: #fff;
+  }
+  .onboarding-primary:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .onboarding-secondary {
+    background: transparent;
+    border-color: var(--border-soft, #c0c0c0);
+    color: inherit;
+  }
+  .onboarding-secondary:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  :global([data-theme='dark']) .onboarding-modal {
+    background: #26292e;
+    border-color: #3a3f46;
+  }
+  :global([data-theme='dark']) .onboarding-fda {
+    background: rgba(232, 160, 32, 0.22);
   }
 
   .search-bar {
