@@ -9,9 +9,12 @@
 //! tells the same story. A dedicated long-lived connection watches
 //! `PRAGMA data_version` to refresh results when the daemon writes (S3:
 //! negative/fd caches invalidated, pooled search connections dropped after a
-//! table swap, `fts_ready` re-derived). When the socket is unreachable the
-//! daemon is revived once per outage through the §4 single rule
-//! (`ensure_daemon_running`), and the outage is classified into
+//! table swap, `fts_ready` re-derived). While the socket is unreachable the
+//! daemon is revived through the §4 single rule (`ensure_daemon_running`),
+//! retried on `REVIVAL_RETRY` — a single attempt can legitimately no-op (the
+//! dying daemon still holds `daemon.lock`, launchd's ~10s relaunch throttle,
+//! the bundle mid-replace during an update) and must not strand the daemon
+//! for the rest of the GUI session. The outage is classified into
 //! `service_health` states for the banner. While the user has auto-start
 //! turned off, the bridge keeps the lease daemon alive with `attach_lease`
 //! renewals (G6).
@@ -38,6 +41,13 @@ const HEALTH_RECHECK: Duration = Duration::from_secs(5);
 const STARTING_GRACE: Duration = Duration::from_secs(15);
 /// Lease renewal cadence while auto-start is off (TTL is 5 min — G6).
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(60);
+/// Re-attempt daemon revival on this cadence while the outage persists. One
+/// shot is not enough: `ensure_daemon_running` no-ops while the dying daemon
+/// still holds `daemon.lock`, and `launchctl kickstart` can fail inside
+/// launchd's ~10s relaunch throttle or while Finder is mid-replace of the
+/// bundle. Longer than STARTING_GRACE's rationale (the launchd throttle) so
+/// retries never hammer launchd.
+const REVIVAL_RETRY: Duration = Duration::from_secs(15);
 
 /// Whether a read-only open of the daemon's DB is currently possible and the
 /// schema exists — the gate for `db_ready` (until then search rides the
@@ -66,7 +76,11 @@ fn map_status(s: &DaemonStatus) -> (&'static str, Option<String>) {
         return ("Error", s.message.clone());
     }
     match s.state.as_str() {
-        "Ready" => ("Ready", None),
+        // Carry the message into Ready: after a completed pass it holds the
+        // "some paths could not be read" line, which is the only explanation
+        // the user gets for a nonzero failure count. Dropping it here left the
+        // status bar showing a bare number and no reason.
+        "Ready" => ("Ready", s.message.clone()),
         "Building" => {
             if s.is_fresh {
                 ("Indexing", s.message.clone())
@@ -100,9 +114,10 @@ pub fn start_macos_readonly(app: AppHandle, state: AppState) {
         let mut last_state: Option<(String, Option<String>)> = None;
         let mut last_health: Option<String> = None;
         let mut last_health_check: Option<Instant> = None;
-        // One revival attempt per unreachable episode (reset when status answers).
+        // Revival attempts are paced by REVIVAL_RETRY within an unreachable
+        // episode (cleared when status answers again).
         let mut outage_since: Option<Instant> = None;
-        let mut revival_requested = false;
+        let mut last_revival_attempt: Option<Instant> = None;
         // One automatic restart per version-mismatch episode (G15: only when
         // the daemon is older — a stray old GUI must not churn a new daemon).
         let mut restart_sent = false;
@@ -112,7 +127,7 @@ pub fn start_macos_readonly(app: AppHandle, state: AppState) {
             match daemon_ipc::status(&data_dir) {
                 Some(s) => {
                     outage_since = None;
-                    revival_requested = false;
+                    last_revival_attempt = None;
                     last_health_check = None;
 
                     if !state.db_ready.load(Ordering::Acquire) && macos_db_usable(&state.db_path)
@@ -234,10 +249,12 @@ pub fn start_macos_readonly(app: AppHandle, state: AppState) {
                     let outage_started = *outage_since.get_or_insert(now);
                     if last_health_check.map_or(true, |t| t.elapsed() >= HEALTH_RECHECK) {
                         last_health_check = Some(now);
-                        // Revive once per outage through the §4 single rule
-                        // (kickstart / spawn / lease-spawn / nothing).
-                        if !revival_requested {
-                            revival_requested = true;
+                        // Revive through the §4 single rule (kickstart / spawn
+                        // / lease-spawn / nothing), retrying while the outage
+                        // persists — the gate is idempotent when a daemon is
+                        // already resident.
+                        if last_revival_attempt.map_or(true, |t| t.elapsed() >= REVIVAL_RETRY) {
+                            last_revival_attempt = Some(now);
                             daemon::ensure_daemon_running("bridge");
                         }
                         let health = classify_daemon_health(

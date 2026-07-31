@@ -9,10 +9,12 @@ use crate::AppResult;
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
+#[cfg(target_os = "macos")]
 use crate::{
-    db_connection, delete_paths, index_row_from_path_and_metadata,
-    invalidate_search_caches, should_skip_path, touch_status_updated, upsert_rows,
-    AppState, IgnorePattern, BATCH_SIZE,
+    apply_scan_scheduling, build_scan_pool, db_connection, delete_paths,
+    index_row_from_path_and_metadata, invalidate_search_caches, should_skip_path,
+    touch_status_updated, upsert_rows, AppState, IgnorePattern, ScanRole, BATCH_SIZE,
 };
 
 const DEFAULT_PATHINDEXING_CONTENTS: &str = "\
@@ -136,6 +138,14 @@ pub(crate) fn scan_extra_roots(
         return Ok(0);
     }
 
+    // This is a full parallel walk like the index pass's, so it takes the same
+    // scheduling. Without it jwalk defaults to `Parallelism::RayonDefaultPool` —
+    // the process-wide rayon pool, sized to every core and with no
+    // `start_handler`, so its threads would run this walk at the caller's
+    // (foreground) class and then stay that way for the process's life.
+    apply_scan_scheduling(ScanRole::IdleWriter);
+    let (pool, _, _) = build_scan_pool();
+
     let mut conn = db_connection(&state.db_path)?;
     let mut total_changed = 0;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
@@ -159,6 +169,10 @@ pub(crate) fn scan_extra_roots(
         let walker = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
             .follow_links(false)
             .skip_hidden(false)
+            .parallelism(jwalk::Parallelism::RayonExistingPool {
+                pool: pool.clone(),
+                busy_timeout: None,
+            })
             .process_read_dir(move |_depth, path, _state, children| {
                 children.retain_mut(|entry_result| match entry_result {
                     Ok(entry) => {
@@ -174,6 +188,14 @@ pub(crate) fn scan_extra_roots(
             });
 
         for result in walker {
+            // Cooperative cancel (G4): the daemon's quiesce/exit/reset monitor
+            // flips this while the scan runs; unwind instead of finishing a
+            // minutes-long walk. The partial upserts are idempotent and the
+            // caller leaves `indexed_extra_roots` unwritten, so a later run
+            // redoes the reconcile.
+            if state.cancel_index.load(Ordering::Acquire) {
+                return Err("extra-root scan cancelled".to_string());
+            }
             if let Ok(entry) = result {
                 let path = entry.path();
                 if path == root.as_path() {

@@ -23,8 +23,12 @@
 //!   * daemon-vs-GUI — the macOS GUI is a hard read-only reader (D4): it never
 //!     writes, so there is nothing to hand over. Its `gui.lock` beacon remains
 //!     for second-instance detection, the lease-liveness check, and as the
-//!     yield signal pre-flip daemons still in the field honor (§7). On Linux
-//!     the GUI still owns writes while running and the daemon defers to it.
+//!     yield signal pre-flip daemons still in the field honor (§7). The
+//!     post-flip GUI also holds `gui_ro.lock`; a `gui.lock` holder *without*
+//!     it is a pre-flip writer GUI (old build still installed) — the daemon
+//!     cancels/defers full passes and skips exclusive maintenance while it is
+//!     up, keeping the single-writer invariant across versions. On Linux the
+//!     GUI still owns writes while running and the daemon defers to it.
 //!
 //! Bootstrap: the MCP server (`--mcp`) spawns this detached on startup (unless
 //! a GUI or another daemon is already the writer), so an agent that only ever
@@ -145,8 +149,35 @@ pub(crate) fn gui_is_running(db_path: &Path) -> bool {
     try_acquire(&gui_lock_path(db_path)).is_none()
 }
 
+#[cfg(target_os = "macos")]
+fn gui_ro_lock_path(db_path: &Path) -> PathBuf {
+    db_path.with_file_name("gui_ro.lock")
+}
+
+/// Whether a pre-flip *writer* GUI is up: `gui.lock` held without the
+/// `gui_ro.lock` read-only marker (post-flip GUIs hold both; bench mode —
+/// deliberately a writer — holds only `gui.lock`). While true the daemon
+/// must not run full passes or exclusive maintenance (§7).
+#[cfg(target_os = "macos")]
+pub(crate) fn writer_gui_running(db_path: &Path) -> bool {
+    gui_is_running(db_path) && try_acquire(&gui_ro_lock_path(db_path)).is_some()
+}
+
 #[cfg(not(target_os = "windows"))]
 static GUI_BEACON: OnceLock<File> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+static GUI_RO_BEACON: OnceLock<File> = OnceLock::new();
+
+/// Called on read-only GUI startup, alongside `hold_gui_beacon`: marks this
+/// `gui.lock` holder as a post-flip reader so the daemon keeps writing.
+/// Bench mode must NOT call it — bench is a real writer the daemon yields to.
+#[cfg(target_os = "macos")]
+pub(crate) fn hold_gui_ro_beacon(db_path: &Path) {
+    if let Some(file) = try_acquire(&gui_ro_lock_path(db_path)) {
+        let _ = GUI_RO_BEACON.set(file);
+    }
+}
 
 /// Called once on GUI startup: hold `gui.lock` for the process lifetime so any
 /// daemon defers to the GUI as the single writer. Returns whether the beacon
@@ -429,12 +460,13 @@ fn build_index(db_path: &Path, state: &AppState, should_cancel: CancelProbe) -> 
             }
             // Storage/GC maintenance only after a full (re)build, matching the
             // GUI finalizing thread; a plain catchup barely changes the file.
-            // macOS (D7): the GUI is a reader — VACUUM proceeds regardless and
-            // concurrent readers ride busy_timeout + the S2 retry. Linux still
-            // skips it while the writer-GUI is up: VACUUM's *exclusive* lock
-            // (not WAL-concurrent) would hand that GUI a hard SQLITE_BUSY.
+            // macOS (D7): the post-flip GUI is a reader — VACUUM proceeds and
+            // concurrent readers ride busy_timeout + the S2 retry. A pre-flip
+            // *writer* GUI (§7) still blocks it, same as Linux: VACUUM's
+            // *exclusive* lock (not WAL-concurrent) would hand that GUI a
+            // hard SQLITE_BUSY.
             #[cfg(target_os = "macos")]
-            let gui_blocks_maintenance = false;
+            let gui_blocks_maintenance = writer_gui_running(db_path);
             #[cfg(not(target_os = "macos"))]
             let gui_blocks_maintenance = gui_is_running(db_path);
             if (is_fresh || fts_dirty) && !gui_blocks_maintenance {
@@ -463,15 +495,18 @@ fn run_build(db_path: &Path, state: &AppState, control: &Arc<DaemonControl>) -> 
     result
 }
 
-/// A pass must unwind when SIGTERM arrived or when IPC asked for exit/reset.
-/// (The GUI is a reader post-flip — it never takes writes over, D4.)
+/// A pass must unwind when SIGTERM arrived, when IPC asked for exit/reset, or
+/// when a pre-flip *writer* GUI appeared (§7 — post-flip GUIs are readers and
+/// never cancel anything, D4).
 #[cfg(target_os = "macos")]
-fn build_cancel_probe(_db_path: &Path, control: &Arc<DaemonControl>) -> CancelProbe {
+fn build_cancel_probe(db_path: &Path, control: &Arc<DaemonControl>) -> CancelProbe {
     let control = Arc::clone(control);
+    let db_path = db_path.to_path_buf();
     Arc::new(move || {
         quiesce_signaled()
             || control.requested_exit().is_some()
             || control.reset_requested.load(Ordering::Acquire)
+            || writer_gui_running(&db_path)
     })
 }
 
@@ -742,6 +777,11 @@ fn run_daemon_macos(db_path: PathBuf, home_dir: PathBuf, app_data_dir: PathBuf) 
     let lease_mode = std::env::args().skip(1).any(|a| a == "--lease");
     let launchd_started = std::env::var_os("EVERYTHING_LAUNCHD").is_some();
 
+    // Field CPU accounting (see mac/cpu_monitor.rs): this process owns every
+    // index build, so if a fan complaint ever comes back, its diag log must
+    // already contain who burned what, on which cluster, at how many watts.
+    crate::mac::cpu_monitor::start_watchdog();
+
     // §4-2 — SIGTERM handler + UDS server BEFORE any build (G4/F6): logout and
     // shutdown quiesce cleanly, and status/restart/disable answer even during
     // a minutes-long fresh build.
@@ -783,7 +823,15 @@ fn run_daemon_macos(db_path: PathBuf, home_dir: PathBuf, app_data_dir: PathBuf) 
     // decided. Existing installs adopt implicitly (§7 migration).
     match wait_for_onboarding_gate(&db_path, &control) {
         GateOutcome::Proceed => {}
-        GateOutcome::Exit(code) => return finish_quiesce(&db_path, &state, &control, code),
+        GateOutcome::Exit(code) => {
+            let code = finish_quiesce(&db_path, &state, &control, code);
+            if code != 0 && !launchd_started {
+                // An IPC restart while gated must still relaunch when there is
+                // no launchd supervisor — same as the resident loop (G15).
+                relaunch_self_detached(lease_mode);
+            }
+            return code;
+        }
     }
 
     // §4-5 — schema + startup build (fresh or catchup).
@@ -799,8 +847,11 @@ fn run_daemon_macos(db_path: PathBuf, home_dir: PathBuf, app_data_dir: PathBuf) 
         let _ = set_meta(&conn, "last_fda_ok", if fda { "1" } else { "0" });
     }
     let _ = run_build(&db_path, &state, &control);
-    reconcile_extra_roots(&state);
-    {
+    // SIGTERM / an IPC exit during the startup build unwound it via the cancel
+    // probe; skip the reconcile/purge housekeeping too so quiesce stays ≤5s
+    // (G4) — the resident loop's first iteration performs the actual quiesce.
+    if !quiesce_signaled() && control.requested_exit().is_none() {
+        reconcile_extra_roots(&state, &control);
         // Housekeeping the GUI used to gate on frontend_ready (§5.3): rows
         // under since-ignored roots are purged by the writer that owns the DB.
         let (ignored_roots, _) = cached_effective_ignore_rules(&state);
@@ -820,18 +871,20 @@ enum GateOutcome {
     Exit(i32),
 }
 
-/// First-install onboarding gate (D6/F3): hold in `WaitingOnboarding` until a
-/// decision is recorded. Existing installs (a usable index already on disk)
-/// adopt `granted-implicit` so upgrades never stall (§7). The Q7 escape hatch
-/// lets MCP-only users out after 7 days of observed search activity.
+/// §7 migration: whether an onboarding decision is on record, adopting
+/// `granted-implicit` first when a usable index already exists on disk (an
+/// install that predates onboarding must never stall or see the modal).
+/// Opens the DB read-only, so the GUI's `get_onboarding_state` calls it too —
+/// on a first post-upgrade launch no daemon may be running yet, and waiting
+/// for the daemon's gate to adopt would flash the modal at an existing user.
 #[cfg(target_os = "macos")]
-fn wait_for_onboarding_gate(db_path: &Path, control: &Arc<DaemonControl>) -> GateOutcome {
+pub(crate) fn onboarding_recorded_or_adopt(db_path: &Path) -> bool {
     use crate::mac::prefs;
     if prefs::onboarding_recorded() {
-        return GateOutcome::Proceed;
+        return true;
     }
     if db_path.exists() {
-        if let Ok(conn) = db_connection(db_path) {
+        if let Ok(conn) = crate::db_connection_for_search(db_path) {
             let complete = get_meta(&conn, "index_complete").as_deref() == Some("1");
             let nonempty = conn
                 .query_row("SELECT EXISTS(SELECT 1 FROM entries)", [], |r| {
@@ -840,10 +893,23 @@ fn wait_for_onboarding_gate(db_path: &Path, control: &Arc<DaemonControl>) -> Gat
                 .unwrap_or(false);
             if complete || nonempty {
                 prefs::record_onboarding_decision("granted-implicit");
-                diag::log("onboarding gate: existing index adopted (granted-implicit, §7)");
-                return GateOutcome::Proceed;
+                diag::log("onboarding: existing index adopted (granted-implicit, §7)");
+                return true;
             }
         }
+    }
+    false
+}
+
+/// First-install onboarding gate (D6/F3): hold in `WaitingOnboarding` until a
+/// decision is recorded. Existing installs (a usable index already on disk)
+/// adopt `granted-implicit` so upgrades never stall (§7). The Q7 escape hatch
+/// lets MCP-only users out after 7 days of observed search activity.
+#[cfg(target_os = "macos")]
+fn wait_for_onboarding_gate(db_path: &Path, control: &Arc<DaemonControl>) -> GateOutcome {
+    use crate::mac::prefs;
+    if onboarding_recorded_or_adopt(db_path) {
+        return GateOutcome::Proceed;
     }
     prefs::mark_first_seen_now();
     control.set_lifecycle(Lifecycle::WaitingOnboarding);
@@ -897,8 +963,14 @@ fn mcp_activity_recent(db_path: &Path, window: Duration) -> bool {
 /// Extra roots added/removed in `.pathindexing` while no writer was running
 /// (the GUI used to reconcile this at startup — §5.3). Compares the stored
 /// `indexed_extra_roots` meta against the roots loaded at state build.
+///
+/// The added-root scan can take minutes on a large tree, so it runs under the
+/// same cancel monitor as a build pass: SIGTERM / IPC exit / reset flips
+/// `cancel_index` and the scan unwinds within ~1-2s, keeping the ≤5s quiesce
+/// contract (G4). A cancelled reconcile leaves `indexed_extra_roots` stale,
+/// so the next daemon start simply retries it.
 #[cfg(target_os = "macos")]
-fn reconcile_extra_roots(state: &AppState) {
+fn reconcile_extra_roots(state: &AppState, control: &Arc<DaemonControl>) {
     let stored_roots: Vec<PathBuf> = db_connection(&state.db_path)
         .ok()
         .and_then(|c| get_meta(&c, "indexed_extra_roots"))
@@ -921,17 +993,41 @@ fn reconcile_extra_roots(state: &AppState) {
     diag::log(format!(
         ".pathindexing changed while the daemon was down: +{added} -{removed} → extra-root reconcile"
     ));
+    let should_cancel = build_cancel_probe(&state.db_path, control);
     while state.indexing_active.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_secs(1));
+        if should_cancel() {
+            state.pathindexing_active.store(false, Ordering::Release);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
+    state.cancel_index.store(false, Ordering::Release);
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let monitor = {
+        let cancel = Arc::clone(&state.cancel_index);
+        let stop = Arc::clone(&monitor_stop);
+        let should_cancel = Arc::clone(&should_cancel);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if should_cancel() {
+                    cancel.store(true, Ordering::Release);
+                    return;
+                }
+                std::thread::sleep(GUI_POLL_INTERVAL);
+            }
+        })
+    };
     let (ign_roots, ign_patterns) = cached_effective_ignore_rules(state);
-    match pathindexing::handle_pathindexing_change(
+    let outcome = pathindexing::handle_pathindexing_change(
         state,
         &stored_roots,
         &current_roots,
         &ign_roots,
         &ign_patterns,
-    ) {
+    );
+    monitor_stop.store(true, Ordering::Release);
+    let _ = monitor.join();
+    match outcome {
         Ok(()) => {
             if let Ok(c) = db_connection(&state.db_path) {
                 let roots_str: Vec<String> = current_roots
@@ -1100,6 +1196,8 @@ fn run_macos_resident(
     // CPU) or a flapping FSEvents worker. Count them and ALERT in the diag log.
     let mut heal_times: VecDeque<Instant> = VecDeque::new();
     let mut consecutive_failed_builds: u32 = 0;
+    // Log-once edge for "a pre-flip writer GUI is up, builds deferred" (§7).
+    let mut deferred_to_writer_gui = false;
     let mut watcher_restarts = diag::RateAlert::new(Duration::from_secs(3600), 5);
     let exe_identity = ExeIdentity::capture();
     let mut exe_missing_ticks: u32 = 0;
@@ -1123,8 +1221,36 @@ fn run_macos_resident(
         }
         if last_supervise.map_or(true, |t| t.elapsed() >= SUPERVISE_INTERVAL) {
             last_supervise = Some(Instant::now());
+            // §7: a pre-flip writer GUI owns index writes while it runs; defer
+            // builds (heal, pathignore catchup) instead of dueling it. The
+            // watcher keeps running — its incremental writes are WAL-safe.
+            let writer_gui_up = writer_gui_running(&db_path);
+            if writer_gui_up && !deferred_to_writer_gui {
+                deferred_to_writer_gui = true;
+                diag::log("pre-flip writer GUI detected; deferring builds until it exits (§7)");
+            } else if !writer_gui_up && deferred_to_writer_gui {
+                deferred_to_writer_gui = false;
+                diag::log("pre-flip writer GUI gone; resuming builds");
+            }
+            // .pathignore edits apply live now that the daemon owns all writes
+            // (the GUI's old restart-to-apply path has no writer to act on it):
+            // purge newly ignored rows, then a catchup pass collects newly
+            // un-ignored paths. The bridge's data_version watch refreshes the
+            // GUI's results.
+            // (writer_gui_up is checked FIRST so a deferred tick doesn't
+            // consume the dirty flag and lose the change.)
+            if !writer_gui_up && state.pathignore_dirty.swap(false, Ordering::AcqRel) {
+                diag::log(".pathignore changed: purging ignored entries + catchup pass");
+                let (ignored_roots, _) = cached_effective_ignore_rules(&state);
+                if let Err(e) = purge_ignored_entries(&db_path, &ignored_roots) {
+                    diag::log(format!("ALERT: pathignore purge failed: {e}"));
+                }
+                invalidate_search_caches(&state);
+                let _ = refresh_and_emit_status_counts(None, &state);
+                let _ = run_build(&db_path, &state, &control);
+            }
             // Heal an incomplete/failed build so MCP never stays stuck.
-            if !index_complete(&db_path) {
+            if !index_complete(&db_path) && !writer_gui_up {
                 eprintln!("[daemon] index incomplete; (re)building");
                 heal_times.push_back(Instant::now());
                 while heal_times
@@ -1241,8 +1367,97 @@ fn supervise_fda(
         let _ = set_meta(&conn, "last_fda_ok", "1");
     }
     eprintln!("[daemon] Full Disk Access granted; catching up protected paths");
-    diag::log("FDA rising edge: granted → forced catchup pass for protected paths (D6)");
+    if rescan_denied_prefixes(db_path, state) {
+        return;
+    }
+    diag::log("FDA rising edge: no recorded denials → full catchup pass (D6)");
     let _ = run_build(db_path, state, control);
+}
+
+/// Rescan only the subtrees the last pass could not enumerate (the prefixes it
+/// recorded under `denied_prefixes`), for the Full Disk Access rising edge.
+///
+/// The alternative is what this used to do: a full catchup pass, re-walking all
+/// ~1M entries within a minute or two of the startup build finishing. On a first
+/// install that doubles the app's CPU window at exactly the moment the user is
+/// watching it, and it is almost entirely wasted work — the only paths whose
+/// readability changed are the ones that were denied. Those collapse onto a
+/// couple of dozen prefixes (`~/Library/Containers`, `~/Library/Mail`, …), so
+/// rescanning exactly them costs seconds.
+///
+/// Returns false when there is nothing recorded to work from (a DB written
+/// before the key existed), so the caller can fall back to a full pass.
+#[cfg(target_os = "macos")]
+fn rescan_denied_prefixes(db_path: &Path, state: &AppState) -> bool {
+    let prefixes = crate::load_denied_prefixes(db_path);
+    if prefixes.is_empty() {
+        return false;
+    }
+    // Same exclusive-writer guard a full pass takes: the live watcher and any
+    // queued subtree rescan stand down on `indexing_active`. Losing the race
+    // means a pass is already running and reconciles the same ground, so the
+    // work is covered either way — never fall back to a second full pass here.
+    if state
+        .indexing_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        diag::log("FDA rising edge: an index pass is already running; it covers the denied paths");
+        return true;
+    }
+    // Nobody is waiting on this, and it is a single-threaded walk: E-cluster.
+    // A later `run_build` on this thread re-applies its own class.
+    crate::apply_scan_scheduling(crate::ScanRole::IdleWriter);
+    diag::log(format!(
+        "FDA rising edge: granted → rescanning {} previously-denied prefix(es) (D6)",
+        prefixes.len()
+    ));
+    let started = Instant::now();
+    let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
+    let mut upserted = 0usize;
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    match db_connection(db_path) {
+        Ok(mut conn) => {
+            for prefix in &prefixes {
+                if quiesce_signaled() {
+                    break;
+                }
+                match crate::rescan::rescan_subtree(
+                    &mut conn,
+                    Path::new(prefix),
+                    &ignored_roots,
+                    &ignored_patterns,
+                ) {
+                    Ok((up, del)) => {
+                        upserted += up;
+                        deleted += del;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("[daemon] denied-prefix rescan {prefix} failed: {e}");
+                    }
+                }
+            }
+            let _ = conn.execute_batch("PRAGMA shrink_memory;");
+        }
+        Err(e) => {
+            diag::log(format!("FDA rising edge: rescan could not open the DB: {e}"));
+            failed = prefixes.len();
+        }
+    }
+    state.indexing_active.store(false, Ordering::Release);
+    if upserted > 0 || deleted > 0 {
+        invalidate_search_caches(state);
+    }
+    let _ = refresh_and_emit_status_counts(None, state);
+    diag::log(format!(
+        "denied-prefix rescan done in {:.1}s: upserted={upserted} deleted={deleted} failed={failed}",
+        started.elapsed().as_secs_f32()
+    ));
+    // A prefix that still cannot be read stays recorded for the next attempt;
+    // one that now reads clean is dropped by the next full pass's rewrite.
+    true
 }
 
 /// Start the FSEvents watcher, replaying from the last persisted event id to

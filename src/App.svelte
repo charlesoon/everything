@@ -1210,7 +1210,10 @@
   // --- macOS daemon-writer onboarding / auto-start (design §5.4, §5.2) ---
 
   // 1s FDA polling while the onboarding modal or the FDA banner waits for the
-  // user to flip the System Settings toggle — grants apply live, no restart.
+  // user to flip the System Settings toggle. Grants often apply live, but
+  // macOS can require relaunching an already-running (previously denied)
+  // process — System Settings itself prompts "quit & reopen" — so the modal
+  // also offers an explicit restart button as the escape hatch.
   function startFdaPoll() {
     if (fdaPollTimer) return;
     fdaPollTimer = setInterval(async () => {
@@ -2014,12 +2017,14 @@
         {:else}
           <span class="onboarding-fda-missing">전체 디스크 접근이 아직 허용되지 않았습니다</span>
           <button class="fda-btn-open" on:click={() => { invoke('open_privacy_settings'); startFdaPoll(); }}>설정 열기</button>
+          <button class="fda-btn-open" on:click={() => invoke('restart_app')}>앱 재시작</button>
         {/if}
       </div>
       <p class="onboarding-note">
         시스템 설정 &gt; 개인정보 보호 및 보안 &gt; 전체 디스크 접근에서 Everything을
         켜 주세요. 목록에 없으면 + 버튼으로 응용 프로그램에서 추가할 수 있습니다.
-        허용하면 이 창이 자동으로 감지합니다.
+        허용하면 이 창이 자동으로 감지합니다 — 잠시 후에도 감지되지 않으면
+        (시스템이 재실행을 요구하는 경우) '앱 재시작'을 눌러 주세요.
       </p>
       <div class="onboarding-actions">
         <button
@@ -2232,11 +2237,17 @@
       {#if searchModeLabel === 'spotlight' || searchModeLabel === 'spotlight_timeout'}
         <span class="status-spotlight">Spotlight fallback{#if searchModeLabel === 'spotlight_timeout'} (partial){/if}</span>
       {/if}
-      {#if indexStatus.permissionErrors > 0}
-        <span class="status-warning">{indexStatus.permissionErrors.toLocaleString()} permission errors</span>
-      {/if}
+      <!-- The failure count used to render here as a bare "N permission errors"
+           next to the backend's own message about the same N — two spans, no
+           explanation. The message now carries both the number and the reason.
+           Severity comes from the index state, not from the count: a message on
+           a pass that completed is a caveat (some paths were unreadable), while
+           only an actual Error state is an error. Keying off permissionErrors
+           instead would mis-style both ways — it is sticky from the last pass,
+           so a later watcher failure would read as a caveat, and an I/O-fault
+           pass would too. -->
       {#if indexStatus.message}
-        <span class={indexStatus.isCatchup ? 'index-progress' : 'status-error'}>{indexStatus.message}</span>
+        <span class={indexStatus.isCatchup ? 'index-progress' : indexStatus.state === 'Error' ? 'status-error' : 'status-warning'}>{indexStatus.message}</span>
       {/if}
     </div>
     <div class="status-right">

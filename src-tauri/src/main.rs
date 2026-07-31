@@ -2,14 +2,14 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         Arc, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -434,6 +434,12 @@ pub(crate) struct AppState {
     pub(crate) watcher_stop: Arc<AtomicBool>,
     /// Set to true while a file watcher event loop is running.
     pub(crate) watcher_active: Arc<AtomicBool>,
+    /// Generation stamp for watcher workers: every start bumps it, and a
+    /// worker exits (without touching `watcher_active`) once the stamp moves
+    /// on. A stop-and-restart (reset) that timed out waiting on a worker
+    /// blocked mid-iteration therefore can't resurrect it into a second live
+    /// watcher when the restart clears `watcher_stop`.
+    pub(crate) watcher_gen: Arc<AtomicU64>,
     /// Set by the Windows RDCW watcher when the OS reports dropped change
     /// notifications (buffer overflow). The daemon's resident loop observes it
     /// and triggers an immediate reconcile pass instead of waiting for the next
@@ -449,6 +455,12 @@ pub(crate) struct AppState {
     /// Guards against concurrent pathindexing background threads.
     #[cfg(target_os = "macos")]
     pub(crate) pathindexing_active: Arc<AtomicBool>,
+    /// Set by the FSEvents watcher when `.pathignore`'s active entries change;
+    /// the daemon's supervise tick consumes it (purge newly ignored rows +
+    /// catchup for un-ignored paths). The read-only GUI can no longer apply
+    /// the change at restart (D4), so the daemon applies it live.
+    #[cfg(target_os = "macos")]
+    pub(crate) pathignore_dirty: Arc<AtomicBool>,
     /// Warm read connections reused across searches. Opening a connection per
     /// search costs ~1-2ms (open + PRAGMAs + schema parse) and starts with a
     /// cold SQLite page cache; reuse keeps hot pages and prepared statements.
@@ -530,6 +542,7 @@ pub(crate) fn build_app_state_with_config(
         mem_index: Arc::new(RwLock::new(None)),
         watcher_stop: Arc::new(AtomicBool::new(false)),
         watcher_active: Arc::new(AtomicBool::new(false)),
+        watcher_gen: Arc::new(AtomicU64::new(0)),
         #[cfg(target_os = "windows")]
         watcher_lost_events: Arc::new(AtomicBool::new(false)),
         #[cfg(target_os = "windows")]
@@ -537,6 +550,8 @@ pub(crate) fn build_app_state_with_config(
         frontend_ready: Arc::new(AtomicBool::new(false)),
         #[cfg(target_os = "macos")]
         pathindexing_active: Arc::new(AtomicBool::new(false)),
+        #[cfg(target_os = "macos")]
+        pathignore_dirty: Arc::new(AtomicBool::new(false)),
         search_conn_pool: Arc::new(Mutex::new(Vec::new())),
         #[cfg(target_os = "macos")]
         watcher_conn: Arc::new(Mutex::new(None)),
@@ -932,6 +947,36 @@ pub(crate) fn set_meta(conn: &Connection, key: &str, value: &str) -> AppResult<(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Read a meta value written by [`set_meta_list`]. Several meta keys hold a list
+/// of paths (`indexed_extra_roots`, `denied_prefixes`), and the newline codec was
+/// open-coded at every site — one pair keeps encode and decode symmetrical, and
+/// keeps "blank lines are not entries" from being re-decided each time.
+pub(crate) fn meta_list(conn: &Connection, key: &str) -> Vec<String> {
+    get_meta(conn, key)
+        .map(|value| {
+            value
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_meta_list<S: AsRef<str>>(
+    conn: &Connection,
+    key: &str,
+    entries: impl IntoIterator<Item = S>,
+) -> AppResult<()> {
+    let joined = entries
+        .into_iter()
+        .map(|e| e.as_ref().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    set_meta(conn, key, &joined)
 }
 
 /// Persist the status-bar counts so the next startup can seed them without a
@@ -2626,6 +2671,20 @@ pub(crate) fn finalize_fresh_index(state: &AppState) {
     let Ok(conn) = db_connection_for_maintenance(&state.db_path) else {
         return;
     };
+    // Declare the role here rather than trusting the caller's: the GUI reaches
+    // this on a dedicated finalizing thread that sets `FreshWriter`, but the
+    // daemon calls it inline on its build thread (daemon.rs `build_index`),
+    // where the class is whatever the pass latched — `IdleWriter`/Background for
+    // a catchup healing a dirty FTS, which would put the minutes-long rebuild
+    // below on the E-cluster. The work's role is unambiguous, so it should not
+    // depend on which caller got here.
+    apply_scan_scheduling(ScanRole::FreshWriter);
+    // The longest single-core stretch in the app (~6W on one P-core for up to
+    // minutes on a 1M-row DB) — worth its own accounting line in the diag log
+    // so a field CPU report can tell it apart from a misscheduled walk.
+    let started = Instant::now();
+    #[cfg(target_os = "macos")]
+    let cpu_start = mac::cpu_monitor::Snapshot::take();
     let t_idx = Instant::now();
     let _ = conn.execute_batch(CREATE_ENTRIES_INDEXES_SQL);
     eprintln!("[timing] create_indexes {}ms", t_idx.elapsed().as_millis());
@@ -2640,6 +2699,15 @@ pub(crate) fn finalize_fresh_index(state: &AppState) {
     let t_analyze = Instant::now();
     let _ = conn.execute_batch("ANALYZE");
     eprintln!("[timing] analyze {}ms", t_analyze.elapsed().as_millis());
+
+    #[cfg(target_os = "macos")]
+    let cpu_note = mac::cpu_monitor::pass_summary(cpu_start);
+    #[cfg(not(target_os = "macos"))]
+    let cpu_note = String::new();
+    diag::log(format!(
+        "fresh finalize done in {:.1}s (indexes + FTS rebuild + ANALYZE){cpu_note}",
+        started.elapsed().as_secs_f32()
+    ));
 }
 
 /// Free pages must exceed this many bytes (and 25% of the DB) before the
@@ -2700,17 +2768,43 @@ pub(crate) fn release_memory_to_os() {
     }
 }
 
-/// How urgent an indexing pass is, which decides how far its threads step out
-/// of the foreground's way.
+/// What a scan thread does, which decides how far it steps out of the
+/// foreground's way. This is a *role*, not an urgency: `UTILITY` does not bound
+/// CPU draw, so what matters is how many threads a role runs on rather than how
+/// badly the user wants the pass to finish. `mac::sched` has the measurements
+/// this rests on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanPriority {
-    /// The user is waiting on this work — a fresh index (the app has nothing to
-    /// search until it lands) or the FTS rebuild that follows it. Gets the
-    /// gentler of the two background classes.
-    Awaited,
-    /// Restart catchup: the index is already usable and nothing is blocked on
-    /// the pass, so it can be pushed all the way down.
-    Idle,
+pub(crate) enum ScanRole {
+    /// The parallel walk: rayon pool threads plus walk workers. The entire
+    /// thread multiplier lives here, so this role is always E-cluster resident.
+    /// `readdir`/`lstat` is syscall-bound work E-cores handle well, and the walk
+    /// has slack anyway — a fresh pass's critical path is the writer below.
+    Walk,
+    /// The one SQLite writer thread of a fresh pass, and the finalizer (index
+    /// creation + FTS rebuild) that follows it. Single-threaded, genuinely
+    /// CPU-bound, and what a fresh pass's wall time is actually made of, so it
+    /// keeps a performance core: one busy P-core is cheap, nine are a fan.
+    FreshWriter,
+    /// Writer/maintenance work nobody is waiting on: restart catchup, subtree
+    /// rescans, the FSEvents watcher and anything it spawns. Same class as
+    /// [`ScanRole::Walk`] today; kept distinct because it documents intent at
+    /// the call site and the two need not stay tied.
+    IdleWriter,
+}
+
+/// The class a role takes right now. Split out from [`apply_scan_scheduling`] so
+/// the scan-start log can name the walk fan-out's class before its threads exist
+/// — the whole point of the writer/walk split is invisible otherwise, which is
+/// how the `UTILITY`-is-a-throttle assumption survived a release.
+#[cfg(target_os = "macos")]
+fn scan_qos(role: ScanRole) -> mac::sched::Qos {
+    use mac::sched::{Pressure, Qos};
+    // A hot or battery-saving machine pushes even the critical-path writer
+    // down: finishing sooner is not worth being throttled.
+    match (role, mac::sched::pressure()) {
+        (ScanRole::FreshWriter, Pressure::None | Pressure::Elevated) => Qos::Utility,
+        _ => Qos::Background,
+    }
 }
 
 /// Step the calling thread out of the foreground's way for the rest of an
@@ -2725,19 +2819,13 @@ pub(crate) enum ScanPriority {
 /// No-op elsewhere: on Windows the indexer already lives in a separate service
 /// process that the SCM runs at a lower priority.
 #[allow(unused_variables)]
-pub(crate) fn apply_scan_scheduling(priority: ScanPriority) {
+pub(crate) fn apply_scan_scheduling(role: ScanRole) {
     #[cfg(target_os = "macos")]
     {
         if index_full_speed() {
             return;
         }
-        use mac::sched::{Pressure, Qos};
-        // A hot or battery-saving machine gets the stricter class no matter how
-        // urgent the pass is: finishing sooner is not worth being throttled.
-        let qos = match (priority, mac::sched::pressure()) {
-            (ScanPriority::Awaited, Pressure::None | Pressure::Elevated) => Qos::Utility,
-            _ => Qos::Background,
-        };
+        let qos = scan_qos(role);
         let errno = mac::sched::apply(qos);
         if errno != 0 {
             // Survivable (the thread keeps its inherited class) but it means the
@@ -2755,21 +2843,230 @@ pub(crate) fn apply_scan_scheduling(priority: ScanPriority) {
     }
 }
 
-/// One-line description of the scheduling actually in force on the calling
-/// thread, for the scan-start log. Makes a silently-failed QoS downgrade (the
-/// difference between quiet fans and not) visible in a field log instead of
-/// something only a profiler would catch.
+/// Filesystem observation failures a pass ran into, split by what the user can
+/// actually do about them.
+///
+/// This replaces a single `permission_errors` counter that lumped three
+/// unrelated things together and reported the total as "N permission/access
+/// error(s) occurred":
+///
+/// * **Denials.** On macOS these are TCC, and a first install before Full Disk
+///   Access is granted produces hundreds: one per `~/Library/Containers/<app>/
+///   Data` (a Mac with many sandboxed apps has several hundred), one per
+///   `~/Library/Group Containers/<id>`, plus the ~20 classic protected
+///   `~/Library` subtrees (Mail, Messages, Safari, Suggestions, …). Expected,
+///   and fixable by granting access.
+/// * **Mid-walk deletions.** A directory that vanishes between its parent's
+///   `readdir` and the walk reaching it. Unbounded on a busy machine (browser
+///   caches, build output) and nothing to report — these are no longer counted
+///   at all.
+/// * **Real I/O faults.** A failing disk, a stalled network mount. Rare, not
+///   user-fixable, and previously indistinguishable from the other two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScanFailures {
+    /// `EACCES`/`EPERM` — a path we are not allowed to enumerate.
+    pub(crate) denied: u64,
+    /// Any other non-`NotFound` error while enumerating or stat-ing.
+    pub(crate) io: u64,
+}
+
+impl ScanFailures {
+    /// Failures worth reporting to the user.
+    pub(crate) fn total(self) -> u64 {
+        self.denied + self.io
+    }
+
+    fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+
+    /// Classify one walk or metadata error. Returns whether it was counted —
+    /// `false` means the path simply vanished mid-walk, which is normal on a
+    /// live filesystem and neither reported nor logged.
+    fn observe(&mut self, kind: Option<io::ErrorKind>) -> bool {
+        match kind {
+            Some(io::ErrorKind::NotFound) => false,
+            Some(io::ErrorKind::PermissionDenied) => {
+                self.denied += 1;
+                true
+            }
+            _ => {
+                self.io += 1;
+                true
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.denied += other.denied;
+        self.io += other.io;
+    }
+}
+
+/// The status-bar line for a pass's observation failures, or `None` when there
+/// is nothing actionable to say. Named in the UI's language (Korean) and phrased
+/// so the number is self-explanatory: the old "321 permission/access error(s)
+/// occurred." told the user something had gone wrong without saying what, and
+/// the answer was almost always "Full Disk Access is not granted yet".
+fn scan_failure_message(failures: ScanFailures, fda_granted: bool) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if failures.denied > 0 {
+        parts.push(if fda_granted {
+            format!("접근 권한이 없어 {}개 건너뜀", failures.denied)
+        } else {
+            format!(
+                "보호된 항목 {}개 건너뜀 — 전체 디스크 접근 권한을 허용하면 모두 검색됩니다",
+                failures.denied
+            )
+        });
+    }
+    if failures.io > 0 {
+        parts.push(format!("읽기 실패 {}개", failures.io));
+    }
+    Some(parts.join(" / "))
+}
+
+/// Whether the writer process last saw Full Disk Access. Read from the
+/// `last_fda_ok` meta the daemon maintains rather than re-probing TCC.db:
+/// non-macOS has no such gate and reads as granted.
+fn fda_granted(conn: &Connection) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return get_meta(conn, "last_fda_ok").as_deref() != Some("0");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = conn;
+        true
+    }
+}
+
+/// How many distinct denied prefixes a pass records for the FDA-rising-edge
+/// rescan. Only a backstop: a few hundred denials collapse onto ~25 prefixes at
+/// [`DENIED_PREFIX_DEPTH`], so the cap exists so that a pathological tree cannot
+/// grow the meta row without bound.
+const DENIED_PREFIX_LIMIT: usize = 64;
+/// How many path components below the scan root a denied path is truncated to
+/// before being recorded. 2 collapses the several-hundred
+/// `~/Library/Containers/<app>/Data` denials onto the single
+/// `~/Library/Containers`, which is what keeps the rescan set small enough to
+/// walk directly instead of repeating a whole 1M-entry pass.
+const DENIED_PREFIX_DEPTH: usize = 2;
+/// Meta key holding the newline-joined denied prefixes of the last full pass.
+const DENIED_PREFIXES_META: &str = "denied_prefixes";
+
+/// The prefix recorded for a denied `path`: truncated to [`DENIED_PREFIX_DEPTH`]
+/// components below `scan_root`, or left whole when it lies outside the scan
+/// root (a `.pathindexing` extra root, which is user-configured and small).
+fn denied_prefix_for(path: &Path, scan_root: &Path) -> String {
+    let keep = scan_root.components().count() + DENIED_PREFIX_DEPTH;
+    if !path.starts_with(scan_root) || path.components().count() <= keep {
+        return path.to_string_lossy().to_string();
+    }
+    path.components()
+        .take(keep)
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Distinct denied prefixes accumulated across a pass's walk workers. `BTreeSet`
+/// so the persisted list is stable between passes (and so a diff of the meta row
+/// is readable in a field report).
+type DeniedPrefixes = Arc<Mutex<BTreeSet<String>>>;
+
+fn note_denied_prefix(denied: &DeniedPrefixes, path: &Path, scan_root: &Path) {
+    let prefix = denied_prefix_for(path, scan_root);
+    let mut set = denied.lock();
+    if set.len() < DENIED_PREFIX_LIMIT || set.contains(&prefix) {
+        set.insert(prefix);
+    }
+}
+
+/// One walk worker's failure accounting: the counts it will ship to the writer,
+/// plus the shared denied-prefix set and the root the prefixes are relative to.
+///
+/// Exists so classification lives in exactly one place. Every call site used to
+/// repeat the same three steps — classify, bump the per-root tally, then re-test
+/// `kind == PermissionDenied` to record the prefix — and the copies had already
+/// drifted on whether a mid-walk deletion counts.
+struct WalkFailures {
+    counts: ScanFailures,
+    /// Failures for the root currently being walked, for its `[timing]` line.
+    root_errors: u64,
+    denied: DeniedPrefixes,
+    scan_root: PathBuf,
+}
+
+impl WalkFailures {
+    fn new(denied: DeniedPrefixes, scan_root: PathBuf) -> Self {
+        Self {
+            counts: ScanFailures::default(),
+            root_errors: 0,
+            denied,
+            scan_root,
+        }
+    }
+
+    /// Classify one walk/metadata error against `path`, recording a denied
+    /// prefix when that is what it was. Returns false when the path merely
+    /// vanished mid-walk, which callers treat as a non-event.
+    fn observe(&mut self, kind: Option<io::ErrorKind>, path: &Path) -> bool {
+        if !self.counts.observe(kind) {
+            return false;
+        }
+        self.root_errors += 1;
+        if kind == Some(io::ErrorKind::PermissionDenied) {
+            note_denied_prefix(&self.denied, path, &self.scan_root);
+        }
+        true
+    }
+
+    /// Whether this failure is within the per-worker stderr budget — the first
+    /// 20 get a line each, then only under `perf_log`.
+    fn should_log(&self) -> bool {
+        self.counts.total() <= 20 || perf_log_enabled()
+    }
+
+    /// Take the counts for a channel flush, leaving the accumulator empty.
+    fn take_counts(&mut self) -> ScanFailures {
+        std::mem::take(&mut self.counts)
+    }
+
+    fn start_root(&mut self) {
+        self.root_errors = 0;
+    }
+}
+
+/// The prefixes the last full pass could not enumerate, for the FDA-rising-edge
+/// rescan. Empty when nothing was recorded (a pass that hit no denials, or a DB
+/// written before this key existed).
+pub(crate) fn load_denied_prefixes(db_path: &Path) -> Vec<String> {
+    db_connection(db_path)
+        .map(|conn| meta_list(&conn, DENIED_PREFIXES_META))
+        .unwrap_or_default()
+}
+
+/// One-line description of the scheduling in force for a pass: the calling
+/// (writer) thread's actual class plus the class the walk fan-out will take.
+/// Makes a silently-failed QoS downgrade — and the writer/walk split itself —
+/// visible in a field log instead of something only a profiler would catch.
 pub(crate) fn scan_scheduling_label() -> String {
     #[cfg(target_os = "macos")]
     {
+        if index_full_speed() {
+            return format!(
+                "writer_qos={} walk_qos=inherited full_speed=1",
+                mac::sched::current_class_name()
+            );
+        }
         return format!(
-            "qos={}{}",
+            "writer_qos={} walk_qos={}",
             mac::sched::current_class_name(),
-            if index_full_speed() {
-                " full_speed=1"
-            } else {
-                ""
-            }
+            mac::sched::class_name_of(scan_qos(ScanRole::Walk)),
         );
     }
     #[cfg(not(target_os = "macos"))]
@@ -3045,6 +3342,17 @@ fn stage_direct_child(
     }
 }
 
+/// Cores a [`ScanRole::Walk`] thread can actually run on: the efficiency cluster
+/// on Apple Silicon, and half the machine anywhere else (the old heuristic, kept
+/// for single-cluster hardware where there is no narrower budget to read).
+fn walk_core_budget(n_cpus: usize) -> usize {
+    #[cfg(target_os = "macos")]
+    if let Some(efficiency) = mac::sched::efficiency_cores() {
+        return efficiency;
+    }
+    n_cpus / 2
+}
+
 /// Build the shared rayon thread pool for a parallel filesystem scan. Returns
 /// the pool, its thread count, and the number of walk workers callers should
 /// spawn against it. Shared by the fresh and catchup scan branches.
@@ -3057,10 +3365,27 @@ fn stage_direct_child(
 /// writer, all at the inherited `USER_INTERACTIVE` QoS — 400%+ CPU with the
 /// fans audible throughout a first-run index.
 ///
-/// The pool is now a fraction of the machine and every thread drops to a
-/// background QoS via `start_handler`, which is the only hook that runs on a
-/// rayon worker before it picks up work.
-fn build_scan_pool(priority: ScanPriority) -> (Arc<jwalk::rayon::ThreadPool>, usize, usize) {
+/// Every thread built here is a [`ScanRole::Walk`] thread and drops to the
+/// E-cluster via `start_handler`, the only hook that runs on a rayon worker
+/// before it picks up work. That class — not this sizing — is what bounds CPU
+/// draw: measured at `BACKGROUND`, going from 3 pool threads to 12 moved avg
+/// cores only 2.4 → 3.9 because the kernel confines them to the E-cluster
+/// regardless.
+///
+/// Which is also why the budget below is the *efficiency* core count rather than
+/// half the machine: it is the cluster these threads share, so scaling off the
+/// whole machine (an M2 Pro would get 5 pool threads from `n_cpus/2`) says
+/// nothing about the resource they actually contend for.
+///
+/// Note that pool threads + walk workers deliberately *exceed* that budget by a
+/// little, because a walk thread is blocked in `readdir`/`lstat` most of the
+/// time — threads are not running cores. Measured at `BACKGROUND` on a 12-E
+/// machine, achieved concurrency by total walk threads: 4 → 2.4 cores, 6 → 3.3,
+/// 9 → 3.8, 16 → 3.9. So the workload's own parallelism tops out near 3.9 cores
+/// however many threads it gets, and sizing strictly *within* the cluster would
+/// leave E-cores idle on I/O without saving any power — the QoS class, not the
+/// thread count, is what bounds draw.
+pub(crate) fn build_scan_pool() -> (Arc<jwalk::rayon::ThreadPool>, usize, usize) {
     let n_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -3069,8 +3394,8 @@ fn build_scan_pool(priority: ScanPriority) -> (Arc<jwalk::rayon::ThreadPool>, us
         ((n_cpus * 2).max(8), n_cpus)
     } else {
         // Walk work (pool) outweighs row-building work (workers) roughly 2:1.
-        let pool = (n_cpus / 2).clamp(2, 6);
-        (pool, (pool / 2).clamp(2, 4))
+        let pool = walk_core_budget(n_cpus).clamp(2, 6);
+        (pool, (pool / 2).clamp(1, 3))
     };
 
     // Already hot or saving power: shrink the fan-out rather than add to it.
@@ -3082,7 +3407,7 @@ fn build_scan_pool(priority: ScanPriority) -> (Arc<jwalk::rayon::ThreadPool>, us
         jwalk::rayon::ThreadPoolBuilder::new()
             .num_threads(pool_threads)
             .thread_name(|i| format!("everything-scan-{i}"))
-            .start_handler(move |_| apply_scan_scheduling(priority))
+            .start_handler(|_| apply_scan_scheduling(ScanRole::Walk))
             .build()
             .expect("failed to build rayon pool for parallel scan"),
     );
@@ -3123,12 +3448,18 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
         "index pass start (fresh={is_fresh_run} fts_dirty={fts_dirty} extra_roots={})",
         state.extra_roots.lock().len()
     ));
-    // This thread is the pass's SQLite writer for the whole run; drop it out of
-    // the foreground's way alongside the scan workers spawned below.
+    // Pass-boundary CPU accounting: the ok/FAILED line below carries what the
+    // pass cost (CPU per QoS class + joules), so a field log answers "was it
+    // the indexer, and was it on the right cluster" without a reproduction.
+    #[cfg(target_os = "macos")]
+    let cpu_pass_start = mac::cpu_monitor::Snapshot::take();
+    // This thread is the pass's SQLite writer for the whole run. A fresh pass's
+    // wall time is essentially this thread (~1M inserts), so it keeps a
+    // performance core while the walk fan-out below runs on the E-cluster.
     apply_scan_scheduling(if is_fresh_run {
-        ScanPriority::Awaited
+        ScanRole::FreshWriter
     } else {
-        ScanPriority::Idle
+        ScanRole::IdleWriter
     });
     if fts_dirty && !is_fresh_run {
         state.fts_ready.store(false, AtomicOrdering::Release);
@@ -3143,6 +3474,10 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
     }
 
     let result = run_incremental_index_inner(app, state, &mut conn);
+    #[cfg(target_os = "macos")]
+    let cpu_note = mac::cpu_monitor::pass_summary(cpu_pass_start);
+    #[cfg(not(target_os = "macos"))]
+    let cpu_note = String::new();
 
     // Fresh runs defer secondary-index creation, FTS rebuild, and ANALYZE to
     // finalize_fresh_index (background finalizing thread): search is already
@@ -3185,9 +3520,9 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
                     let _guard = IndexingGuard(Arc::clone(&fin_state.indexing_active));
                     // Single-threaded, but CREATE INDEX + FTS rebuild + ANALYZE
                     // over ~1M rows is minutes of sustained work; search runs on
-                    // LIKE fallbacks until it lands, so it is awaited rather
-                    // than idle.
-                    apply_scan_scheduling(ScanPriority::Awaited);
+                    // LIKE fallbacks until it lands, so this one thread keeps a
+                    // performance core.
+                    apply_scan_scheduling(ScanRole::FreshWriter);
 
                     // 1. Transition to Ready: update state and emit event
                     // (index_updated already emitted by run_incremental_index_inner)
@@ -3239,7 +3574,7 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
                 snapshot.message,
             ));
             diag::log(format!(
-                "index pass ok in {:.1}s (scanned={} indexed={} entries={} permission_errors={})",
+                "index pass ok in {:.1}s (scanned={} indexed={} entries={} permission_errors={}){cpu_note}",
                 started.elapsed().as_secs_f32(),
                 snapshot.scanned,
                 snapshot.indexed,
@@ -3254,7 +3589,7 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
                 err,
             ));
             diag::log(format!(
-                "index pass FAILED after {:.1}s: {err}",
+                "index pass FAILED after {:.1}s: {err}{cpu_note}",
                 started.elapsed().as_secs_f32()
             ));
         }
@@ -3301,7 +3636,11 @@ fn run_incremental_index_inner(
 
     let mut scanned: u64 = 0;
     let mut indexed: u64 = 0;
-    let mut permission_errors: u64 = 0;
+    let mut failures = ScanFailures::default();
+    // Shared by the walk workers below: the subtrees this pass could not
+    // enumerate, so a later Full Disk Access grant can rescan exactly those
+    // instead of repeating the whole pass.
+    let denied_prefixes: DeniedPrefixes = Arc::new(Mutex::new(BTreeSet::new()));
     let mut current_path = String::new();
     let mut batch: Vec<IndexRow> = Vec::with_capacity(flush_batch_size);
     // Paths removed because they vanished from disk (catchup set-difference).
@@ -3422,6 +3761,10 @@ fn run_incremental_index_inner(
         .map(|root| root.to_string_lossy().to_string())
         .collect();
     let mut scanned_extra_roots = Vec::new();
+    // Same accumulator the walk workers use, so an unreadable extra root is
+    // classified and prefix-recorded by the one code path that does that.
+    let mut root_failures =
+        WalkFailures::new(Arc::clone(&denied_prefixes), state.scan_root.clone());
     for root in configured_extra_roots {
         // metadata() intentionally follows aliases such as /tmp ->
         // /private/tmp. Any observation error preserves previously indexed
@@ -3429,21 +3772,26 @@ fn run_incremental_index_inner(
         match fs::metadata(&root) {
             Ok(metadata) if metadata.is_dir() => scanned_extra_roots.push(root),
             Ok(_) => {
-                permission_errors += 1;
+                // A configured root that is not a directory is a `.pathindexing`
+                // mistake, not an access failure — but it is still something the
+                // user should see rather than a silent no-op.
+                root_failures.counts.io += 1;
                 eprintln!(
                     "[index] configured extra root is not a directory; preserving existing rows: {}",
                     root.display()
                 );
             }
             Err(error) => {
-                permission_errors += 1;
-                eprintln!(
-                    "[index] {}; preserving existing extra-root rows",
-                    filesystem_observation_error("extra_root_metadata", &root, &error)
-                );
+                if root_failures.observe(Some(error.kind()), &root) {
+                    eprintln!(
+                        "[index] {}; preserving existing extra-root rows",
+                        filesystem_observation_error("extra_root_metadata", &root, &error)
+                    );
+                }
             }
         }
     }
+    failures.merge(root_failures.take_counts());
     // Extra roots removed from .pathindexing are intentional policy changes
     // and may be deleted. A configured-but-unreadable root remains in the
     // configured set and is never mistaken for a removed root.
@@ -3494,7 +3842,7 @@ fn run_incremental_index_inner(
         }
 
         // Shared rayon pool: all workers share one background-QoS pool.
-        let (shared_pool, pool_threads, max_workers) = build_scan_pool(ScanPriority::Awaited);
+        let (shared_pool, pool_threads, max_workers) = build_scan_pool();
         let n_workers = max_workers.min(roots.len().max(1));
         eprintln!(
             "[index] fresh parallel scan: {} workers, {} pool threads, {} roots, {}",
@@ -3504,7 +3852,7 @@ fn run_incremental_index_inner(
             scan_scheduling_label(),
         );
 
-        type ScanMsg = (Vec<IndexRow>, u64, u64, u64, String);
+        type ScanMsg = (Vec<IndexRow>, u64, u64, ScanFailures, String);
         let (row_tx, row_rx) = std::sync::mpsc::sync_channel::<ScanMsg>(SCAN_CHANNEL_CAP);
         let roots_arc: Arc<Vec<PathBuf>> = Arc::new(roots);
         let par_started = Instant::now();
@@ -3522,14 +3870,16 @@ fn run_incremental_index_inner(
                 // 10k rows instead of 50k → progress updates reach the main thread sooner.
                 let flush_size = BATCH_SIZE;
                 let cancel = Arc::clone(&state.cancel_index);
+                let denied = Arc::clone(&denied_prefixes);
+                let scan_root = state.scan_root.clone();
 
                 scope.spawn(move || {
-                    apply_scan_scheduling(ScanPriority::Awaited);
+                    apply_scan_scheduling(ScanRole::Walk);
                     let mut throttle = ScanThrottle::new();
                     let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
                     let mut local_scanned = 0u64;
                     let mut local_indexed = 0u64;
-                    let mut local_perm_errors = 0u64;
+                    let mut failures = WalkFailures::new(denied, scan_root);
                     let mut local_path = String::new();
 
                     // Interleaved distribution: worker 0 handles roots[0, n_w, 2*n_w, …]
@@ -3538,7 +3888,7 @@ fn run_incremental_index_inner(
                         let root_started = Instant::now();
                         let mut root_scanned = 0u64;
                         let mut root_indexed = 0u64;
-                        let mut root_perm_errors = 0u64;
+                        failures.start_root();
                         let root_str = root.to_string_lossy().to_string();
 
                         let s_roots = skip_roots.clone();
@@ -3620,11 +3970,18 @@ fn run_incremental_index_inner(
 
                                     let metadata = match entry.client_state {
                                         Some(m) => m,
-                                        None => {
-                                            local_perm_errors += 1;
-                                            root_perm_errors += 1;
-                                            continue;
-                                        }
+                                        // The `process_read_dir` stat failed. Re-probe
+                                        // rather than counting blind: it gives a
+                                        // transient failure one cheap retry, and the
+                                        // error kind is what separates "vanished
+                                        // mid-walk" (normal) from a real denial.
+                                        None => match fs::symlink_metadata(&path) {
+                                            Ok(metadata) => metadata,
+                                            Err(error) => {
+                                                failures.observe(Some(error.kind()), &path);
+                                                continue;
+                                            }
+                                        },
                                     };
 
                                     if let Some(mut row) =
@@ -3646,21 +4003,26 @@ fn run_incremental_index_inner(
                                             std::mem::replace(&mut local_batch, Vec::with_capacity(flush_size)),
                                             local_scanned,
                                             local_indexed,
-                                            local_perm_errors,
+                                            failures.take_counts(),
                                             local_path.clone(),
                                         ));
                                         local_scanned = 0;
                                         local_indexed = 0;
-                                        local_perm_errors = 0;
                                     }
                                 }
                                 Err(err) => {
                                     local_scanned += 1;
                                     root_scanned += 1;
-                                    local_perm_errors += 1;
-                                    root_perm_errors += 1;
-                                    if local_perm_errors <= 20 || perf_log_enabled() {
-                                        eprintln!("[index] permission error: {}", err);
+                                    let error_path = err.path().unwrap_or(root.as_path());
+                                    // False = vanished between its parent's readdir
+                                    // and this walk: normal, not the user's problem.
+                                    if !failures
+                                        .observe(err.io_error().map(|e| e.kind()), error_path)
+                                    {
+                                        continue;
+                                    }
+                                    if failures.should_log() {
+                                        eprintln!("[index] walk error: {}", err);
                                     }
                                 }
                             }
@@ -3672,18 +4034,19 @@ fn run_incremental_index_inner(
                             root_started.elapsed().as_millis(),
                             root_scanned,
                             root_indexed,
-                            root_perm_errors,
+                            failures.root_errors,
                         );
                     }
 
                     // Flush partial batch remaining after all roots processed.
-                    if !local_batch.is_empty() || local_scanned > 0 || local_perm_errors > 0 {
+                    let counts = failures.take_counts();
+                    if !local_batch.is_empty() || local_scanned > 0 || !counts.is_empty() {
                         local_batch.sort_unstable_by(|a, b| a.path.cmp(&b.path));
                         let _ = tx.send((
                             local_batch,
                             local_scanned,
                             local_indexed,
-                            local_perm_errors,
+                            counts,
                             local_path,
                         ));
                     }
@@ -3694,7 +4057,7 @@ fn run_incremental_index_inner(
             drop(row_tx);
 
             // Main thread: receive row batches from workers and write to SQLite.
-            for (worker_batch, s, i, pe, path) in row_rx {
+            for (worker_batch, s, i, f, path) in row_rx {
                 // On cancel keep draining (so bounded-channel senders never
                 // block and the scope can join) but stop writing.
                 if state.cancel_index.load(AtomicOrdering::Acquire) {
@@ -3702,7 +4065,7 @@ fn run_incremental_index_inner(
                 }
                 scanned += s;
                 indexed += i;
-                permission_errors += pe;
+                failures.merge(f);
                 if !path.is_empty() {
                     current_path = path;
                 }
@@ -3741,7 +4104,7 @@ fn run_incremental_index_inner(
             batch.clear();
         }
 
-        let (shared_pool, pool_threads, max_workers) = build_scan_pool(ScanPriority::Idle);
+        let (shared_pool, pool_threads, max_workers) = build_scan_pool();
         // Each worker holds one root's preload map in memory, so the worker cap
         // also bounds peak memory when several large roots run at once. The 8
         // that used to be spelled out here is now subsumed by build_scan_pool's
@@ -3755,8 +4118,8 @@ fn run_incremental_index_inner(
             scan_scheduling_label(),
         );
 
-        // (rows to upsert, vanished paths to delete, scanned, indexed, perm_errors, current path)
-        type CatchupMsg = (Vec<IndexRow>, Vec<String>, u64, u64, u64, String);
+        // (rows to upsert, vanished paths to delete, scanned, indexed, failures, current path)
+        type CatchupMsg = (Vec<IndexRow>, Vec<String>, u64, u64, ScanFailures, String);
         let (row_tx, row_rx) = std::sync::mpsc::sync_channel::<CatchupMsg>(SCAN_CHANNEL_CAP);
         let roots_arc: Arc<Vec<PathBuf>> = Arc::new(roots);
         let par_started = Instant::now();
@@ -3774,15 +4137,17 @@ fn run_incremental_index_inner(
                 let flush_size = BATCH_SIZE;
                 let worker_db = worker_db_path.clone();
                 let cancel = Arc::clone(&state.cancel_index);
+                let denied = Arc::clone(&denied_prefixes);
+                let scan_root = state.scan_root.clone();
 
                 scope.spawn(move || {
-                    apply_scan_scheduling(ScanPriority::Idle);
+                    apply_scan_scheduling(ScanRole::Walk);
                     let mut throttle = ScanThrottle::new();
                     let worker_conn = db_connection(&worker_db).ok();
                     let mut local_batch: Vec<IndexRow> = Vec::with_capacity(flush_size);
                     let mut local_scanned = 0u64;
                     let mut local_indexed = 0u64;
-                    let mut local_perm_errors = 0u64;
+                    let mut failures = WalkFailures::new(denied, scan_root);
                     let mut local_path = String::new();
 
                     'roots: for i in (worker_idx..roots_ref.len()).step_by(n_w) {
@@ -3790,7 +4155,7 @@ fn run_incremental_index_inner(
                         let root_started = Instant::now();
                         let mut root_scanned = 0u64;
                         let mut root_indexed = 0u64;
-                        let mut root_perm_errors = 0u64;
+                        failures.start_root();
                         let root_str = root.to_string_lossy().to_string();
 
                         let mut existing = worker_conn
@@ -3886,12 +4251,9 @@ fn run_incremental_index_inner(
                                                 continue;
                                             }
                                             Err(error) => {
-                                                local_perm_errors += 1;
-                                                root_perm_errors += 1;
+                                                failures.observe(Some(error.kind()), &path);
                                                 existing.mark_errored(&path);
-                                                if local_perm_errors <= 20
-                                                    || perf_log_enabled()
-                                                {
+                                                if failures.should_log() {
                                                     eprintln!(
                                                         "[index] {}; preserving existing subtree",
                                                         filesystem_observation_error(
@@ -3926,28 +4288,26 @@ fn run_incremental_index_inner(
                                             Vec::new(),
                                             local_scanned,
                                             local_indexed,
-                                            local_perm_errors,
+                                            failures.take_counts(),
                                             local_path.clone(),
                                         ));
                                         local_scanned = 0;
                                         local_indexed = 0;
-                                        local_perm_errors = 0;
                                     }
                                 }
                                 Err(err) => {
                                     local_scanned += 1;
                                     root_scanned += 1;
-                                    local_perm_errors += 1;
-                                    root_perm_errors += 1;
                                     // Keep rows under an unreadable directory;
                                     // NotFound means it truly vanished and its
                                     // rows should become deletion leftovers.
+                                    let io_kind = err.io_error().map(|e| e.kind());
                                     let error_path = err.path().unwrap_or(root.as_path());
-                                    existing.observe_walk_error(
-                                        err.io_error().map(|e| e.kind()),
-                                        error_path,
-                                    );
-                                    if local_perm_errors <= 20 || perf_log_enabled() {
+                                    existing.observe_walk_error(io_kind, error_path);
+                                    if !failures.observe(io_kind, error_path) {
+                                        continue;
+                                    }
+                                    if failures.should_log() {
                                         if let Some(error) = err.io_error() {
                                             eprintln!(
                                                 "[index] {}",
@@ -3973,7 +4333,14 @@ fn run_incremental_index_inner(
                             while !deletes.is_empty() {
                                 let rest = deletes.split_off(flush_size.min(deletes.len()));
                                 let chunk = std::mem::replace(&mut deletes, rest);
-                                let _ = tx.send((Vec::new(), chunk, 0, 0, 0, String::new()));
+                                let _ = tx.send((
+                                    Vec::new(),
+                                    chunk,
+                                    0,
+                                    0,
+                                    ScanFailures::default(),
+                                    String::new(),
+                                ));
                             }
                         }
 
@@ -3983,17 +4350,18 @@ fn run_incremental_index_inner(
                             root_started.elapsed().as_millis(),
                             root_scanned,
                             root_indexed,
-                            root_perm_errors,
+                            failures.root_errors,
                         );
                     }
 
-                    if !local_batch.is_empty() || local_scanned > 0 || local_perm_errors > 0 {
+                    let counts = failures.take_counts();
+                    if !local_batch.is_empty() || local_scanned > 0 || !counts.is_empty() {
                         let _ = tx.send((
                             local_batch,
                             Vec::new(),
                             local_scanned,
                             local_indexed,
-                            local_perm_errors,
+                            counts,
                             local_path,
                         ));
                     }
@@ -4002,7 +4370,7 @@ fn run_incremental_index_inner(
 
             drop(row_tx);
 
-            for (worker_batch, deletes, s, i, pe, path) in row_rx {
+            for (worker_batch, deletes, s, i, f, path) in row_rx {
                 // On cancel keep draining (so bounded-channel senders never
                 // block and the scope can join) but stop writing.
                 if state.cancel_index.load(AtomicOrdering::Acquire) {
@@ -4010,7 +4378,7 @@ fn run_incremental_index_inner(
                 }
                 scanned += s;
                 indexed += i;
-                permission_errors += pe;
+                failures.merge(f);
                 if !path.is_empty() {
                     current_path = path;
                 }
@@ -4089,28 +4457,43 @@ fn run_incremental_index_inner(
     persist_cached_counts(conn, entries_count, last_updated);
     let updated_at = last_updated.unwrap_or_else(now_epoch);
 
+    // Record what this pass could not read, so an FDA grant can rescan exactly
+    // those subtrees instead of repeating the whole pass. Written on every full
+    // pass (including the empty case) so the list can never outlive the denials
+    // it describes.
+    {
+        let prefixes = denied_prefixes.lock();
+        let _ = set_meta_list(conn, DENIED_PREFIXES_META, prefixes.iter());
+        if !prefixes.is_empty() {
+            diag::log(format!(
+                "{} path(s) denied under {} prefix(es): {}",
+                failures.denied,
+                prefixes.len(),
+                prefixes.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+
+    let reported_failures = failures.total();
     {
         let mut status = state.status.lock();
-        status.permission_errors = permission_errors;
+        status.permission_errors = reported_failures;
         status.scanned = scanned;
         status.indexed = indexed;
         status.current_path = current_path.clone();
-        status.message = if permission_errors > 0 {
-            Some(format!(
-                "{} permission/access error(s) occurred.",
-                permission_errors
-            ))
-        } else {
-            None
-        };
+        // `last_fda_ok` is this process's own already-probed answer (the daemon
+        // stores it at startup and on the rising edge), so the message needs no
+        // second TCC.db read — which also keeps `probe_full_disk_access`'s
+        // documented side effect out of a string formatter.
+        status.message = scan_failure_message(failures, fda_granted(conn));
     }
     if let Some(app) = app {
         emit_index_progress(app, scanned, indexed, current_path);
-        emit_index_updated(app, entries_count, updated_at, permission_errors);
+        emit_index_updated(app, entries_count, updated_at, reported_failures);
     }
     perf_log(format!(
-        "index_scan_done scanned={} indexed={} deleted={} entries={} permission_errors={}",
-        scanned, indexed, deleted_count, entries_count, permission_errors
+        "index_scan_done scanned={} indexed={} deleted={} entries={} denied={} io_errors={}",
+        scanned, indexed, deleted_count, entries_count, failures.denied, failures.io
     ));
 
     Ok(())
@@ -4760,6 +5143,10 @@ fn spawn_due_subtree_rescan(
     let inflight = Arc::clone(inflight);
     let finished = Arc::clone(finished);
     std::thread::spawn(move || {
+        // Single-threaded, but a MustScanSubDirs overflow can hand this all of
+        // `$HOME` — minutes of walking and writing that nobody is waiting on.
+        // Without this it would inherit the watcher thread's foreground class.
+        apply_scan_scheduling(ScanRole::IdleWriter);
         // Hold the exclusive-writer guard for the rescan's duration: it opens
         // its own write connection and both walks and deletes over many
         // seconds, so without this it can race the full-index writer (fresh
@@ -4851,7 +5238,21 @@ fn start_fsevent_watcher_worker(
     since_event_id: Option<u64>,
     conditional: bool,
 ) {
+    // Invalidate any previous worker. One may still be alive past a
+    // stop-and-restart's bounded wait (blocked in a single loop iteration on
+    // e.g. an unresponsive network extra root); once the restart clears
+    // `watcher_stop` that worker would otherwise resurrect alongside this one.
+    // It exits at its next generation check instead, and no longer touches
+    // `watcher_active`.
+    let my_gen = state.watcher_gen.fetch_add(1, AtomicOrdering::AcqRel) + 1;
     std::thread::spawn(move || {
+        // The daemon starts this from its build thread, whose class the startup
+        // pass already latched (`Utility` after a fresh build) — and QoS is
+        // inherited through `pthread_create`, so this worker would carry that
+        // for the process's life and hand it down to every thread it spawns
+        // (subtree rescans, the `.pathindexing` reconcile). Declaring it here
+        // fixes the parent instead of each child.
+        apply_scan_scheduling(ScanRole::IdleWriter);
         let mut since_event_id = since_event_id;
         let mut replay = conditional;
         // Rescan bookkeeping outlives stream rebuilds: the cooldown history
@@ -4907,8 +5308,11 @@ fn start_fsevent_watcher_worker(
                     // A prior iteration may have set watcher_active on a
                     // successful build; clear it before bailing so reset_index
                     // doesn't spin for its full 5s deadline waiting on a
-                    // watcher thread that has already exited.
-                    state.watcher_active.store(false, AtomicOrdering::Release);
+                    // watcher thread that has already exited. (Skipped when a
+                    // newer generation took over — its liveness is not ours.)
+                    if state.watcher_gen.load(AtomicOrdering::Acquire) == my_gen {
+                        state.watcher_active.store(false, AtomicOrdering::Release);
+                    }
                     return;
                 }
             };
@@ -4926,6 +5330,7 @@ fn start_fsevent_watcher_worker(
             let exit = run_fsevent_stream(
                 app.as_ref(),
                 &state,
+                my_gen,
                 &rx,
                 &watcher,
                 &remaps,
@@ -4948,7 +5353,9 @@ fn start_fsevent_watcher_worker(
                 WatcherExit::Stop => break,
             }
         }
-        state.watcher_active.store(false, AtomicOrdering::Release);
+        if state.watcher_gen.load(AtomicOrdering::Acquire) == my_gen {
+            state.watcher_active.store(false, AtomicOrdering::Release);
+        }
         eprintln!("[watcher] fsevent watcher stopped");
     });
 }
@@ -4959,6 +5366,7 @@ fn start_fsevent_watcher_worker(
 fn run_fsevent_stream(
     app: Option<&AppHandle>,
     state: &AppState,
+    my_gen: u64,
     rx: &std::sync::mpsc::Receiver<mac::fsevent_watcher::FsEvent>,
     watcher: &mac::fsevent_watcher::FsEventWatcher,
     remaps: &[(PathBuf, PathBuf)],
@@ -4994,7 +5402,9 @@ fn run_fsevent_stream(
         pathindexing::pathindexing_active_entries(&fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default());
 
     loop {
-        if state.watcher_stop.load(AtomicOrdering::Acquire) {
+        if state.watcher_stop.load(AtomicOrdering::Acquire)
+            || state.watcher_gen.load(AtomicOrdering::Acquire) != my_gen
+        {
             break;
         }
 
@@ -5025,6 +5435,10 @@ fn run_fsevent_stream(
                         );
                         if new_entries != last_config_entries {
                             last_config_entries = new_entries;
+                            // Daemon (app=None): its supervise tick applies the
+                            // change live (purge + catchup). GUI-writer paths
+                            // (bench) keep the restart banner.
+                            state.pathignore_dirty.store(true, AtomicOrdering::Release);
                             if let Some(app) = app {
                                 app.emit("pathignore_changed", ()).ok();
                             }
@@ -5276,7 +5690,10 @@ fn run_fsevent_stream(
         !replay_phase,
     );
 
-    if rebuild_requested && !state.watcher_stop.load(AtomicOrdering::Acquire) {
+    if rebuild_requested
+        && !state.watcher_stop.load(AtomicOrdering::Acquire)
+        && state.watcher_gen.load(AtomicOrdering::Acquire) == my_gen
+    {
         WatcherExit::Rebuild
     } else {
         WatcherExit::Stop
@@ -5627,37 +6044,51 @@ struct OnboardingStateDto {
 }
 
 #[tauri::command]
-fn get_onboarding_state(state: State<'_, AppState>) -> OnboardingStateDto {
+async fn get_onboarding_state(state: State<'_, AppState>) -> AppResult<OnboardingStateDto> {
     #[cfg(target_os = "macos")]
     {
         use mac::launch_agent::{self, RegState};
-        let daemon = daemon_ipc::status(&daemon_data_dir(&state));
-        OnboardingStateDto {
-            recorded: mac::prefs::onboarding_recorded(),
-            decision: mac::prefs::onboarding_decision(),
-            fda_ok: mac::probe_full_disk_access(),
-            opted_out: mac::prefs::opted_out(),
-            registration: match launch_agent::agent_status() {
-                RegState::Enabled => "enabled",
-                RegState::RequiresApproval => "requires_approval",
-                RegState::NotRegistered => "not_registered",
-                RegState::NotFound => "not_found",
-                RegState::Unsupported => "unsupported",
+        let data_dir = daemon_data_dir(&state);
+        let db_path = state.db_path.clone();
+        // Everything below blocks: the UDS status round-trip has 5s read/write
+        // timeouts, each `defaults` read is a subprocess, the FDA probe touches
+        // TCC.db, and agent_status is an XPC call. The frontend calls this in
+        // onMount and after every onboarding/toggle action, so keep it off the
+        // main thread (a wedged daemon would otherwise freeze the window).
+        tauri::async_runtime::spawn_blocking(move || {
+            let daemon = daemon_ipc::status(&data_dir);
+            OnboardingStateDto {
+                // §7: adopt an existing index as granted-implicit here too —
+                // on a first post-upgrade launch no daemon may be running yet,
+                // and existing installs must never see the onboarding modal.
+                recorded: daemon::onboarding_recorded_or_adopt(&db_path),
+                decision: mac::prefs::onboarding_decision(),
+                fda_ok: mac::probe_full_disk_access(),
+                opted_out: mac::prefs::opted_out(),
+                registration: match launch_agent::agent_status() {
+                    RegState::Enabled => "enabled",
+                    RegState::RequiresApproval => "requires_approval",
+                    RegState::NotRegistered => "not_registered",
+                    RegState::NotFound => "not_found",
+                    RegState::Unsupported => "unsupported",
+                }
+                .to_string(),
+                daemon_state: daemon.as_ref().map(|s| s.state.clone()),
+                daemon_degraded: daemon.map(|s| s.degraded || !s.fda_ok).unwrap_or(false),
             }
-            .to_string(),
-            daemon_state: daemon.as_ref().map(|s| s.state.clone()),
-            daemon_degraded: daemon.map(|s| s.degraded || !s.fda_ok).unwrap_or(false),
-        }
+        })
+        .await
+        .map_err(|e| e.to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = state;
-        OnboardingStateDto {
+        Ok(OnboardingStateDto {
             recorded: true,
             fda_ok: true,
             registration: "unsupported".to_string(),
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -5665,23 +6096,30 @@ fn get_onboarding_state(state: State<'_, AppState>) -> OnboardingStateDto {
 /// the registration self-heal — the recorded decision releases the daemon's
 /// gate, and the first registration starts it immediately (G3).
 #[tauri::command]
-fn record_onboarding_decision(decision: String, state: State<'_, AppState>) -> AppResult<()> {
+async fn record_onboarding_decision(decision: String, state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(target_os = "macos")]
     {
         if decision != "granted" && decision != "skipped" {
             return Err(format!("invalid onboarding decision: {decision:?}"));
         }
-        if !mac::prefs::record_onboarding_decision(&decision) {
-            return Err("failed to persist the onboarding decision".to_string());
-        }
         let data_dir = daemon_data_dir(&state);
-        std::thread::spawn(move || {
-            let outcome = mac::launch_agent::self_heal(&data_dir);
-            diag::log(format!(
-                "onboarding: decision recorded ({decision}); registration self-heal: {outcome:?}"
-            ));
-        });
-        Ok(())
+        // The persist is a `defaults write` subprocess — off the main thread.
+        // The registration self-heal (XPC, can start the daemon — G3) stays on
+        // its own thread so the modal button doesn't wait on it.
+        tauri::async_runtime::spawn_blocking(move || {
+            if !mac::prefs::record_onboarding_decision(&decision) {
+                return Err("failed to persist the onboarding decision".to_string());
+            }
+            std::thread::spawn(move || {
+                let outcome = mac::launch_agent::self_heal(&data_dir);
+                diag::log(format!(
+                    "onboarding: decision recorded ({decision}); registration self-heal: {outcome:?}"
+                ));
+            });
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -5693,19 +6131,26 @@ fn record_onboarding_decision(decision: String, state: State<'_, AppState>) -> A
 /// The `not_registered` banner action: register the login-item agent now
 /// (starts the daemon immediately — G3).
 #[tauri::command]
-fn register_daemon(state: State<'_, AppState>) -> AppResult<()> {
+async fn register_daemon(state: State<'_, AppState>) -> AppResult<()> {
     #[cfg(target_os = "macos")]
     {
-        // The gate needs a decision on record before a daemon may build; a
-        // user registering from the banner without onboarding effectively
-        // skipped it (FDA state is whatever it is — the probe decides).
-        if !mac::prefs::onboarding_recorded() {
-            mac::prefs::record_onboarding_decision("skipped");
-        }
-        mac::prefs::set_opt_out(false);
-        mac::launch_agent::register()?;
-        mac::launch_agent::write_marker(&daemon_data_dir(&state));
-        Ok(())
+        let data_dir = daemon_data_dir(&state);
+        // `defaults` subprocesses + the SMAppService XPC registration — off
+        // the main thread.
+        tauri::async_runtime::spawn_blocking(move || {
+            // The gate needs a decision on record before a daemon may build; a
+            // user registering from the banner without onboarding effectively
+            // skipped it (FDA state is whatever it is — the probe decides).
+            if !mac::prefs::onboarding_recorded() {
+                mac::prefs::record_onboarding_decision("skipped");
+            }
+            mac::prefs::set_opt_out(false);
+            mac::launch_agent::register()?;
+            mac::launch_agent::write_marker(&data_dir);
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -5815,13 +6260,18 @@ fn register_service_elevated() -> AppResult<()> {
 }
 
 #[tauri::command]
-fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+async fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     // macOS read-only GUI (D4): a full re-index is the daemon's job — mapped
-    // to its reset_index (G15), same as the Windows service model.
+    // to its reset_index (G15), same as the Windows service model. The UDS
+    // call blocks (5s read/write timeouts), so it runs off the async runtime,
+    // mirroring the reset_index command.
     #[cfg(target_os = "macos")]
     {
         let _ = app;
-        return daemon_ipc::reset_index(&daemon_data_dir(&state));
+        let data_dir = daemon_data_dir(&state);
+        return tauri::async_runtime::spawn_blocking(move || daemon_ipc::reset_index(&data_dir))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -5833,9 +6283,13 @@ fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()>
         }
         #[cfg(target_os = "windows")]
         {
-            // Read-only GUI (§3.3): a full (re)index is the service's job — delegate.
+            // Read-only GUI (§3.3): a full (re)index is the service's job —
+            // delegate, off the runtime (the control-pipe call blocks with no
+            // client-side read timeout).
             let _ = (app, state);
-            win::service_client::reset_index()
+            tauri::async_runtime::spawn_blocking(win::service_client::reset_index)
+                .await
+                .map_err(|e| e.to_string())?
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -8378,6 +8832,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     // field incidents are otherwise unreproducible, and a Finder-launched
     // process has no visible stderr. (db_path is resolved per-platform below.)
     diag::init(&app_data_dir, "gui");
+    // Field CPU accounting: if this process ever burns fan-relevant power
+    // (P-band CPU ≥ ~5W sustained), the episode lands in the diag log with a
+    // per-QoS-class split, so a "fans spun up" report is diagnosable from the
+    // log alone. Quiet otherwise.
+    #[cfg(target_os = "macos")]
+    mac::cpu_monitor::start_watchdog();
     let home_dir = resolve_home_dir();
 
     // D3 self-heal: keep the login-item agent registered and its plist marker
@@ -8452,6 +8912,12 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 set_db_readonly();
                 state.is_writer.store(false, AtomicOrdering::Release);
                 let _ = beacon_held;
+                // Read-only marker: a gui.lock holder WITHOUT gui_ro.lock is a
+                // pre-flip writer GUI the daemon yields to (§7); holding it
+                // tells the daemon this GUI is a post-flip reader, so it keeps
+                // writing. Bench mode (above) is a real writer and must not
+                // hold it.
+                daemon::hold_gui_ro_beacon(&db_path);
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -8872,6 +9338,126 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// The invariant the fans depend on. `UTILITY` measurably does not keep work
+    /// off performance cores (see `mac::sched`), so the multi-threaded walk must
+    /// map to `BACKGROUND` under *every* pressure state — including a cool, idle,
+    /// mains-powered machine, which is exactly the first-install case that spun
+    /// an M2 Pro's fans at 320% CPU.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn walk_threads_are_background_regardless_of_pressure() {
+        use mac::sched::{Pressure, Qos};
+        assert_eq!(scan_qos(ScanRole::Walk), Qos::Background);
+        assert_eq!(scan_qos(ScanRole::IdleWriter), Qos::Background);
+        // The single writer thread of a fresh pass is the pass's critical path
+        // and keeps a performance core while the machine is cool.
+        let expected = match mac::sched::pressure() {
+            Pressure::None | Pressure::Elevated => Qos::Utility,
+            Pressure::High => Qos::Background,
+        };
+        assert_eq!(scan_qos(ScanRole::FreshWriter), expected);
+
+        // The scan-start log must name both halves; a regression that silently
+        // put the walk back on P-cores would otherwise be invisible in the field.
+        let label = scan_scheduling_label();
+        assert!(
+            label.contains("walk_qos=background") || label.contains("full_speed=1"),
+            "scan log must record the walk's class, got {label:?}"
+        );
+    }
+
+    #[test]
+    fn scan_failures_ignore_paths_that_vanished_mid_walk() {
+        let mut failures = ScanFailures::default();
+        // The case that inflated the old counter: a directory deleted between
+        // its parent's readdir and the walk reaching it. Normal, unbounded on a
+        // busy machine, and nothing for the user to act on.
+        assert!(!failures.observe(Some(io::ErrorKind::NotFound)));
+        assert_eq!(failures, ScanFailures::default());
+        assert_eq!(scan_failure_message(failures, true), None);
+
+        assert!(failures.observe(Some(io::ErrorKind::PermissionDenied)));
+        assert!(failures.observe(Some(io::ErrorKind::Other)));
+        // A walker error with no io::Error behind it is still a real failure.
+        assert!(failures.observe(None));
+        assert_eq!(failures, ScanFailures { denied: 1, io: 2 });
+        assert_eq!(failures.total(), 3);
+    }
+
+    /// Only the no-FDA wording names the permission — with access granted a
+    /// denial is a genuine oddity, not an onboarding step the user skipped.
+    #[test]
+    fn scan_failure_message_names_full_disk_access_only_when_missing() {
+        let denied = ScanFailures { denied: 7, io: 0 };
+        let without = scan_failure_message(denied, false).unwrap();
+        assert!(without.contains("전체 디스크 접근 권한"), "{without}");
+        assert!(without.contains('7'), "{without}");
+        let with = scan_failure_message(denied, true).unwrap();
+        assert!(!with.contains("전체 디스크 접근 권한"), "{with}");
+
+        // I/O faults are reported on their own terms, never as a permission story.
+        let io_only = scan_failure_message(ScanFailures { denied: 0, io: 3 }, false).unwrap();
+        assert_eq!(io_only, "읽기 실패 3개");
+    }
+
+    #[test]
+    fn scan_failures_merge_across_workers() {
+        let mut total = ScanFailures { denied: 2, io: 1 };
+        total.merge(ScanFailures { denied: 3, io: 0 });
+        assert_eq!(total, ScanFailures { denied: 5, io: 1 });
+    }
+
+    #[test]
+    fn denied_prefix_collapses_per_app_container_denials() {
+        let home = Path::new("/Users/u");
+        // Several hundred of these on a Mac with many sandboxed apps: without the
+        // collapse they would be the whole rescan set instead of one prefix.
+        assert_eq!(
+            denied_prefix_for(Path::new("/Users/u/Library/Containers/com.a.b/Data"), home),
+            "/Users/u/Library/Containers"
+        );
+        assert_eq!(
+            denied_prefix_for(
+                Path::new("/Users/u/Library/Group Containers/ABC.com.x/Library"),
+                home
+            ),
+            "/Users/u/Library/Group Containers"
+        );
+        // Already at or above the depth cap: kept whole.
+        assert_eq!(
+            denied_prefix_for(Path::new("/Users/u/Library/Mail"), home),
+            "/Users/u/Library/Mail"
+        );
+        // Outside the scan root (a .pathindexing extra root): kept whole, since
+        // truncating against the wrong root could name an unrelated ancestor.
+        assert_eq!(
+            denied_prefix_for(Path::new("/Volumes/ext/a/b/c/d"), home),
+            "/Volumes/ext/a/b/c/d"
+        );
+    }
+
+    #[test]
+    fn note_denied_prefix_dedups_and_stays_bounded() {
+        let denied: DeniedPrefixes = Arc::new(Mutex::new(BTreeSet::new()));
+        let home = Path::new("/Users/u");
+        for i in 0..500 {
+            note_denied_prefix(
+                &denied,
+                &PathBuf::from(format!("/Users/u/Library/Containers/app{i}/Data")),
+                home,
+            );
+        }
+        assert_eq!(
+            denied.lock().iter().cloned().collect::<Vec<_>>(),
+            vec!["/Users/u/Library/Containers".to_string()],
+            "per-app denials must collapse onto one prefix"
+        );
+        for i in 0..DENIED_PREFIX_LIMIT * 2 {
+            note_denied_prefix(&denied, &PathBuf::from(format!("/Users/u/r{i}/x/y")), home);
+        }
+        assert_eq!(denied.lock().len(), DENIED_PREFIX_LIMIT);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn remap_event_path_maps_canonical_to_stored_prefix() {
@@ -9018,6 +9604,7 @@ mod tests {
             mem_index: Arc::new(RwLock::new(None)),
             watcher_stop: Arc::new(AtomicBool::new(false)),
             watcher_active: Arc::new(AtomicBool::new(false)),
+            watcher_gen: Arc::new(AtomicU64::new(0)),
             #[cfg(target_os = "windows")]
             watcher_lost_events: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "windows")]
@@ -9025,6 +9612,8 @@ mod tests {
             frontend_ready: Arc::new(AtomicBool::new(true)),
             #[cfg(target_os = "macos")]
             pathindexing_active: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            pathignore_dirty: Arc::new(AtomicBool::new(false)),
             search_conn_pool: Arc::new(Mutex::new(Vec::new())),
             #[cfg(target_os = "macos")]
             watcher_conn: Arc::new(Mutex::new(None)),

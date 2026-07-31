@@ -7,11 +7,35 @@
 //! which is why a fresh index of a ~1M-entry home held 400%+ CPU and spun up
 //! the fans on an M2 Pro.
 //!
-//! [`apply`] fixes that with one per-thread call, from inside the thread it
-//! affects. `QOS_CLASS_UTILITY` makes the scheduler prefer efficiency cores and
-//! only spill onto performance cores when those are idle; `QOS_CLASS_BACKGROUND`
-//! is stricter (E-cores only) at roughly 3x the wall time, so it is reserved for
-//! restart catchup and for passes running under thermal or battery pressure.
+//! [`apply`] steps a thread out of the way with one per-thread call, from inside
+//! the thread it affects.
+//!
+//! ## `UTILITY` is not a throttle — only `BACKGROUND` is
+//!
+//! This module first shipped assuming `QOS_CLASS_UTILITY` "prefers efficiency
+//! cores and only spills onto performance cores when those are idle". It does
+//! not. Measured on a 6P+12E Mac, walking a 1.39M-entry `$HOME` with the real
+//! pool shape (6 pool threads + 3 walk workers, warm dentry cache):
+//!
+//! | class              | wall  | CPU time | avg cores |
+//! |--------------------|-------|----------|-----------|
+//! | `USER_INTERACTIVE` |  7.4s |    41s   |    5.6    |
+//! | `UTILITY`          |  8.9s |    49s   |    5.5    |
+//! | `BACKGROUND`       | 17.6s |    67s   |    3.8    |
+//!
+//! `UTILITY` lands within a few percent of the foreground class on both CPU draw
+//! and wall time: the scheduler happily runs it on performance cores at full
+//! clock, so it does nothing for the fans. `BACKGROUND` is the only class that
+//! actually confines the fan-out to the E-cluster — visible in the numbers as
+//! *more* total CPU time (E-cores are slower per unit of work) spread over
+//! fewer simultaneous cores, at ~2x the wall time. E-cores at full tilt cost
+//! roughly a watt for the whole cluster, which is what keeps the fan off.
+//!
+//! Hence the split in [`crate::ScanRole`]: the walk fan-out — the only place
+//! with a thread multiplier, and syscall-bound work E-cores handle well — is
+//! always `BACKGROUND`, while the *single* SQLite writer thread of a fresh pass
+//! (the pass's actual critical path) keeps `UTILITY` and therefore a
+//! performance core. One busy P-core does not spin a fan; nine do.
 //!
 //! ## Why there is no `setiopolicy_np` call here
 //!
@@ -55,13 +79,15 @@ extern "C" {
 /// How far to step the calling thread out of the foreground's way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qos {
-    /// E-core preferred, may still use P-cores when they are idle. The default
-    /// for a fresh index: the user is waiting for it, so it should not be
-    /// gratuitously slow — just cheap enough not to spin the fans.
+    /// Lower scheduling priority, but still scheduled on performance cores at
+    /// full clock — see the measurements at the top of this file. Reserved for
+    /// work that is both single-threaded and on a pass's critical path, where
+    /// one busy P-core is the cheapest way to keep wall time down.
     Utility,
-    /// E-core only plus a throttled I/O tier. Used for restart catchup (nobody
-    /// is waiting on it) and whenever [`pressure`] reports the machine is hot or
-    /// in Low Power Mode.
+    /// E-cluster only plus a throttled I/O tier: the only class that actually
+    /// bounds CPU draw. Used for every multi-threaded walk fan-out, for work
+    /// nobody is waiting on (catchup, subtree rescans), and whenever
+    /// [`pressure`] reports the machine is hot or in Low Power Mode.
     Background,
 }
 
@@ -72,17 +98,65 @@ pub enum Qos {
 /// its inherited scheduling, i.e. the old behavior — but it is the difference
 /// between quiet fans and not, so callers should not discard it silently.
 pub fn apply(qos: Qos) -> i32 {
-    let qos_class = match qos {
+    unsafe { pthread_set_qos_class_self_np(raw_class(qos), 0) }
+}
+
+/// The `<sys/qos.h>` constant for a [`Qos`]. Single definition, so `apply` and
+/// [`class_name_of`] cannot disagree about what a variant means.
+fn raw_class(qos: Qos) -> u32 {
+    match qos {
         Qos::Utility => QOS_CLASS_UTILITY,
         Qos::Background => QOS_CLASS_BACKGROUND,
+    }
+}
+
+/// Logical cores in the efficiency cluster — the only ones a `BACKGROUND` thread
+/// can occupy, and therefore the real budget for the walk fan-out. `None` on a
+/// machine with no separate cluster (Intel) or if the sysctl is unavailable.
+///
+/// `hw.perflevel0` is the performance cluster and `hw.perflevel1` the efficiency
+/// one; a single-cluster machine has no `perflevel1` at all, which is exactly the
+/// "fall back to the old heuristic" signal.
+pub fn efficiency_cores() -> Option<usize> {
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            b"hw.perflevel1.logicalcpu\0".as_ptr() as *const c_char,
+            &mut value as *mut u32 as *mut c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
     };
-    unsafe { pthread_set_qos_class_self_np(qos_class, 0) }
+    (rc == 0 && value > 0).then_some(value as usize)
+}
+
+/// The name [`current_class_name`] would report for a class we are about to
+/// apply, so a log line can name the class a thread pool *will* take before its
+/// threads exist. Goes through the same table, so the two halves of a
+/// `writer_qos=… walk_qos=…` line can never drift apart.
+pub fn class_name_of(qos: Qos) -> &'static str {
+    name_for_class(raw_class(qos))
+}
+
+/// `<sys/qos.h>` constant → log name. `"unspecified"` means the thread is opted
+/// out of the QoS system — the failure mode described at the top of this file,
+/// and the one worth noticing in a field log because it brings the CPU spike
+/// back.
+fn name_for_class(raw: u32) -> &'static str {
+    match raw {
+        0x21 => "user-interactive",
+        0x19 => "user-initiated",
+        0x15 => "default",
+        QOS_CLASS_UTILITY => "utility",
+        QOS_CLASS_BACKGROUND => "background",
+        _ => "unspecified",
+    }
 }
 
 /// The calling thread's effective QoS class as the kernel reports it, for
-/// logging. `"unspecified"` means the thread is opted out of the QoS system —
-/// the failure mode described at the top of this file, and the one worth
-/// noticing in a field log because it brings the CPU spike back.
+/// logging.
 pub fn current_class_name() -> &'static str {
     let mut qos_class = 0u32;
     let mut relative_priority = 0i32;
@@ -91,14 +165,7 @@ pub fn current_class_name() -> &'static str {
     {
         return "unreadable";
     }
-    match qos_class {
-        0x21 => "user-interactive",
-        0x19 => "user-initiated",
-        0x15 => "default",
-        QOS_CLASS_UTILITY => "utility",
-        QOS_CLASS_BACKGROUND => "background",
-        _ => "unspecified",
-    }
+    name_for_class(qos_class)
 }
 
 /// System-level reasons to index more gently, worst-first.
@@ -261,6 +328,25 @@ mod tests {
         let before = current_settings();
         std::thread::spawn(|| apply(Qos::Background)).join().unwrap();
         assert_eq!(current_settings(), before);
+    }
+
+    #[test]
+    fn efficiency_core_count_is_plausible() {
+        // A wrong sysctl name returns None and silently reverts the walk to the
+        // old half-the-machine sizing, so assert the read actually lands. Every
+        // Apple Silicon Mac has an efficiency cluster smaller than the whole
+        // machine; Intel has none, which is a legitimate None.
+        let total = std::thread::available_parallelism().unwrap().get();
+        match efficiency_cores() {
+            Some(e) => {
+                assert!(e >= 1 && e < total, "efficiency={e} of total={total}");
+                eprintln!("efficiency cores: {e} of {total} logical");
+            }
+            None => assert!(
+                cfg!(target_arch = "x86_64"),
+                "Apple Silicon must report hw.perflevel1.logicalcpu"
+            ),
+        }
     }
 
     #[test]
