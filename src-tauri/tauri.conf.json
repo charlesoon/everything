@@ -50,7 +50,10 @@
       "signingIdentity": null,
       "entitlements": "Entitlements.plist",
       "minimumSystemVersion": "13.0",
-      "infoPlist": "Info.plist"
+      "infoPlist": "Info.plist",
+      "files": {
+        "Library/LaunchAgents/com.everything.app.daemon.plist": "launchd/com.everything.app.daemon.plist"
+      }
     },
     "windows": {
       "nsis": {

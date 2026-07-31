@@ -27,6 +27,10 @@ chrono = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4"
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+objc2-service-management = { version = "0.3", features = ["SMAppService"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [

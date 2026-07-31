@@ -70,6 +70,14 @@ pub fn handle_cli_args() -> bool {
         register_all_and_log(None);
         return true;
     }
+    if args.iter().any(|a| a == "--register-daemon") {
+        register_daemon_cli();
+        return true;
+    }
+    if args.iter().any(|a| a == "--unregister-daemon") {
+        unregister_daemon_cli();
+        return true;
+    }
     // Intercept the common informational flags. Without this they fall through
     // and boot the full Tauri GUI — e.g. `everything --version` would silently
     // launch a second GUI window (and, holding gui.lock, evict the daemon).
@@ -83,12 +91,70 @@ pub fn handle_cli_args() -> bool {
              everything --mcp      Run the MCP stdio server (index reader)\n  \
              everything --daemon   Run the headless indexer daemon\n  \
              everything --register-mcp   Register the MCP server into Claude Code / Codex\n  \
+             everything --register-daemon    Register the daemon as a login item (macOS; starts it immediately)\n  \
+             everything --unregister-daemon  Remove the login-item registration (macOS)\n  \
              everything --version  Print the version and exit",
             env!("CARGO_PKG_VERSION")
         );
         return true;
     }
     false
+}
+
+/// `--register-daemon`: opt in to the login-item agent from the CLI (D3).
+/// Registering counts as the onboarding decision — a launchd-started daemon
+/// would otherwise idle in its onboarding gate forever — and clears any
+/// opt-out. SMAppService starts the daemon immediately on success (G3).
+#[cfg(target_os = "macos")]
+fn register_daemon_cli() {
+    use crate::mac::{launch_agent, prefs};
+    if !prefs::onboarding_recorded() {
+        prefs::record_onboarding_decision("cli");
+    }
+    prefs::set_opt_out(false);
+    match launch_agent::register() {
+        Ok(()) => {
+            if let Some(data_dir) = default_db_path().parent() {
+                launch_agent::write_marker(data_dir);
+            }
+            println!(
+                "registered login item '{}' — the indexer daemon starts now and at every login",
+                launch_agent::AGENT_LABEL
+            );
+        }
+        Err(e) => {
+            eprintln!("register-daemon failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_daemon_cli() {
+    eprintln!("--register-daemon is macOS-only (Windows uses --register-service)");
+    std::process::exit(1);
+}
+
+/// `--unregister-daemon`: remove the login-item registration. launchd stops a
+/// running daemon as part of unregistration.
+#[cfg(target_os = "macos")]
+fn unregister_daemon_cli() {
+    match crate::mac::launch_agent::unregister() {
+        Ok(()) => println!(
+            "unregistered login item '{}' — auto-start is off (a running daemon is stopped by launchd)",
+            crate::mac::launch_agent::AGENT_LABEL
+        ),
+        Err(e) => {
+            eprintln!("unregister-daemon failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unregister_daemon_cli() {
+    eprintln!("--unregister-daemon is macOS-only (Windows uses --register-service)");
+    std::process::exit(1);
 }
 
 // ---------------------------------------------------------------------------

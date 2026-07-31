@@ -8101,6 +8101,31 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
     diag::init(&app_data_dir, "gui");
     let home_dir = resolve_home_dir();
 
+    // D3 self-heal: keep the login-item agent registered and its plist marker
+    // current. Inert until an onboarding decision exists (recorded by the
+    // onboarding flow, or by `--register-daemon` today), and it never
+    // overrides the user's opt-out or an OS-side disable. Own thread:
+    // SMAppService calls and `defaults` shell-outs must not block window
+    // bring-up.
+    #[cfg(target_os = "macos")]
+    {
+        let data_dir = app_data_dir.clone();
+        std::thread::spawn(move || {
+            use mac::launch_agent::SelfHeal;
+            match mac::launch_agent::self_heal(&data_dir) {
+                outcome @ (SelfHeal::AlreadyCurrent | SelfHeal::Skipped(_)) => {
+                    eprintln!("[launch-agent] self-heal: {outcome:?}");
+                }
+                outcome @ (SelfHeal::Registered | SelfHeal::Reregistered) => {
+                    diag::log(format!("launch-agent self-heal: {outcome:?}"));
+                }
+                SelfHeal::Failed(e) => {
+                    diag::log(format!("ALERT: launch-agent self-heal failed: {e}"));
+                }
+            }
+        });
+    }
+
     // Windows (service model, §3.3): mark this process a pure reader and point
     // it at the machine-global ProgramData index the service writes; the GUI
     // never touches per-user %APPDATA% and never writes. config\ (user-writable)

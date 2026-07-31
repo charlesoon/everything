@@ -356,9 +356,16 @@ pub fn run_daemon() {
     // already points at the same file): timestamps + pass boundaries + ALERTs.
     diag::init(&app_data_dir, "daemon");
     eprintln!(
-        "[daemon] everything indexer daemon v{} db={}",
+        "[daemon] everything indexer daemon v{} db={}{}",
         env!("CARGO_PKG_VERSION"),
-        db_path.display()
+        db_path.display(),
+        // launchd-started daemons carry this from the agent plist; a missing
+        // marker means a spawn_detached/manual start.
+        if std::env::var_os("EVERYTHING_LAUNCHD").is_some() {
+            " (launchd)"
+        } else {
+            ""
+        }
     );
 
     // Defer to the GUI, which owns all writes while it runs.
