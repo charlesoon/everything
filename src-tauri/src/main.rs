@@ -25,6 +25,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use std::os::windows::process::CommandExt;
 mod fd_search;
 mod daemon;
+#[cfg(target_os = "macos")]
+mod daemon_ipc;
 mod diag;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -5659,27 +5661,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         }
 
         let conn = db_connection(&state.db_path)?;
-
-        // Fast reset: rename entries (O(1), no data movement) → create new empty table
-        // → FTS rebuild from empty content table (instant) → background DROP old table.
-        // This avoids per-row WAL writes that make DELETE FROM entries slow at scale.
-        let _ = set_meta(&conn, "fts_dirty", "1");
-        let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
-        let _ = conn.execute_batch("DROP TABLE IF EXISTS entries_gc_reset;");
-        conn.execute_batch("ALTER TABLE entries RENAME TO entries_gc_reset;")
-            .map_err(|e| e.to_string())?;
-        conn.execute_batch(CREATE_ENTRIES_TABLE_SQL).map_err(|e| e.to_string())?;
-        conn.execute_batch(CREATE_FTS_TRIGGERS_SQL).map_err(|e| e.to_string())?;
-        let _ = conn.execute_batch(REBUILD_FTS_SQL);
-
-        // entries_gc_reset will be dropped by the GC cleanup in the finalizing thread
-        // after indexing completes — avoids a race between DROP TABLE and the new indexer
-        // both competing for the SQLite WAL write lock.
-
-        // Clears every meta row (last_run_id, cached counts, and the fts_dirty=1
-        // set above) so the follow-up index runs fresh with a clean FTS.
-        conn.execute("DELETE FROM meta", [])
-            .map_err(|e| e.to_string())?;
+        reset_index_storage(&conn)?;
 
         {
             let mut status = state.status.lock();
@@ -5720,6 +5702,29 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
     .map_err(|e| e.to_string())?
     };
     out
+}
+
+/// The table-swap core of a reset: rename `entries` aside (O(1), no data
+/// movement) → recreate it empty with fresh FTS triggers → FTS rebuild from
+/// the empty content table (instant) → wipe `meta` (last_run_id, cached
+/// counts, and the fts_dirty=1 set here) so the follow-up pass runs fresh.
+/// The renamed `entries_gc_reset` is dropped later by the finalizing thread's
+/// GC — DROPping it here would contend with the new indexer for the WAL write
+/// lock. Shared by the GUI reset command and the daemon's IPC `reset_index`.
+pub(crate) fn reset_index_storage(conn: &Connection) -> AppResult<()> {
+    let _ = set_meta(conn, "fts_dirty", "1");
+    let _ = conn.execute_batch(DROP_FTS_TRIGGERS_SQL);
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS entries_gc_reset;");
+    conn.execute_batch("ALTER TABLE entries RENAME TO entries_gc_reset;")
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch(CREATE_ENTRIES_TABLE_SQL)
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch(CREATE_FTS_TRIGGERS_SQL)
+        .map_err(|e| e.to_string())?;
+    let _ = conn.execute_batch(REBUILD_FTS_SQL);
+    conn.execute("DELETE FROM meta", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn log_search(db_path: &Path, query: &str, mode: &str, results: &[EntryDto]) {

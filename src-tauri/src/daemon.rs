@@ -6,11 +6,23 @@
 //! periodic catchup pass. A resident supervisory loop heals a failed build and
 //! restarts a dead watcher so the daemon can never wedge silently.
 //!
+//! macOS lifecycle (design §4, D8): launchd runs the daemon as a login-item
+//! LaunchAgent (`mac/launch_agent.rs`) with `KeepAlive.SuccessfulExit=false`,
+//! making the exit code the supervision contract — `exit(0)` = dormant until
+//! the next login/kickstart, `exit(1)` = relaunch from the on-disk binary.
+//! States: Starting → WaitingOnboarding → Building → Ready → Quiescing,
+//! reported over the UDS control socket (`daemon_ipc.rs`), which opens before
+//! the first build so status/restart/disable always answer. SIGTERM (logout,
+//! shutdown, unregister) quiesces cleanly. A supervision tick watches the
+//! executable's identity (update/rollback → exit 1; deletion → dormant), the
+//! FDA rising edge, and — in `--lease` mode (opt-out users) — the renewable
+//! lease's liveness.
+//!
 //! Single-writer coordination (WAL allows only one writer):
 //!   * daemon-vs-daemon — the `daemon.lock` advisory lock; a duplicate self-exits.
-//!   * daemon-vs-GUI — the GUI holds a `gui.lock` beacon for its lifetime; the
-//!     daemon defers to it (never spawns / exits promptly when the GUI appears),
-//!     so the two never write concurrently.
+//!   * daemon-vs-GUI — TRANSITIONAL until the P2 ownership flip: the GUI holds a
+//!     `gui.lock` beacon for its lifetime and the daemon defers to it (never
+//!     spawns / exits promptly when the GUI appears).
 //!
 //! Bootstrap: the MCP server (`--mcp`) spawns this detached on startup (unless
 //! a GUI or another daemon is already the writer), so an agent that only ever
@@ -18,8 +30,10 @@
 //! session.
 
 #[cfg(target_os = "macos")]
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use std::process::{Command, Stdio};
@@ -32,6 +46,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use fs2::FileExt;
+#[cfg(target_os = "macos")]
+use parking_lot::Mutex;
 
 use crate::diag;
 use crate::mcp_server::default_db_path;
@@ -40,6 +56,11 @@ use crate::{
     finalize_fresh_index, get_meta, init_db_tables, resolve_home_dir, run_db_maintenance,
     run_incremental_index, AppState,
 };
+#[cfg(target_os = "macos")]
+use crate::{
+    cached_effective_ignore_rules, invalidate_search_caches, pathindexing,
+    purge_ignored_entries, refresh_and_emit_status_counts, reset_index_storage, set_meta,
+};
 
 /// How often the resident daemon polls the GUI beacon so it yields writes
 /// almost immediately when the GUI launches. This is the daemon half of the
@@ -47,7 +68,8 @@ use crate::{
 /// never overlap as WAL writers.
 const GUI_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// Cadence for heavier supervision (heal a failed build, restart a dead
-/// watcher) — kept coarse; only the GUI-yield check needs to be fast.
+/// watcher, FDA probe, exe-identity, lease liveness) — kept coarse; only the
+/// GUI-yield/quiesce checks need to be fast.
 #[cfg(target_os = "macos")]
 const SUPERVISE_INTERVAL: Duration = Duration::from_secs(5);
 /// Linux fallback reconcile cadence (no live watcher there).
@@ -59,6 +81,20 @@ const CATCHUP_INTERVAL: Duration = Duration::from_secs(60);
 /// is no GUI↔daemon handshake (D6).
 #[cfg(not(target_os = "windows"))]
 const DAEMON_EXIT_WAIT: Duration = Duration::from_secs(10);
+/// While FDA is missing, re-probe on this cadence (not every supervise tick —
+/// each probe touches tccd; 60s keeps the rising edge ≤1min behind, G9).
+#[cfg(target_os = "macos")]
+const FDA_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// A lease user (GUI bridge / MCP session) that hasn't renewed within the TTL
+/// is presumed dead. Renewals come every ~60s, so this absorbs several missed
+/// beats before a lease daemon self-retires (R10).
+#[cfg(target_os = "macos")]
+pub(crate) const LEASE_TTL: Duration = Duration::from_secs(300);
+/// Consecutive supervise ticks the executable must be missing before that
+/// counts as "app deleted" — Finder's replace-on-update briefly unlinks the
+/// bundle, which must read as an update, not a deletion (G12).
+#[cfg(target_os = "macos")]
+const EXE_MISSING_TICKS: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Advisory locks (writer coordination)
@@ -142,7 +178,7 @@ pub(crate) fn hold_gui_beacon(db_path: &Path) -> bool {
 /// lingers past the deadline we proceed anyway (WAL keeps writes safe).
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let mut waited = false;
     while daemon_running(db_path) {
         waited = true;
@@ -165,6 +201,141 @@ pub(crate) fn wait_for_daemon_exit(db_path: &Path) {
     if waited {
         eprintln!("[gui] daemon yielded; GUI now owns index writes");
         diag::log("daemon yielded; GUI owns index writes");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle state + IPC-shared control block (macOS, design §4)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+    Starting,
+    WaitingOnboarding,
+    Building,
+    Ready,
+    Quiescing,
+}
+
+#[cfg(target_os = "macos")]
+impl Lifecycle {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Lifecycle::Starting => "Starting",
+            Lifecycle::WaitingOnboarding => "WaitingOnboarding",
+            Lifecycle::Building => "Building",
+            Lifecycle::Ready => "Ready",
+            Lifecycle::Quiescing => "Quiescing",
+        }
+    }
+}
+
+/// State shared between the daemon's main loop and the UDS control server.
+#[cfg(target_os = "macos")]
+pub(crate) struct DaemonControl {
+    lifecycle: Mutex<Lifecycle>,
+    /// One-shot: the IPC server sets it, the resident loop consumes it.
+    pub(crate) reset_requested: AtomicBool,
+    /// Requested exit code (restart=1 / disable=0). `disable` wins: once a 0
+    /// is recorded a later restart cannot upgrade it back to a relaunch.
+    exit_request: Mutex<Option<i32>>,
+    pub(crate) last_reset: Mutex<Option<Instant>>,
+    /// Live lease users keyed by (pid, per-process token) → last renewal.
+    leases: Mutex<HashMap<(u32, u64), Instant>>,
+    pub(crate) fda_ok: AtomicBool,
+    pub(crate) degraded: AtomicBool,
+    /// Whether the current/last build is a fresh pass (vs catchup) — lets the
+    /// GUI bridge label progress as catchup (isCatchup).
+    pub(crate) is_fresh: AtomicBool,
+    pub(crate) lease_mode: bool,
+    pub(crate) socket_path: Mutex<Option<PathBuf>>,
+}
+
+#[cfg(target_os = "macos")]
+impl DaemonControl {
+    pub(crate) fn new(lease_mode: bool) -> Self {
+        Self {
+            lifecycle: Mutex::new(Lifecycle::Starting),
+            reset_requested: AtomicBool::new(false),
+            exit_request: Mutex::new(None),
+            last_reset: Mutex::new(None),
+            leases: Mutex::new(HashMap::new()),
+            fda_ok: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            is_fresh: AtomicBool::new(false),
+            lease_mode,
+            socket_path: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn lifecycle(&self) -> Lifecycle {
+        *self.lifecycle.lock()
+    }
+
+    pub(crate) fn set_lifecycle(&self, lifecycle: Lifecycle) {
+        *self.lifecycle.lock() = lifecycle;
+    }
+
+    /// Record an exit request. `disable` (0) wins over `restart` (1) — G15.
+    pub(crate) fn request_exit(&self, code: i32) {
+        let mut slot = self.exit_request.lock();
+        *slot = Some(match *slot {
+            Some(0) => 0,
+            _ => code,
+        });
+    }
+
+    pub(crate) fn requested_exit(&self) -> Option<i32> {
+        *self.exit_request.lock()
+    }
+
+    pub(crate) fn attach_lease(&self, pid: u32, token: u64) {
+        self.leases.lock().insert((pid, token), Instant::now());
+    }
+
+    /// Prunes expired leases and returns how many users are still live.
+    pub(crate) fn live_lease_count(&self) -> usize {
+        let mut leases = self.leases.lock();
+        leases.retain(|_, renewed| renewed.elapsed() < LEASE_TTL);
+        leases.len()
+    }
+
+    /// Cover the gap between a lease spawn and the first user's attach (the
+    /// spawner can't attach before the UDS server answers).
+    pub(crate) fn seed_grace_lease(&self) {
+        self.leases.lock().insert((0, 0), Instant::now());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIGTERM (logout / shutdown / unregister — G4)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+static QUIESCE_SIGNALED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn quiesce_signaled() -> bool {
+    QUIESCE_SIGNALED.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn on_sigterm(_sig: libc::c_int) {
+    // Async-signal-safe: a single atomic store. The resident loop (300ms) and
+    // the build cancel probe observe it; launchd's default grace is 20s and
+    // quiesce targets ≤5s.
+    QUIESCE_SIGNALED.store(true, Ordering::Release);
+}
+
+#[cfg(target_os = "macos")]
+fn install_sigterm_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigterm as extern "C" fn(libc::c_int) as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0;
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
     }
 }
 
@@ -201,6 +372,10 @@ fn fresh_and_dirty(db_path: &Path) -> (bool, bool) {
     }
 }
 
+/// External cancellation probe for a build pass, polled every
+/// `GUI_POLL_INTERVAL` by the pass monitor thread.
+type CancelProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Run one index pass and, when it was a fresh build (or crash recovery), the
 /// finalization the `app:None` path skips: secondary indexes, FTS rebuild, GC,
 /// and storage maintenance (VACUUM / WAL truncate) — mirroring the GUI's
@@ -208,25 +383,25 @@ fn fresh_and_dirty(db_path: &Path) -> (bool, bool) {
 /// watcher stands down instead of racing this writer. Returns the pass result
 /// so the supervisory loops can count consecutive failures (rebuild-loop
 /// detection in the diag log).
-fn build_index(db_path: &Path, state: &AppState) -> Result<(), String> {
-    // Clear any cancel signal a previously-yielded pass may have left set.
+///
+/// `should_cancel` is polled while the (possibly minutes-long) pass runs; when
+/// it turns true, `cancel_index` makes the pass unwind within ~1-2s (index
+/// left incomplete — the heal loop or the next start finishes it). Callers use
+/// it for the GUI beacon (pre-flip) and for quiesce/restart/reset requests.
+fn build_index(db_path: &Path, state: &AppState, should_cancel: CancelProbe) -> Result<(), String> {
+    // Clear any cancel signal a previously-cancelled pass may have left set.
     state.cancel_index.store(false, Ordering::Release);
     state.indexing_active.store(true, Ordering::Release);
     let (is_fresh, fts_dirty) = fresh_and_dirty(db_path);
 
-    // Watch for the GUI while this (possibly minutes-long) pass runs. The
-    // resident loop can't poll the beacon until the pass returns, and the GUI's
-    // wait_for_daemon_exit is bounded to DAEMON_EXIT_WAIT, so a long fresh build
-    // would otherwise overlap the GUI as a second writer. Setting cancel_index
-    // makes run_incremental_index unwind within ~1-2s (index left incomplete).
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let monitor = {
         let cancel = Arc::clone(&state.cancel_index);
         let stop = Arc::clone(&monitor_stop);
-        let db_path = db_path.to_path_buf();
+        let should_cancel = Arc::clone(&should_cancel);
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                if gui_is_running(&db_path) {
+                if should_cancel() {
                     cancel.store(true, Ordering::Release);
                     return;
                 }
@@ -269,8 +444,34 @@ fn build_index(db_path: &Path, state: &AppState) -> Result<(), String> {
     result
 }
 
+/// Wrap a build pass in the Building/Ready lifecycle and record whether it
+/// was a fresh pass (for the bridge's catchup labeling).
+#[cfg(target_os = "macos")]
+fn run_build(db_path: &Path, state: &AppState, control: &Arc<DaemonControl>) -> Result<(), String> {
+    control.set_lifecycle(Lifecycle::Building);
+    let (is_fresh, _) = fresh_and_dirty(db_path);
+    control.is_fresh.store(is_fresh, Ordering::Release);
+    let result = build_index(db_path, state, build_cancel_probe(db_path, control));
+    control.set_lifecycle(Lifecycle::Ready);
+    result
+}
+
+/// A pass must unwind when the GUI appears (transitional, pre-flip), when
+/// SIGTERM arrived, or when IPC asked for exit/reset.
+#[cfg(target_os = "macos")]
+fn build_cancel_probe(db_path: &Path, control: &Arc<DaemonControl>) -> CancelProbe {
+    let db_path = db_path.to_path_buf();
+    let control = Arc::clone(control);
+    Arc::new(move || {
+        gui_is_running(&db_path)
+            || quiesce_signaled()
+            || control.requested_exit().is_some()
+            || control.reset_requested.load(Ordering::Acquire)
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Detached spawn (bootstrap from the MCP server)
+// Detached spawn + revival gate
 // ---------------------------------------------------------------------------
 
 /// Spawn `everything --daemon` as a detached background process that outlives
@@ -282,14 +483,24 @@ fn build_index(db_path: &Path, state: &AppState) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 pub fn spawn_detached() {
     let db_path = default_db_path();
+    // Transitional (pre-flip): the GUI owns writes while it runs.
     if gui_is_running(&db_path) {
         eprintln!("[daemon] GUI owns index writes; not spawning a daemon");
         diag::log("bootstrap: GUI owns index writes; not spawning a daemon");
         return;
     }
-    if daemon_running(&db_path) {
-        diag::log("bootstrap: daemon already resident");
-        return; // one is already resident
+    spawn_detached_with(&[], "bootstrap", true);
+}
+
+/// The one true spawn: every daemon-spawning path funnels through here (§4).
+/// `skip_if_resident=false` is for self-relaunch, where the exiting process
+/// still holds `daemon.lock` at spawn time.
+#[cfg(not(target_os = "windows"))]
+fn spawn_detached_with(extra_args: &[&str], reason: &str, skip_if_resident: bool) {
+    let db_path = default_db_path();
+    if skip_if_resident && daemon_running(&db_path) {
+        diag::log(format!("{reason}: daemon already resident"));
+        return;
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -309,6 +520,7 @@ pub fn spawn_detached() {
         .unwrap_or_else(Stdio::null);
     let mut cmd = Command::new(exe);
     cmd.arg("--daemon")
+        .args(extra_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
@@ -329,8 +541,8 @@ pub fn spawn_detached() {
     }
     match cmd.spawn() {
         Ok(_) => {
-            eprintln!("[daemon] spawned detached indexer daemon");
-            diag::log("spawned detached indexer daemon");
+            eprintln!("[daemon] spawned detached indexer daemon ({reason})");
+            diag::log(format!("spawned detached indexer daemon ({reason})"));
         }
         Err(e) => {
             eprintln!("[daemon] spawn failed: {e}");
@@ -339,13 +551,81 @@ pub fn spawn_detached() {
     }
 }
 
+/// How a caller that needs a live daemon should revive one (design §4 single
+/// rule): a registered agent is kickstarted so launchd stays the supervisor
+/// (G2); opt-out / OS-disabled users only ever get a lease daemon (G1); a
+/// plain spawn is reserved for unregistered contexts (dev builds,
+/// translocation, pre-registration installs).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevivalAction {
+    Kickstart,
+    SpawnDetached,
+    SpawnLease,
+    Nothing,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn revival_action(
+    reg: crate::mac::launch_agent::RegState,
+    opted_out: bool,
+    daemon_alive: bool,
+) -> RevivalAction {
+    use crate::mac::launch_agent::RegState;
+    if daemon_alive {
+        return RevivalAction::Nothing;
+    }
+    if opted_out || reg == RegState::RequiresApproval {
+        return RevivalAction::SpawnLease;
+    }
+    match reg {
+        RegState::Enabled => RevivalAction::Kickstart,
+        // Unsupported (dev/translocated) / NotRegistered / NotFound.
+        _ => RevivalAction::SpawnDetached,
+    }
+}
+
+/// The single revival gate every "daemon must be running" path calls
+/// (GUI bridge self-heal, MCP bootstrap, hot-WAL recovery, toggle-ON).
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // wired up by the P2.2 bridge and P2.3 MCP bootstrap
+pub(crate) fn ensure_daemon_running(reason: &str) {
+    let db_path = default_db_path();
+    let action = revival_action(
+        crate::mac::launch_agent::agent_status(),
+        crate::mac::prefs::opted_out(),
+        daemon_running(&db_path),
+    );
+    match action {
+        RevivalAction::Nothing => {}
+        RevivalAction::Kickstart => match crate::mac::launch_agent::kickstart() {
+            Ok(()) => diag::log(format!("revival ({reason}): launchctl kickstart")),
+            Err(e) => diag::log(format!("revival ({reason}): kickstart failed: {e}")),
+        },
+        RevivalAction::SpawnDetached => spawn_detached_with(&[], reason, true),
+        RevivalAction::SpawnLease => spawn_detached_with(&["--lease"], reason, true),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[allow(dead_code)]
+pub(crate) fn ensure_daemon_running(_reason: &str) {
+    // No launchd equivalent here; the legacy spawn gate applies.
+    spawn_detached();
+}
+
 // ---------------------------------------------------------------------------
 // Resident daemon
 // ---------------------------------------------------------------------------
 
-/// Entry point for `everything --daemon`. Runs until another writer owns the
-/// index (GUI/another daemon) or startup fails hard; otherwise resident.
+/// Entry point for `everything --daemon`. The process exit code is the
+/// launchd supervision contract on macOS (§4): 0 = dormant, non-zero =
+/// relaunch (KeepAlive.SuccessfulExit=false).
 pub fn run_daemon() {
+    std::process::exit(run_daemon_impl());
+}
+
+fn run_daemon_impl() -> i32 {
     let db_path = default_db_path();
     let home_dir = resolve_home_dir();
     let app_data_dir = db_path
@@ -368,52 +648,306 @@ pub fn run_daemon() {
         }
     );
 
-    // Defer to the GUI, which owns all writes while it runs.
-    if gui_is_running(&db_path) {
-        eprintln!("[daemon] GUI is running; it owns index writes — exiting");
-        diag::log("GUI is running; exiting (it owns index writes)");
-        return;
+    #[cfg(target_os = "macos")]
+    {
+        run_daemon_macos(db_path, home_dir, app_data_dir)
     }
-    let Some(_lock) = try_acquire_daemon_lock(&db_path) else {
-        eprintln!("[daemon] another daemon already running; exiting");
-        diag::log("another daemon already resident; exiting");
-        return;
-    };
 
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Defer to the GUI, which owns all writes while it runs.
+        if gui_is_running(&db_path) {
+            eprintln!("[daemon] GUI is running; it owns index writes — exiting");
+            diag::log("GUI is running; exiting (it owns index writes)");
+            return 0;
+        }
+        let Some(_lock) = try_acquire_daemon_lock(&db_path) else {
+            eprintln!("[daemon] another daemon already running; exiting");
+            diag::log("another daemon already resident; exiting");
+            return 0;
+        };
+
+        if let Err(e) = fs::create_dir_all(&app_data_dir) {
+            eprintln!("[daemon] create data dir failed: {e}");
+            diag::log(format!("FATAL: create data dir failed: {e}"));
+            return 1;
+        }
+        if let Err(e) = init_db_tables(&db_path) {
+            eprintln!("[daemon] init_db_tables failed: {e}");
+            diag::log(format!("FATAL: init_db_tables failed: {e}"));
+            return 1;
+        }
+
+        let state = build_app_state(db_path.clone(), home_dir, &app_data_dir);
+
+        // Startup reconcile: a fresh build if the DB is empty, otherwise a catchup
+        // covering everything changed while no daemon was running. A failure is
+        // not fatal — the supervisory loop below heals it (and logs the loop).
+        let cancel_probe: CancelProbe = {
+            let db_path = db_path.clone();
+            Arc::new(move || gui_is_running(&db_path))
+        };
+        let _ = build_index(&db_path, &state, cancel_probe);
+        if gui_is_running(&db_path) {
+            eprintln!("[daemon] GUI appeared during startup build; yielding writes");
+        } else {
+            eprintln!("[daemon] index ready; entering resident mode");
+        }
+        diag::log("entering resident mode");
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        run_polling_resident(db_path, state);
+        // Windows: the SCM-managed indexer service is the sole writer (Q3). A stray
+        // `--daemon` already self-exited above when it couldn't take daemon.lock, and
+        // the ProgramData data dir is read-only to a non-SYSTEM process, so there is
+        // no Windows resident fallback.
+        #[cfg(target_os = "windows")]
+        let _ = (db_path, state);
+        0
+    }
+}
+
+/// macOS §4 lifecycle: Starting → (WaitingOnboarding) → Building → Ready →
+/// Quiescing, with the UDS server and SIGTERM handler installed before the
+/// first build.
+#[cfg(target_os = "macos")]
+fn run_daemon_macos(db_path: PathBuf, home_dir: PathBuf, app_data_dir: PathBuf) -> i32 {
+    use crate::mac::{launch_agent, prefs};
+
+    // §4-1 — daemon.lock. A duplicate is dormant, not an error. Brief retry:
+    // a self-relaunch (exe replaced outside launchd) spawns while its parent
+    // still holds the lock for a few hundred ms.
+    let lock_deadline = Instant::now() + Duration::from_secs(3);
+    let _lock = loop {
+        if let Some(lock) = try_acquire_daemon_lock(&db_path) {
+            break lock;
+        }
+        if Instant::now() >= lock_deadline {
+            eprintln!("[daemon] another daemon already resident; dormant exit(0)");
+            diag::log("duplicate daemon; dormant exit(0)");
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    // Transitional (until the P2 ownership flip): the GUI still owns writes
+    // while it runs, so a daemon starting under a live GUI goes dormant.
+    if gui_is_running(&db_path) {
+        eprintln!("[daemon] GUI is running; it owns index writes — dormant exit(0)");
+        diag::log("GUI is running; dormant exit(0) (it owns index writes)");
+        return 0;
+    }
     if let Err(e) = fs::create_dir_all(&app_data_dir) {
         eprintln!("[daemon] create data dir failed: {e}");
         diag::log(format!("FATAL: create data dir failed: {e}"));
-        return;
+        return 1; // launchd relaunches (10s throttle)
     }
+
+    let lease_mode = std::env::args().skip(1).any(|a| a == "--lease");
+    let launchd_started = std::env::var_os("EVERYTHING_LAUNCHD").is_some();
+
+    // §4-2 — SIGTERM handler + UDS server BEFORE any build (G4/F6): logout and
+    // shutdown quiesce cleanly, and status/restart/disable answer even during
+    // a minutes-long fresh build.
+    install_sigterm_handler();
+    let control = Arc::new(DaemonControl::new(lease_mode));
+    if lease_mode {
+        control.seed_grace_lease();
+    }
+    let state = build_app_state(db_path.clone(), home_dir, &app_data_dir);
+    match crate::daemon_ipc::start_server(
+        crate::daemon_ipc::IpcContext {
+            state: state.clone(),
+            control: Arc::clone(&control),
+        },
+        &app_data_dir,
+    ) {
+        Ok(path) => {
+            eprintln!("[daemon] control socket at {}", path.display());
+            *control.socket_path.lock() = Some(path);
+        }
+        Err(e) => diag::log(format!(
+            "ALERT: daemon IPC server failed to start: {e} — this run has no status/control channel"
+        )),
+    }
+
+    // §4-3 — opt-out / OS-OFF gate (G1). launchd may legitimately start us
+    // right after the user turned auto-start off (KeepAlive races); the
+    // launchd instance self-selects dormancy. Manual and lease starts pass.
+    if launchd_started && !lease_mode {
+        let os_off = launch_agent::agent_status() == launch_agent::RegState::RequiresApproval;
+        if prefs::opted_out() || os_off {
+            eprintln!("[daemon] auto-start is off (opt-out or Login Items); dormant exit(0)");
+            diag::log("auto-start off (app opt-out or OS setting); dormant exit(0)");
+            return 0;
+        }
+    }
+
+    // §4-4 — onboarding gate (F3/G8): no build, no TCC access until the user
+    // decided. Existing installs adopt implicitly (§7 migration).
+    match wait_for_onboarding_gate(&db_path, &control) {
+        GateOutcome::Proceed => {}
+        GateOutcome::Exit(code) => return finish_quiesce(&db_path, &state, &control, code),
+    }
+
+    // §4-5 — schema + startup build (fresh or catchup).
     if let Err(e) = init_db_tables(&db_path) {
         eprintln!("[daemon] init_db_tables failed: {e}");
         diag::log(format!("FATAL: init_db_tables failed: {e}"));
+        return 1;
+    }
+    let fda = crate::mac::probe_full_disk_access();
+    control.fda_ok.store(fda, Ordering::Release);
+    control.degraded.store(!fda, Ordering::Release);
+    if let Ok(conn) = db_connection(&db_path) {
+        let _ = set_meta(&conn, "last_fda_ok", if fda { "1" } else { "0" });
+    }
+    let _ = run_build(&db_path, &state, &control);
+    reconcile_extra_roots(&state);
+    {
+        // Housekeeping the GUI used to gate on frontend_ready (§5.3): rows
+        // under since-ignored roots are purged by the writer that owns the DB.
+        let (ignored_roots, _) = cached_effective_ignore_rules(&state);
+        if let Err(e) = purge_ignored_entries(&db_path, &ignored_roots) {
+            eprintln!("[daemon] purge_ignored_entries failed: {e}");
+        }
+    }
+
+    eprintln!("[daemon] index ready; entering resident mode");
+    diag::log("entering resident mode");
+    run_macos_resident(db_path, state, control, launchd_started)
+}
+
+#[cfg(target_os = "macos")]
+enum GateOutcome {
+    Proceed,
+    Exit(i32),
+}
+
+/// First-install onboarding gate (D6/F3): hold in `WaitingOnboarding` until a
+/// decision is recorded. Existing installs (a usable index already on disk)
+/// adopt `granted-implicit` so upgrades never stall (§7). The Q7 escape hatch
+/// lets MCP-only users out after 7 days of observed search activity.
+#[cfg(target_os = "macos")]
+fn wait_for_onboarding_gate(db_path: &Path, control: &Arc<DaemonControl>) -> GateOutcome {
+    use crate::mac::prefs;
+    if prefs::onboarding_recorded() {
+        return GateOutcome::Proceed;
+    }
+    if db_path.exists() {
+        if let Ok(conn) = db_connection(db_path) {
+            let complete = get_meta(&conn, "index_complete").as_deref() == Some("1");
+            let nonempty = conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM entries)", [], |r| {
+                    r.get::<_, bool>(0)
+                })
+                .unwrap_or(false);
+            if complete || nonempty {
+                prefs::record_onboarding_decision("granted-implicit");
+                diag::log("onboarding gate: existing index adopted (granted-implicit, §7)");
+                return GateOutcome::Proceed;
+            }
+        }
+    }
+    prefs::mark_first_seen_now();
+    control.set_lifecycle(Lifecycle::WaitingOnboarding);
+    eprintln!("[daemon] first install: waiting for the onboarding decision");
+    diag::log("first install: WaitingOnboarding (no build, no TCC access)");
+    loop {
+        if quiesce_signaled() {
+            return GateOutcome::Exit(0);
+        }
+        if let Some(code) = control.requested_exit() {
+            return GateOutcome::Exit(code);
+        }
+        if prefs::onboarding_recorded() {
+            diag::log("onboarding decision recorded; proceeding");
+            return GateOutcome::Proceed;
+        }
+        // Q7 escape hatch: gated ≥7 days + MCP search activity within 24h →
+        // treat as "skipped" and build degraded, so an MCP-only user is never
+        // stuck with an empty index (G8).
+        if let Some(first_seen) = prefs::first_seen_epoch() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if now.saturating_sub(first_seen) >= 7 * 24 * 3600
+                && mcp_activity_recent(db_path, Duration::from_secs(24 * 3600))
+            {
+                prefs::record_onboarding_decision("skipped");
+                diag::log("onboarding gate: 7d elapsed + MCP activity → proceeding degraded (Q7)");
+                return GateOutcome::Proceed;
+            }
+        }
+        std::thread::sleep(SUPERVISE_INTERVAL);
+    }
+}
+
+/// Whether the MCP server observed search activity within `window` (it
+/// touches `<data dir>/mcp.activity`, throttled).
+#[cfg(target_os = "macos")]
+fn mcp_activity_recent(db_path: &Path, window: Duration) -> bool {
+    db_path
+        .parent()
+        .map(|dir| dir.join("mcp.activity"))
+        .and_then(|p| fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age <= window)
+        .unwrap_or(false)
+}
+
+/// Extra roots added/removed in `.pathindexing` while no writer was running
+/// (the GUI used to reconcile this at startup — §5.3). Compares the stored
+/// `indexed_extra_roots` meta against the roots loaded at state build.
+#[cfg(target_os = "macos")]
+fn reconcile_extra_roots(state: &AppState) {
+    let stored_roots: Vec<PathBuf> = db_connection(&state.db_path)
+        .ok()
+        .and_then(|c| get_meta(&c, "indexed_extra_roots"))
+        .map(|v| v.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    let current_roots = state.extra_roots.lock().clone();
+    let stored_set: std::collections::HashSet<&PathBuf> = stored_roots.iter().collect();
+    let added = current_roots.iter().filter(|r| !stored_set.contains(r)).count();
+    let removed = stored_roots.iter().filter(|r| !current_roots.contains(r)).count();
+    if added == 0 && removed == 0 {
         return;
     }
-
-    let state = build_app_state(db_path.clone(), home_dir, &app_data_dir);
-
-    // Startup reconcile: a fresh build if the DB is empty, otherwise a catchup
-    // covering everything changed while no daemon was running. A failure is
-    // not fatal — the supervisory loop below heals it (and logs the loop).
-    let _ = build_index(&db_path, &state);
-    if gui_is_running(&db_path) {
-        eprintln!("[daemon] GUI appeared during startup build; yielding writes");
-    } else {
-        eprintln!("[daemon] index ready; entering resident mode");
+    if state
+        .pathindexing_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
     }
-    diag::log("entering resident mode");
-
-    #[cfg(target_os = "macos")]
-    run_macos_resident(db_path, state);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    run_polling_resident(db_path, state);
-    // Windows: the SCM-managed indexer service is the sole writer (Q3). A stray
-    // `--daemon` already self-exited above when it couldn't take daemon.lock, and
-    // the ProgramData data dir is read-only to a non-SYSTEM process, so there is
-    // no Windows resident fallback.
-    #[cfg(target_os = "windows")]
-    let _ = (db_path, state);
+    diag::log(format!(
+        ".pathindexing changed while the daemon was down: +{added} -{removed} → extra-root reconcile"
+    ));
+    while state.indexing_active.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let (ign_roots, ign_patterns) = cached_effective_ignore_rules(state);
+    match pathindexing::handle_pathindexing_change(
+        state,
+        &stored_roots,
+        &current_roots,
+        &ign_roots,
+        &ign_patterns,
+    ) {
+        Ok(()) => {
+            if let Ok(c) = db_connection(&state.db_path) {
+                let roots_str: Vec<String> = current_roots
+                    .iter()
+                    .map(|r| r.to_string_lossy().to_string())
+                    .collect();
+                let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
+            }
+            let _ = refresh_and_emit_status_counts(None, state);
+        }
+        Err(e) => diag::log(format!("extra-root reconcile FAILED: {e}")),
+    }
+    state.pathindexing_active.store(false, Ordering::Release);
 }
 
 /// Yield to the GUI: stop the watcher and wait for it to actually exit before
@@ -432,13 +966,148 @@ fn yield_to_gui(state: &AppState) {
     }
 }
 
-/// macOS: real-time freshness via the FSEvents watcher, supervised so a failed
-/// build gets healed and a dead watcher gets restarted (instead of parking
-/// forever). The GUI beacon is polled on the fast `GUI_POLL_INTERVAL` so the
-/// daemon exits within a few hundred ms of the GUI launching (handshake);
-/// heavier supervision runs on the coarse `SUPERVISE_INTERVAL`.
+/// The shared graceful shutdown (§4): cancel a running pass (≤2s), stop and
+/// join the watcher (≤3s), checkpoint the WAL best-effort (G10 — an active
+/// reader can hold it off; the next writer's open recovers), and resolve the
+/// final exit code (a late IPC disable/restart re-targets it; disable wins).
 #[cfg(target_os = "macos")]
-fn run_macos_resident(db_path: PathBuf, state: AppState) {
+fn finish_quiesce(db_path: &Path, state: &AppState, control: &Arc<DaemonControl>, code: i32) -> i32 {
+    control.set_lifecycle(Lifecycle::Quiescing);
+    state.cancel_index.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state.indexing_active.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    state.watcher_stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.watcher_active.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if let Ok(conn) = db_connection(db_path) {
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+    let code = control.requested_exit().unwrap_or(code);
+    diag::log(format!("quiesce complete; exit({code})"));
+    code
+}
+
+/// IPC `reset_index`: stop the watcher, swap the tables (shared
+/// `reset_index_storage`), rebuild fresh, restart the watcher. The cooldown
+/// was already enforced at the IPC layer.
+#[cfg(target_os = "macos")]
+fn perform_reset(db_path: &Path, state: &AppState, control: &Arc<DaemonControl>) {
+    diag::log("IPC reset_index: stop watcher → swap tables → fresh build");
+    state.watcher_stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.watcher_active.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    match db_connection(db_path).and_then(|conn| reset_index_storage(&conn)) {
+        Ok(()) => {
+            {
+                let mut status = state.status.lock();
+                status.entries_count = 0;
+                status.scanned = 0;
+                status.indexed = 0;
+                status.message = None;
+            }
+            invalidate_search_caches(state);
+        }
+        Err(e) => diag::log(format!("ALERT: reset_index storage swap failed: {e}")),
+    }
+    let _ = run_build(db_path, state, control);
+    start_watcher(db_path, state);
+}
+
+// ---------------------------------------------------------------------------
+// Executable identity (update / rollback / deletion — F5, G12)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+struct ExeIdentity {
+    path: PathBuf,
+    ino: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+#[cfg(target_os = "macos")]
+impl ExeIdentity {
+    fn capture() -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::current_exe().ok()?;
+        let meta = fs::metadata(&path).ok()?;
+        Some(Self {
+            path,
+            ino: meta.ino(),
+            mtime: meta.modified().ok(),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum ExeCheck {
+    Unchanged,
+    Replaced,
+    Missing,
+}
+
+#[cfg(target_os = "macos")]
+fn exe_identity_check(identity: &Option<ExeIdentity>, missing_ticks: &mut u32) -> ExeCheck {
+    let Some(identity) = identity else {
+        return ExeCheck::Unchanged;
+    };
+    match fs::metadata(&identity.path) {
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            // A path that vanished and reappeared different is a replacement
+            // (Finder's delete-then-copy update) — reclassified here (G12).
+            if meta.ino() != identity.ino || meta.modified().ok() != identity.mtime {
+                return ExeCheck::Replaced;
+            }
+            *missing_ticks = 0;
+            ExeCheck::Unchanged
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            *missing_ticks += 1;
+            if *missing_ticks >= EXE_MISSING_TICKS {
+                ExeCheck::Missing
+            } else {
+                ExeCheck::Unchanged
+            }
+        }
+        Err(_) => ExeCheck::Unchanged,
+    }
+}
+
+/// Re-exec ourselves detached — the restart path for daemons launchd does not
+/// supervise (spawned/lease/manual — G15). The exiting process still holds
+/// `daemon.lock`, so the child skips the resident check and briefly retries
+/// the lock instead.
+#[cfg(target_os = "macos")]
+fn relaunch_self_detached(lease_mode: bool) {
+    if lease_mode {
+        spawn_detached_with(&["--lease"], "self-relaunch", false);
+    } else {
+        spawn_detached_with(&[], "self-relaunch", false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resident loops
+// ---------------------------------------------------------------------------
+
+/// macOS: real-time freshness via the FSEvents watcher, supervised (§4). The
+/// GUI beacon is polled on the fast `GUI_POLL_INTERVAL` (transitional yield),
+/// as are quiesce/exit/reset requests; heavier supervision runs on the coarse
+/// `SUPERVISE_INTERVAL`: heal, watcher restart, FDA rising edge, exe identity,
+/// lease liveness. Returns the process exit code.
+#[cfg(target_os = "macos")]
+fn run_macos_resident(
+    db_path: PathBuf,
+    state: AppState,
+    control: Arc<DaemonControl>,
+    launchd_started: bool,
+) -> i32 {
     start_watcher(&db_path, &state);
     // `None` => supervise on the first loop iteration, so a failed startup build
     // is healed immediately rather than after one SUPERVISE_INTERVAL.
@@ -451,10 +1120,30 @@ fn run_macos_resident(db_path: PathBuf, state: AppState) {
     let mut heal_times: VecDeque<Instant> = VecDeque::new();
     let mut consecutive_failed_builds: u32 = 0;
     let mut watcher_restarts = diag::RateAlert::new(Duration::from_secs(3600), 5);
+    let exe_identity = ExeIdentity::capture();
+    let mut exe_missing_ticks: u32 = 0;
+    let mut last_fda_probe = Instant::now();
     loop {
+        // Transitional (until the P2 flip): yield to a launching GUI.
         if gui_is_running(&db_path) {
             yield_to_gui(&state);
-            return;
+            return 0;
+        }
+        if quiesce_signaled() {
+            diag::log("SIGTERM: quiescing (logout/shutdown/unregister — G4)");
+            return finish_quiesce(&db_path, &state, &control, 0);
+        }
+        if let Some(code) = control.requested_exit() {
+            diag::log(format!("IPC exit request: quiescing toward exit({code})"));
+            let code = finish_quiesce(&db_path, &state, &control, code);
+            if code != 0 && !launchd_started {
+                // No launchd supervisor to relaunch us — re-exec (G15).
+                relaunch_self_detached(control.lease_mode);
+            }
+            return code;
+        }
+        if control.reset_requested.swap(false, Ordering::AcqRel) {
+            perform_reset(&db_path, &state, &control);
         }
         if last_supervise.map_or(true, |t| t.elapsed() >= SUPERVISE_INTERVAL) {
             last_supervise = Some(Instant::now());
@@ -481,7 +1170,7 @@ fn run_macos_resident(db_path: PathBuf, state: AppState) {
                          every heal rescans all roots at full parallelism",
                     );
                 }
-                match build_index(&db_path, &state) {
+                match run_build(&db_path, &state, &control) {
                     Ok(()) => {
                         consecutive_failed_builds = 0;
                         if !index_complete(&db_path) {
@@ -516,9 +1205,68 @@ fn run_macos_resident(db_path: PathBuf, state: AppState) {
                 }
                 start_watcher(&db_path, &state);
             }
+            supervise_fda(&db_path, &state, &control, &mut last_fda_probe);
+            match exe_identity_check(&exe_identity, &mut exe_missing_ticks) {
+                ExeCheck::Unchanged => {}
+                ExeCheck::Replaced => {
+                    diag::log(
+                        "exe identity changed (update/rollback): quiesce + exit(1) → relaunch \
+                         from the on-disk binary (F5)",
+                    );
+                    let code = finish_quiesce(&db_path, &state, &control, 1);
+                    if !launchd_started {
+                        relaunch_self_detached(control.lease_mode);
+                    }
+                    return code;
+                }
+                ExeCheck::Missing => {
+                    diag::log(format!(
+                        "exe missing for {EXE_MISSING_TICKS} ticks (app deleted): quiesce + \
+                         dormant exit(0) (G12)"
+                    ));
+                    return finish_quiesce(&db_path, &state, &control, 0);
+                }
+            }
+            if control.lease_mode
+                && control.live_lease_count() == 0
+                && !gui_is_running(&db_path)
+            {
+                diag::log("lease expired: no live users and no GUI — exit(0)");
+                return finish_quiesce(&db_path, &state, &control, 0);
+            }
         }
         std::thread::sleep(GUI_POLL_INTERVAL);
     }
+}
+
+/// FDA supervision (D6): while missing, probe every `FDA_PROBE_INTERVAL`; on
+/// the rising edge (granted), persist it and force a catchup pass so paths the
+/// earlier degraded pass couldn't read get collected.
+#[cfg(target_os = "macos")]
+fn supervise_fda(
+    db_path: &Path,
+    state: &AppState,
+    control: &Arc<DaemonControl>,
+    last_probe: &mut Instant,
+) {
+    if control.fda_ok.load(Ordering::Acquire) {
+        return;
+    }
+    if last_probe.elapsed() < FDA_PROBE_INTERVAL {
+        return;
+    }
+    *last_probe = Instant::now();
+    if !crate::mac::probe_full_disk_access() {
+        return;
+    }
+    control.fda_ok.store(true, Ordering::Release);
+    control.degraded.store(false, Ordering::Release);
+    if let Ok(conn) = db_connection(db_path) {
+        let _ = set_meta(&conn, "last_fda_ok", "1");
+    }
+    eprintln!("[daemon] Full Disk Access granted; catching up protected paths");
+    diag::log("FDA rising edge: granted → forced catchup pass for protected paths (D6)");
+    let _ = run_build(db_path, state, control);
 }
 
 /// Start the FSEvents watcher, replaying from the last persisted event id to
@@ -550,13 +1298,12 @@ fn stored_event_id(db_path: &Path) -> Option<u64> {
         .filter(|&id| id != u64::MAX)
 }
 
-
 /// Linux fallback: no headless live watcher, so reconcile on `CATCHUP_INTERVAL`.
 /// The GUI beacon is still polled on the fast `GUI_POLL_INTERVAL` so the daemon
 /// yields promptly (handshake). `build_index` also heals a dirty FTS.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn run_polling_resident(db_path: PathBuf, state: AppState) {
-    let mut last_catchup = Instant::now();
+    let mut last_catchup = std::time::Instant::now();
     let mut consecutive_failed_builds: u32 = 0;
     loop {
         if gui_is_running(&db_path) {
@@ -565,8 +1312,12 @@ fn run_polling_resident(db_path: PathBuf, state: AppState) {
             return;
         }
         if last_catchup.elapsed() >= CATCHUP_INTERVAL {
-            last_catchup = Instant::now();
-            match build_index(&db_path, &state) {
+            last_catchup = std::time::Instant::now();
+            let cancel_probe: CancelProbe = {
+                let db_path = db_path.clone();
+                Arc::new(move || gui_is_running(&db_path))
+            };
+            match build_index(&db_path, &state, cancel_probe) {
                 Ok(()) => consecutive_failed_builds = 0,
                 Err(_) => {
                     consecutive_failed_builds += 1;

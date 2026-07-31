@@ -60,3 +60,22 @@ pub(crate) fn opted_out() -> bool {
 pub(crate) fn set_opt_out(on: bool) -> bool {
     defaults_write(OPT_OUT_KEY, if on { "1" } else { "0" })
 }
+
+/// Epoch seconds of the first time the daemon found itself gated on
+/// onboarding — the clock for the Q7 MCP-only escape hatch.
+pub(crate) const FIRST_SEEN_KEY: &str = "onboardingFirstSeen";
+
+pub(crate) fn first_seen_epoch() -> Option<i64> {
+    defaults_read(FIRST_SEEN_KEY)?.parse().ok()
+}
+
+pub(crate) fn mark_first_seen_now() {
+    if first_seen_epoch().is_some() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    defaults_write(FIRST_SEEN_KEY, &now.to_string());
+}
