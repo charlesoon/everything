@@ -31,7 +31,7 @@ fsevent-sys = "4"
 muda = { version = "=0.17.1", default-features = false }
 libc = "0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSEvent", "NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }
 cocoa = { version = "0.26", optional = true }

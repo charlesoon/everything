@@ -1,4 +1,4 @@
-GPUI migration contract: preserve the running Tauri UI and behavior (baseline `68e4ddf`). Enter=Open on both platforms; F2=Rename.
+GPUI migration contract: preserve the running Tauri UI and behavior (baseline `68e4ddf`). Enter=Open on both platforms; macOS selected-click Rename follows merged commit `86f525b`, with F2 only on Windows.
 
 
 GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration decisions](gpui-migration-plan.md).
@@ -32,7 +32,7 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
   - Copy Path
   - Copy Files (macOS: NSPasteboard 클립보드)
   - Move to Trash / 휴지통
-  - Rename (양 플랫폼 F2)
+  - Rename (macOS: 선택한 항목을 잠시 후 다시 클릭, Windows: F2)
   - Quick Look (macOS: Space 키)
 
 ### 1.2 비목표(이번 버전에서 하지 않음)
@@ -66,6 +66,7 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 ### 2.2 입력/조작 규칙(확정)
 
 - **Double click:** Open
+- **선택한 항목을 잠시 후 다시 클릭(macOS):** 시스템 더블클릭 간격 + 50ms 후 Rename. 다른 클릭·키 입력·스크롤·드래그·포커스 이탈은 이름 변경 예약을 취소한다.
 - **Enter(macOS, 선택 상태, 편집 아님):** Open
 - **Enter(Windows, 선택 상태, 편집 아님):** Open
 - **Enter(편집 중):** Rename 확정
@@ -89,7 +90,7 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 - `Alt+Cmd+C`(macOS) / `Ctrl+C`(Windows) : Copy Path; `Cmd+C`(macOS) : Copy Files
 - `Cmd+F` / `Ctrl+F` : 검색 입력 포커스
 - `Del` 또는 `Cmd+Backspace` : Move to Trash
-- `F2` : Rename
+- `F2` (Windows) : Rename
 - `Space` : Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` : 전체 선택
 - `Enter` : Open (macOS / Windows)
@@ -348,12 +349,12 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 
 ### 8.8 Rename
 
-Rename은 단일 선택 상태에서만 동작한다. F2는 양 플랫폼 공통. Enter는 양 플랫폼에서 Open.
+Rename은 단일 선택 상태에서만 동작한다. macOS는 선택한 항목을 잠시 후 다시 클릭하면 편집을 시작한다. F2는 Windows에서만 사용한다. Enter는 양 플랫폼에서 Open.
 
 Rename은 파일 시스템 변경 + DB 갱신 + watcher 중복 억제까지 포함합니다.
 
 동작 정의:
-- F2 → 인라인 편집
+- 선택한 항목을 잠시 후 다시 클릭(macOS) / F2(Windows) → 인라인 편집
 - 편집 중 Enter → 확정
 - 확정 시:
   1. 새 이름 정합성 검사(빈 문자열 금지, 경로 구분자 금지)
@@ -450,7 +451,7 @@ DTO 최소 필드(성능):
 - 리스트 키다운:
   - Enter (both platforms): openSelected()
   - 편집 중 Enter: rename 확정
-  - F2: startRename()
+  - 선택한 항목을 잠시 후 다시 클릭(macOS) / F2(Windows): startRename()
   - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder

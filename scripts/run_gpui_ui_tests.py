@@ -116,6 +116,10 @@ def run(binary, fixture, output):
         def idle():
             return d.wait(lambda s: not s['actionBusy'])
 
+        def start_rename():
+            d.click(90,120)
+            d.wait(lambda s:s['renamePath'] is not None)
+
         def selected_one(text):
             query(text, 1)
             d.key('down')
@@ -223,15 +227,14 @@ def run(binary, fixture, output):
 
             def rename():
                 selected_one('gpui-tc-rename.txt')
-                d.key('f2')
-                d.wait(lambda s:s['renamePath'] is not None)
+                start_rename()
                 d.text('gpui-tc-renamed')
                 s=d.wait(lambda s:s['renameValue']=='gpui-tc-renamed.txt')
                 d.key('enter')
                 d.wait(lambda s:not s['actionBusy'] and s['renamePath'] is None)
                 assert not (files/'gpui-tc-rename.txt').exists()
                 assert (files/'gpui-tc-renamed.txt').read_bytes()==originals['gpui-tc-rename.txt']
-                d.key('f2')
+                start_rename()
                 d.key('cmd-a')
                 d.text('gpui-tc-collision.txt')
                 d.key('enter')
@@ -248,19 +251,53 @@ def run(binary, fixture, output):
                 d.wait(lambda s:not s['actionBusy'] and s['renamePath'] is None)
                 assert (files/'gpui-tc-rename.txt').exists()
                 assert not (files/'gpui-tc-renamed.txt').exists()
-                d.key('f2')
-                d.wait(lambda s:s['renamePath'] is not None)
+                start_rename()
                 d.key('cmd-a');d.text('gpui-tc-renamed.txt')
                 d.click(80,50)
                 d.wait(lambda s:not s['actionBusy'] and s['renamePath'] is None)
                 assert (files/'gpui-tc-renamed.txt').exists()
                 # Restore via the still-rendered row, since fixture DB writes are disabled.
-                d.click(90,120);d.key('f2')
-                d.wait(lambda s:s['renamePath'] is not None)
+                d.click(90,120)
+                start_rename()
                 d.key('cmd-a');d.text('gpui-tc-rename.txt');d.key('enter')
                 d.wait(lambda s:not s['actionBusy'] and s['renamePath'] is None)
                 assert (files/'gpui-tc-rename.txt').exists()
-            case('UI-08','F2 Rename, stem selection, collision/empty/slash errors, success',rename)
+            case('UI-08','Click Rename, stem selection, collision/empty/slash errors, success',rename)
+
+            def rename_gestures():
+                selected_one('gpui-tc-rename.txt')
+                d.key('f2')
+                time.sleep(.1)
+                assert d.state()['renamePath'] is None, 'macOS F2 must not start rename'
+                delay=d.state()['renameDelayMs']/1000
+                d.click(90,120)
+                d.wait(lambda s:s['renamePending'])
+                assert d.state()['renamePath'] is None, 'Rename must wait for the double-click interval'
+                d.key('escape')
+                time.sleep(delay+.1)
+                assert d.state()['renamePath'] is None
+                d.key('down')
+                d.click(90,120)
+                d.wait(lambda s:s['renamePending'])
+                d.click(90,120,count=2)
+                d.wait(lambda s:not s['actionBusy'] and s['completedAction']=='Open')
+                time.sleep(delay+.1)
+                assert d.state()['renamePath'] is None, 'Double-click opens without renaming'
+                d.click(90,120)
+                d.wait(lambda s:s['renamePending'])
+                d.click(80,50)
+                time.sleep(delay+.1)
+                assert d.state()['renamePath'] is None, 'Focus change cancels rename'
+                d.key('down')
+                d.click(90,120)
+                d.wait(lambda s:s['renamePending'])
+                d.send('hide')
+                time.sleep(delay+.1)
+                d.send('activate')
+                assert d.state()['renamePath'] is None, 'Window deactivation cancels rename'
+                capture('14-rename-gestures')
+            case('UI-14','macOS selected-click delay, F2 disabled, Escape/double-click/focus/activation cancellation',rename_gestures)
+
 
             def trash():
                 selected_one('gpui-tc-trash.txt')

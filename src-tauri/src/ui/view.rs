@@ -99,6 +99,16 @@ impl EverythingView {
                         return;
                     }
                     this.context_menu = None;
+                    this.rename_click_candidate = (cfg!(target_os = "macos")
+                        && event.click_count == 1
+                        && !event.modifiers.alt
+                        && !event.modifiers.platform
+                        && !event.modifiers.control
+                        && !event.modifiers.shift
+                        && this.rename_path.is_none()
+                        && this.model.selected.len() == 1
+                        && this.model.selected.contains(&index))
+                    .then(|| this.model.rows[index].path.clone());
                     if this.rename_path.is_some() {
                         this.commit_rename(window, cx);
                     }
@@ -117,6 +127,7 @@ impl EverythingView {
             )
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.click_count() == 2 {
+                    this.cancel_pending_rename();
                     this.model.select(index, false, false);
                     this.action(UiAction::Open, window, cx);
                 } else if !event.modifiers().platform
@@ -124,7 +135,11 @@ impl EverythingView {
                     && !event.modifiers().shift
                     && this.rename_path.is_none()
                 {
+                    let rename = this.rename_click_candidate.take();
                     this.model.select(index, false, false);
+                    if let Some(path) = rename {
+                        this.schedule_click_rename(path, window, cx);
+                    }
                     cx.notify();
                 }
             }))
@@ -546,8 +561,7 @@ impl EverythingView {
                         .when(!self.displayed_query.is_empty(), |d| {
                             d.child(div().whitespace_nowrap().child(format!(
                                 "\"{}\" · {} results",
-                                self.displayed_query,
-                                self.model.total,
+                                self.displayed_query, self.model.total,
                             )))
                         })
                     })
@@ -782,6 +796,11 @@ impl Render for EverythingView {
                                     ),
                                 )
                                 .track_scroll(self.list_scroll.clone())
+                                .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                                    if this.cancel_pending_rename() {
+                                        cx.notify();
+                                    }
+                                }))
                                 .size_full(),
                             )
                         },
@@ -805,6 +824,16 @@ impl Render for EverythingView {
             .text_color(p.text)
             .font_family(SANS)
             .line_height(relative(1.2))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.cancel_pending_rename() {
+                    cx.notify();
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                if this.cancel_pending_rename() {
+                    cx.notify();
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &FocusSearch, window, cx| {
                     this.focus_search(true, window, cx)
@@ -828,6 +857,7 @@ impl Render for EverythingView {
                             > 5.
                         {
                             this.drag_start = None;
+                            this.cancel_pending_rename();
                             if !this.model.selected.contains(&index) {
                                 this.model.select(index, false, false);
                             }
@@ -1109,6 +1139,7 @@ impl EverythingView {
                 "loaded":self.model.rows.len(),"total":self.model.total,"totalKnown":self.model.total_known,"busy":self.model.busy,"paging":self.model.paging,
                 "selected":self.model.paths(),"primary":self.model.primary,"sortBy":self.sort_by,"sortDir":self.sort_dir,
                 "renamePath":self.rename_path,"renameValue":self.rename_input.read(cx).value(),
+                "renamePending":self.rename_click_task.is_some(),"renameDelayMs":Self::rename_delay().as_millis() as u64,
                 "modal":self.modal.as_ref().map(|m|match m{Modal::Trash(_)=>"trash",Modal::Onboarding=>"onboarding"}),
                 "modalSelection":self.modal_selection,"contextMenu":self.context_menu.is_some(),"menuSelection":self.menu_selection,
                 "fdaOk":self.fda_ok,"fdaDismissed":self.prefs.fda_dismissed,"fdaSettingsOpened":self.status_display.fda_settings_opened,"pathignoreBanner":self.status_display.pathignore_changed,"pathindexingBanner":self.status_display.pathindexing_changed,"tableFocused":self.table_focus.is_focused(window),

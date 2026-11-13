@@ -1,0 +1,65 @@
+{
+  "date": "2026-11-14T01:28:17+0900",
+  "sourceBranch": "macos-daemon-writer",
+  "sourceHead": "86f525b7f6d30df9289075e7b9ae720757800354",
+  "targetBefore": "875a812e467b7cab4fd3dcc39908043c9fd53408",
+  "initialUiAttempt": {
+    "passed": 13,
+    "failed": 1,
+    "failure": "UI-01 startup committed-text input timed out; the query remained empty and table focus was observed. All other cases, including new rename gestures, passed.",
+    "followup": "Six independent launches accepted committed Korean text without changing the focus implementation; the complete rerun passed all 14 cases. The startup failure was not reproduced and its cause remains unidentified."
+  },
+  "nativeTrashIntegration": {
+    "passed": 1,
+    "failed": 0,
+    "fixture": "uniquely named temporary files and folder; restored and removed by the test"
+  },
+  "rust": {
+    "command": "cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4 -- --test-threads=1",
+    "suites": [
+      {
+        "passed": 136,
+        "failed": 0,
+        "ignored": 4
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 4
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 3
+      }
+    ]
+  },
+  "npmTestCompile": {
+    "command": "npm test -- --release --features ui-automation -j4",
+    "exitCode": 0
+  },
+  "ui": {
+    "passed": 14,
+    "failed": 0,
+    "resultFile": "ui/ui-results.json",
+    "binarySha256": "ecdc863107086c26d84cd72117cdf13a12ae0b64240f79504d32970ebe000ddc",
+    "finalRunDate": "2026-11-14T01:28:00+0900",
+    "runtimeEnvironment": "MACOSX_DEPLOYMENT_TARGET and DEVELOPER_DIR unset; all 14 cases passed again"
+  },
+  "behavior": {
+    "macosRename": "Second single click on the only selected row, after NSEvent.doubleClickInterval + 50ms; F2 disabled on macOS",
+    "unchanged": "GPUI renderer, Tauri-derived layout, Enter/double-click Open, clipboard URLs and batch Trash semantics",
+    "cancellation": "Other mouse presses, keys, scrolling, dragging, search focus and window deactivation"
+  },
+  "productionBuild": {
+    "command": "cargo build --release --locked --manifest-path src-tauri/Cargo.toml -j4",
+    "exitCode": 0,
+    "binarySha256": "60dd7f31eb4183854aa9c032696b3839cccbea0ab99ff5c17d0211839a1efcfc",
+    "versionOutput": "everything 0.6.0"
+  },
+  "nativeIconCheck": {
+    "passed": true,
+    "observed": "11 icon requests resolved in 430ms, 0 unresolved; native file icons visually confirmed after waiting for asynchronous loading",
+    "note": "Verified native icons after asynchronous loading, then reran all 14 UI cases with build deployment variables unset; the complete final suite passed."
+  }
+}

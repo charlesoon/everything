@@ -64,7 +64,8 @@ tests use temporary fixtures.
 | Up/Down, PageUp/PageDown | Navigate; Shift extends selection |
 | Cmd/Ctrl+A | Select loaded results when the table has focus |
 | Enter | Open on both platforms |
-| F2 | Inline Rename |
+| Click selected item again after a pause (macOS) | Inline Rename |
+| F2 (Windows) | Inline Rename |
 | Cmd/Ctrl+O, double click | Open |
 | Cmd/Ctrl+Enter | Reveal in file manager |
 | Cmd+C (macOS) | Copy Files |

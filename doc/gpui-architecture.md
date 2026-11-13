@@ -39,7 +39,7 @@ to Cancel and supports Tab/arrows, Enter/Space and Escape. The macOS menu uses t
 
 The text input and rename editor use gpui-component InputState for selection,
 clipboard and IME integration. Table shortcuts apply when the table has focus.
-Enter opens files and F2 starts rename on both platforms, preserving the running Tauri UI. macOS Cmd+C copies files and Alt+Cmd+C copies paths; Windows Ctrl+C copies paths. Native outgoing drag
+Enter opens files on both platforms. Following merged commit `86f525b`, macOS starts rename after another single click on the selected item and the system double-click interval plus 50ms; F2 remains Windows-only. Pending renames cancel on pointer presses, keys, scrolling, dragging, search focus or window deactivation. macOS Cmd+C copies files and Alt+Cmd+C copies paths; Windows Ctrl+C copies paths. Native outgoing drag
 uses the drag crate. macOS Cmd+Shift+Space uses global-hotkey.
 
 Index/status events pass through `runtime::EventSink`: a bounded wake channel

@@ -19,7 +19,7 @@
 | 선택 | 단일, Cmd/Ctrl 토글, Shift 범위, 전체 선택, 키보드·Page 이동, 재검색 시 경로 기반 선택 보존 |
 | 파일 작업 | Open, Open With (Reveal fallback), Reveal, Copy Path/Files, 휴지통 확인·부분 실패, 인라인 Rename·검증, Quick Look, 패키지 내용 보기, 파일 드래그 |
 | 키보드 | 스펙 §2.3: Cmd/Ctrl+F/O/Enter/C/A, Del/Cmd+Backspace, F2, Space, Esc, 방향키·Shift·Page, macOS Cmd+Shift+Space |
-| macOS Enter | 기존 실행 소스에 맞춰 Enter=Open, F2=Rename을 유지한다. 최신 UI 동일 요구를 우선한다. |
+| macOS Enter | Enter=Open을 유지한다. 병합한 `86f525b`에 따라 macOS는 선택한 항목을 잠시 후 다시 클릭해 Rename하며, F2는 Windows에서만 사용한다. |
 | 클립보드 | macOS는 기존 Cmd+C=Copy Files, Alt+Cmd+C=Copy Path; Windows는 Ctrl+C=Copy Path. 입력창의 일반 복사/붙여넣기는 유지한다. |
 | 상태 | Ready/Indexing/Error, 개수·시간·권한 실패, 데몬/서비스 상태, 갱신 시 검색 결과 반영 |
 | 온보딩/설정 | FDA 안내·설정 열기·닫기, 첫 실행 선택, 자동 실행, 데몬/서비스 복구, Add/Ignore, 기존 Reset 즉시 재색인, 앱 재시작 |

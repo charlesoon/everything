@@ -30,7 +30,12 @@ def capture(tauri,gpui,fixture,output):
                     d.query('');time.sleep(1.2);shot('empty')
                     app.query('report');time.sleep(1.2);shot('results')
                     d.key('down');time.sleep(.15);shot('selected')
-                    d.key('f2');time.sleep(.15);shot('rename')
+                    if label=='gpui':
+                        d.click(90,120)
+                        time.sleep(d.send('window')['doubleClickIntervalMs']/1000+.1)
+                    else:
+                        d.key('f2');time.sleep(.15)
+                    shot('rename')
                     d.key('escape');d.key('delete');time.sleep(.15);shot('trash')
                     d.key('escape')
                     app.query('no-such-gpui-file-xyz');time.sleep(.3);shot('no-results')

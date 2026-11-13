@@ -128,6 +128,8 @@ struct EverythingView {
     menu_selection: usize,
     modal_selection: usize,
     rename_path: Option<String>,
+    rename_click_candidate: Option<String>,
+    rename_click_task: Option<Task<()>>,
     action_busy: bool,
     completed_action: Option<UiAction>,
     toast: Option<(String, Instant)>,
@@ -184,6 +186,8 @@ impl EverythingView {
             menu_selection: 0,
             modal_selection: 0,
             rename_path: None,
+            rename_click_candidate: None,
+            rename_click_task: None,
             action_busy: false,
             completed_action: None,
             toast: None,
@@ -210,6 +214,7 @@ impl EverythingView {
             window,
             |this, input, event, window, cx| match event {
                 InputEvent::Change => {
+                    this.cancel_pending_rename();
                     this.input_started = Instant::now();
                     this.status_display.clear_finished();
                     this.rename_path = None;
@@ -220,6 +225,7 @@ impl EverythingView {
                     this.schedule_search(false, true, window, cx);
                 }
                 InputEvent::Focus => {
+                    this.cancel_pending_rename();
                     this.model.clear_selection();
                     cx.notify();
                 }
@@ -264,6 +270,9 @@ impl EverythingView {
         }));
         this._subscriptions
             .push(cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.cancel_pending_rename();
+                }
                 crate::ui_gate::set_visible(&this.sink, window.is_window_active());
                 if window.is_window_active() {
                     this.update_status(crate::get_index_status(&this.backend), cx);
@@ -485,6 +494,7 @@ impl EverythingView {
     }
 
     fn focus_search(&mut self, select: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_rename();
         self.context_menu = None;
         self.model.clear_selection();
         self.input.update(cx, |input, cx| input.focus(window, cx));

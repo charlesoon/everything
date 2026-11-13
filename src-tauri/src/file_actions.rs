@@ -165,7 +165,10 @@ mod tests {
         conn.execute_batch("CREATE TABLE entries(path TEXT UNIQUE);")
             .unwrap();
         for path in [
-            format!("{removed}/child.txt"),
+            Path::new(&removed)
+                .join("child.txt")
+                .to_string_lossy()
+                .into_owned(),
             recreated.clone(),
             format!("{prefix}-other"),
         ] {
@@ -177,5 +180,64 @@ mod tests {
         conn.execute("DELETE FROM entries", []).unwrap();
         assert!(pending_trash_paths(&conn, &paths).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "moves temporary fixtures to the macOS Trash and restores them; run explicitly"]
+    fn macos_trashes_multiple_files_and_selected_directory_with_child() {
+        use objc2_foundation::{
+            NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask, NSString, NSURL,
+        };
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("everything-trash-check-{}-{stamp}", std::process::id());
+        let root = std::env::temp_dir().join(&prefix);
+        let folder = root.join(format!("{prefix}-folder"));
+        fs::create_dir_all(&folder).unwrap();
+        let first = root.join(format!("{prefix}-한글 one.txt"));
+        let second = root.join(format!("{prefix}-two.txt"));
+        let child = folder.join("child.txt");
+        for path in [&first, &second, &child] {
+            fs::write(path, "trash verification fixture").unwrap();
+        }
+        let manager = NSFileManager::defaultManager();
+        let url = NSURL::fileURLWithPath(&NSString::from_str(first.to_str().unwrap()));
+        let trash = manager
+            .URLForDirectory_inDomain_appropriateForURL_create_error(
+                NSSearchPathDirectory::TrashDirectory,
+                NSSearchPathDomainMask::UserDomainMask,
+                Some(&url),
+                false,
+            )
+            .unwrap();
+        let trash = std::path::PathBuf::from(trash.path().unwrap().to_string());
+        let paths: Vec<String> = [&child, &first, &second, &folder]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let result = move_to_trash(&paths);
+        let sources_missing = paths.iter().all(|path| is_missing(Path::new(path)));
+        let trashed_child = trash.join(folder.file_name().unwrap()).join("child.txt");
+        let child_preserved = fs::read_to_string(trashed_child)
+            .is_ok_and(|text| text == "trash verification fixture");
+        // Restore only our uniquely named fixtures, then remove the test tree.
+        for path in [&first, &second, &folder] {
+            let trashed = trash.join(path.file_name().unwrap());
+            if trashed.exists() {
+                fs::rename(trashed, path).unwrap();
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.failures.is_empty(), "{result:?}");
+        assert_eq!(result.removed_paths.len(), 4);
+        assert!(sources_missing, "all selected sources must disappear");
+        assert!(
+            child_preserved,
+            "directory contents must reach the Trash intact"
+        );
     }
 }

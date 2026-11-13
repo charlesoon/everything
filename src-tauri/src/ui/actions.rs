@@ -37,6 +37,7 @@ enum Outcome {
 
 impl EverythingView {
     pub(super) fn action(&mut self, action: UiAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_rename();
         telemetry(serde_json::json!({"event":"action","action":format!("{action:?}")}));
         self.context_menu = None;
         match action {
@@ -293,7 +294,45 @@ impl EverythingView {
         cx.notify();
     }
 
+    pub(super) fn cancel_pending_rename(&mut self) -> bool {
+        self.rename_click_candidate = None;
+        self.rename_click_task.take().is_some()
+    }
+
+    pub(super) fn rename_delay() -> Duration {
+        #[cfg(target_os = "macos")]
+        let interval = (objc2_app_kit::NSEvent::doubleClickInterval() * 1000.).ceil() as u64;
+        #[cfg(not(target_os = "macos"))]
+        let interval = 500;
+        Duration::from_millis(interval + 50)
+    }
+
+    pub(super) fn schedule_click_rename(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename_click_task = Some(cx.spawn_in(window, async move |view, cx| {
+            Timer::after(Self::rename_delay()).await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.rename_click_task = None;
+                cx.notify();
+                if window.is_window_active()
+                    && this.table_focus.is_focused(window)
+                    && this.rename_path.is_none()
+                    && this.modal.is_none()
+                    && this.context_menu.is_none()
+                    && this.model.paths() == [path]
+                {
+                    this.start_rename(window, cx);
+                }
+            });
+        }));
+    }
+
     pub(super) fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_pending_rename();
         if self.model.selected.len() != 1 {
             return;
         }
@@ -451,6 +490,9 @@ impl EverythingView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.cancel_pending_rename() {
+            cx.notify();
+        }
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let meta = modifiers.platform || modifiers.control;
@@ -586,7 +628,7 @@ impl EverythingView {
                     self.action(UiAction::Open, window, cx);
                     true
                 }
-                "f2" => {
+                "f2" if !cfg!(target_os = "macos") => {
                     self.action(UiAction::Rename, window, cx);
                     true
                 }

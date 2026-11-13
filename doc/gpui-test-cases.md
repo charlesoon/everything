@@ -1,6 +1,6 @@
 # GPUI 전환 테스트
 
-기준은 Tauri 커밋 `68e4ddf`와 그 소스로 실행한 실제 창이다. UI를 새로 디자인하지 않고 글꼴, 색상, 배치, 메뉴와 기존 기본 동작을 유지한다. macOS 26.7.3 / Apple M5 Pro에서 release 바이너리를 테스트했다.
+화면 기준은 Tauri 커밋 `68e4ddf`와 그 소스로 실행한 실제 창이다. UI를 새로 디자인하지 않고 글꼴, 색상, 배치와 메뉴를 유지한다. 이후 `macos-daemon-writer`의 `b2f2686`, `86f525b`를 병합하면서 macOS 이름 변경 제스처도 GPUI에 반영했다. macOS 26.7.3 / Apple M5 Pro에서 release 바이너리를 테스트했다.
 
 ## 자동화 방법
 
@@ -14,7 +14,7 @@ python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-ui-fixture \
   --output doc/gpui-evidence/ui
 ```
 
-실행 결과: **13 통과 / 0 실패**. 기계 판독 결과와 실행 시각은 [ui-results.json](gpui-evidence/ui/ui-results.json)에 있다.
+실행 결과: **14 통과 / 0 실패**. 기계 판독 결과와 실행 시각은 [ui-results.json](gpui-evidence/ui/ui-results.json)에 있다.
 
 | TC | 조작과 확인 | 결과 |
 | --- | --- | --- |
@@ -25,12 +25,13 @@ python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-ui-fixture \
 | UI-05 | 서버 정렬, Name/Path 경계 드래그, 정렬 버튼과 리사이저 hit testing | 통과 |
 | UI-06 | Cmd/Shift 마우스 선택, Shift 방향키, 전체 선택, 실제 경로/파일 pasteboard | 통과 |
 | UI-07 | 실제 macOS 네이티브 메뉴 열기, 방향키로 Copy Path 선택, clipboard 확인 | 통과 |
-| UI-08 | F2 이름 변경, 확장자 제외 선택, 충돌·빈 이름·슬래시 오류, Enter/포커스 이탈 확정, 실제 파일 내용/경로 확인 | 통과 |
+| UI-08 | 선택한 항목 다시 클릭으로 이름 변경, 확장자 제외 선택, 충돌·빈 이름·슬래시 오류, Enter/포커스 이탈 확정, 실제 파일 내용/경로 확인 | 통과 |
 | UI-09 | 휴지통 기본 Cancel, Tab+Enter 확인, 실제 삭제와 pending-trash 결과 억제 | 통과 |
 | UI-10 | 앱에만 적용한 시스템 light/dark, fixture Reset 차단, 400×300 창과 확인창 | 통과 |
 | UI-11 | Enter/Cmd+O 열기, Cmd+Enter 표시, Space Quick Look의 OS 요청 완료 | 통과 |
 | UI-12 | 컬럼/창 크기 저장, 두 번 재시작 후 크기 증가 없음 | 통과 |
 | UI-13 | 온보딩 키보드 포커스 유지, 나중에 선택, FDA 설정 버튼의 안내 변경과 배너 닫기 | 통과 |
+| UI-14 | 시스템 더블클릭 간격 후 Rename, macOS F2 비활성, Escape·더블클릭 Open·입력창 포커스·창 비활성화 시 예약 취소 | 통과 |
 
 UI-11은 요청 완료를 검증한다. 외부 편집기나 Quick Look 내용의 화면 검증으로 해석하지 않는다. 한글 TC는 확정 문자 입력이며 실제 한국어 IME 조합 중간 상태 검증은 아니다.
 
@@ -53,15 +54,17 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   --manifest-path src-tauri/Cargo.toml -j4 -- --test-threads=1
 ```
 
-**136 통과 / 0 실패**. HOME 스캔/운영 DB benchmark 2개, Swift 툴체인을 실행하는 아이콘 통합 테스트 1개와 기존 수동 benchmark 7개는 기본 실행에서 제외한다. 파서·검색·DB·MCP·선택/페이지/삭제 상태와 설정 변경 알림·인덱싱 진행 상태 테스트가 포함된다.
+**136 통과 / 0 실패**. HOME 스캔/운영 DB benchmark 2개, Swift 툴체인을 실행하는 아이콘 통합 테스트 1개, 네이티브 휴지통 통합 테스트 1개와 기존 수동 benchmark 7개는 기본 실행에서 제외한다. 파서·검색·DB·MCP·선택/페이지/삭제 상태와 설정 변경 알림·인덱싱 진행 상태 테스트가 포함된다.
 
-마지막 변경 후 첫 실행에서 기존 CPU QoS 타이밍 테스트가 한 번 실패했다(300ms wall time 동안 background CPU 0.080s 관측, 기대값 ≥0.15s). 해당 테스트 개별 실행과 전체 재실행은 코드나 기대값 변경 없이 통과했다. [원시 실행 요약](gpui-evidence/rust-results.json)에 이 이력도 기록했다.
+초기 GPUI 전환 검증 중 기존 CPU QoS 타이밍 테스트가 한 번 실패했다(300ms wall time 동안 background CPU 0.080s 관측, 기대값 ≥0.15s). 해당 테스트 개별 실행과 전체 재실행은 코드나 기대값 변경 없이 통과했다. [초기 실행 요약](gpui-evidence/rust-results.json)에 이 이력도 기록했다.
+
+후속 병합에서는 `npm test -- --release --features ui-automation -j4`와 전체 Rust 테스트를 다시 실행했다. 추가된 네이티브 휴지통 테스트도 명시적으로 실행해 **1 통과**를 확인했다. 고유한 이름의 임시 파일 여러 개와 하위 파일이 있는 폴더를 휴지통으로 옮긴 뒤 복원·정리한다. 첫 UI 실행에서는 UI-01의 시작 직후 문자 입력이 한 번 실패했고, 포커스 구현 변경 없이 독립 실행 6회에서 재현되지 않았다. 이후 전체 UI suite를 재실행했다. [병합 검증 기록](gpui-evidence/merge-results.json)에 결과와 이력을 기록했다.
 
 Tauri/GPUI의 실제 production search engine에 동일한 36개 케이스를 넣고 반환 경로 전체, 결과 수와 mode를 비교했다. **36개 모두 일치**한다. 케이스당 warmup 3회 후 10회 측정했다. [측정 보고서](gpui-performance.md)와 [원시 검색 결과](gpui-evidence/performance/gpui-engine.json)를 참고한다.
 
 ## macOS 배포 패키지
 
-최종 소스를 기본 기능의 production release로 다시 빌드해 `.app`과 arm64 DMG를 만들었다. `ui-automation`을 넣은 성능 측정 바이너리와 구분한다.
+병합 전 `0.6.0` 소스를 기본 기능의 production release로 빌드해 `.app`과 arm64 DMG를 만들었다. `ui-automation`을 넣은 성능 측정 바이너리와 구분한다. 후속 병합의 검증 결과는 위 병합 검증 기록에 별도로 남겼다.
 
 ```sh
 python3 scripts/bundle_macos.py --dmg

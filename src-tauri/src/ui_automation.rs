@@ -101,8 +101,9 @@ unsafe fn execute(request: Value) -> Result<Value, String> {
         "window" => {
             let frame = NSWindow::frame(window);
             let number = window.windowNumber();
+            let double_click_interval: f64 = msg_send![class!(NSEvent), doubleClickInterval];
             Ok(
-                json!({"windowId":number,"x":frame.origin.x,"y":frame.origin.y,"width":bounds.size.width,"height":bounds.size.height}),
+                json!({"windowId":number,"x":frame.origin.x,"y":frame.origin.y,"width":bounds.size.width,"height":bounds.size.height,"doubleClickIntervalMs":(double_click_interval*1000.).ceil() as u64}),
             )
         }
         "appearance" => {
