@@ -4,24 +4,22 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter};
+use crate::runtime::EventSink;
 
 use super::dir_rescan::DirRescanQueue;
 use super::volume;
 use crate::{
-    db_connection, delete_paths, invalidate_search_caches,
-    index_row_from_path_and_metadata, is_recently_touched,
-    now_epoch, pathignore_active_entries, perf_log,
-    refresh_and_emit_status_counts, set_meta,
-    should_skip_path, update_status_counts, upsert_rows,
+    db_connection, delete_paths, index_row_from_path_and_metadata, invalidate_search_caches,
+    is_recently_touched, now_epoch, pathignore_active_entries, perf_log,
+    refresh_and_emit_status_counts, set_meta, should_skip_path, update_status_counts, upsert_rows,
     AppState,
 };
 
 use windows::Win32::Foundation::{
     ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE, HANDLE,
 };
-use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::FSCTL_READ_USN_JOURNAL;
+use windows::Win32::System::IO::DeviceIoControl;
 
 const USN_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(2);
@@ -91,7 +89,7 @@ type FrnPathCache = HashMap<u64, String>;
 /// `frn_cache`: pre-built FRN→path map from MFT scan (empty if unavailable).
 /// `outside_scan_frns`: directory FRNs known to be outside scan_root (pre-populated skip set).
 pub fn start(
-    app: Option<AppHandle>,
+    app: Option<EventSink>,
     state: AppState,
     frn_cache: FrnPathCache,
     outside_scan_frns: HashSet<u64>,
@@ -101,13 +99,24 @@ pub fn start(
 
     perf_log(format!(
         "[win/usn] starting watcher, journal_id={} next_usn={} frn_cache={} skip_frns={}",
-        journal.journal_id, journal.next_usn, frn_cache.len(), outside_scan_frns.len()
+        journal.journal_id,
+        journal.next_usn,
+        frn_cache.len(),
+        outside_scan_frns.len()
     ));
 
     let last_usn = journal.next_usn;
     let journal_id = journal.journal_id;
 
-    spawn_poll_loop(app, state, vol, last_usn, journal_id, frn_cache, outside_scan_frns);
+    spawn_poll_loop(
+        app,
+        state,
+        vol,
+        last_usn,
+        journal_id,
+        frn_cache,
+        outside_scan_frns,
+    );
     Ok(())
 }
 
@@ -116,7 +125,7 @@ pub fn start(
 /// Falls back to the current tip if the journal was recreated during the scan
 /// or the captured position has since wrapped out of the journal.
 pub fn start_at(
-    app: Option<AppHandle>,
+    app: Option<EventSink>,
     state: AppState,
     start_usn: i64,
     journal_id: u64,
@@ -126,29 +135,41 @@ pub fn start_at(
     let vol = volume::open_volume('C')?;
     let journal = volume::query_usn_journal(&vol)?;
 
-    let (resume_usn, resume_jid) =
-        if journal.journal_id == journal_id && start_usn >= journal.first_usn {
-            (start_usn, journal_id)
-        } else {
-            perf_log(format!(
+    let (resume_usn, resume_jid) = if journal.journal_id == journal_id
+        && start_usn >= journal.first_usn
+    {
+        (start_usn, journal_id)
+    } else {
+        perf_log(format!(
                 "[win/usn] pre-scan position unusable (stored jid={} usn={}; current jid={} first_usn={}); \
                  starting at current tip {}",
                 journal_id, start_usn, journal.journal_id, journal.first_usn, journal.next_usn
             ));
-            (journal.next_usn, journal.journal_id)
-        };
+        (journal.next_usn, journal.journal_id)
+    };
 
     perf_log(format!(
         "[win/usn] starting watcher at usn={} journal_id={} frn_cache={} skip_frns={}",
-        resume_usn, resume_jid, frn_cache.len(), outside_scan_frns.len()
+        resume_usn,
+        resume_jid,
+        frn_cache.len(),
+        outside_scan_frns.len()
     ));
 
-    spawn_poll_loop(app, state, vol, resume_usn, resume_jid, frn_cache, outside_scan_frns);
+    spawn_poll_loop(
+        app,
+        state,
+        vol,
+        resume_usn,
+        resume_jid,
+        frn_cache,
+        outside_scan_frns,
+    );
     Ok(())
 }
 
 fn spawn_poll_loop(
-    app: Option<AppHandle>,
+    app: Option<EventSink>,
     state: AppState,
     vol: volume::VolumeHandle,
     initial_usn: i64,
@@ -157,12 +178,20 @@ fn spawn_poll_loop(
     outside_scan_frns: HashSet<u64>,
 ) {
     std::thread::spawn(move || {
-        poll_loop(app.as_ref(), &state, &vol, initial_usn, journal_id, frn_cache, outside_scan_frns);
+        poll_loop(
+            app.as_ref(),
+            &state,
+            &vol,
+            initial_usn,
+            journal_id,
+            frn_cache,
+            outside_scan_frns,
+        );
     });
 }
 
 fn poll_loop(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     vol: &volume::VolumeHandle,
     initial_usn: i64,
@@ -227,41 +256,49 @@ fn poll_loop(
         }
 
         let t0 = Instant::now();
-        let (next_usn, records) =
-            match read_usn_journal(vol.raw(), last_usn, journal_id, &mut reusable_buffer) {
-                Ok(v) => {
-                    transient_retries = 0;
-                    v
-                }
-                // S2: journal deleted/wrapped — resuming is impossible. Flag a
-                // full rescan for the supervisor and exit the watcher.
-                Err(UsnReadError::JournalStale(msg)) => {
-                    eprintln!(
-                        "[win/usn] journal stale ({msg}); requesting full rescan, exiting watcher"
-                    );
-                    state.watcher_lost_events.store(true, AtomicOrdering::Release);
-                    break;
-                }
-                // S2: transient error — bounded backoff retry, then exit so the
-                // supervisor restarts (and rescans) instead of spinning forever.
-                Err(UsnReadError::Transient(msg)) => {
-                    transient_retries += 1;
-                    eprintln!(
+        let (next_usn, records) = match read_usn_journal(
+            vol.raw(),
+            last_usn,
+            journal_id,
+            &mut reusable_buffer,
+        ) {
+            Ok(v) => {
+                transient_retries = 0;
+                v
+            }
+            // S2: journal deleted/wrapped — resuming is impossible. Flag a
+            // full rescan for the supervisor and exit the watcher.
+            Err(UsnReadError::JournalStale(msg)) => {
+                eprintln!(
+                    "[win/usn] journal stale ({msg}); requesting full rescan, exiting watcher"
+                );
+                state
+                    .watcher_lost_events
+                    .store(true, AtomicOrdering::Release);
+                break;
+            }
+            // S2: transient error — bounded backoff retry, then exit so the
+            // supervisor restarts (and rescans) instead of spinning forever.
+            Err(UsnReadError::Transient(msg)) => {
+                transient_retries += 1;
+                eprintln!(
                         "[win/usn] transient read error ({msg}); retry {transient_retries}/{MAX_TRANSIENT_RETRIES}"
                     );
-                    if transient_retries > MAX_TRANSIENT_RETRIES {
-                        eprintln!("[win/usn] too many transient read errors; exiting watcher for supervisor restart");
-                        // Signal the supervisor to restart the watcher via a full
-                        // rescan (mirrors the JournalStale path above). Without
-                        // this the watcher stays dead — and live updates stop —
-                        // until the hourly periodic reconcile fires.
-                        state.watcher_lost_events.store(true, AtomicOrdering::Release);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(500 * transient_retries as u64));
-                    continue;
+                if transient_retries > MAX_TRANSIENT_RETRIES {
+                    eprintln!("[win/usn] too many transient read errors; exiting watcher for supervisor restart");
+                    // Signal the supervisor to restart the watcher via a full
+                    // rescan (mirrors the JournalStale path above). Without
+                    // this the watcher stays dead — and live updates stop —
+                    // until the hourly periodic reconcile fires.
+                    state
+                        .watcher_lost_events
+                        .store(true, AtomicOrdering::Release);
+                    break;
                 }
-            };
+                std::thread::sleep(Duration::from_millis(500 * transient_retries as u64));
+                continue;
+            }
+        };
         diag_read_us += t0.elapsed().as_micros() as u64;
 
         diag_polls += 1;
@@ -271,32 +308,38 @@ fn poll_loop(
             diag_total_records += 1;
 
             // Resolve parent path: FRN cache (MFT) → skip_frns → dir_cache → syscall
-            let parent_path: Option<PathBuf> =
-                if let Some(path) = frn_cache.get(&record.parent_frn) {
-                    diag_frn_cache_hits += 1;
-                    Some(PathBuf::from(path))
-                } else if skip_frns.contains(&record.parent_frn) {
-                    // Known outside scan_root or unresolvable — skip without syscall
-                    diag_skip_hits += 1;
-                    None
-                } else if let Some(cached) = dir_cache.get(&record.parent_frn) {
-                    diag_frn_cache_hits += 1;
-                    Some(cached.clone())
-                } else {
-                    diag_syscalls += 1;
-                    let resolved =
-                        frn_to_path(vol.raw(), record.parent_frn).filter(|p| {
-                            let s = p.to_string_lossy();
-                            *s == *scan_str || s.starts_with(&scan_prefix)
-                        });
-                    match &resolved {
-                        Some(p) => { dir_cache.insert(record.parent_frn, p.clone()); }
-                        None => { skip_frns.insert(record.parent_frn); }
+            let parent_path: Option<PathBuf> = if let Some(path) = frn_cache.get(&record.parent_frn)
+            {
+                diag_frn_cache_hits += 1;
+                Some(PathBuf::from(path))
+            } else if skip_frns.contains(&record.parent_frn) {
+                // Known outside scan_root or unresolvable — skip without syscall
+                diag_skip_hits += 1;
+                None
+            } else if let Some(cached) = dir_cache.get(&record.parent_frn) {
+                diag_frn_cache_hits += 1;
+                Some(cached.clone())
+            } else {
+                diag_syscalls += 1;
+                let resolved = frn_to_path(vol.raw(), record.parent_frn).filter(|p| {
+                    let s = p.to_string_lossy();
+                    *s == *scan_str || s.starts_with(&scan_prefix)
+                });
+                match &resolved {
+                    Some(p) => {
+                        dir_cache.insert(record.parent_frn, p.clone());
                     }
-                    resolved
-                };
+                    None => {
+                        skip_frns.insert(record.parent_frn);
+                    }
+                }
+                resolved
+            };
             let full_path = match parent_path {
-                Some(ref _p) => { diag_home_matches += 1; _p.join(&record.name) }
+                Some(ref _p) => {
+                    diag_home_matches += 1;
+                    _p.join(&record.name)
+                }
                 None => continue,
             };
 
@@ -325,11 +368,7 @@ fn poll_loop(
 
             // Early path filter: skip paths in ignored directories BEFORE
             // creating FileChange events (avoids expensive stat + DB ops)
-            if should_skip_path(
-                &full_path,
-                &state.path_ignores,
-                &state.path_ignore_patterns,
-            ) {
+            if should_skip_path(&full_path, &state.path_ignores, &state.path_ignore_patterns) {
                 continue;
             }
 
@@ -473,7 +512,11 @@ fn poll_loop(
         // Only use POLL_BUSY for outstanding rename pairs (which have a 500ms timeout).
         // pending_changes don't need fast polling — they accumulate until the 5s debounce.
         let has_rename_pending = !pending_renames.is_empty();
-        std::thread::sleep(if has_rename_pending { POLL_BUSY } else { POLL_IDLE });
+        std::thread::sleep(if has_rename_pending {
+            POLL_BUSY
+        } else {
+            POLL_IDLE
+        });
     }
 
     // Barrier flush: persist any unpersisted changes before this watcher thread
@@ -510,7 +553,7 @@ fn cleanup_expired_renames(
 }
 
 fn apply_changes(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     changes: &mut Vec<FileChange>,
     last_status_emit: &mut Instant,
@@ -739,8 +782,7 @@ fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
     }
 
     let frn = u64::from_le_bytes(data[8..16].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
-    let parent_frn =
-        u64::from_le_bytes(data[16..24].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
+    let parent_frn = u64::from_le_bytes(data[16..24].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
     let reason = u32::from_le_bytes(data[40..44].try_into().ok()?);
     // FileAttributes (offset 52) — used to detect directory renames (S6).
     let attributes = u32::from_le_bytes(data[52..56].try_into().ok()?);
@@ -777,17 +819,15 @@ fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
 fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Storage::FileSystem::{
-        GetFinalPathNameByHandleW, OpenFileById, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_TYPE,
-        FILE_NAME_NORMALIZED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFinalPathNameByHandleW, OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR,
+        FILE_ID_DESCRIPTOR_0, FILE_ID_TYPE, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
     let file_id = FILE_ID_DESCRIPTOR {
         dwSize: mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
         Type: FILE_ID_TYPE(0), // FileIdType
-        Anonymous: FILE_ID_DESCRIPTOR_0 {
-            FileId: frn as i64,
-        },
+        Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: frn as i64 },
     };
 
     let handle = unsafe {
@@ -803,9 +843,7 @@ fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
     };
 
     let mut buf = vec![0u16; 512];
-    let len = unsafe {
-        GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED)
-    };
+    let len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) };
 
     unsafe {
         let _ = CloseHandle(handle);
@@ -817,9 +855,7 @@ fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
 
     let path_str = String::from_utf16_lossy(&buf[..len as usize]);
     // GetFinalPathNameByHandleW returns "\\?\C:\..." prefix; strip it
-    let cleaned = path_str
-        .strip_prefix("\\\\?\\")
-        .unwrap_or(&path_str);
+    let cleaned = path_str.strip_prefix("\\\\?\\").unwrap_or(&path_str);
 
     Some(PathBuf::from(cleaned))
 }

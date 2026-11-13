@@ -1,153 +1,92 @@
 # Everything
 
-An ultrafast file/folder name search app for macOS and Windows. Inspired by [Everything](https://www.voidtools.com/) for Windows, it indexes the filesystem into SQLite, delivering sub-50ms search responses.
+Native file and folder search for macOS and Windows, built with Rust and GPUI.
+The search engine uses the existing SQLite v7 index with LIKE and FTS5 trigram
+queries. The macOS daemon and Windows service own indexing; the GUI reads it.
 
 ## Features
 
-- **Instant search** — Results update as you type (backend p95 < 30ms)
-- **Large-scale support** — Handles 500K–1M entries without UI freezes
-- **Multiple search modes** — Name prefix/contains, glob patterns (`*`, `?`), extension search, path search (when query contains `/` or `\`)
-- **File actions** — Open, Reveal in Finder/Explorer, Copy Path, Copy Files, Move to Trash, inline Rename, Quick Look (macOS)
-- **Real-time sync** — File system watcher automatically reflects file changes
-- **Native icons** — macOS: NSWorkspace system icons, Windows: IShellItemImageFactory per-file icons
-- **Native context menu** — Windows: Explorer shell context menu integration
-- **In-memory search** — Instant results during initial indexing (Windows)
-- **Theme toggle** — Dark/light mode with system preference sync
+- Name, glob, extension and path searches; Korean and spaces in file names
+- Virtual result table, sorting, adjustable columns and multiple selection
+- Open, Reveal, Copy Path/Files, Trash confirmation, inline Rename and Quick Look
+- System light/dark appearance, preserving the Tauri UI and saved window/column preferences
+- Full Disk Access onboarding, background indexer health and auto-start controls
+- The same executable supports `--mcp`, `--daemon` and Windows service commands
 
-## Platform Support
+The UI renders directly through GPUI. No browser runtime or JavaScript assets
+are bundled. `src-tauri/` retains its historical directory name for stable paths.
 
-| Feature | macOS | Windows |
-|---------|-------|---------|
-| Indexing | jwalk incremental scan (`$HOME`) | NTFS MFT scan (`C:\`) → WalkDir fallback |
-| File watcher | FSEvents (direct binding) | USN Change Journal → ReadDirectoryChangesW fallback |
-| Icons | NSWorkspace (extension-based) | IShellItemImageFactory + SHGetFileInfo |
-| Context menu | Custom frontend menu | Native Explorer context menu (Shell API) |
-| Global shortcut | Cmd+Shift+Space | — |
-| Quick Look | Space key | — |
-| Full Disk Access | FDA banner check | — |
+## Build and run
 
-## Tech Stack
+Use the Rust version in `rust-toolchain.toml` (1.97.1).
 
-| Layer | Technology |
-|-------|------------|
-| Framework | Tauri v2 |
-| Backend | Rust |
-| Frontend | Svelte 5 |
-| Database | SQLite (WAL mode, LIKE-based search) |
-| macOS watcher | fsevent-sys |
-| Windows indexer | Win32 MFT/USN APIs, notify crate (RDCW fallback) |
+macOS requires macOS 13+, full Xcode and the Metal compiler. If the compiler is
+missing, run `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild -downloadComponent MetalToolchain`.
+Windows requires Windows 10/11 x64, the Rust MSVC toolchain, Visual Studio C++
+build tools and a DirectX 11 compatible GPU. NSIS 3 is needed for installers.
 
-## Getting Started
+```sh
+# Native development window
+cargo run --manifest-path src-tauri/Cargo.toml
 
-### Prerequisites
+# Release executable
+cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 
-**macOS:**
-- macOS 11.0+
-- [Rust](https://rustup.rs/) (stable)
-- [Node.js](https://nodejs.org/) (v18+)
-- Xcode Command Line Tools
+# macOS .app / .dmg (ad-hoc signing by default)
+python3 scripts/bundle_macos.py
+scripts/build_dmg.sh
 
-**Windows:**
-- Windows 10/11
-- [Rust](https://rustup.rs/) (stable, MSVC toolchain)
-- [Node.js](https://nodejs.org/) (v18+)
-- Visual Studio Build Tools (C++ workload)
+# Windows installer (PowerShell)
+./scripts/build-windows.ps1
 
-### Install & Run
-
-```bash
-# Install dependencies
-npm install
-
-# Dev server (Vite on :1420 + Tauri window)
-npm run tauri dev
-
-# Production build
-npm run tauri build
+# Compile and run Rust regression tests
+cargo test --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-### Testing
+On macOS, scope `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` to
+Cargo commands when the default developer directory is Command Line Tools.
+The packaging script does this automatically. For Developer ID releases, set
+`APPLE_SIGNING_IDENTITY`; optional `NOTARY_PROFILE` names an existing notarytool
+keychain profile. Packaging leaves the working source unchanged.
 
-```bash
-# Rust tests
-cargo test --manifest-path src-tauri/Cargo.toml
+Node is optional. Existing npm entry points are dependency-free aliases:
+`npm run dev`, `npm run build`, `npm run bundle`, `npm run bundle:dmg`,
+`npm run lint` (cargo check), `npm test` (compile tests), `npm run test:run`.
+Legacy HOME/production-index stress benchmarks require `--ignored`; normal
+tests use temporary fixtures.
 
-# Lint (frontend build + cargo check)
-npm run lint
-```
-
-## Keyboard Shortcuts
+## Shortcuts
 
 | Shortcut | Action |
-|----------|--------|
-| `Cmd+Shift+Space` | Global — Activate app / focus search (macOS) |
-| `Enter` | Open (Windows) / Rename (macOS) |
-| `F2` | Rename (inline edit) |
-| `Space` | Quick Look (macOS) |
-| `Cmd+O` / `Ctrl+O` | Open |
-| `Cmd+Enter` / `Ctrl+Enter` | Reveal in Finder/Explorer |
-| `Cmd+C` / `Ctrl+C` | Copy Path |
-| `Cmd+F` / `Ctrl+F` | Focus search input |
-| `Cmd+Backspace` / `Delete` | Move to Trash |
-| `↑` / `↓` | Navigate selection |
-| `Shift+Click` | Range select |
-| `Cmd+Click` / `Ctrl+Click` | Toggle select |
-| `Cmd+A` / `Ctrl+A` | Select all |
+| --- | --- |
+| Cmd+Shift+Space | Activate/focus search (macOS) |
+| Cmd/Ctrl+F | Focus and select search text |
+| Up/Down, PageUp/PageDown | Navigate; Shift extends selection |
+| Cmd/Ctrl+A | Select loaded results when the table has focus |
+| Enter | Open on both platforms |
+| F2 | Inline Rename |
+| Cmd/Ctrl+O, double click | Open |
+| Cmd/Ctrl+Enter | Reveal in file manager |
+| Cmd+C (macOS) | Copy Files |
+| Alt+Cmd+C (macOS) / Ctrl+C (Windows) | Copy Path |
+| Cmd+Shift+C | Copy Files (macOS) |
+| Space | Quick Look (macOS) |
+| Delete, Cmd+Backspace | Confirm Move to Trash |
+| Escape | Cancel editing/menu/dialog, clear selection |
 
-## Project Structure
+Search inputs keep their normal text selection and clipboard shortcuts.
+Confirmation dialogs default to Cancel; Tab/arrow keys select an action.
 
-```
-src-tauri/src/
-  main.rs          # App state, indexer, search, file actions, Tauri commands
-  query.rs         # Search query parser (Glob/Path/Name/Ext mode classification)
-  fd_search.rs     # jwalk-based live filesystem search
-  mem_search.rs    # In-memory compact entry search (MemIndex)
-  gitignore_filter.rs  # .gitignore rule matching
+## Source and verification
 
-  mac/             # macOS-specific modules
-    fsevent_watcher.rs   # Direct FSEvents binding
-    spotlight_search.rs  # mdfind-based Spotlight fallback
+- `src-tauri/src/ui/`: GPUI lifecycle, rendering, actions and status notices
+- `ui_model.rs`, `ui_prefs.rs`, `runtime.rs`: selection/search state, preferences, worker/event bridge
+- `main.rs`, `query.rs`, `mac/`, `win/`: shared engine, file actions and indexers
+- `scripts/ui_fixture.py`, `ui_driver.py`: isolated real-window test tools
+- [Migration plan](doc/gpui-migration-plan.md)
+- [Native architecture](doc/gpui-architecture.md)
+- [Test cases and results](doc/gpui-test-cases.md)
+- [Performance comparison](doc/gpui-performance.md)
 
-  win/             # Windows-specific modules
-    mft_indexer.rs       # NTFS Master File Table scan
-    nonadmin_indexer.rs  # WalkDir fallback (non-admin)
-    usn_watcher.rs       # USN Change Journal monitor
-    rdcw_watcher.rs      # ReadDirectoryChangesW fallback
-    search_catchup.rs    # Offline sync (Windows Search / mtime scan)
-    icon.rs              # Shell icon loading (IShellItemImageFactory)
-    context_menu.rs      # Native Explorer context menu
-    volume.rs            # NTFS volume handle operations
-    path_resolver.rs     # FRN-to-path resolution
-    com_guard.rs         # COM lifecycle management
-
-src/
-  App.svelte       # Single-component UI (search, virtual scroll, context menu)
-  main.js          # Svelte mount point
-  search-utils.js  # Search debounce & viewport-preserve utilities
-
-doc/
-  architecture.md  # Detailed architecture documentation
-  architecture_KR.md # Architecture documentation (Korean)
-  spec.md          # Design spec (English)
-  spec_KR.md       # Design spec (Korean)
-```
-
-## Architecture
-
-### macOS
-1. On launch, scans `$HOME` via jwalk and batch-upserts into SQLite
-2. FSEvents watcher detects file changes for incremental updates
-3. Supports event ID replay on restart (skip full scan if clean)
-4. Spotlight (mdfind) used as search fallback during initial indexing
-
-### Windows
-1. On launch, enumerates NTFS Master File Table for near-instant full indexing
-2. Builds in-memory MemIndex for instant search while DB upsert runs
-3. USN Change Journal monitors file changes with zero-syscall path resolution
-4. Falls back to WalkDir (non-admin) or ReadDirectoryChangesW if MFT/USN unavailable
-5. Offline catchup via Windows Search service or mtime-based scan on restart
-
-### Common
-1. User input → Rust queries MemIndex or SQLite (LIKE-based, multi-mode) → returns results
-2. If results are sparse, a background live scan (jwalk) supplements them
-3. Relevance sorting: exact match > prefix > contains > path match
+Product specs remain in `doc/spec.md` and `doc/spec_KR.md`. Migration decisions,
+validation scope and known platform limits are recorded in the linked reports.

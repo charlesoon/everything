@@ -3,18 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::runtime::EventSink;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
-use tauri::{AppHandle, Emitter};
 
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 use crate::{
-    db_connection, delete_paths, invalidate_search_caches,
-    index_row_from_path_and_metadata, is_recently_touched,
-    now_epoch, pathignore_active_entries, refresh_and_emit_status_counts,
-    set_meta, should_skip_path, update_status_counts, upsert_rows,
-    AppState, WATCH_DEBOUNCE,
+    db_connection, delete_paths, index_row_from_path_and_metadata, invalidate_search_caches,
+    is_recently_touched, now_epoch, pathignore_active_entries, refresh_and_emit_status_counts,
+    set_meta, should_skip_path, update_status_counts, upsert_rows, AppState, WATCH_DEBOUNCE,
 };
 
 const STATUS_EMIT_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -43,12 +41,12 @@ struct RenamePending {
     created_at: Instant,
 }
 
-pub fn start(app: Option<AppHandle>, state: AppState) -> Result<(), String> {
+pub fn start(app: Option<EventSink>, state: AppState) -> Result<(), String> {
     start_with_roots(app, state, vec![PathBuf::from("C:\\")])
 }
 
 pub fn start_with_roots(
-    app: Option<AppHandle>,
+    app: Option<EventSink>,
     state: AppState,
     roots: Vec<PathBuf>,
 ) -> Result<(), String> {
@@ -67,7 +65,11 @@ pub fn start_with_roots(
     if watched == 0 {
         return Err("no directories could be watched".to_string());
     }
-    eprintln!("[win/rdcw] watcher started on {}/{} root(s)", watched, roots.len());
+    eprintln!(
+        "[win/rdcw] watcher started on {}/{} root(s)",
+        watched,
+        roots.len()
+    );
     state.watcher_active.store(true, AtomicOrdering::Release);
 
     std::thread::spawn(move || {
@@ -82,7 +84,7 @@ pub fn start_with_roots(
 }
 
 fn event_loop(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     rx: mpsc::Receiver<notify::Result<Event>>,
 ) {
@@ -155,7 +157,13 @@ fn event_loop(
         cleanup_expired_renames(&mut pending_renames, &mut pending_changes);
 
         if !pending_changes.is_empty() && last_flush.elapsed() >= WATCH_DEBOUNCE {
-            apply_changes(app, state, &mut pending_changes, &mut last_status_emit, &mut db_conn);
+            apply_changes(
+                app,
+                state,
+                &mut pending_changes,
+                &mut last_status_emit,
+                &mut db_conn,
+            );
             last_flush = Instant::now();
         }
 
@@ -260,7 +268,7 @@ fn is_under_scan_root(path: &Path, scan_root: &Path) -> bool {
 }
 
 fn apply_changes(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     changes: &mut Vec<FileChange>,
     last_status_emit: &mut Instant,
@@ -316,11 +324,7 @@ fn apply_changes(
         match action {
             PathAction::Delete => to_delete.push(path_str),
             PathAction::Upsert => {
-                if should_skip_path(
-                    &path,
-                    &state.path_ignores,
-                    &state.path_ignore_patterns,
-                ) {
+                if should_skip_path(&path, &state.path_ignores, &state.path_ignore_patterns) {
                     continue;
                 }
                 match std::fs::symlink_metadata(&path) {

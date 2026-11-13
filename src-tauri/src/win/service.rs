@@ -259,7 +259,10 @@ fn graceful_stop(
     if let Ok(conn) = db_connection(&state.db_path) {
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
-    service_log::file(data_dir, "graceful stop complete (worker joined, WAL checkpointed)");
+    service_log::file(
+        data_dir,
+        "graceful stop complete (worker joined, WAL checkpointed)",
+    );
 }
 
 struct Prepared {
@@ -290,7 +293,10 @@ fn quick_prep(data_dir: &Path) -> Result<Prepared, String> {
     // D6: hold daemon.lock for our lifetime so a stray `--daemon` self-exits.
     let daemon_lock = crate::daemon::try_acquire_daemon_lock(&db_path);
     if daemon_lock.is_none() {
-        service_log::file(data_dir, "warning: daemon.lock already held by another process");
+        service_log::file(
+            data_dir,
+            "warning: daemon.lock already held by another process",
+        );
     }
 
     let state = build_app_state_with_config(db_path, resolve_home_dir(), data_dir, &config_dir);
@@ -440,7 +446,7 @@ fn run_pass(state: &AppState, stop: &Arc<AtomicBool>, data_dir: &Path) -> bool {
     state.cancel_index.store(false, Ordering::Release);
 
     service_log::file(data_dir, "index pass: starting headless MFT scan");
-    // Headless: no AppHandle and no MemIndex — the service has no searcher (R5).
+    // Headless: no EventSink and no MemIndex — the service has no searcher (R5).
     match super::mft_indexer::scan_mft(state, None, false) {
         Ok(result) => {
             // scan_mft returns after the synchronous scan; the background

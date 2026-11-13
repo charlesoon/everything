@@ -15,8 +15,8 @@ pub(crate) struct TrashResult {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TrashFailure {
-    path: String,
-    error: String,
+    pub(crate) path: String,
+    pub(crate) error: String,
 }
 
 pub(crate) fn move_to_trash(paths: &[String]) -> TrashResult {

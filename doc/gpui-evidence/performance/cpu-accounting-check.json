@@ -1,0 +1,10 @@
+{
+  "measuredOn": "2026-11-14",
+  "reference": "Python time.process_time_ns over a CPU burn",
+  "processCpuNs": 200000000,
+  "rusageCpuTicks": 4800614,
+  "machTimebase": {"numer": 125, "denom": 3},
+  "convertedCpuNs": 200025583,
+  "convertedToReferenceRatio": 1.000127915,
+  "conclusion": "proc_pid_rusage user/system accounting uses mach ticks on this machine; convert with mach_timebase_info before computing CPU percent"
+}

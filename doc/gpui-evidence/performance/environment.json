@@ -1,0 +1,27 @@
+{
+  "date": "2026-11-14T00:45:41+0900",
+  "cpu": "Apple M5 Pro",
+  "memoryBytes": 51539607552,
+  "os": "ProductName:\t\tmacOS\nProductVersion:\t\t26.7.3\nBuildVersion:\t\t25G342",
+  "rust": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "commonDaemon": [
+    {
+      "pid": 1879,
+      "ppid": 1,
+      "rssKiB": 52368,
+      "command": "Everything --daemon",
+      "residentBytes": 53624832,
+      "physicalFootprintBytes": 53379912,
+      "cpuTicks": 5201262195,
+      "cpuNs": 216719258125,
+      "responsiblePid": 1879,
+      "sampledAt": 1794584741.364446
+    }
+  ],
+  "loadAverage": "{ 2.92 4.09 4.73 }",
+  "buildProcesses": [],
+  "cpuTimebase": {
+    "numer": 125,
+    "denom": 3
+  }
+}

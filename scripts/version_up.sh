@@ -7,7 +7,6 @@
 # Updates (structural, anchored replacements — no blind global search/replace):
 #   - package.json                (top-level "version")
 #   - package-lock.json           ("everything" package: root + packages."")
-#   - src-tauri/tauri.conf.json   (top-level "version")
 #   - src-tauri/Cargo.toml        ([package] version)
 #   - src-tauri/Cargo.lock        ([[package]] name = "everything")
 set -euo pipefail
@@ -33,7 +32,6 @@ cd "$REPO_ROOT"
 
 PKG_JSON="package.json"
 PKG_LOCK="package-lock.json"
-TAURI_CONF="src-tauri/tauri.conf.json"
 CARGO_TOML="src-tauri/Cargo.toml"
 CARGO_LOCK="src-tauri/Cargo.lock"
 
@@ -57,7 +55,7 @@ verify() { # <file> <perl-regex>
     || { echo "Error: verification failed for '$1' (anchor not updated)." >&2; exit 1; }
 }
 
-for f in "$PKG_JSON" "$PKG_LOCK" "$TAURI_CONF" "$CARGO_TOML" "$CARGO_LOCK"; do
+for f in "$PKG_JSON" "$PKG_LOCK" "$CARGO_TOML" "$CARGO_LOCK"; do
   require_file "$f"
 done
 
@@ -66,9 +64,6 @@ done
 # ---------------------------------------------------------------------------
 # package.json — first (top-level) "version" key.
 perl -0777 -pi -e 's/("version"\s*:\s*")[^"]*"/${1}'"$NEW_VERSION"'"/' "$PKG_JSON"
-
-# tauri.conf.json — first (top-level) "version" key.
-perl -0777 -pi -e 's/("version"\s*:\s*")[^"]*"/${1}'"$NEW_VERSION"'"/' "$TAURI_CONF"
 
 # package-lock.json — both "version" fields that belong to the "everything"
 # package (root object + packages.""). Anchored on the preceding name so
@@ -85,14 +80,12 @@ perl -0777 -pi -e 's/(name = "everything"\s*version = ")[^"]*"/${1}'"$NEW_VERSIO
 # Verify every anchor was actually updated
 # ---------------------------------------------------------------------------
 verify "$PKG_JSON"    '"version"\s*:\s*"'"$NEW_RE"'"'
-verify "$TAURI_CONF"  '"version"\s*:\s*"'"$NEW_RE"'"'
 verify "$PKG_LOCK"    '"name"\s*:\s*"everything",\s*"version"\s*:\s*"'"$NEW_RE"'"'
 verify "$CARGO_TOML"  'name\s*=\s*"everything"\s*version\s*=\s*"'"$NEW_RE"'"'
 verify "$CARGO_LOCK"  'name = "everything"\s*version = "'"$NEW_RE"'"'
 
-echo "Done. Updated 5 files to $NEW_VERSION:"
+echo "Done. Updated 4 files to $NEW_VERSION:"
 echo "  - $PKG_JSON"
 echo "  - $PKG_LOCK"
-echo "  - $TAURI_CONF"
 echo "  - $CARGO_TOML"
 echo "  - $CARGO_LOCK"

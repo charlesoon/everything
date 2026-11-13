@@ -1,5 +1,5 @@
 ; NSIS installer hooks for Everything — Windows admin indexer service.
-; Inserted by the Tauri v2 NSIS template via bundle.windows.nsis.installerHooks.
+; Inserted by windows/installer.nsi.
 ; Design: design-windows-service-writer.html §3.2 (perMachine install, D1/D5).
 ;
 ; Principles:
@@ -12,7 +12,7 @@
 ;     Only exit code 1060 (ERROR_SERVICE_DOES_NOT_EXIST) counts as "not
 ;     installed"; any other sc failure Aborts rather than being mistaken for
 ;     stopped (so a partial/corrupt SCM state is never papered over).
-;   * LogicLib (${If}/${EndIf}) is provided by the Tauri NSIS template.
+;   * LogicLib (${If}/${EndIf}) is provided by installer.nsi.
 
 !define EVERYTHING_SERVICE "EverythingIndexer"
 ; With `SetShellVarContext all`, $APPDATA resolves to <ProgramData>. Expanded at
@@ -122,12 +122,9 @@
 !macro KILL_OUR_PROCESSES_BY_PATH UID
   ; Path-scoped termination (§3.2): stop only Everything.exe instances whose
   ; module path is under OUR locations ($INSTDIR or an old per-user install), so
-  ; voidtools' unrelated Everything.exe is never touched. Runs before Tauri's
-  ; name-based CheckIfAppIsRunning, so when voidtools isn't running that check
-  ; then finds nothing. A temp .ps1 avoids -Command quoting pitfalls; best-effort
-  ; and non-fatal, so any failure just leaves Tauri's default behavior in place.
-  ; NOTE: Tauri's name-based check still runs afterwards; fully removing it (so a
-  ; *running* voidtools is never caught) needs an nsis.template override.
+  ; voidtools' unrelated Everything.exe is never touched. The native template
+  ; performs no process-name-only check. Failure leaves files locked and makes
+  ; the ordinary installer copy fail rather than killing an unrelated app.
   FileOpen $9 "$TEMP\everything_killpath.ps1" w
   StrCmp $9 "" kill_skip_${UID} 0
     FileWrite $9 "Get-Process Everything -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and ($$_.Path -like '$INSTDIR\*' -or $$_.Path -like '*\AppData\Local\Everything\Everything.exe') } | Stop-Process -Force -ErrorAction SilentlyContinue$\r$\n"
@@ -143,8 +140,7 @@
 ; ---------------------------------------------------------------------------
 
 !macro NSIS_HOOK_PREINSTALL
-  ; Path-scope-kill our own running GUI first (protects voidtools' Everything.exe
-  ; from Tauri's later name-based check), then stop the service so its files can
+  ; Stop our own running GUI by path, then stop the service so its files can
   ; be replaced. Cleanup of a previous install is deferred to POSTINSTALL.
   !insertmacro KILL_OUR_PROCESSES_BY_PATH "pre"
   nsExec::Exec 'cmd /c sc stop ${EVERYTHING_SERVICE}'
@@ -222,10 +218,7 @@
   ;       Sweeps every profile: old data (unique identifier) + the old per-user
   ;       install dir (guarded by our Everything.exe). HKCU keys/shortcuts are
   ;       cleaned by each user's first GUI run (§5 ②). Our own running processes
-  ;       are already path-scope-killed in PRE(UN)INSTALL; fully suppressing
-  ;       Tauri's redundant name-based check (for a *running* voidtools) still
-  ;       needs an `nsis.template` override — a follow-up needing an NSIS
-  ;       build/test environment (design §3.2). --
+  ;       are already path-scope-killed in PRE(UN)INSTALL. --
   !insertmacro CLEANUP_OLD_PERUSER
 !macroend
 
@@ -235,8 +228,7 @@
 
 !macro NSIS_HOOK_PREUNINSTALL
   SetShellVarContext all
-  ; Path-scope-kill our own running processes so their files unlock (protecting
-  ; voidtools' Everything.exe from Tauri's later name-based check).
+  ; Path-scope-kill our own running processes so their files unlock.
   !insertmacro KILL_OUR_PROCESSES_BY_PATH "preun"
   nsExec::Exec 'cmd /c sc stop ${EVERYTHING_SERVICE}'
   Pop $0

@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::runtime::EventSink;
 use parking_lot::Mutex;
-use tauri::AppHandle;
 
 use crate::{
     cached_effective_ignore_rules, db_connection, invalidate_search_caches,
@@ -83,7 +83,7 @@ impl DirRescanQueue {
     /// Spawn the next due queued rescan on a background thread (single-flight).
     /// Skipped while an index pass is active — the pass reconciles the same
     /// ground — and retried on the next poll tick.
-    pub(crate) fn pump(&mut self, app: Option<&AppHandle>, state: &AppState) {
+    pub(crate) fn pump(&mut self, app: Option<&EventSink>, state: &AppState) {
         if self.queued.is_empty()
             || self.inflight.load(Ordering::Acquire)
             || state.indexing_active.load(Ordering::Acquire)

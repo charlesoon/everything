@@ -16,19 +16,24 @@ use std::{
 };
 
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{
-    params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension,
-};
+use runtime::EventSink;
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+mod runtime;
+mod ui;
+#[cfg(all(target_os = "macos", feature = "ui-automation"))]
+mod ui_automation;
+mod ui_model;
+mod ui_prefs;
+mod ui_search_bench;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-mod fd_search;
-mod file_actions;
 mod daemon;
 #[cfg(target_os = "macos")]
 mod daemon_ipc;
 mod diag;
+mod fd_search;
+mod file_actions;
 #[cfg(target_os = "macos")]
 mod mac;
 mod mcp_server;
@@ -78,7 +83,13 @@ pub(crate) fn resolve_home_dir() -> PathBuf {
     PathBuf::from(
         std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() }),
+            .unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    "C:\\".to_string()
+                } else {
+                    "/".to_string()
+                }
+            }),
     )
 }
 
@@ -125,12 +136,18 @@ CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCAS
 CREATE INDEX IF NOT EXISTS idx_entries_ext_name ON entries(ext, name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_entries_indexed_at ON entries(indexed_at);";
 const DEFERRED_DIR_NAMES: &[&str] = &[
-    "Library", ".Trash", ".Trashes",
+    "Library",
+    ".Trash",
+    ".Trashes",
     // Windows system directories (deferred when scan_root is C:\)
-    "Windows", "Program Files", "Program Files (x86)",
-    "$Recycle.Bin", "System Volume Information", "Recovery", "PerfLogs",
+    "Windows",
+    "Program Files",
+    "Program Files (x86)",
+    "$Recycle.Bin",
+    "System Volume Information",
+    "Recovery",
+    "PerfLogs",
 ];
-
 
 pub(crate) const BUILTIN_SKIP_NAMES: &[&str] = &[
     ".git",
@@ -485,9 +502,13 @@ pub(crate) struct AppState {
 
 /// Construct `AppState` from resolved paths, without Tauri. Shared by GUI
 /// startup (`setup_app`) and the headless MCP index builder, which has no
-/// `AppHandle`. `app_data_dir` (the DB's parent) holds the `.pathignore` and
+/// `EventSink`. `app_data_dir` (the DB's parent) holds the `.pathignore` and
 /// `.pathindexing` sidecars and is itself excluded from indexing.
-pub(crate) fn build_app_state(db_path: PathBuf, home_dir: PathBuf, app_data_dir: &Path) -> AppState {
+pub(crate) fn build_app_state(
+    db_path: PathBuf,
+    home_dir: PathBuf,
+    app_data_dir: &Path,
+) -> AppState {
     // Default layout: the config sidecars live alongside the DB (GUI / daemon /
     // MCP). The Windows service overrides this via build_app_state_with_config.
     build_app_state_with_config(db_path, home_dir, app_data_dir, app_data_dir)
@@ -623,7 +644,8 @@ fn perf_log_enabled() -> bool {
 /// fan-out to performance cores, so it is opt-in (and implied by bench mode,
 /// which measures throughput rather than power).
 fn index_full_speed() -> bool {
-    *INDEX_FULL_SPEED.get_or_init(|| env_truthy("EVERYTHING_INDEX_FULL_SPEED") || bench_mode_enabled())
+    *INDEX_FULL_SPEED
+        .get_or_init(|| env_truthy("EVERYTHING_INDEX_FULL_SPEED") || bench_mode_enabled())
 }
 
 /// Unique per-test scratch directory (not created). Shared by the main.rs and
@@ -737,7 +759,9 @@ struct PooledSearchConn {
 impl std::ops::Deref for PooledSearchConn {
     type Target = Connection;
     fn deref(&self) -> &Connection {
-        self.conn.as_ref().expect("pooled connection present until drop")
+        self.conn
+            .as_ref()
+            .expect("pooled connection present until drop")
     }
 }
 
@@ -803,7 +827,10 @@ pub(crate) fn restore_normal_pragmas(conn: &Connection) -> AppResult<()> {
 fn init_db_tables(db_path: &Path) -> AppResult<()> {
     let t = Instant::now();
     let conn = db_connection(db_path)?;
-    eprintln!("[init_db] +{}ms db_connection opened", t.elapsed().as_millis());
+    eprintln!(
+        "[init_db] +{}ms db_connection opened",
+        t.elapsed().as_millis()
+    );
 
     let current_version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -840,7 +867,8 @@ fn init_db_tables(db_path: &Path) -> AppResult<()> {
                 .map_err(|e| e.to_string())?;
 
             // Create new empty entries (FTS triggers + rebuild deferred to after unconditional block below)
-            conn.execute_batch(CREATE_ENTRIES_TABLE_SQL).map_err(|e| e.to_string())?;
+            conn.execute_batch(CREATE_ENTRIES_TABLE_SQL)
+                .map_err(|e| e.to_string())?;
 
             // Reset meta keys so startup triggers a full index scan
             let meta_exists: bool = conn
@@ -877,9 +905,14 @@ fn init_db_tables(db_path: &Path) -> AppResult<()> {
         conn.execute_batch(&format!("PRAGMA user_version = {};", DB_VERSION))
             .map_err(|e| e.to_string())?;
     }
-    eprintln!("[init_db] +{}ms version check done (v={})", t.elapsed().as_millis(), current_version);
+    eprintln!(
+        "[init_db] +{}ms version check done (v={})",
+        t.elapsed().as_millis(),
+        current_version
+    );
 
-    conn.execute_batch(CREATE_ENTRIES_TABLE_SQL).map_err(|e| e.to_string())?;
+    conn.execute_batch(CREATE_ENTRIES_TABLE_SQL)
+        .map_err(|e| e.to_string())?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (
            key TEXT PRIMARY KEY,
@@ -893,7 +926,8 @@ fn init_db_tables(db_path: &Path) -> AppResult<()> {
          );",
     )
     .map_err(|e| e.to_string())?;
-    conn.execute_batch(CREATE_FTS_TRIGGERS_SQL).map_err(|e| e.to_string())?;
+    conn.execute_batch(CREATE_FTS_TRIGGERS_SQL)
+        .map_err(|e| e.to_string())?;
     eprintln!("[init_db] +{}ms tables ensured", t.elapsed().as_millis());
 
     Ok(())
@@ -918,7 +952,10 @@ fn ensure_db_indexes(db_path: &Path) -> AppResult<()> {
             .map_err(|e| e.to_string())?;
         set_meta(&conn, legacy_key, "1")?;
     }
-    eprintln!("[init_db] +{}ms total (indexes + migration)", t.elapsed().as_millis());
+    eprintln!(
+        "[init_db] +{}ms total (indexes + migration)",
+        t.elapsed().as_millis()
+    );
 
     Ok(())
 }
@@ -983,7 +1020,11 @@ pub(crate) fn set_meta_list<S: AsRef<str>>(
 
 /// Persist the status-bar counts so the next startup can seed them without a
 /// COUNT(*)/MAX() scan over `entries`. Best-effort: write errors are ignored.
-pub(crate) fn persist_cached_counts(conn: &Connection, entries_count: u64, last_updated: Option<i64>) {
+pub(crate) fn persist_cached_counts(
+    conn: &Connection,
+    entries_count: u64,
+    last_updated: Option<i64>,
+) {
     let _ = set_meta(conn, "cached_entries_count", &entries_count.to_string());
     if let Some(lu) = last_updated {
         let _ = set_meta(conn, "cached_last_updated", &lu.to_string());
@@ -1102,8 +1143,10 @@ fn remember_negative_name_query(state: &AppState, query: &str) {
     );
     const MAX_NEGATIVE_CACHE: usize = 512;
     if cache.len() > MAX_NEGATIVE_CACHE {
-        let mut entries: Vec<_> =
-            cache.iter().map(|(k, v)| (k.clone(), v.created_at)).collect();
+        let mut entries: Vec<_> = cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.created_at))
+            .collect();
         entries.sort_by_key(|(_, t)| *t);
         let drop_count = cache.len() - MAX_NEGATIVE_CACHE;
         for (key, _) in entries.into_iter().take(drop_count) {
@@ -1311,7 +1354,11 @@ fn resolve_dirs_from_db(conn: &Connection, dir_hint: &str) -> Vec<String> {
 }
 
 fn normalize_slashes(s: String) -> String {
-    if s.contains('\\') { s.replace('\\', "/") } else { s }
+    if s.contains('\\') {
+        s.replace('\\', "/")
+    } else {
+        s
+    }
 }
 
 fn resolve_ignore_path(raw: &str, base_dir: &Path, home_dir: &Path) -> Option<PathBuf> {
@@ -1442,7 +1489,11 @@ fn ensure_pathignore_exists(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn load_pathignore_rules(config_file: &Path, home_dir: &Path, cwd: &Path) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
+fn load_pathignore_rules(
+    config_file: &Path,
+    home_dir: &Path,
+    cwd: &Path,
+) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
     // Windows: never auto-create the sidecar (D1 — a missing file means the
     // builtin defaults; the editor command creates it on demand). Other
     // platforms keep seeding a default template at startup.
@@ -1509,7 +1560,6 @@ fn load_pathignore_rules(config_file: &Path, home_dir: &Path, cwd: &Path) -> (Ve
 
     (roots, patterns)
 }
-
 
 #[cfg(target_os = "macos")]
 fn macos_tcc_ignore_roots(home_dir: &Path) -> Vec<PathBuf> {
@@ -1658,7 +1708,9 @@ fn builtin_ignore_patterns(home_dir: &Path) -> Vec<IgnorePattern> {
     ]
 }
 
-pub(crate) fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
+pub(crate) fn cached_effective_ignore_rules(
+    state: &AppState,
+) -> (Vec<PathBuf>, Vec<IgnorePattern>) {
     let home_dir = &state.home_dir;
     let cwd = &state.cwd;
     let config_file = &state.config_file_path;
@@ -1676,7 +1728,8 @@ pub(crate) fn cached_effective_ignore_rules(state: &AppState) -> (Vec<PathBuf>, 
 
     let mut cache = state.ignore_cache.lock();
     if let Some(ref cached) = *cache {
-        if cached.config_file_mtime == config_file_mtime && cached.pathignore_mtime == pathignore_mtime
+        if cached.config_file_mtime == config_file_mtime
+            && cached.pathignore_mtime == pathignore_mtime
         {
             return (cached.roots.clone(), cached.patterns.clone());
         }
@@ -1933,7 +1986,6 @@ fn should_skip_child(
     })
 }
 
-
 fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
     if is_dir {
         return None;
@@ -1944,7 +1996,10 @@ fn extension_for(path: &Path, is_dir: bool) -> Option<String> {
         .map(|ext| ext.to_lowercase())
 }
 
-pub(crate) fn index_row_from_path_and_metadata(path: &Path, metadata: &fs::Metadata) -> Option<IndexRow> {
+pub(crate) fn index_row_from_path_and_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Option<IndexRow> {
     let is_dir = metadata.is_dir();
 
     let name = path
@@ -1997,7 +2052,6 @@ pub(crate) fn index_row_from_walkdir_entry(entry: &walkdir::DirEntry) -> Option<
     let metadata = entry.metadata().ok()?;
     index_row_from_path_and_metadata(entry.path(), &metadata)
 }
-
 
 fn entry_from_index_row(row: IndexRow) -> EntryDto {
     EntryDto {
@@ -2146,7 +2200,11 @@ fn sort_entries_with_relevance(
             let rank = relevance_rank(&entry, &query_lower, &path_suffix);
             // For highly-relevant matches, prefer shallower paths first
             // so `~/name` ranks above deep descendants with the same name.
-            let depth = if rank <= 3 { path_depth(&entry.path) } else { 0 };
+            let depth = if rank <= 3 {
+                path_depth(&entry.path)
+            } else {
+                0
+            };
             (rank, depth, entry)
         })
         .collect();
@@ -2452,13 +2510,10 @@ pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppRe
     Ok(deleted)
 }
 
-// Every `index_*` emit runs through the visibility gate: Tauri delivers events
-// by evaluating JS in the page, which on macOS wakes a WebContent process
-// WebKit has suspended, only for it to be re-suspended (and its layer tree
-// re-hidden) before it can paint. While the page reports itself hidden the
-// payload is held and flushed on the way back. See `ui_gate`.
+// Coalesce index updates while the native window is inactive, then flush the
+// latest payload on activation. The daemon does not depend on a window.
 
-pub(crate) fn emit_index_state(app: &AppHandle, state: &str, message: Option<String>) {
+pub(crate) fn emit_index_state(app: &EventSink, state: &str, message: Option<String>) {
     if !ui_gate::is_visible() {
         ui_gate::hold_state(state.to_string(), message);
         return;
@@ -2466,8 +2521,10 @@ pub(crate) fn emit_index_state(app: &AppHandle, state: &str, message: Option<Str
     emit_index_state_now(app, state, message);
 }
 
-pub(crate) fn emit_index_state_now(app: &AppHandle, state: &str, message: Option<String>) {
-    let is_catchup = message.as_ref().map_or(false, |m| m.starts_with("Catchup:"));
+pub(crate) fn emit_index_state_now(app: &EventSink, state: &str, message: Option<String>) {
+    let is_catchup = message
+        .as_ref()
+        .map_or(false, |m| m.starts_with("Catchup:"));
     let _ = app.emit(
         "index_state",
         IndexStateEvent {
@@ -2479,7 +2536,7 @@ pub(crate) fn emit_index_state_now(app: &AppHandle, state: &str, message: Option
 }
 
 pub(crate) fn emit_index_updated(
-    app: &AppHandle,
+    app: &EventSink,
     entries_count: u64,
     last_updated: i64,
     permission_errors: u64,
@@ -2492,7 +2549,7 @@ pub(crate) fn emit_index_updated(
 }
 
 pub(crate) fn emit_index_updated_now(
-    app: &AppHandle,
+    app: &EventSink,
     entries_count: u64,
     last_updated: i64,
     permission_errors: u64,
@@ -2507,7 +2564,12 @@ pub(crate) fn emit_index_updated_now(
     );
 }
 
-pub(crate) fn emit_index_progress(app: &AppHandle, scanned: u64, indexed: u64, current_path: String) {
+pub(crate) fn emit_index_progress(
+    app: &EventSink,
+    scanned: u64,
+    indexed: u64,
+    current_path: String,
+) {
     if !ui_gate::is_visible() {
         ui_gate::hold_progress(scanned, indexed, current_path);
         return;
@@ -2516,7 +2578,7 @@ pub(crate) fn emit_index_progress(app: &AppHandle, scanned: u64, indexed: u64, c
 }
 
 pub(crate) fn emit_index_progress_now(
-    app: &AppHandle,
+    app: &EventSink,
     scanned: u64,
     indexed: u64,
     current_path: String,
@@ -2544,7 +2606,7 @@ pub(crate) fn set_progress(state: &AppState, scanned: u64, indexed: u64, current
     status.current_path = current_path.to_string();
 }
 
-fn emit_status_counts(app: &AppHandle, state: &AppState) {
+fn emit_status_counts(app: &EventSink, state: &AppState) {
     let status = state.status.lock();
     emit_index_updated(
         app,
@@ -2566,7 +2628,10 @@ pub(crate) fn update_status_counts(state: &AppState) -> AppResult<(u64, Option<i
     Ok((entries_count, last_updated))
 }
 
-pub(crate) fn refresh_and_emit_status_counts(app: Option<&AppHandle>, state: &AppState) -> AppResult<()> {
+pub(crate) fn refresh_and_emit_status_counts(
+    app: Option<&EventSink>,
+    state: &AppState,
+) -> AppResult<()> {
     let conn = db_connection(&state.db_path)?;
     let (entries_count, last_updated) = update_counts(&conn)?;
     {
@@ -2589,7 +2654,7 @@ pub(crate) fn refresh_and_emit_status_counts(app: Option<&AppHandle>, state: &Ap
 /// it is safe on every watcher batch: the COUNT(*)/MAX() recount there was a
 /// periodic whole-table scan — a visible CPU spike every ~2s on large DBs.
 #[cfg(target_os = "macos")]
-fn emit_and_persist_cached_counts(app: Option<&AppHandle>, state: &AppState) {
+fn emit_and_persist_cached_counts(app: Option<&EventSink>, state: &AppState) {
     let (entries_count, last_updated) = {
         let status = state.status.lock();
         (status.entries_count, status.last_updated)
@@ -2608,7 +2673,7 @@ fn emit_and_persist_cached_counts(app: Option<&AppHandle>, state: &AppState) {
 /// Used on read-only-GUI startup paths (Windows service reader, macOS daemon
 /// reader) where the index is already complete from a prior writer run.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-pub(crate) fn set_ready_with_cached_counts(app: &AppHandle, state: &AppState) {
+pub(crate) fn set_ready_with_cached_counts(app: &EventSink, state: &AppState) {
     let (count, last_updated) = db_connection(&state.db_path)
         .ok()
         .map(|conn| {
@@ -2634,12 +2699,12 @@ fn touch_status_updated(state: &AppState) {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn start_full_index_worker(app: AppHandle, state: AppState) -> AppResult<()> {
+pub(crate) fn start_full_index_worker(app: EventSink, state: AppState) -> AppResult<()> {
     start_full_index_worker_inner(app, state, false)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn start_full_index_worker_inner(app: AppHandle, state: AppState, silent: bool) -> AppResult<()> {
+fn start_full_index_worker_inner(app: EventSink, state: AppState, silent: bool) -> AppResult<()> {
     if state
         .indexing_active
         .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
@@ -2795,10 +2860,7 @@ pub(crate) fn release_memory_to_os() {
     #[cfg(target_os = "macos")]
     unsafe {
         extern "C" {
-            fn malloc_zone_pressure_relief(
-                zone: *mut std::os::raw::c_void,
-                goal: usize,
-            ) -> usize;
+            fn malloc_zone_pressure_relief(zone: *mut std::os::raw::c_void, goal: usize) -> usize;
         }
         malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
     }
@@ -3275,9 +3337,8 @@ where
         .map_err(|error| filesystem_observation_error("read_dir_open", scan_root, &error))?;
     let mut observed = Vec::new();
     for entry in entries {
-        let child_path = entry.map_err(|error| {
-            filesystem_observation_error("read_dir_entry", scan_root, &error)
-        })?;
+        let child_path = entry
+            .map_err(|error| filesystem_observation_error("read_dir_entry", scan_root, &error))?;
         if should_skip(&child_path) {
             continue;
         }
@@ -3373,8 +3434,8 @@ fn stage_direct_child(
 
     // Preserve the previous behavior for a direct symlink to a directory:
     // jwalk may use it as a root while still refusing nested symlink traversal.
-    let is_dir = child.metadata.is_dir()
-        || (child.metadata.file_type().is_symlink() && child.path.is_dir());
+    let is_dir =
+        child.metadata.is_dir() || (child.metadata.file_type().is_symlink() && child.path.is_dir());
     if is_dir {
         if is_deferred_dir(&child.path, scan_root) {
             deferred_roots.push(child.path);
@@ -3459,7 +3520,7 @@ pub(crate) fn build_scan_pool() -> (Arc<jwalk::rayon::ThreadPool>, usize, usize)
 /// `app: None` runs the index pipeline without UI event emission and without
 /// spawning the background finalizing thread (the caller finalizes explicitly)
 /// — used by benchmarks/tests to exercise the real indexing path.
-pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -> AppResult<()> {
+pub(crate) fn run_incremental_index(app: Option<&EventSink>, state: &AppState) -> AppResult<()> {
     let started = Instant::now();
     perf_log(format!(
         "index_run_start home={} db={}",
@@ -3535,13 +3596,19 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
     }
     let t_checkpoint = Instant::now();
     let _ = restore_normal_pragmas(&conn);
-    eprintln!("[timing] checkpoint {}ms", t_checkpoint.elapsed().as_millis());
+    eprintln!(
+        "[timing] checkpoint {}ms",
+        t_checkpoint.elapsed().as_millis()
+    );
 
     match &result {
         Ok(_) => {
             let _ = set_meta(&conn, "index_complete", "1");
             let extra_roots = state.extra_roots.lock().clone();
-            let roots_str: Vec<String> = extra_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
+            let roots_str: Vec<String> = extra_roots
+                .iter()
+                .map(|r| r.to_string_lossy().to_string())
+                .collect();
             let _ = set_meta(&conn, "indexed_extra_roots", &roots_str.join("\n"));
             // Transition to Ready, then run deferred DDL (fresh finalization,
             // ensure_db_indexes) + GC in one background thread. Search works
@@ -3641,11 +3708,10 @@ pub(crate) fn run_incremental_index(app: Option<&AppHandle>, state: &AppState) -
 }
 
 fn run_incremental_index_inner(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     conn: &mut Connection,
 ) -> AppResult<()> {
-
     let (runtime_ignored_roots, runtime_ignored_patterns) = effective_ignore_rules(
         &state.config_file_path,
         &state.home_dir,
@@ -3721,17 +3787,10 @@ fn run_incremental_index_inner(
     let observed_direct_children = observe_direct_children(
         &state.scan_root,
         |root| {
-            fs::read_dir(root)
-                .map(|entries| entries.map(|entry| entry.map(|entry| entry.path())))
+            fs::read_dir(root).map(|entries| entries.map(|entry| entry.map(|entry| entry.path())))
         },
         |path| fs::symlink_metadata(path),
-        |path| {
-            should_skip_path(
-                path,
-                &runtime_ignored_roots,
-                &runtime_ignored_patterns,
-            )
-        },
+        |path| should_skip_path(path, &runtime_ignored_roots, &runtime_ignored_patterns),
     )?;
     for child in observed_direct_children {
         scanned += 1;
@@ -3754,13 +3813,7 @@ fn run_incremental_index_inner(
         let reconciliation = reconcile_unseen_direct_children(
             &root_existing,
             |path| fs::symlink_metadata(path),
-            |path| {
-                should_skip_path(
-                    path,
-                    &runtime_ignored_roots,
-                    &runtime_ignored_patterns,
-                )
-            },
+            |path| should_skip_path(path, &runtime_ignored_roots, &runtime_ignored_patterns),
         )?;
 
         for child in reconciliation.present {
@@ -3779,8 +3832,7 @@ fn run_incremental_index_inner(
 
         if !reconciliation.delete_paths.is_empty() {
             if reconciliation.delete_paths.iter().any(|path| {
-                path == &scan_str
-                    || Path::new(path).parent() != Some(state.scan_root.as_path())
+                path == &scan_str || Path::new(path).parent() != Some(state.scan_root.as_path())
             }) {
                 return Err("direct-child deletion escaped the scan-root boundary".to_string());
             }
@@ -3868,7 +3920,6 @@ fn run_incremental_index_inner(
     let arc_ignored_roots = Arc::new(runtime_ignored_roots.clone());
     let arc_ignored_patterns = Arc::new(runtime_ignored_patterns.clone());
 
-
     if is_fresh {
         // FRESH INDEX: parallel root scan.
         // All roots are scanned concurrently by N worker threads; the main thread
@@ -3943,45 +3994,42 @@ fn run_incremental_index_inner(
                         // scanned as configured without passing that filter, so
                         // such a root falls back to the full per-entry check.
                         let root_vetted = !should_skip_path(root, &skip_roots, &skip_patterns);
-                        let walker =
-                            jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
-                                .follow_links(false)
-                                .skip_hidden(false)
-                                .parallelism(jwalk::Parallelism::RayonExistingPool {
-                                    pool: pool.clone(),
-                                    busy_timeout: None,
-                                })
-                                .process_read_dir(move |_depth, path, _state, children| {
-                                    // Normalize the parent once per directory
-                                    // instead of the whole path once per child.
-                                    let dir_str =
-                                        normalize_slashes(path.to_string_lossy().to_string());
-                                    let mut scratch = String::with_capacity(dir_str.len() + 64);
-                                    children.retain_mut(|entry_result| match entry_result {
-                                        Ok(entry) => {
-                                            let full_path = path.join(&entry.file_name);
-                                            let skip = if root_vetted {
-                                                should_skip_child(
-                                                    &dir_str,
-                                                    &entry.file_name.to_string_lossy(),
-                                                    &full_path,
-                                                    &mut scratch,
-                                                    &s_roots,
-                                                    &s_patterns,
-                                                )
-                                            } else {
-                                                should_skip_path(&full_path, &s_roots, &s_patterns)
-                                            };
-                                            if skip {
-                                                return false;
-                                            }
-                                            entry.client_state =
-                                                fs::symlink_metadata(&full_path).ok();
-                                            true
+                        let walker = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
+                            .follow_links(false)
+                            .skip_hidden(false)
+                            .parallelism(jwalk::Parallelism::RayonExistingPool {
+                                pool: pool.clone(),
+                                busy_timeout: None,
+                            })
+                            .process_read_dir(move |_depth, path, _state, children| {
+                                // Normalize the parent once per directory
+                                // instead of the whole path once per child.
+                                let dir_str = normalize_slashes(path.to_string_lossy().to_string());
+                                let mut scratch = String::with_capacity(dir_str.len() + 64);
+                                children.retain_mut(|entry_result| match entry_result {
+                                    Ok(entry) => {
+                                        let full_path = path.join(&entry.file_name);
+                                        let skip = if root_vetted {
+                                            should_skip_child(
+                                                &dir_str,
+                                                &entry.file_name.to_string_lossy(),
+                                                &full_path,
+                                                &mut scratch,
+                                                &s_roots,
+                                                &s_patterns,
+                                            )
+                                        } else {
+                                            should_skip_path(&full_path, &s_roots, &s_patterns)
+                                        };
+                                        if skip {
+                                            return false;
                                         }
-                                        Err(_) => false,
-                                    });
+                                        entry.client_state = fs::symlink_metadata(&full_path).ok();
+                                        true
+                                    }
+                                    Err(_) => false,
                                 });
+                            });
 
                         for result in walker {
                             // Cooperative cancel (daemon yielding to the GUI):
@@ -4039,10 +4087,12 @@ fn run_incremental_index_inner(
                                         // Sort on the worker (parallel) so the
                                         // single writer thread gets b-tree
                                         // friendly, pre-ordered batches.
-                                        local_batch
-                                            .sort_unstable_by(|a, b| a.path.cmp(&b.path));
+                                        local_batch.sort_unstable_by(|a, b| a.path.cmp(&b.path));
                                         let _ = tx.send((
-                                            std::mem::replace(&mut local_batch, Vec::with_capacity(flush_size)),
+                                            std::mem::replace(
+                                                &mut local_batch,
+                                                Vec::with_capacity(flush_size),
+                                            ),
                                             local_scanned,
                                             local_indexed,
                                             failures.take_counts(),
@@ -4214,46 +4264,43 @@ fn run_incremental_index_inner(
                         // See the fresh branch: the fast per-child check needs a
                         // parent that already cleared `should_skip_path`.
                         let root_vetted = !should_skip_path(root, &skip_roots, &skip_patterns);
-                        let walker =
-                            jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
-                                .follow_links(false)
-                                .skip_hidden(false)
-                                .parallelism(jwalk::Parallelism::RayonExistingPool {
-                                    pool: pool.clone(),
-                                    busy_timeout: None,
-                                })
-                                .process_read_dir(move |_depth, path, _state, children| {
-                                    let dir_str =
-                                        normalize_slashes(path.to_string_lossy().to_string());
-                                    let mut scratch = String::with_capacity(dir_str.len() + 64);
-                                    children.retain_mut(|entry_result| match entry_result {
-                                        Ok(entry) => {
-                                            let full_path = path.join(&entry.file_name);
-                                            let skip = if root_vetted {
-                                                should_skip_child(
-                                                    &dir_str,
-                                                    &entry.file_name.to_string_lossy(),
-                                                    &full_path,
-                                                    &mut scratch,
-                                                    &s_roots,
-                                                    &s_patterns,
-                                                )
-                                            } else {
-                                                should_skip_path(&full_path, &s_roots, &s_patterns)
-                                            };
-                                            if skip {
-                                                return false;
-                                            }
-                                            entry.client_state =
-                                                fs::symlink_metadata(&full_path).ok();
-                                            true
+                        let walker = jwalk::WalkDirGeneric::<((), Option<fs::Metadata>)>::new(root)
+                            .follow_links(false)
+                            .skip_hidden(false)
+                            .parallelism(jwalk::Parallelism::RayonExistingPool {
+                                pool: pool.clone(),
+                                busy_timeout: None,
+                            })
+                            .process_read_dir(move |_depth, path, _state, children| {
+                                let dir_str = normalize_slashes(path.to_string_lossy().to_string());
+                                let mut scratch = String::with_capacity(dir_str.len() + 64);
+                                children.retain_mut(|entry_result| match entry_result {
+                                    Ok(entry) => {
+                                        let full_path = path.join(&entry.file_name);
+                                        let skip = if root_vetted {
+                                            should_skip_child(
+                                                &dir_str,
+                                                &entry.file_name.to_string_lossy(),
+                                                &full_path,
+                                                &mut scratch,
+                                                &s_roots,
+                                                &s_patterns,
+                                            )
+                                        } else {
+                                            should_skip_path(&full_path, &s_roots, &s_patterns)
+                                        };
+                                        if skip {
+                                            return false;
                                         }
-                                        // Preserve read-dir errors so the
-                                        // outer iterator can mark their
-                                        // prefixes as errored before diffing.
-                                        Err(_) => true,
-                                    });
+                                        entry.client_state = fs::symlink_metadata(&full_path).ok();
+                                        true
+                                    }
+                                    // Preserve read-dir errors so the
+                                    // outer iterator can mark their
+                                    // prefixes as errored before diffing.
+                                    Err(_) => true,
                                 });
+                            });
 
                         for result in walker {
                             // Cooperative cancel (daemon yielding to the GUI):
@@ -4751,13 +4798,9 @@ fn apply_path_changes(
         to_upsert,
         to_delete,
         retry_paths,
-    } = prepare_path_changes(
-        state,
-        paths,
-        &ignored_roots,
-        &ignored_patterns,
-        |path| fs::symlink_metadata(path),
-    );
+    } = prepare_path_changes(state, paths, &ignored_roots, &ignored_patterns, |path| {
+        fs::symlink_metadata(path)
+    });
 
     if to_upsert.is_empty() && to_delete.is_empty() {
         return Ok(PathChangeOutcome {
@@ -4830,7 +4873,7 @@ const FS_OBSERVATION_RETRY_DELAY: Duration = Duration::from_secs(3);
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn process_watcher_paths(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     pending: &mut HashSet<PathBuf>,
     deadline: &mut Option<Instant>,
@@ -4868,7 +4911,12 @@ fn process_watcher_paths(
                 rescan_candidates,
             } = outcome;
             for dir in rescan_candidates {
-                queue_subtree_rescan(dir, RENAME_RESCAN_COOLDOWN, queued_rescans, finished_rescans);
+                queue_subtree_rescan(
+                    dir,
+                    RENAME_RESCAN_COOLDOWN,
+                    queued_rescans,
+                    finished_rescans,
+                );
             }
             if retry_paths.is_empty() {
                 *deadline = None;
@@ -4899,7 +4947,8 @@ fn process_watcher_paths(
             }
         }
         Err(err) => {
-            let is_busy = err.contains("locked") || err.contains("busy") || err.contains("unable to open");
+            let is_busy =
+                err.contains("locked") || err.contains("busy") || err.contains("unable to open");
             if is_busy {
                 *busy_streak += 1;
                 if *busy_streak == WATCHER_BUSY_ALERT_STREAK {
@@ -5142,7 +5191,7 @@ fn queue_subtree_rescan(
 /// retried on the next loop tick.
 #[cfg(target_os = "macos")]
 fn spawn_due_subtree_rescan(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     queued: &mut HashMap<PathBuf, QueuedRescan>,
     inflight: &Arc<AtomicBool>,
@@ -5246,10 +5295,7 @@ fn spawn_due_subtree_rescan(
                 }
             }
             Err(err) => {
-                eprintln!(
-                    "[watcher] subtree rescan {} failed: {err}",
-                    path.display()
-                );
+                eprintln!("[watcher] subtree rescan {} failed: {err}", path.display());
                 diag::log(format!(
                     "subtree rescan FAILED for {}: {err}",
                     path.display()
@@ -5275,7 +5321,7 @@ enum WatcherExit {
 
 #[cfg(target_os = "macos")]
 fn start_fsevent_watcher_worker(
-    app: Option<AppHandle>,
+    app: Option<EventSink>,
     state: AppState,
     since_event_id: Option<u64>,
     conditional: bool,
@@ -5313,11 +5359,8 @@ fn start_fsevent_watcher_worker(
             let (tx, rx) = std::sync::mpsc::channel();
             let (watch_roots, remaps) = fsevent_watch_roots(&state);
 
-            let built = mac::fsevent_watcher::FsEventWatcher::new(
-                &watch_roots,
-                since_event_id,
-                tx.clone(),
-            );
+            let built =
+                mac::fsevent_watcher::FsEventWatcher::new(&watch_roots, since_event_id, tx.clone());
             let built = match built {
                 Err(err) if watch_roots.len() > 1 => {
                     eprintln!(
@@ -5406,7 +5449,7 @@ fn start_fsevent_watcher_worker(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn run_fsevent_stream(
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     state: &AppState,
     my_gen: u64,
     rx: &std::sync::mpsc::Receiver<mac::fsevent_watcher::FsEvent>,
@@ -5440,8 +5483,9 @@ fn run_fsevent_stream(
     // pathignore_changed when actual rule entries change (ignores whitespace/comments).
     let mut last_config_entries =
         pathignore_active_entries(&fs::read_to_string(&state.config_file_path).unwrap_or_default());
-    let mut last_pathindexing_entries =
-        pathindexing::pathindexing_active_entries(&fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default());
+    let mut last_pathindexing_entries = pathindexing::pathindexing_active_entries(
+        &fs::read_to_string(&state.pathindexing_file_path).unwrap_or_default(),
+    );
 
     loop {
         if state.watcher_stop.load(AtomicOrdering::Acquire)
@@ -5495,7 +5539,9 @@ fn run_fsevent_stream(
                             let old_roots = pathindexing::parse_pathindexing_paths_unchecked(
                                 &last_pathindexing_entries.join("\n"),
                             );
-                            let new_roots = pathindexing::load_pathindexing_roots(&state.pathindexing_file_path);
+                            let new_roots = pathindexing::load_pathindexing_roots(
+                                &state.pathindexing_file_path,
+                            );
                             last_pathindexing_entries = new_entries;
 
                             let bg_state = state.clone();
@@ -5505,7 +5551,16 @@ fn run_fsevent_stream(
                             // Roots changed: rebuild the FSEvents stream so
                             // the new extra roots are watched live.
                             rebuild_requested = true;
-                            if state.pathindexing_active.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
+                            if state
+                                .pathindexing_active
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    AtomicOrdering::AcqRel,
+                                    AtomicOrdering::Acquire,
+                                )
+                                .is_err()
+                            {
                                 eprintln!("[pathindexing] scan already in progress, skipping");
                                 continue;
                             }
@@ -5530,9 +5585,14 @@ fn run_fsevent_stream(
                                     target_roots.len()
                                 ));
                                 loop {
-                                    let (ign_roots, ign_patterns) = cached_effective_ignore_rules(&bg_state);
+                                    let (ign_roots, ign_patterns) =
+                                        cached_effective_ignore_rules(&bg_state);
                                     match pathindexing::handle_pathindexing_change(
-                                        &bg_state, &prev_roots, &target_roots, &ign_roots, &ign_patterns,
+                                        &bg_state,
+                                        &prev_roots,
+                                        &target_roots,
+                                        &ign_roots,
+                                        &ign_patterns,
                                     ) {
                                         Ok(()) => {
                                             eprintln!("[pathindexing] background scan done");
@@ -5541,10 +5601,20 @@ fn run_fsevent_stream(
                                                 scan_started.elapsed().as_secs_f32()
                                             ));
                                             if let Ok(c) = db_connection(&bg_state.db_path) {
-                                                let roots_str: Vec<String> = target_roots.iter().map(|r| r.to_string_lossy().to_string()).collect();
-                                                let _ = set_meta(&c, "indexed_extra_roots", &roots_str.join("\n"));
+                                                let roots_str: Vec<String> = target_roots
+                                                    .iter()
+                                                    .map(|r| r.to_string_lossy().to_string())
+                                                    .collect();
+                                                let _ = set_meta(
+                                                    &c,
+                                                    "indexed_extra_roots",
+                                                    &roots_str.join("\n"),
+                                                );
                                             }
-                                            let _ = refresh_and_emit_status_counts(bg_app.as_ref(), &bg_state);
+                                            let _ = refresh_and_emit_status_counts(
+                                                bg_app.as_ref(),
+                                                &bg_state,
+                                            );
                                         }
                                         Err(e) => {
                                             eprintln!("[pathindexing] change handling error: {e}");
@@ -5568,7 +5638,9 @@ fn run_fsevent_stream(
                                     emit_index_state(bg_app, "Ready", None);
                                     bg_app.emit("pathindexing_changed", ()).ok();
                                 }
-                                bg_state.pathindexing_active.store(false, AtomicOrdering::Release);
+                                bg_state
+                                    .pathindexing_active
+                                    .store(false, AtomicOrdering::Release);
                             });
                         }
                         continue;
@@ -5611,10 +5683,7 @@ fn run_fsevent_stream(
                         path.display()
                     ));
                 }
-                if replay_phase
-                    && must_scan_count >= MUST_SCAN_THRESHOLD
-                    && !full_scan_triggered
-                {
+                if replay_phase && must_scan_count >= MUST_SCAN_THRESHOLD && !full_scan_triggered {
                     perf_log(format!(
                         "conditional_startup: MustScanSubDirs={} >= threshold, triggering full scan",
                         must_scan_count
@@ -5990,8 +6059,7 @@ fn renders_from_file(_ext: &str) -> bool {
     false
 }
 
-#[tauri::command]
-fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
+fn get_index_status(state: &AppState) -> IndexStatusDto {
     let started = Instant::now();
     let snapshot = state.status.lock().clone();
     let snapshot_state = snapshot.state.as_str().to_string();
@@ -6033,12 +6101,10 @@ fn get_index_status(state: State<'_, AppState>) -> IndexStatusDto {
     dto
 }
 
-#[tauri::command]
-fn get_home_dir(state: State<'_, AppState>) -> String {
+fn get_home_dir(state: &AppState) -> String {
     state.home_dir.to_string_lossy().to_string()
 }
 
-#[tauri::command]
 fn check_full_disk_access() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -6053,7 +6119,6 @@ fn check_full_disk_access() -> bool {
     }
 }
 
-#[tauri::command]
 fn open_privacy_settings() {
     #[cfg(target_os = "macos")]
     {
@@ -6064,7 +6129,6 @@ fn open_privacy_settings() {
 }
 
 /// System Settings → Login Items — the `approval_required` banner action.
-#[tauri::command]
 fn open_login_items_settings() {
     #[cfg(target_os = "macos")]
     mac::launch_agent::open_login_items_settings();
@@ -6085,8 +6149,7 @@ struct OnboardingStateDto {
     daemon_degraded: bool,
 }
 
-#[tauri::command]
-async fn get_onboarding_state(state: State<'_, AppState>) -> AppResult<OnboardingStateDto> {
+async fn get_onboarding_state(state: &AppState) -> AppResult<OnboardingStateDto> {
     #[cfg(target_os = "macos")]
     {
         use mac::launch_agent::{self, RegState};
@@ -6097,7 +6160,7 @@ async fn get_onboarding_state(state: State<'_, AppState>) -> AppResult<Onboardin
         // TCC.db, and agent_status is an XPC call. The frontend calls this in
         // onMount and after every onboarding/toggle action, so keep it off the
         // main thread (a wedged daemon would otherwise freeze the window).
-        tauri::async_runtime::spawn_blocking(move || {
+        runtime::spawn_blocking(move || {
             let daemon = daemon_ipc::status(&data_dir);
             OnboardingStateDto {
                 // §7: adopt an existing index as granted-implicit here too —
@@ -6137,8 +6200,7 @@ async fn get_onboarding_state(state: State<'_, AppState>) -> AppResult<Onboardin
 /// Record the first-run onboarding decision ("granted" | "skipped") and kick
 /// the registration self-heal — the recorded decision releases the daemon's
 /// gate, and the first registration starts it immediately (G3).
-#[tauri::command]
-async fn record_onboarding_decision(decision: String, state: State<'_, AppState>) -> AppResult<()> {
+async fn record_onboarding_decision(decision: String, state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "macos")]
     {
         if decision != "granted" && decision != "skipped" {
@@ -6148,7 +6210,7 @@ async fn record_onboarding_decision(decision: String, state: State<'_, AppState>
         // The persist is a `defaults write` subprocess — off the main thread.
         // The registration self-heal (XPC, can start the daemon — G3) stays on
         // its own thread so the modal button doesn't wait on it.
-        tauri::async_runtime::spawn_blocking(move || {
+        runtime::spawn_blocking(move || {
             if !mac::prefs::record_onboarding_decision(&decision) {
                 return Err("failed to persist the onboarding decision".to_string());
             }
@@ -6172,14 +6234,13 @@ async fn record_onboarding_decision(decision: String, state: State<'_, AppState>
 
 /// The `not_registered` banner action: register the login-item agent now
 /// (starts the daemon immediately — G3).
-#[tauri::command]
-async fn register_daemon(state: State<'_, AppState>) -> AppResult<()> {
+async fn register_daemon(state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "macos")]
     {
         let data_dir = daemon_data_dir(&state);
         // `defaults` subprocesses + the SMAppService XPC registration — off
         // the main thread.
-        tauri::async_runtime::spawn_blocking(move || {
+        runtime::spawn_blocking(move || {
             // The gate needs a decision on record before a daemon may build; a
             // user registering from the banner without onboarding effectively
             // skipped it (FDA state is whatever it is — the probe decides).
@@ -6205,14 +6266,13 @@ async fn register_daemon(state: State<'_, AppState>) -> AppResult<()> {
 /// final defense), stop the daemon (dormant), unregister. ON (G5): clear the
 /// opt-out, clear any lease/unmanaged daemon holding the lock, then
 /// kickstart/register — the user sees the daemon come up immediately.
-#[tauri::command]
-async fn set_daemon_autostart(enabled: bool, state: State<'_, AppState>) -> AppResult<()> {
+async fn set_daemon_autostart(enabled: bool, state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "macos")]
     {
         use mac::launch_agent::{self, RegState};
         let data_dir = daemon_data_dir(&state);
         let db_path = state.db_path.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        runtime::spawn_blocking(move || {
             if enabled {
                 mac::prefs::set_opt_out(false);
                 // A lease/unmanaged daemon may hold daemon.lock; ask it to
@@ -6244,7 +6304,9 @@ async fn set_daemon_autostart(enabled: bool, state: State<'_, AppState>) -> AppR
                     // Best-effort: the opt-out record + start gate already
                     // guarantee no full daemon returns even if this fails.
                     if let Err(e) = launch_agent::unregister() {
-                        diag::log(format!("toggle-off: unregister failed (gate still holds): {e}"));
+                        diag::log(format!(
+                            "toggle-off: unregister failed (gate still holds): {e}"
+                        ));
                     }
                 }
                 Ok(())
@@ -6260,12 +6322,14 @@ async fn set_daemon_autostart(enabled: bool, state: State<'_, AppState>) -> AppR
     }
 }
 
-#[tauri::command]
-fn open_pathignore(state: State<'_, AppState>) -> AppResult<()> {
+fn open_pathignore(state: &AppState) -> AppResult<()> {
     let path = &state.config_file_path;
     ensure_pathignore_exists(path)?;
     #[cfg(target_os = "macos")]
-    Command::new("open").arg(path).spawn().map_err(|e| e.to_string())?;
+    Command::new("open")
+        .arg(path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     Command::new("cmd")
         .args(["/C", "start", "", &path.to_string_lossy().to_string()])
@@ -6277,19 +6341,16 @@ fn open_pathignore(state: State<'_, AppState>) -> AppResult<()> {
     Ok(())
 }
 
-#[tauri::command]
-fn open_pathindexing(state: State<'_, AppState>) -> AppResult<()> {
+fn open_pathindexing(state: &AppState) -> AppResult<()> {
     pathindexing::open_pathindexing_file(&state.pathindexing_file_path)
 }
 
-#[tauri::command]
-fn restart_app(app: AppHandle) {
+fn restart_app(app: EventSink) {
     app.restart();
 }
 
 /// Relaunch `--register-service` elevated (UAC) — the GUI banner action for a
 /// missing/broken indexer service (D5). No-op off Windows.
-#[tauri::command]
 fn register_service_elevated() -> AppResult<()> {
     #[cfg(target_os = "windows")]
     {
@@ -6301,8 +6362,7 @@ fn register_service_elevated() -> AppResult<()> {
     }
 }
 
-#[tauri::command]
-async fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+async fn start_full_index(app: EventSink, state: &AppState) -> AppResult<()> {
     // macOS read-only GUI (D4): a full re-index is the daemon's job — mapped
     // to its reset_index (G15), same as the Windows service model. The UDS
     // call blocks (5s read/write timeouts), so it runs off the async runtime,
@@ -6311,7 +6371,7 @@ async fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResu
     {
         let _ = app;
         let data_dir = daemon_data_dir(&state);
-        return tauri::async_runtime::spawn_blocking(move || daemon_ipc::reset_index(&data_dir))
+        return runtime::spawn_blocking(move || daemon_ipc::reset_index(&data_dir))
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -6319,8 +6379,7 @@ async fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResu
     {
         if !state.is_writer.load(AtomicOrdering::Acquire) {
             return Err(
-                "Another Everything instance owns the index; this window is read-only."
-                    .to_string(),
+                "Another Everything instance owns the index; this window is read-only.".to_string(),
             );
         }
         #[cfg(target_os = "windows")]
@@ -6329,13 +6388,13 @@ async fn start_full_index(app: AppHandle, state: State<'_, AppState>) -> AppResu
             // delegate, off the runtime (the control-pipe call blocks with no
             // client-side read timeout).
             let _ = (app, state);
-            tauri::async_runtime::spawn_blocking(win::service_client::reset_index)
+            runtime::spawn_blocking(win::service_client::reset_index)
                 .await
                 .map_err(|e| e.to_string())?
         }
         #[cfg(not(target_os = "windows"))]
         {
-            start_full_index_worker(app, state.inner().clone())
+            start_full_index_worker(app, state.clone())
         }
     }
 }
@@ -6350,8 +6409,7 @@ fn daemon_data_dir(state: &AppState) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-#[tauri::command]
-async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+async fn reset_index(app: EventSink, state: &AppState) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     let out: AppResult<()> = {
         // Read-only GUI (§3.3/D3): delegate the re-index to the service, which
@@ -6359,7 +6417,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         // I/O with no client-side read timeout, so run it off the async runtime —
         // a stalled service handler would otherwise freeze the GUI's IPC.
         let _ = (app, state);
-        tauri::async_runtime::spawn_blocking(win::service_client::reset_index)
+        runtime::spawn_blocking(win::service_client::reset_index)
             .await
             .map_err(|e| e.to_string())?
     };
@@ -6370,7 +6428,7 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
         // the Windows arm.
         let _ = app;
         let data_dir = daemon_data_dir(&state);
-        tauri::async_runtime::spawn_blocking(move || daemon_ipc::reset_index(&data_dir))
+        runtime::spawn_blocking(move || daemon_ipc::reset_index(&data_dir))
             .await
             .map_err(|e| e.to_string())?
     };
@@ -6382,63 +6440,63 @@ async fn reset_index(app: AppHandle, state: State<'_, AppState>) -> AppResult<()
                 "Another Everything instance owns the index; this window is read-only.".to_string(),
             );
         }
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if state.indexing_active.load(AtomicOrdering::Acquire) {
-            return Err("Cannot reset while indexing is in progress.".to_string());
-        }
-
-        // Stop existing file watcher and wait for it to fully exit
-        state.watcher_stop.store(true, AtomicOrdering::Release);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.watcher_active.load(AtomicOrdering::Acquire) {
-            if std::time::Instant::now() >= deadline {
-                eprintln!("[reset] watcher did not stop within 5s, proceeding anyway");
-                break;
+        let state = state.clone();
+        runtime::spawn_blocking(move || {
+            if state.indexing_active.load(AtomicOrdering::Acquire) {
+                return Err("Cannot reset while indexing is in progress.".to_string());
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
 
-        let conn = db_connection(&state.db_path)?;
-        reset_index_storage(&conn)?;
+            // Stop existing file watcher and wait for it to fully exit
+            state.watcher_stop.store(true, AtomicOrdering::Release);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.watcher_active.load(AtomicOrdering::Acquire) {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("[reset] watcher did not stop within 5s, proceeding anyway");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
 
-        {
-            let mut status = state.status.lock();
-            status.state = IndexState::Indexing;
-            status.entries_count = 0;
-            status.last_updated = None;
-            status.permission_errors = 0;
-            status.message = None;
-            status.scanned = 0;
-            status.indexed = 0;
-            status.current_path.clear();
-        }
+            let conn = db_connection(&state.db_path)?;
+            reset_index_storage(&conn)?;
 
-        invalidate_search_caches(&state);
-        // Schema was swapped (entries renamed + recreated): drop pooled search
-        // connections so nothing holds statements against the old table.
-        state.search_conn_pool.lock().clear();
+            {
+                let mut status = state.status.lock();
+                status.state = IndexState::Indexing;
+                status.entries_count = 0;
+                status.last_updated = None;
+                status.permission_errors = 0;
+                status.message = None;
+                status.scanned = 0;
+                status.indexed = 0;
+                status.current_path.clear();
+            }
 
-        emit_index_state(&app, "Indexing", None);
-        emit_index_updated(&app, 0, now_epoch(), 0);
+            invalidate_search_caches(&state);
+            // Schema was swapped (entries renamed + recreated): drop pooled search
+            // connections so nothing holds statements against the old table.
+            state.search_conn_pool.lock().clear();
 
-        // Allow new watcher to start
-        state.watcher_stop.store(false, AtomicOrdering::Release);
+            emit_index_state(&app, "Indexing", None);
+            emit_index_updated(&app, 0, now_epoch(), 0);
 
-        #[cfg(target_os = "windows")]
-        {
-            win::start_windows_indexing(app, state);
-            Ok(())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            start_full_index_worker(app.clone(), state.clone())?;
-            start_fsevent_watcher_worker(Some(app), state, None, false);
-            Ok(())
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())?
+            // Allow new watcher to start
+            state.watcher_stop.store(false, AtomicOrdering::Release);
+
+            #[cfg(target_os = "windows")]
+            {
+                win::start_windows_indexing(app, state);
+                Ok(())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                start_full_index_worker(app.clone(), state.clone())?;
+                start_fsevent_watcher_worker(Some(app), state, None, false);
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
     };
     out
 }
@@ -6748,44 +6806,43 @@ fn run_db_search(
                     results.push(row.map_err(|e| e.to_string())?);
                 }
             } else {
+                let escaped_query = escape_like(query);
+                let exact_query = query.to_string();
+                let prefix_like = format!("{}%", escaped_query);
+                let bare_order = sort_clause(sort_by, sort_dir, "");
 
-            let escaped_query = escape_like(query);
-            let exact_query = query.to_string();
-            let prefix_like = format!("{}%", escaped_query);
-            let bare_order = sort_clause(sort_by, sort_dir, "");
-
-            if offset == 0 {
-                let exact_sql = format!(
-                    r#"
+                if offset == 0 {
+                    let exact_sql = format!(
+                        r#"
                     SELECT path, name, dir, is_dir, ext, size, mtime
                     FROM entries
                     WHERE name COLLATE NOCASE = ?1
                     ORDER BY {bare_order}
                     LIMIT ?2
                     "#,
-                );
-                let mut stmt = conn.prepare_cached(&exact_sql).map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![exact_query, effective_limit], row_to_entry)
-                    .map_err(|e| e.to_string())?;
-                for row in rows {
-                    results.push(row.map_err(|e| e.to_string())?);
+                    );
+                    let mut stmt = conn.prepare_cached(&exact_sql).map_err(|e| e.to_string())?;
+                    let rows = stmt
+                        .query_map(params![exact_query, effective_limit], row_to_entry)
+                        .map_err(|e| e.to_string())?;
+                    for row in rows {
+                        results.push(row.map_err(|e| e.to_string())?);
+                    }
                 }
-            }
 
-            if (results.len() as u32) < effective_limit {
-                let remaining = effective_limit - results.len() as u32;
-                let adj_offset = if offset > 0 {
-                    offset.saturating_sub(results.len() as u32)
-                } else {
-                    0
-                };
+                if (results.len() as u32) < effective_limit {
+                    let remaining = effective_limit - results.len() as u32;
+                    let adj_offset = if offset > 0 {
+                        offset.saturating_sub(results.len() as u32)
+                    } else {
+                        0
+                    };
 
-                // Try indexed prefix search first; fall back to unindexed if
-                // the index is temporarily unavailable (during background DB
-                // rebuild the index may be dropped then recreated).
-                let prefix_sql_indexed = format!(
-                    r#"
+                    // Try indexed prefix search first; fall back to unindexed if
+                    // the index is temporarily unavailable (during background DB
+                    // rebuild the index may be dropped then recreated).
+                    let prefix_sql_indexed = format!(
+                        r#"
                     SELECT path, name, dir, is_dir, ext, size, mtime
                     FROM entries INDEXED BY idx_entries_name_nocase
                     WHERE name LIKE ?1 ESCAPE '\'
@@ -6793,9 +6850,9 @@ fn run_db_search(
                     ORDER BY {bare_order}
                     LIMIT ?3 OFFSET ?4
                     "#,
-                );
-                let prefix_sql_fallback = format!(
-                    r#"
+                    );
+                    let prefix_sql_fallback = format!(
+                        r#"
                     SELECT path, name, dir, is_dir, ext, size, mtime
                     FROM entries
                     WHERE name LIKE ?1 ESCAPE '\'
@@ -6803,46 +6860,49 @@ fn run_db_search(
                     ORDER BY {bare_order}
                     LIMIT ?3 OFFSET ?4
                     "#,
-                );
-                let mut stmt = match conn.prepare_cached(&prefix_sql_indexed) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        eprintln!("[search] idx_entries_name_nocase unavailable, using fallback");
-                        conn.prepare_cached(&prefix_sql_fallback).map_err(|e| e.to_string())?
+                    );
+                    let mut stmt = match conn.prepare_cached(&prefix_sql_indexed) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            eprintln!(
+                                "[search] idx_entries_name_nocase unavailable, using fallback"
+                            );
+                            conn.prepare_cached(&prefix_sql_fallback)
+                                .map_err(|e| e.to_string())?
+                        }
+                    };
+                    let rows = stmt
+                        .query_map(
+                            params![prefix_like, exact_query, remaining, adj_offset],
+                            row_to_entry,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    for row in rows {
+                        results.push(row.map_err(|e| e.to_string())?);
                     }
-                };
-                let rows = stmt
-                    .query_map(
-                        params![prefix_like, exact_query, remaining, adj_offset],
-                        row_to_entry,
-                    )
-                    .map_err(|e| e.to_string())?;
-                for row in rows {
-                    results.push(row.map_err(|e| e.to_string())?);
                 }
-            }
 
-            if results.is_empty() && fts_ready && query.chars().count() >= 3 {
-                // Phase 2: contains-match via FTS5 trigram — indexed, complete
-                // (no time budget), and paginatable. Reached only when exact and
-                // prefix found nothing, so no exclusion predicates are needed.
-                // For offset>0 the page belongs to the contains result set only
-                // when the query has no prefix matches at all (guard below).
-                let serve_contains_page = if offset == 0 {
-                    true
-                } else {
-                    !conn
+                if results.is_empty() && fts_ready && query.chars().count() >= 3 {
+                    // Phase 2: contains-match via FTS5 trigram — indexed, complete
+                    // (no time budget), and paginatable. Reached only when exact and
+                    // prefix found nothing, so no exclusion predicates are needed.
+                    // For offset>0 the page belongs to the contains result set only
+                    // when the query has no prefix matches at all (guard below).
+                    let serve_contains_page = if offset == 0 {
+                        true
+                    } else {
+                        !conn
                         .query_row(
                             "SELECT EXISTS(SELECT 1 FROM entries WHERE name LIKE ?1 ESCAPE '\\')",
                             params![prefix_like],
                             |r| r.get::<_, bool>(0),
                         )
                         .unwrap_or(true)
-                };
-                if serve_contains_page {
-                    let fts_match = fts_phrase(query);
-                    let phase2_sql = format!(
-                        r#"
+                    };
+                    if serve_contains_page {
+                        let fts_match = fts_phrase(query);
+                        let phase2_sql = format!(
+                            r#"
                         SELECT e.path, e.name, e.dir, e.is_dir, e.ext, e.size, e.mtime
                         FROM entries_fts f
                         JOIN entries e ON e.id = f.rowid
@@ -6850,29 +6910,29 @@ fn run_db_search(
                         ORDER BY {order_by}
                         LIMIT ?2 OFFSET ?3
                         "#,
-                    );
-                    let mut stmt2 =
-                        conn.prepare_cached(&phase2_sql).map_err(|e| e.to_string())?;
-                    let rows2 = stmt2
-                        .query_map(params![fts_match, effective_limit, offset], row_to_entry)
-                        .map_err(|e| e.to_string())?;
-                    for row in rows2 {
-                        results.push(row.map_err(|e| e.to_string())?);
+                        );
+                        let mut stmt2 = conn
+                            .prepare_cached(&phase2_sql)
+                            .map_err(|e| e.to_string())?;
+                        let rows2 = stmt2
+                            .query_map(params![fts_match, effective_limit, offset], row_to_entry)
+                            .map_err(|e| e.to_string())?;
+                        for row in rows2 {
+                            results.push(row.map_err(|e| e.to_string())?);
+                        }
                     }
-                }
-            } else if results.is_empty() && offset == 0 {
-                // Phase 2 fallback (query < 3 chars or FTS rebuilding):
-                // contains-match (LIKE '%q%') with tight time budget.
-                let phase2_start = Instant::now();
-                let _ = conn.progress_handler(
-                    2_000,
-                    Some(move || phase2_start.elapsed().as_millis() > 5),
-                );
+                } else if results.is_empty() && offset == 0 {
+                    // Phase 2 fallback (query < 3 chars or FTS rebuilding):
+                    // contains-match (LIKE '%q%') with tight time budget.
+                    let phase2_start = Instant::now();
+                    let _ = conn.progress_handler(
+                        2_000,
+                        Some(move || phase2_start.elapsed().as_millis() > 5),
+                    );
 
-                {
-
-                    let phase2_sql = format!(
-                        r#"
+                    {
+                        let phase2_sql = format!(
+                            r#"
                         SELECT path, name, dir, is_dir, ext, size, mtime
                         FROM entries
                         WHERE name LIKE ?1 ESCAPE '\'
@@ -6881,25 +6941,24 @@ fn run_db_search(
                         ORDER BY {bare_order}
                         LIMIT ?4
                         "#,
-                    );
-                    if let Ok(mut stmt2) = conn.prepare(&phase2_sql) {
-                        if let Ok(rows2) = stmt2.query_map(
-                            params![name_like, exact_query, prefix_like, effective_limit],
-                            row_to_entry,
-                        ) {
-                            for row in rows2 {
-                                match row {
-                                    Ok(entry) => results.push(entry),
-                                    Err(_) => break,
+                        );
+                        if let Ok(mut stmt2) = conn.prepare(&phase2_sql) {
+                            if let Ok(rows2) = stmt2.query_map(
+                                params![name_like, exact_query, prefix_like, effective_limit],
+                                row_to_entry,
+                            ) {
+                                for row in rows2 {
+                                    match row {
+                                        Ok(entry) => results.push(entry),
+                                        Err(_) => break,
+                                    }
                                 }
                             }
                         }
                     }
+
+                    let _ = conn.progress_handler(0, None::<fn() -> bool>);
                 }
-
-                let _ = conn.progress_handler(0, None::<fn() -> bool>);
-            }
-
             } // end sort_by == "name" branch
         }
 
@@ -7129,12 +7188,7 @@ fn run_db_search(
                             );
                             if let Ok(mut stmt) = conn.prepare_cached(&sql) {
                                 if let Ok(rows) = stmt.query_map(
-                                    params![
-                                        pfx,
-                                        dir_like_exact,
-                                        dir_like_sub,
-                                        effective_limit
-                                    ],
+                                    params![pfx, dir_like_exact, dir_like_sub, effective_limit],
                                     row_to_entry,
                                 ) {
                                     for row in rows {
@@ -7263,7 +7317,13 @@ fn execute_search(
         let guard = state.mem_index.read();
         if let Some(ref mi) = *guard {
             let mem_results = mem_search::search_mem_index(
-                mi, &query, &mode, effective_limit, offset, &sort_by, &sort_dir,
+                mi,
+                &query,
+                &mode,
+                effective_limit,
+                offset,
+                &sort_by,
+                &sort_dir,
             );
             mode_label = format!("mem_{mode_label}");
             return Ok(SearchExecution {
@@ -7336,7 +7396,9 @@ fn execute_search(
     match pooled_search_connection(state) {
         Ok(conn) => {
             #[cfg(target_os = "macos")]
-            { db_unavailable = false; }
+            {
+                db_unavailable = false;
+            }
             let outcome = run_db_search(
                 &conn,
                 &state.home_dir,
@@ -7395,7 +7457,9 @@ fn execute_search(
         }
         Err(_) => {
             #[cfg(target_os = "macos")]
-            { db_unavailable = true; }
+            {
+                db_unavailable = true;
+            }
             perf_log(format!("search_db_unavailable query={:?}", query));
         }
     }
@@ -7471,19 +7535,18 @@ fn execute_search(
     })
 }
 
-#[tauri::command]
 async fn search(
-    _app: AppHandle,
+    _app: EventSink,
     query: String,
     limit: Option<u32>,
     offset: Option<u32>,
     sort_by: Option<String>,
     sort_dir: Option<String>,
     include_total: Option<bool>,
-    state: State<'_, AppState>,
+    state: &AppState,
 ) -> AppResult<SearchResultDto> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let state = state.clone();
+    runtime::spawn_blocking(move || {
         let rpc_started = Instant::now();
         let execute_started = Instant::now();
         let execution = execute_search(&state, query, limit, offset, sort_by, sort_dir)?;
@@ -7567,9 +7630,8 @@ async fn search(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
 async fn quick_look(path: String) -> AppResult<()> {
-    tauri::async_runtime::spawn_blocking(move || {
+    runtime::spawn_blocking(move || {
         #[cfg(target_os = "macos")]
         {
             Command::new("qlmanage")
@@ -7599,9 +7661,8 @@ async fn quick_look(path: String) -> AppResult<()> {
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
 async fn open(paths: Vec<String>) -> AppResult<()> {
-    tauri::async_runtime::spawn_blocking(move || {
+    runtime::spawn_blocking(move || {
         for path in &paths {
             #[cfg(target_os = "macos")]
             {
@@ -7794,33 +7855,28 @@ fn copy_text_to_clipboard(text: &str) -> AppResult<()> {
     }))
 }
 
-#[tauri::command]
 async fn open_with(path: String) -> AppResult<()> {
-    tauri::async_runtime::spawn_blocking(move || reveal_in_finder_impl(vec![path]))
+    runtime::spawn_blocking(move || reveal_in_finder_impl(vec![path]))
         .await
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
 async fn reveal_in_finder(paths: Vec<String>) -> AppResult<()> {
-    tauri::async_runtime::spawn_blocking(move || reveal_in_finder_impl(paths))
+    runtime::spawn_blocking(move || reveal_in_finder_impl(paths))
         .await
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
 fn copy_paths(paths: Vec<String>) -> AppResult<()> {
     copy_text_to_clipboard(&paths.join("\n"))
 }
 
 #[cfg(target_os = "macos")]
-#[tauri::command]
 fn copy_files(paths: Vec<String>) -> AppResult<()> {
     mac::clipboard::copy_files(&paths)
 }
 
 #[cfg(not(target_os = "macos"))]
-#[tauri::command]
 fn copy_files(_paths: Vec<String>) -> AppResult<()> {
     Err("copy_files is only supported on macOS".to_string())
 }
@@ -7847,7 +7903,11 @@ fn has_package_extension(path: &str) -> bool {
     Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| PACKAGE_EXTENSIONS.iter().any(|pkg| pkg.eq_ignore_ascii_case(e)))
+        .is_some_and(|e| {
+            PACKAGE_EXTENSIONS
+                .iter()
+                .any(|pkg| pkg.eq_ignore_ascii_case(e))
+        })
 }
 
 /// Finder-style "Show Package Contents": browse a package directory (e.g. an
@@ -7856,18 +7916,24 @@ fn has_package_extension(path: &str) -> bool {
 /// pointed at the package root instead; the path travels via argv to avoid
 /// AppleScript string escaping.
 #[cfg(target_os = "macos")]
-#[tauri::command]
 async fn show_package_contents(path: String) -> AppResult<()> {
-    tauri::async_runtime::spawn_blocking(move || {
+    runtime::spawn_blocking(move || {
         let status = Command::new("osascript")
             .args([
-                "-e", "on run argv",
-                "-e", "tell application \"Finder\"",
-                "-e", "set w to make new Finder window",
-                "-e", "set target of w to (POSIX file (item 1 of argv) as alias)",
-                "-e", "activate",
-                "-e", "end tell",
-                "-e", "end run",
+                "-e",
+                "on run argv",
+                "-e",
+                "tell application \"Finder\"",
+                "-e",
+                "set w to make new Finder window",
+                "-e",
+                "set target of w to (POSIX file (item 1 of argv) as alias)",
+                "-e",
+                "activate",
+                "-e",
+                "end tell",
+                "-e",
+                "end run",
                 &path,
             ])
             .status()
@@ -7882,19 +7948,17 @@ async fn show_package_contents(path: String) -> AppResult<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[tauri::command]
 async fn show_package_contents(_path: String) -> AppResult<()> {
     Err("show_package_contents is only supported on macOS".to_string())
 }
 
-#[tauri::command]
 async fn move_to_trash(
     paths: Vec<String>,
-    app: AppHandle,
-    state: State<'_, AppState>,
+    app: EventSink,
+    state: &AppState,
 ) -> AppResult<file_actions::TrashResult> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let state = state.clone();
+    runtime::spawn_blocking(move || {
         // Windows/macOS (D4): the indexer service/daemon owns index.db (this
         // process is read-only) and reflects the deletion through its own
         // watcher, so the GUI performs only the filesystem operation and keeps
@@ -7920,13 +7984,9 @@ async fn move_to_trash(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-async fn get_pending_trash_paths(
-    paths: Vec<String>,
-    state: State<'_, AppState>,
-) -> AppResult<Vec<String>> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+async fn get_pending_trash_paths(paths: Vec<String>, state: &AppState) -> AppResult<Vec<String>> {
+    let state = state.clone();
+    runtime::spawn_blocking(move || {
         let conn = db_connection_for_search(&state.db_path)?;
         file_actions::pending_trash_paths(&conn, &paths)
     })
@@ -7934,15 +7994,14 @@ async fn get_pending_trash_paths(
     .map_err(|error| error.to_string())?
 }
 
-#[tauri::command]
 async fn rename(
     path: String,
     new_name: String,
-    app: AppHandle,
-    state: State<'_, AppState>,
+    app: EventSink,
+    state: &AppState,
 ) -> AppResult<EntryDto> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let state = state.clone();
+    runtime::spawn_blocking(move || {
         let validated_name = validate_new_name(&new_name)?;
         let old_path = PathBuf::from(&path);
 
@@ -8041,17 +8100,16 @@ async fn rename(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
 async fn fd_search(
     query: String,
     limit: Option<u32>,
     offset: Option<u32>,
     sort_by: Option<String>,
     sort_dir: Option<String>,
-    state: State<'_, AppState>,
+    state: &AppState,
 ) -> AppResult<FdSearchResultDto> {
-    let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let state = state.clone();
+    runtime::spawn_blocking(move || {
         let query = query.trim().to_string();
         let limit = limit.unwrap_or(500).clamp(1, 5000) as usize;
         let offset = offset.unwrap_or(0) as usize;
@@ -8131,208 +8189,15 @@ async fn fd_search(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
 fn frontend_log(msg: String) {
     eprintln!("{msg}");
 }
 
-#[tauri::command]
-fn mark_frontend_ready(state: State<'_, AppState>) {
+fn mark_frontend_ready(state: &AppState) {
     state.frontend_ready.store(true, AtomicOrdering::Release);
     if cfg!(debug_assertions) {
         eprintln!("[startup] frontend_ready=true");
     }
-}
-
-/// Frontend `visibilitychange` relay. Closing the gate keeps `index_*` emits
-/// from waking a webview macOS has suspended; opening it flushes what was held.
-#[tauri::command]
-fn set_webview_visible(app: AppHandle, visible: bool) {
-    ui_gate::set_visible(&app, visible);
-}
-
-/// Answer to `ui_repaint_probe`, sent from inside a `requestAnimationFrame` so
-/// it proves the page rendered a frame — not merely that its JS ran.
-#[tauri::command]
-fn note_webview_painted(seq: u64) {
-    ui_gate::note_painted(seq);
-}
-
-#[tauri::command]
-fn get_platform() -> String {
-    if cfg!(target_os = "windows") {
-        "windows".to_string()
-    } else if cfg!(target_os = "macos") {
-        "macos".to_string()
-    } else {
-        "linux".to_string()
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[tauri::command]
-async fn show_context_menu(
-    paths: Vec<String>,
-    x: f64,
-    y: f64,
-    _single_selection: bool,
-    _single_is_dir: bool,
-    app: AppHandle,
-) -> AppResult<()> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let win_pos = window.inner_position().map_err(|e| e.to_string())?;
-    let screen_x = win_pos.x + (x * scale) as i32;
-    let screen_y = win_pos.y + (y * scale) as i32;
-
-    let hwnd_raw = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
-
-    // TrackPopupMenu must run on the thread that owns the HWND (main UI thread).
-    // Use a channel to relay the result back to the async context.
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
-
-    app.run_on_main_thread(move || {
-        let result = win::context_menu::show(hwnd_raw, &paths, screen_x, screen_y);
-        let _ = tx.send(result);
-    })
-    .map_err(|e| e.to_string())?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv().map_err(|e| format!("context menu channel: {e}"))?
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[cfg(target_os = "macos")]
-#[tauri::command]
-async fn show_context_menu(
-    paths: Vec<String>,
-    x: f64,
-    y: f64,
-    single_selection: bool,
-    single_is_dir: bool,
-    app: AppHandle,
-) -> AppResult<()> {
-    use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
-
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-
-    // The frontend passes isDir from the index entry, so no stat is needed here.
-    let show_package = single_selection
-        && single_is_dir
-        && paths.first().is_some_and(|p| has_package_extension(p));
-
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
-
-    let app_clone = app.clone();
-    app.run_on_main_thread(move || {
-        let app = app_clone;
-        let result = (|| -> Result<(), tauri::Error> {
-            let open = MenuItem::with_id(&app, "ctx_open", "Open", true, None::<&str>)?;
-            let show_pkg = show_package
-                .then(|| {
-                    MenuItem::with_id(
-                        &app,
-                        "ctx_show_package_contents",
-                        "Show Package Contents",
-                        true,
-                        None::<&str>,
-                    )
-                })
-                .transpose()?;
-            let quick_look =
-                MenuItem::with_id(&app, "ctx_quick_look", "Quick Look", true, None::<&str>)?;
-            let open_with =
-                MenuItem::with_id(&app, "ctx_open_with", "Open With...", true, None::<&str>)?;
-            let sep1 = PredefinedMenuItem::separator(&app)?;
-            let reveal = MenuItem::with_id(
-                &app,
-                "ctx_reveal",
-                "Reveal in Finder",
-                true,
-                None::<&str>,
-            )?;
-            let sep2 = PredefinedMenuItem::separator(&app)?;
-            let copy_files =
-                MenuItem::with_id(&app, "ctx_copy_files", "Copy", true, None::<&str>)?;
-            let copy_path =
-                MenuItem::with_id(&app, "ctx_copy_path", "Copy Path", true, None::<&str>)?;
-            let sep3 = PredefinedMenuItem::separator(&app)?;
-            let trash = MenuItem::with_id(
-                &app,
-                "ctx_trash",
-                "Move to Trash",
-                true,
-                None::<&str>,
-            )?;
-            let rename =
-                MenuItem::with_id(&app, "ctx_rename", "Rename", true, None::<&str>)?;
-
-            let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = vec![
-                &open, &quick_look, &open_with, &sep1, &reveal, &sep2, &copy_files, &copy_path, &sep3, &trash,
-            ];
-            if let Some(show_pkg) = &show_pkg {
-                // Finder places "Show Package Contents" directly after "Open".
-                items.insert(1, show_pkg);
-            }
-            if single_selection {
-                items.push(&rename);
-            }
-
-            let menu = Menu::with_items(&app, &items)?;
-            // Position is window-relative logical pixels, matching clientX/clientY.
-            window.popup_menu_at(&menu, tauri::LogicalPosition::new(x, y))?;
-            Ok(())
-        })();
-        let _ = tx.send(result.map_err(|e| e.to_string()));
-    })
-    .map_err(|e| e.to_string())?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        rx.recv().map_err(|e| format!("context menu channel: {e}"))?
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-#[tauri::command]
-async fn show_context_menu(
-    _paths: Vec<String>,
-    _x: f64,
-    _y: f64,
-    _single_selection: bool,
-    _single_is_dir: bool,
-    _app: AppHandle,
-) -> AppResult<()> {
-    Err("Native context menu is only supported on Windows and macOS".to_string())
-}
-
-#[tauri::command]
-async fn set_native_theme(theme: String, app: AppHandle) -> AppResult<()> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-    let is_light = theme == "light";
-    // Follow the OS appearance for the native window. Forcing a theme here
-    // would pin the webview's prefers-color-scheme, so the frontend's system
-    // theme listener would never fire again. Only the window background color
-    // (anti-flash on resize) tracks the theme the frontend reports.
-    window.set_theme(None).map_err(|e| e.to_string())?;
-    use tauri::window::Color;
-    let bg = if is_light {
-        Color(0xF5, 0xF5, 0xF7, 0xFF)
-    } else {
-        Color(0x1E, 0x1E, 0x21, 0xFF)
-    };
-    let _ = window.set_background_color(Some(bg));
-    Ok(())
 }
 
 /// One row's icon request. `path` comes along for every row so the formats whose
@@ -8411,7 +8276,11 @@ fn resolve_file_icons(
                 misses[slot].rows.push(row);
             } else {
                 slot_of.insert(job.key.as_str(), misses.len());
-                misses.push(IconMiss { job, rows: vec![row], png: None });
+                misses.push(IconMiss {
+                    job,
+                    rows: vec![row],
+                    png: None,
+                });
             }
         }
     }
@@ -8462,8 +8331,10 @@ fn resolve_file_icons(
             }
         }
         if !pending.is_empty() {
-            let sources: Vec<IconSource> =
-                pending.iter().map(|(ext, _)| IconSource::Type(ext)).collect();
+            let sources: Vec<IconSource> = pending
+                .iter()
+                .map(|(ext, _)| IconSource::Type(ext))
+                .collect();
             let pngs = render_icon_pngs(&sources);
             let mut cache = cache.lock();
             for ((ext, slots), png) in pending.iter().zip(pngs) {
@@ -8500,17 +8371,13 @@ fn resolve_file_icons(
     icons
 }
 
-#[tauri::command]
-async fn get_file_icons(
-    requests: Vec<IconRequest>,
-    state: State<'_, AppState>,
-) -> AppResult<Vec<Vec<u8>>> {
-    let state = state.inner().clone();
-    Ok(tauri::async_runtime::spawn_blocking(move || {
-        resolve_file_icons(&state.icon_cache, &requests)
-    })
-    .await
-    .unwrap_or_default())
+async fn get_file_icons(requests: Vec<IconRequest>, state: &AppState) -> AppResult<Vec<Vec<u8>>> {
+    let state = state.clone();
+    Ok(
+        runtime::spawn_blocking(move || resolve_file_icons(&state.icon_cache, &requests))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 fn default_bench_cases() -> Vec<BenchCase> {
@@ -8627,7 +8494,7 @@ fn write_bench_report(path: &Path, report: &BenchReport) -> AppResult<()> {
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
-fn start_bench_runner(app_handle: AppHandle, state: AppState) {
+fn start_bench_runner(app_handle: EventSink, state: AppState) {
     std::thread::spawn(move || {
         let run_label = bench_run_label();
         let output_path = bench_output_path(&state.db_path, &run_label);
@@ -8813,53 +8680,15 @@ fn start_bench_runner(app_handle: AppHandle, state: AppState) {
     });
 }
 
-fn setup_app(app: &mut tauri::App) -> AppResult<()> {
+fn setup_native() -> AppResult<(AppState, EventSink, async_channel::Receiver<()>)> {
     let setup_started = std::time::Instant::now();
     eprintln!("[startup] setup_app() entered");
     let bench_mode = bench_mode_enabled();
 
-    #[cfg(target_os = "macos")]
-    if let Some(window) = app.get_webview_window("main") {
-        use tauri::window::Color;
-        let is_dark = window
-            .theme()
-            .map(|t| t == tauri::Theme::Dark)
-            .unwrap_or(false);
-        let bg = if is_dark {
-            Color(0x1E, 0x1E, 0x21, 0xFF)
-        } else {
-            Color(0xF5, 0xF5, 0xF7, 0xFF)
-        };
-        let _ = window.set_background_color(Some(bg));
-        let _ = window.show();
+    let app_data_dir = ui_prefs::app_data_dir();
+    if env_truthy("EVERYTHING_UI_TEST") {
+        return ui_model::fixture_runtime(&app_data_dir);
     }
-
-    #[cfg(target_os = "windows")]
-    if let Some(window) = app.get_webview_window("main") {
-        eprintln!("[startup +{}ms] windows setup: before window.show()", startup_elapsed_ms());
-        use tauri::window::Color;
-        let is_dark = window.theme().map(|t| t == tauri::Theme::Dark).unwrap_or(false);
-        let bg = if is_dark {
-            Color(0x1E, 0x1E, 0x21, 0xFF)
-        } else {
-            Color(0xF5, 0xF5, 0xF7, 0xFF)
-        };
-        let _ = window.set_background_color(Some(bg));
-        if let Err(e) = window.set_decorations(false) {
-            eprintln!(
-                "[startup +{}ms] windows setup: set_decorations(false) failed: {}",
-                startup_elapsed_ms(),
-                e
-            );
-        }
-        let _ = window.show();
-        eprintln!("[startup +{}ms] windows setup: window.show() returned", startup_elapsed_ms());
-    }
-
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
     // Post-mortem diagnostics (shared with --daemon/--mcp): rebuild loops,
@@ -8966,37 +8795,14 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             }
         }
     }
-    eprintln!("[startup] +{}ms AppState created ({} extra roots)", setup_started.elapsed().as_millis(), state.extra_roots.lock().len());
-    app.manage(state.clone());
-    // Context menu item IDs use the "ctx_" prefix by convention.
-    // All matching IDs are forwarded as "context_menu_action" events to the frontend.
-    #[cfg(target_os = "macos")]
-    {
-        app.handle().on_menu_event(|app, event| {
-            let action = match event.id().as_ref() {
-                "ctx_open" => "open",
-                "ctx_show_package_contents" => "show_package_contents",
-                "ctx_quick_look" => "quick_look",
-                "ctx_open_with" => "open_with",
-                "ctx_reveal" => "reveal",
-                "ctx_copy_files" => "copy_files",
-                "ctx_copy_path" => "copy_path",
-                "ctx_trash" => "trash",
-                "ctx_rename" => "rename",
-                _ => return,
-            };
-            let _ = app.emit("context_menu_action", action);
-        });
-    }
-    if bench_mode {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
-        }
-    }
-
-    eprintln!("[startup] +{}ms setup_app() done, spawning init thread", setup_started.elapsed().as_millis());
-
-    let app_handle = app.handle().clone();
+    eprintln!(
+        "[startup] +{}ms AppState created ({} extra roots)",
+        setup_started.elapsed().as_millis(),
+        state.extra_roots.lock().len()
+    );
+    let (app_handle, receiver) = EventSink::channel();
+    let ui_sink = app_handle.clone();
+    let native_state = state.clone();
     std::thread::spawn(move || {
         let thread_started = std::time::Instant::now();
         eprintln!("[startup/thread] init thread started");
@@ -9012,13 +8818,19 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
             #[cfg(not(target_os = "macos"))]
             let init_here = true;
             if init_here {
-                eprintln!("[startup/thread] +{}ms calling init_db_tables...", thread_started.elapsed().as_millis());
+                eprintln!(
+                    "[startup/thread] +{}ms calling init_db_tables...",
+                    thread_started.elapsed().as_millis()
+                );
                 if let Err(err) = init_db_tables(&state.db_path) {
                     set_state(&state, IndexState::Error, Some(err.clone()));
                     emit_index_state(&app_handle, "Error", Some(err));
                     return;
                 }
-                eprintln!("[startup/thread] +{}ms init_db_tables done", thread_started.elapsed().as_millis());
+                eprintln!(
+                    "[startup/thread] +{}ms init_db_tables done",
+                    thread_started.elapsed().as_millis()
+                );
             }
         }
 
@@ -9036,7 +8848,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         }
         #[cfg(not(target_os = "macos"))]
         state.db_ready.store(true, AtomicOrdering::Release);
-        eprintln!("[startup/thread] +{}ms db_ready set -- continuing startup", thread_started.elapsed().as_millis());
+        eprintln!(
+            "[startup/thread] +{}ms db_ready set -- continuing startup",
+            thread_started.elapsed().as_millis()
+        );
 
         // If a previous run crashed mid FTS rebuild, don't trust the FTS index
         // until the healing rebuild (finalize_fresh_index) completes.
@@ -9092,7 +8907,9 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 }
                 if !logged {
                     eprintln!("[startup] daemon still building the index; GUI stays read-only until it yields");
-                    diag::log("daemon mid-build at GUI launch; GUI defers index writes until it yields");
+                    diag::log(
+                        "daemon mid-build at GUI launch; GUI defers index writes until it yields",
+                    );
                     logged = true;
                 }
                 std::thread::sleep(Duration::from_millis(300));
@@ -9116,7 +8933,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let hk_started = std::time::Instant::now();
                 let _ = refresh_and_emit_status_counts(Some(&hk_app), &hk_state);
-                eprintln!("[startup/housekeeping] refresh_and_emit_status_counts done in {}ms", hk_started.elapsed().as_millis());
+                eprintln!(
+                    "[startup/housekeeping] refresh_and_emit_status_counts done in {}ms",
+                    hk_started.elapsed().as_millis()
+                );
                 // Wait for frontend readiness so initial paint and first input are not contended by purge I/O.
                 const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(180);
                 const POST_READY_GRACE: Duration = Duration::from_secs(2);
@@ -9148,7 +8968,10 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
                         purge_started.elapsed().as_millis()
                     );
                 }
-                eprintln!("[startup/housekeeping] all done in {}ms", hk_started.elapsed().as_millis());
+                eprintln!(
+                    "[startup/housekeeping] all done in {}ms",
+                    hk_started.elapsed().as_millis()
+                );
             });
         }
 
@@ -9253,104 +9076,13 @@ fn setup_app(app: &mut tauri::App) -> AppResult<()> {
         }
     });
 
-    Ok(())
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    let _ = STARTUP_T0.set(Instant::now());
-    eprintln!("[startup +{}ms] run() entered", startup_elapsed_ms());
-    #[cfg(target_os = "windows")]
-    if cfg!(debug_assertions) {
-        // Safety: called at program start before any threads are spawned.
-        // Will require `unsafe` block when migrating to Rust edition 2024.
-        std::env::set_var(
-            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-            "--no-proxy-server --disable-http-cache --disk-cache-size=1 --media-cache-size=1",
-        );
-        eprintln!(
-            "[startup +{}ms] set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--no-proxy-server --disable-http-cache --disk-cache-size=1 --media-cache-size=1",
-            startup_elapsed_ms()
-        );
-    }
-    let mut builder = tauri::Builder::default()
-        .plugin(tauri_plugin_decorum::init())
-        .plugin(tauri_plugin_drag::init());
-
-    if !cfg!(debug_assertions) {
-        builder = builder.plugin(tauri_plugin_window_state::Builder::default().build());
-    } else {
-        eprintln!(
-            "[startup +{}ms] debug mode: window-state plugin disabled for startup A/B test",
-            startup_elapsed_ms()
-        );
-    }
-
-    builder
-        .on_window_event(|window, event| {
-            // Focus is the one signal that survives the failure in `ui_gate`:
-            // it is an AppKit key-window event, not the window-occlusion state
-            // WebKit had stopped re-evaluating while the window sat blank.
-            if let tauri::WindowEvent::Focused(true) = event {
-                ui_gate::on_window_focused(window.app_handle());
-            }
-        })
-        .on_page_load(|window, payload| {
-            eprintln!(
-                "[startup/page +{}ms] on_page_load label={} event={:?} url={}",
-                startup_elapsed_ms(),
-                window.label(),
-                payload.event(),
-                payload.url()
-            );
-        })
-        .setup(|app| {
-            setup_app(app).map_err(|e| {
-                Box::<dyn std::error::Error>::from(io::Error::new(io::ErrorKind::Other, e))
-            })
-        })
-        .invoke_handler(tauri::generate_handler![
-            get_index_status,
-            get_home_dir,
-            start_full_index,
-            reset_index,
-            search,
-            fd_search,
-            quick_look,
-            open,
-            open_with,
-            reveal_in_finder,
-            show_package_contents,
-            copy_paths,
-            copy_files,
-            move_to_trash,
-            get_pending_trash_paths,
-            rename,
-            get_file_icons,
-            get_platform,
-            show_context_menu,
-            set_native_theme,
-            frontend_log,
-            mark_frontend_ready,
-            set_webview_visible,
-            note_webview_painted,
-            check_full_disk_access,
-            open_privacy_settings,
-            open_login_items_settings,
-            get_onboarding_state,
-            record_onboarding_decision,
-            register_daemon,
-            set_daemon_autostart,
-            open_pathignore,
-            open_pathindexing,
-            restart_app,
-            register_service_elevated
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    Ok((native_state, ui_sink, receiver))
 }
 
 fn main() {
+    if ui_search_bench::handle_cli_args() {
+        return;
+    }
     // `--mcp` / `--register-mcp` run headless and must not boot the GUI.
     if mcp_server::handle_cli_args() {
         return;
@@ -9377,7 +9109,7 @@ fn main() {
             return;
         }
     }
-    run();
+    ui::run();
 }
 
 #[cfg(test)]
@@ -9528,7 +9260,12 @@ mod tests {
     fn queue_subtree_rescan_collapses_covered_paths() {
         let finished = Mutex::new(Vec::new());
         let mut queued = HashMap::new();
-        queue_subtree_rescan(PathBuf::from("/h/a/b"), RESCAN_COOLDOWN, &mut queued, &finished);
+        queue_subtree_rescan(
+            PathBuf::from("/h/a/b"),
+            RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
         queue_subtree_rescan(
             PathBuf::from("/h/a/b/c"),
             RENAME_RESCAN_COOLDOWN,
@@ -9553,9 +9290,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn queue_subtree_rescan_defers_within_cooldown() {
-        let finished = Mutex::new(vec![(PathBuf::from("/h/a"), Instant::now(), RESCAN_COOLDOWN)]);
+        let finished = Mutex::new(vec![(
+            PathBuf::from("/h/a"),
+            Instant::now(),
+            RESCAN_COOLDOWN,
+        )]);
         let mut queued = HashMap::new();
-        queue_subtree_rescan(PathBuf::from("/h/a/x"), RESCAN_COOLDOWN, &mut queued, &finished);
+        queue_subtree_rescan(
+            PathBuf::from("/h/a/x"),
+            RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
         let entry = queued.get(Path::new("/h/a/x")).expect("queued");
         assert!(
             entry.due > Instant::now() + RESCAN_COOLDOWN - Duration::from_secs(60),
@@ -9599,7 +9345,12 @@ mod tests {
             &mut queued,
             &finished,
         );
-        queue_subtree_rescan(PathBuf::from("/h/a/b"), RESCAN_COOLDOWN, &mut queued, &finished);
+        queue_subtree_rescan(
+            PathBuf::from("/h/a/b"),
+            RESCAN_COOLDOWN,
+            &mut queued,
+            &finished,
+        );
         assert_eq!(queued.len(), 1, "covered by the queued ancestor");
         let entry = queued.get(Path::new("/h/a")).expect("ancestor entry");
         assert_eq!(
@@ -9869,7 +9620,11 @@ mod tests {
             let png = icon
                 .as_ref()
                 .unwrap_or_else(|| panic!("no icon rendered for source {slot}"));
-            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "source {slot} is not a PNG");
+            assert_eq!(
+                &png[..8],
+                b"\x89PNG\r\n\x1a\n",
+                "source {slot} is not a PNG"
+            );
             // IHDR width/height, big-endian, right after the 8-byte magic and
             // the 8-byte chunk header.
             assert_eq!(
@@ -10109,10 +9864,7 @@ mod tests {
 
         let iterator_error = observe_direct_children(
             &scan_root,
-            |_| {
-                Ok(vec![Err(io::Error::new(io::ErrorKind::Other, "iterator I/O"))]
-                    .into_iter())
-            },
+            |_| Ok(vec![Err(io::Error::new(io::ErrorKind::Other, "iterator I/O"))].into_iter()),
             |_| -> io::Result<fs::Metadata> { unreachable!() },
             |_| false,
         )
@@ -10172,10 +9924,7 @@ mod tests {
         assert_eq!(reconciliation.present[0].path, present);
 
         let denied = root.join("denied");
-        let denied_existing = HashMap::from([(
-            denied.to_string_lossy().to_string(),
-            (None, None),
-        )]);
+        let denied_existing = HashMap::from([(denied.to_string_lossy().to_string(), (None, None))]);
         let error = reconcile_unseen_direct_children(
             &denied_existing,
             |_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
@@ -10471,7 +10220,11 @@ mod tests {
         // After the subtree lands in the DB, the same event is quiet.
         let out = apply_path_changes(
             &state,
-            &[moved.clone(), moved.join("sub"), moved.join("sub/child.txt")],
+            &[
+                moved.clone(),
+                moved.join("sub"),
+                moved.join("sub/child.txt"),
+            ],
             true,
         )
         .unwrap();

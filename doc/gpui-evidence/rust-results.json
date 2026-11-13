@@ -1,0 +1,36 @@
+{
+  "command": "cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4 -- --test-threads=1",
+  "date": "2026-11-14T00:38:29+0900",
+  "suites": [
+    {
+      "passed": 136,
+      "failed": 0,
+      "ignored": 3
+    },
+    {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 4
+    },
+    {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 3
+    }
+  ],
+  "priorAttempt": {
+    "suites": [
+      {
+        "passed": 135,
+        "failed": 1,
+        "ignored": 3
+      }
+    ],
+    "failure": "mac::cpu_monitor::tests::snapshot_accounts_burn_in_the_right_class: 0.080 CPU seconds during the 300ms wall-time burn, expected at least 0.15 seconds",
+    "followup": "The isolated test and then the entire unchanged suite passed. No threshold or monitor implementation was changed."
+  },
+  "environment": {
+    "MACOSX_DEPLOYMENT_TARGET": "13.0",
+    "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer"
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "binary": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+  "fixture": "/private/tmp/everything-gpui-validation",
+  "date": "2026-11-14T00:45:18+0900",
+  "passed": 13,
+  "failed": 0,
+  "cases": [
+    {
+      "id": "UI-01",
+      "title": "Startup focus, Korean committed text, clear input",
+      "status": "pass",
+      "elapsedMs": 648.6046249999999
+    },
+    {
+      "id": "UI-02",
+      "title": "Name/case/space/Korean/glob/relative and absolute path/empty result",
+      "status": "pass",
+      "elapsedMs": 2486.8388330000002
+    },
+    {
+      "id": "UI-03",
+      "title": "Rapid replacement rejects stale results; single character cap",
+      "status": "pass",
+      "elapsedMs": 521.7815829999996
+    },
+    {
+      "id": "UI-04",
+      "title": "Actual keyboard scrolling and next-page load",
+      "status": "pass",
+      "elapsedMs": 548.8080829999996
+    },
+    {
+      "id": "UI-05",
+      "title": "Server sort, header drag resize, sort/resize hit testing",
+      "status": "pass",
+      "elapsedMs": 497.5108749999997
+    },
+    {
+      "id": "UI-06",
+      "title": "Mouse/keyboard multi-selection and real path/file pasteboard",
+      "status": "pass",
+      "elapsedMs": 307.3547919999999
+    },
+    {
+      "id": "UI-07",
+      "title": "Context menu keyboard navigation and Copy Path",
+      "status": "pass",
+      "elapsedMs": 1198.4165829999993
+    },
+    {
+      "id": "UI-08",
+      "title": "F2 Rename, stem selection, collision/empty/slash errors, success",
+      "status": "pass",
+      "elapsedMs": 608.5631660000006
+    },
+    {
+      "id": "UI-09",
+      "title": "Safe default Trash cancel, keyboard confirm, real filesystem removal and suppression",
+      "status": "pass",
+      "elapsedMs": 711.2732500000005
+    },
+    {
+      "id": "UI-10",
+      "title": "System light/dark, isolated Reset guard, minimum size and responsive confirmation",
+      "status": "pass",
+      "elapsedMs": 754.8116249999995
+    },
+    {
+      "id": "UI-11",
+      "title": "OS Open/Reveal/Quick Look requests on a fixture file",
+      "status": "pass",
+      "elapsedMs": 373.5666250000005
+    },
+    {
+      "id": "UI-12",
+      "title": "Column/window persistence and no size growth across two restarts",
+      "status": "pass",
+      "elapsedMs": 798.3160000000016
+    },
+    {
+      "id": "UI-13",
+      "title": "First-run modal keyboard trap, Later choice and dismissible FDA banner",
+      "status": "pass",
+      "elapsedMs": 641.8139170000004
+    }
+  ]
+}

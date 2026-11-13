@@ -1,32 +1,34 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/` contains the Svelte frontend (`App.svelte`, `main.js`).
-- `src-tauri/src/` contains the Rust backend. Keep command wiring and app lifecycle in `main.rs`; keep query parsing/search helpers in focused modules like `query.rs`.
-- `src-tauri/tauri.conf.json` and `src-tauri/capabilities/` define desktop runtime configuration and permissions.
-- `doc/` stores specs and review notes.
-- Build artifacts are generated in `dist/` and `src-tauri/target/` and should stay untracked.
+- `src-tauri/src/ui/` contains the native GPUI lifecycle, views and actions.
+- `src-tauri/src/` contains the shared Rust engine, daemon, search state and preferences. Keep parsing/search helpers in focused modules such as `query.rs`.
+- `scripts/bundle_macos.py` and `src-tauri/windows/installer.nsi` define native packaging; preserve bundle/service identifiers and the embedded LaunchAgent.
+- `doc/` stores specs, TC results and performance evidence.
+- Build artifacts in `src-tauri/target/`, `dist/` and `.artifacts/` stay untracked.
 
 ## Build, Test, and Development Commands
-- `npm install`: install frontend and Tauri CLI dependencies.
-- `npm run dev`: run the Vite frontend for UI iteration.
-- `npm run tauri dev`: run the full desktop app (frontend + Rust backend).
-- `npm run build`: build the frontend bundle into `dist/`.
-- `npm run lint`: run project checks (`vite build` + `cargo check`).
-- `npm run test`: compile Rust tests (`cargo test --no-run`).
-- `cargo test --manifest-path src-tauri/Cargo.toml`: run Rust unit tests.
+- `cargo run --manifest-path src-tauri/Cargo.toml`: run the native app.
+- `cargo build --release --locked --manifest-path src-tauri/Cargo.toml`: build GPUI release.
+- `npm run dev`, `npm run build`, `npm run lint`: optional aliases for Cargo run/build/check, with no npm dependencies.
+- `npm test`: compile Rust tests. `cargo test --manifest-path src-tauri/Cargo.toml`: run regression tests.
+- `python3 scripts/bundle_macos.py --dmg`: build/sign/package a macOS DMG.
+- `scripts/build-windows.ps1`: build the Windows binary and NSIS installer.
+- macOS needs full Xcode/Metal; scope `DEVELOPER_DIR` to the build when required.
 
 ## Coding Style & Naming Conventions
-- Svelte/JS: 2-space indentation, semicolons, and single quotes.
-- Use `camelCase` for variables/functions and `PascalCase` for Svelte components.
 - Rust: follow `rustfmt` defaults; use `snake_case` for functions/modules and `CamelCase` for types.
-- Keep backend-to-frontend payloads in `camelCase` (for example, `#[serde(rename_all = "camelCase")]`).
+- Keep serializable payloads in `camelCase`, for example `#[serde(rename_all = "camelCase")]`.
+- Keep filesystem I/O, DB operations and shell commands off the GPUI foreground executor.
+- Preserve generation checks for search responses and use the coalescing EventSink for status updates.
 
 ## Testing Guidelines
-- Put backend unit tests near the code under `#[cfg(test)] mod tests` (see `src-tauri/src/query.rs`).
-- Name tests by behavior, for example `path_search_dir_only` and `glob_to_like_escapes`.
-- Run `npm run test` before pushing. Run full `cargo test --manifest-path src-tauri/Cargo.toml` when touching parser, indexing, or DB logic.
-- Frontend tests are not set up yet; manually verify key flows in `npm run tauri dev`.
+- Put backend and UI model unit tests near the code under `#[cfg(test)] mod tests`.
+- Name tests by behavior, for example `path_search_dir_only`.
+- Run `npm test` before pushing. Run full `cargo test --manifest-path src-tauri/Cargo.toml` when touching parser, indexing or DB logic.
+- Legacy stress benchmarks are ignored by default: they scan HOME or open a production index. Run them explicitly with `--ignored` only when needed.
+- Verify actual GPUI flows with an isolated fixture and the opt-in `ui-automation` feature; see `doc/gpui-test-cases.md`.
+- Never reset/register a real daemon or change actual user preferences from fixture tests.
 
 ## Commit & Pull Request Guidelines
 - Current history is minimal (`Initial commit`), so keep commit subjects short, clear, and imperative.

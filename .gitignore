@@ -9,3 +9,6 @@ certificates
 .entire
 src-tauri/target-test-review/
 src-tauri/target-test-review2/
+.artifacts/
+target/
+__pycache__/

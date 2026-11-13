@@ -1,20 +1,20 @@
 # Architecture
 
-Everything — a Tauri v2 desktop app that indexes the filesystem into SQLite for sub-50ms file/folder name search. Supports macOS and Windows.
+Everything — a GPUI desktop app that indexes the filesystem into SQLite for sub-50ms file/folder name search. Supports macOS and Windows.
 
 ## Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
-| App framework | Tauri v2 |
+| App framework | GPUI |
 | Backend | Rust (rusqlite, jwalk, ignore) |
-| Frontend | Svelte 5 (single component) |
+| Frontend | Rust + gpui-component |
 | DB | SQLite WAL mode, LIKE-based search |
-| Build | Vite 7, Cargo |
+| Build | Cargo |
 | macOS watcher | fsevent-sys (direct FSEvents binding) |
 | Windows indexer | MFT scan (Win32 FSCTL), USN journal, ReadDirectoryChangesW fallback, WalkDir non-admin fallback |
 | Windows extras | windows 0.58, notify, rayon, png |
-| Plugins | tauri-plugin-global-shortcut, tauri-plugin-drag, tauri-plugin-window-state, tauri-plugin-decorum |
+| Native integrations | global-hotkey, drag, GPUI native window lifecycle |
 
 ---
 
@@ -22,34 +22,17 @@ Everything — a Tauri v2 desktop app that indexes the filesystem into SQLite fo
 
 ```
 src-tauri/src/
-├── main.rs              # App state, DB, indexing, search, file actions, IPC handlers
-├── query.rs             # Search query parser (SearchMode classification)
-├── fd_search.rs         # jwalk-based live filesystem search
-├── mem_search.rs        # In-memory compact entry search (MemIndex)
-├── gitignore_filter.rs  # Lazy .gitignore discovery and matching
-│
-├── mac/                 # macOS-specific modules
-│   ├── mod.rs
-│   ├── fsevent_watcher.rs   # Direct FSEvents binding
-│   └── spotlight_search.rs  # mdfind-based Spotlight search fallback
-│
-└── win/                 # Windows-specific modules
-    ├── mod.rs               # Windows indexing orchestration (MFT → USN → RDCW fallback)
-    ├── mft_indexer.rs       # NTFS Master File Table scan (rayon parallel)
-    ├── nonadmin_indexer.rs  # WalkDir fallback (when MFT access denied)
-    ├── usn_watcher.rs       # USN Change Journal monitor
-    ├── rdcw_watcher.rs      # ReadDirectoryChangesW fallback (notify crate)
-    ├── search_catchup.rs    # Offline sync (Windows Search service / mtime scan)
-    ├── icon.rs              # IShellItemImageFactory + SHGetFileInfo icon loading
-    ├── context_menu.rs      # Native Explorer context menu via Shell API
-    ├── volume.rs            # NTFS volume handle and USN journal queries
-    ├── path_resolver.rs     # FRN (File Reference Number) → path resolution
-    └── com_guard.rs         # COM initialization/cleanup wrapper
-
-src/
-├── main.js              # Svelte mount point
-├── App.svelte           # Entire UI (single component)
-└── search-utils.js      # Search debounce & viewport-preserve utilities
+├── ui/mod.rs, view.rs, actions.rs  # Native GPUI lifecycle, views, file actions
+├── ui_model.rs, ui_prefs.rs      # Generations, selection, pagination, preferences
+├── runtime.rs, ui_gate.rs        # Worker executor, coalesced status event bridge
+├── main.rs                      # Shared app setup, search, DB and file APIs
+├── query.rs, mem_search.rs       # Query parser and in-memory search
+├── daemon.rs, daemon_ipc.rs      # Daemon lifecycle and control socket
+├── mcp_server.rs                # Read-only MCP stdio server
+├── mac/                         # FSEvents, daemon bridge, login item, FDA, icons
+└── win/                         # MFT/USN/RDCW, service, Shell menu and icons
+scripts/bundle_macos.py           # Native .app/.dmg packaging
+src-tauri/windows/installer.nsi   # Native NSIS installer and service hooks
 ```
 
 ### Module Dependencies
@@ -110,7 +93,7 @@ struct AppState {
 }
 ```
 
-All fields are wrapped in `Arc` for `Clone` support. Injected into IPC handlers via Tauri `State<AppState>`.
+All fields are wrapped in `Arc` for `Clone` support. Passed directly to native Rust APIs.
 
 ---
 
@@ -524,32 +507,12 @@ RDCW watcher (fallback — when USN unavailable)
 
 ---
 
-## IPC Commands
+## Native UI APIs
 
-| Command | Direction | Description |
-|---------|-----------|-------------|
-| `get_index_status` | FE→BE | Indexing state, entry count, progress |
-| `get_home_dir` | FE→BE | Home directory path |
-| `get_platform` | FE→BE | Returns `"windows"`, `"macos"`, or other |
-| `start_full_index` | FE→BE | Trigger full re-indexing |
-| `reset_index` | FE→BE | Reset DB and re-index |
-| `search` | FE→BE | DB search → `SearchResultDto { entries, modeLabel, totalCount, totalKnown }` |
-| `fd_search` | FE→BE | jwalk live search → `FdSearchResultDto { entries, total, timedOut }` |
-| `open` | FE→BE | Open file (macOS: `open`, Windows: `cmd /C start`, Linux: `xdg-open`) |
-| `open_with` | FE→BE | Reveal in file manager |
-| `reveal_in_finder` | FE→BE | macOS: `open -R`, Windows: `explorer /select,`, Linux: `xdg-open` parent |
-| `copy_paths` | FE→BE | Copy paths to clipboard (macOS: `pbcopy`, Windows: `clip`) |
-| `copy_files` | FE→BE | Copy files to clipboard (macOS only, NSPasteboard) |
-| `move_to_trash` | FE→BE | Move to trash + delete from DB |
-| `rename` | FE→BE | Rename + DB update → return new EntryDto |
-| `get_file_icons` | FE→BE | Return system icon PNGs for a batch of rows, positionally |
-| `show_context_menu` | FE→BE | Native context menu (Windows: Explorer Shell API, macOS: custom) |
-| `quick_look` | FE→BE | Quick Look preview (macOS only) |
-| `check_full_disk_access` | FE→BE | Check Full Disk Access permission (macOS only) |
-| `open_privacy_settings` | FE→BE | Open Privacy settings (macOS only) |
-| `set_native_theme` | FE→BE | Set native window theme (dark/light) |
-| `mark_frontend_ready` | FE→BE | Signal frontend initialization complete |
-| `frontend_log` | FE→BE | Debug logging from frontend |
+GPUI calls Rust search/file/settings functions directly through worker tasks.
+There are no Tauri command macros, State injection or WebView IPC messages.
+Rename/trash update the filesystem; the daemon/service alone writes the shared
+index. See [GPUI architecture](gpui-architecture.md).
 
 ## Backend Events
 
@@ -563,151 +526,12 @@ RDCW watcher (fallback — when USN unavailable)
 
 ---
 
-## Frontend Architecture
+## Native UI Architecture
 
-### Single Component (`App.svelte`)
-
-Single component containing search input, virtual-scrolled table, inline rename, context menu, keyboard shortcuts, icon cache, status bar, theme toggle, and Full Disk Access banner (macOS).
-
-### Platform Detection
-
-Calls `get_platform()` at startup. Stores result in `platform` variable for conditional behavior (e.g., Windows native context menu vs custom context menu on macOS).
-
-### State Management
-
-Uses Svelte 5 reactive variables (no stores).
-
-| Category | Key Variables |
-|----------|--------------|
-| Search | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir`, `totalResults`, `totalResultsKnown` |
-| Selection | `selectedIndices` (Set), `selectionAnchor`, `lastSelectedIndex` |
-| Editing | `editing { active, path, index, draftName }` |
-| Indexing | `indexStatus { state, entriesCount, lastUpdated, permissionErrors, isCatchup, backgroundActive }`, `scanned`, `indexed`, `currentPath` |
-| Virtual scroll | `scrollTop`, `viewportHeight`, `colWidths` |
-| Cache | `iconCache` (Map, max 500), `highlightCache` (Map, max 300) |
-| UI | `platform`, `isMaximized`, `showFdaBanner`, `theme`, `contextMenu`, `toast` |
-
-### Search Input → Result Sequence
-
-```
-User typing
-  │
-  ├─ on:input → scheduleSearch()
-  │    ├─ 200ms+ elapsed → execute immediately (leading edge)
-  │    └─ < 200ms → execute after 200ms (trailing edge)
-  │
-  ├─ runSearch()
-  │    ├─ searchGeneration++ (prevent stale responses)
-  │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir, include_total: false })
-  │    ├─ Response: { entries, modeLabel, totalCount, totalKnown }
-  │    ├─ results = entries
-  │    ├─ searchModeLabel = modeLabel
-  │    ├─ Viewport-preserve logic for scroll position
-  │    └─ Selection restoration based on path
-  │
-  └─ Infinite scroll
-       Within 10 rows of bottom → loadMore()
-       → invoke('search', { offset: results.length })
-       → append to results
-```
-
-### Virtual Scroll
-
-```
-Fixed row height: 26px
-Buffer: 10 rows above and below (total overscan ~20 rows)
-OverlayScrollbars for custom scrollbar styling
-
-scrollTop
-  → startIndex = max(0, floor(scrollTop / 26) - 10)
-  → endIndex = min(results.length, startIndex + visibleCount)
-  → visibleRows = results.slice(startIndex, endIndex)
-  → translateY = startIndex * 26
-
-DOM:
-  <div class="table-body">          ← scroll container
-    <div style="height:{totalHeight}px">  ← total virtual height
-      <div style="transform:translateY({translateY}px)">  ← offset
-        {#each visibleRows}...
-      </div>
-    </div>
-  </div>
-```
-
-### Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `Escape` | Deselect, focus search input / cancel rename |
-| `Up` / `Down` | Move selection (Shift: range select) |
-| `PageUp` / `PageDown` | Page-level navigation |
-| `Enter` | Open (Windows) / Start inline rename (macOS) |
-| `F2` | Start inline rename |
-| `Space` | Quick Look (macOS) |
-| `Cmd+O` / `Ctrl+O` | Open selected items |
-| `Cmd+Enter` / `Ctrl+Enter` | Reveal in Finder/Explorer |
-| `Cmd+C` / `Ctrl+C` | Copy paths |
-| `Cmd+A` / `Ctrl+A` | Select all |
-| `Cmd+F` / `Ctrl+F` | Focus search input |
-| `Delete` / `Cmd+Backspace` | Move to trash |
-
-### Context Menu
-
-| Platform | Implementation |
-|----------|---------------|
-| Windows | Native Explorer context menu via Shell API (`show_context_menu` command), actions via `context_menu_action` event |
-| macOS | Custom menu: Open, Quick Look, Open With, Reveal in Finder, Copy Files, Copy Path, Move to Trash, Rename (single-select only) |
-
-### Icon System
-
-```
-visibleRows change
-  → call queueIcon(entry)
-  → if in iconCache, return immediately (max 500 entries)
-  → if not, queue the cache key and flush the whole viewport's misses
-      in one invoke('get_file_icons', { requests: [{ ext, path }, ...] })
-      (one batch in flight at a time; later misses coalesce into the next)
-
-macOS:
-  → swift -e NSWorkspace → 32x32 PNG (16pt@2x) — one process per batch,
-      not per icon (each `swift -e` is a full compiler run, ~1s)
-  → Batch entries ride argv tagged `f:<path>` / `t:<type>`; .app bundles
-      render from their path in the same process as the extension icons
-  → Prewarm 20 common extensions once indexing settles
-
-Windows:
-  → Per-file icons for: exe, lnk, ico, url, scr, appx
-      via IShellItemImageFactory (16x16 PNG, requires real file path)
-  → Extension-based fallback via SHGetFileInfo
-  → No prewarming (loaded on demand)
-```
-
-### Theme
-
-Syncs with system settings (`prefers-color-scheme: dark`). Toggle via theme button. Based on CSS custom properties and `data-theme` attribute. Persisted to localStorage.
-
-```css
-:root {
-  --bg-app, --text-primary, --surface, --row-hover,
-  --row-selected, --border-soft, --focus-ring, ...
-}
-```
-
-### Status Bar
-
-| State | Display |
-|-------|---------|
-| Indexing (has entries) | Pulsing `●` + progress % + elapsed time + entry count |
-| Indexing (no entries) | `Starting indexing...` |
-| Ready | Green `●` + entry count + indexing duration |
-| Ready (background active) | Pulsing green `●` |
-| Search complete | `"query" Xms · N results` |
-
-### Full Disk Access Banner (macOS)
-
-On macOS, checks `check_full_disk_access()` at startup. If not granted, shows a dismissible banner with a link to Privacy settings.
-
----
+See [GPUI architecture](gpui-architecture.md) for the current source layout,
+input/IME handling, generation guards, virtual list, dialogs, preferences,
+status bridge and native packaging. See [test cases](gpui-test-cases.md) and
+[performance](gpui-performance.md) for measured behavior.
 
 ## Platform Comparison
 
@@ -721,8 +545,8 @@ On macOS, checks `check_full_disk_access()` at startup. If not granted, shows a 
 | In-memory index | N/A | MemIndex during MFT→DB upsert |
 | Icon loading | NSWorkspace (extension-based, prewarmed) | IShellItemImageFactory (per-file for exe/lnk) + SHGetFileInfo |
 | Context menu | Custom (frontend) | Native Explorer context menu (Shell API) |
-| Global shortcut | Cmd+Shift+Space (tauri-plugin-global-shortcut) | Not registered |
-| Window effect | Vibrancy (NSVisualEffectMaterial) | Background color per theme |
+| Global shortcut | Cmd+Shift+Space (global-hotkey) | Not registered |
+| Window effect | GPUI window with the original custom titlebar | Background color per theme |
 | Quick Look | Supported (Space key) | N/A |
 | Full Disk Access | FDA banner check | N/A |
 | Clipboard | `pbcopy` (paths), NSPasteboard (files) | `cmd /C clip` |
@@ -754,11 +578,10 @@ On macOS, checks `check_full_disk_access()` at startup. If not granted, shows a 
 | `EVENT_ID_FLUSH_INTERVAL` | 30s | event_id / usn_next DB save interval |
 | `STATUS_EMIT_MIN_INTERVAL` | 2s | Status update throttle |
 | `DB_BUSY_RETRY_DELAY` | 3s | Retry delay on DB busy |
-| `SEARCH_DEBOUNCE_MS` (FE) | 200ms | Frontend search debounce |
-| `PAGE_SIZE` (FE) | 500 | Frontend page size |
-| `rowHeight` (FE) | 26px | Virtual scroll row height |
-| `ICON_CACHE_MAX` (FE) | 500 | Frontend icon cache limit |
-| `HIGHLIGHT_CACHE_MAX` (FE) | 300 | Frontend highlight cache limit |
+| Search debounce | 200ms leading + trailing | `ui/mod.rs` |
+| Page size | 500 / 100 single character | `ui/mod.rs` |
+| Row height | 27px | GPUI uniform_list |
+| Native icon cache | 512 | Frontend icon cache limit |
 
 ## macOS Daemon-Writer Architecture
 

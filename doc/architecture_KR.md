@@ -1,20 +1,20 @@
 # Architecture
 
-Everything — 파일 시스템 전체를 SQLite에 인덱싱하여 sub-50ms 파일/폴더 이름 검색을 제공하는 Tauri v2 데스크톱 앱. macOS와 Windows를 지원.
+Everything — 파일 시스템 전체를 SQLite에 인덱싱하여 sub-50ms 파일/폴더 이름 검색을 제공하는 GPUI 데스크톱 앱. macOS와 Windows를 지원.
 
 ## Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
-| App framework | Tauri v2 |
+| App framework | GPUI |
 | Backend | Rust (rusqlite, jwalk, ignore) |
-| Frontend | Svelte 5 (단일 컴포넌트) |
+| Frontend | Rust + gpui-component |
 | DB | SQLite WAL mode, LIKE 기반 검색 |
-| Build | Vite 7, Cargo |
+| Build | Cargo |
 | macOS watcher | fsevent-sys (FSEvents 직접 바인딩) |
 | Windows 인덱서 | MFT 스캔 (Win32 FSCTL), USN 저널, ReadDirectoryChangesW fallback, WalkDir non-admin fallback |
 | Windows 추가 | windows 0.58, notify, rayon, png |
-| Plugins | tauri-plugin-global-shortcut, tauri-plugin-drag, tauri-plugin-window-state, tauri-plugin-decorum |
+| Native integrations | global-hotkey, drag, GPUI native window lifecycle |
 
 ---
 
@@ -22,34 +22,17 @@ Everything — 파일 시스템 전체를 SQLite에 인덱싱하여 sub-50ms 파
 
 ```
 src-tauri/src/
-├── main.rs              # 앱 상태, DB, 인덱싱, 검색, 파일 액션, IPC 핸들러
-├── query.rs             # 검색 쿼리 파서 (SearchMode 분류)
-├── fd_search.rs         # jwalk 기반 라이브 파일시스템 검색
-├── mem_search.rs        # 인메모리 컴팩트 엔트리 검색 (MemIndex)
-├── gitignore_filter.rs  # 지연 .gitignore 탐색 및 매칭
-│
-├── mac/                 # macOS 전용 모듈
-│   ├── mod.rs
-│   ├── fsevent_watcher.rs   # FSEvents 직접 바인딩
-│   └── spotlight_search.rs  # mdfind 기반 Spotlight 검색 fallback
-│
-└── win/                 # Windows 전용 모듈
-    ├── mod.rs               # Windows 인덱싱 오케스트레이션 (MFT → USN → RDCW fallback)
-    ├── mft_indexer.rs       # NTFS Master File Table 스캔 (rayon 병렬)
-    ├── nonadmin_indexer.rs  # WalkDir fallback (MFT 접근 불가 시)
-    ├── usn_watcher.rs       # USN Change Journal 모니터
-    ├── rdcw_watcher.rs      # ReadDirectoryChangesW fallback (notify 크레이트)
-    ├── search_catchup.rs    # 오프라인 동기화 (Windows Search 서비스 / mtime 스캔)
-    ├── icon.rs              # IShellItemImageFactory + SHGetFileInfo 아이콘 로딩
-    ├── context_menu.rs      # 네이티브 Explorer 컨텍스트 메뉴 (Shell API)
-    ├── volume.rs            # NTFS 볼륨 핸들 및 USN 저널 쿼리
-    ├── path_resolver.rs     # FRN (File Reference Number) → 경로 변환
-    └── com_guard.rs         # COM 초기화/정리 래퍼
-
-src/
-├── main.js              # Svelte 마운트 포인트
-├── App.svelte           # 전체 UI (단일 컴포넌트)
-└── search-utils.js      # 검색 디바운스 & 뷰포트 보존 유틸리티
+├── ui/mod.rs, view.rs, actions.rs  # Native GPUI lifecycle, views, file actions
+├── ui_model.rs, ui_prefs.rs      # Generations, selection, pagination, preferences
+├── runtime.rs, ui_gate.rs        # Worker executor, coalesced status event bridge
+├── main.rs                      # Shared app setup, search, DB and file APIs
+├── query.rs, mem_search.rs       # Query parser and in-memory search
+├── daemon.rs, daemon_ipc.rs      # Daemon lifecycle and control socket
+├── mcp_server.rs                # Read-only MCP stdio server
+├── mac/                         # FSEvents, daemon bridge, login item, FDA, icons
+└── win/                         # MFT/USN/RDCW, service, Shell menu and icons
+scripts/bundle_macos.py           # Native .app/.dmg packaging
+src-tauri/windows/installer.nsi   # Native NSIS installer and service hooks
 ```
 
 ### 모듈 의존성
@@ -110,7 +93,7 @@ struct AppState {
 }
 ```
 
-모든 필드가 `Arc`로 래핑되어 `Clone` 가능. Tauri `State<AppState>`로 IPC 핸들러에 주입.
+모든 필드가 `Arc`로 래핑되어 `Clone` 가능. 네이티브 Rust API에 직접 전달한다.
 
 ---
 
@@ -524,32 +507,12 @@ RDCW watcher (fallback — USN 사용 불가 시)
 
 ---
 
-## IPC Commands
+## Native UI APIs
 
-| Command | 방향 | 설명 |
-|---------|------|------|
-| `get_index_status` | FE→BE | 인덱싱 상태, 엔트리 수, 진행률 |
-| `get_home_dir` | FE→BE | 홈 디렉토리 경로 |
-| `get_platform` | FE→BE | `"windows"`, `"macos"` 등 반환 |
-| `start_full_index` | FE→BE | 전체 재인덱싱 트리거 |
-| `reset_index` | FE→BE | DB 초기화 후 재인덱싱 |
-| `search` | FE→BE | DB 검색 → `SearchResultDto { entries, modeLabel, totalCount, totalKnown }` |
-| `fd_search` | FE→BE | jwalk 라이브 검색 → `FdSearchResultDto { entries, total, timedOut }` |
-| `open` | FE→BE | 파일 열기 (macOS: `open`, Windows: `cmd /C start`, Linux: `xdg-open`) |
-| `open_with` | FE→BE | 파일 관리자에서 보기 |
-| `reveal_in_finder` | FE→BE | macOS: `open -R`, Windows: `explorer /select,`, Linux: `xdg-open` 부모 |
-| `copy_paths` | FE→BE | 경로 클립보드 복사 (macOS: `pbcopy`, Windows: `clip`) |
-| `copy_files` | FE→BE | 파일 클립보드 복사 (macOS 전용, NSPasteboard) |
-| `move_to_trash` | FE→BE | 휴지통 이동 + DB 삭제 |
-| `rename` | FE→BE | 이름 변경 + DB 갱신 → 새 EntryDto 반환 |
-| `get_file_icons` | FE→BE | 여러 행의 시스템 아이콘 PNG를 한 번에 위치 대응으로 반환 |
-| `show_context_menu` | FE→BE | 네이티브 컨텍스트 메뉴 (Windows: Explorer Shell API, macOS: 커스텀) |
-| `quick_look` | FE→BE | Quick Look 미리보기 (macOS 전용) |
-| `check_full_disk_access` | FE→BE | 전체 디스크 접근 권한 확인 (macOS 전용) |
-| `open_privacy_settings` | FE→BE | 개인 정보 설정 열기 (macOS 전용) |
-| `set_native_theme` | FE→BE | 네이티브 윈도우 테마 설정 (dark/light) |
-| `mark_frontend_ready` | FE→BE | 프론트엔드 초기화 완료 신호 |
-| `frontend_log` | FE→BE | 프론트엔드 디버그 로깅 |
+GPUI calls Rust search/file/settings functions directly through worker tasks.
+There are no Tauri command macros, State injection or WebView IPC messages.
+Rename/trash update the filesystem; the daemon/service alone writes the shared
+index. See [GPUI architecture](gpui-architecture.md).
 
 ## Backend Events
 
@@ -563,151 +526,12 @@ RDCW watcher (fallback — USN 사용 불가 시)
 
 ---
 
-## Frontend Architecture
+## Native UI Architecture
 
-### 단일 컴포넌트 (`App.svelte`)
-
-검색 입력, 가상 스크롤 테이블, 인라인 이름 변경, 컨텍스트 메뉴, 키보드 단축키, 아이콘 캐시, 상태 바, 테마 토글, Full Disk Access 배너(macOS)를 포함하는 단일 컴포넌트.
-
-### 플랫폼 감지
-
-시작 시 `get_platform()` 호출. 결과를 `platform` 변수에 저장하여 조건부 동작에 사용 (예: Windows 네이티브 컨텍스트 메뉴 vs macOS 커스텀 컨텍스트 메뉴).
-
-### 상태 관리
-
-Svelte 5 리액티브 변수 사용 (store 미사용).
-
-| 카테고리 | 주요 변수 |
-|---------|----------|
-| 검색 | `query`, `results`, `searchGeneration`, `dbLatencyMs`, `searchModeLabel`, `sortBy`, `sortDir`, `totalResults`, `totalResultsKnown` |
-| 선택 | `selectedIndices` (Set), `selectionAnchor`, `lastSelectedIndex` |
-| 편집 | `editing { active, path, index, draftName }` |
-| 인덱싱 | `indexStatus { state, entriesCount, lastUpdated, permissionErrors, isCatchup, backgroundActive }`, `scanned`, `indexed`, `currentPath` |
-| 가상 스크롤 | `scrollTop`, `viewportHeight`, `colWidths` |
-| 캐시 | `iconCache` (Map, 최대 500), `highlightCache` (Map, 최대 300) |
-| UI | `platform`, `isMaximized`, `showFdaBanner`, `theme`, `contextMenu`, `toast` |
-
-### 검색 입력 → 결과 시퀀스
-
-```
-사용자 타이핑
-  │
-  ├─ on:input → scheduleSearch()
-  │    ├─ 200ms 이상 경과 → 즉시 실행 (leading edge)
-  │    └─ 200ms 미만 → 200ms 후 실행 (trailing edge)
-  │
-  ├─ runSearch()
-  │    ├─ searchGeneration++ (stale 응답 방지)
-  │    ├─ invoke('search', { query, limit: 500, offset: 0, sort_by, sort_dir, include_total: false })
-  │    ├─ 응답: { entries, modeLabel, totalCount, totalKnown }
-  │    ├─ results = entries
-  │    ├─ searchModeLabel = modeLabel
-  │    ├─ 뷰포트 보존 로직 (스크롤 위치)
-  │    └─ 선택 경로 기반 복원
-  │
-  └─ 무한 스크롤
-       스크롤 하단 10행 이내 → loadMore()
-       → invoke('search', { offset: results.length })
-       → results에 append
-```
-
-### 가상 스크롤
-
-```
-고정 행 높이: 26px
-버퍼: 상하 10행 (총 overscan ~20행)
-OverlayScrollbars로 커스텀 스크롤바 스타일링
-
-scrollTop
-  → startIndex = max(0, floor(scrollTop / 26) - 10)
-  → endIndex = min(results.length, startIndex + visibleCount)
-  → visibleRows = results.slice(startIndex, endIndex)
-  → translateY = startIndex * 26
-
-DOM:
-  <div class="table-body">          ← 스크롤 컨테이너
-    <div style="height:{totalHeight}px">  ← 전체 가상 높이
-      <div style="transform:translateY({translateY}px)">  ← 오프셋
-        {#each visibleRows}...
-      </div>
-    </div>
-  </div>
-```
-
-### 키보드 단축키
-
-| 키 | 동작 |
-|----|------|
-| `Escape` | 선택 해제, 검색 입력 포커스 / 이름 변경 취소 |
-| `↑` / `↓` | 선택 이동 (Shift: 범위 선택) |
-| `PageUp` / `PageDown` | 페이지 단위 이동 |
-| `Enter` | 열기 (Windows) / 인라인 이름 변경 시작 (macOS) |
-| `F2` | 인라인 이름 변경 시작 |
-| `Space` | Quick Look (macOS) |
-| `Cmd+O` / `Ctrl+O` | 선택 항목 열기 |
-| `Cmd+Enter` / `Ctrl+Enter` | Finder/Explorer에서 보기 |
-| `Cmd+C` / `Ctrl+C` | 경로 복사 |
-| `Cmd+A` / `Ctrl+A` | 전체 선택 |
-| `Cmd+F` / `Ctrl+F` | 검색 입력 포커스 |
-| `Delete` / `Cmd+⌫` | 휴지통 이동 |
-
-### 컨텍스트 메뉴
-
-| 플랫폼 | 구현 |
-|--------|------|
-| Windows | 네이티브 Explorer 컨텍스트 메뉴 (Shell API, `show_context_menu` 커맨드), `context_menu_action` 이벤트로 액션 수신 |
-| macOS | 커스텀 메뉴: Open, Quick Look, Open With, Reveal in Finder, Copy Files, Copy Path, Move to Trash, Rename (단일 선택 시) |
-
-### 아이콘 시스템
-
-```
-visibleRows 변경
-  → queueIcon(entry) 호출
-  → iconCache에 있으면 즉시 반환 (최대 500개)
-  → 없으면 캐시 키를 큐에 넣고, 뷰포트의 미스 전체를
-      invoke('get_file_icons', { requests: [{ ext, path }, ...] }) 한 번으로 요청
-      (동시 인플라이트 배치는 1개, 이후 미스는 다음 배치로 합류)
-
-macOS:
-  → swift -e NSWorkspace → 32x32 PNG (16pt@2x) — 아이콘당이 아니라
-      배치당 프로세스 1개 (swift -e 한 번이 Swift 컴파일러 풀 실행, 약 1초)
-  → 배치 항목은 argv에 `f:<경로>` / `t:<타입>`으로 태깅해 전달,
-      .app 번들의 경로 기반 아이콘도 확장자 아이콘과 같은 프로세스에서 렌더
-  → 인덱싱이 끝난 뒤 20개 주요 확장자 프리워밍
-
-Windows:
-  → 실행 파일 전용 아이콘: exe, lnk, ico, url, scr, appx
-      IShellItemImageFactory (16x16 PNG, 실제 파일 경로 필요)
-  → 확장자 기반 fallback: SHGetFileInfo
-  → 프리워밍 없음 (온디맨드 로딩)
-```
-
-### 테마
-
-시스템 설정 연동 (`prefers-color-scheme: dark`). 테마 버튼으로 토글. CSS 커스텀 프로퍼티 및 `data-theme` 속성 기반. localStorage에 저장.
-
-```css
-:root {
-  --bg-app, --text-primary, --surface, --row-hover,
-  --row-selected, --border-soft, --focus-ring, ...
-}
-```
-
-### 상태 바
-
-| 상태 | 표시 내용 |
-|------|----------|
-| 인덱싱 중 (엔트리 있음) | 펄싱 `●` + 진행률% + 경과 시간 + 엔트리 수 |
-| 인덱싱 중 (엔트리 없음) | `인덱싱 시작 중...` |
-| Ready | 녹색 `●` + 엔트리 수 + 인덱싱 소요 시간 |
-| Ready (백그라운드 활성) | 펄싱 녹색 `●` |
-| 검색 완료 | `"query" Xms · N results` |
-
-### Full Disk Access 배너 (macOS)
-
-macOS에서 시작 시 `check_full_disk_access()` 확인. 미부여 시 개인정보 설정 링크가 포함된 해제 가능한 배너 표시.
-
----
+See [GPUI architecture](gpui-architecture.md) for the current source layout,
+input/IME handling, generation guards, virtual list, dialogs, preferences,
+status bridge and native packaging. See [test cases](gpui-test-cases.md) and
+[performance](gpui-performance.md) for measured behavior.
 
 ## 플랫폼 비교
 
@@ -721,8 +545,8 @@ macOS에서 시작 시 `check_full_disk_access()` 확인. 미부여 시 개인�
 | 인메모리 인덱스 | N/A | MemIndex (MFT→DB upsert 중) |
 | 아이콘 로딩 | NSWorkspace (확장자 기반, 프리워밍) | IShellItemImageFactory (exe/lnk 파일별) + SHGetFileInfo |
 | 컨텍스트 메뉴 | 커스텀 (프론트엔드) | 네이티브 Explorer 컨텍스트 메뉴 (Shell API) |
-| 글로벌 단축키 | Cmd+Shift+Space (tauri-plugin-global-shortcut) | 미등록 |
-| 윈도우 효과 | Vibrancy (NSVisualEffectMaterial) | 테마별 배경색 |
+| 글로벌 단축키 | Cmd+Shift+Space (global-hotkey) | 미등록 |
+| 윈도우 효과 | GPUI window with the original custom titlebar | 테마별 배경색 |
 | Quick Look | 지원 (Space 키) | N/A |
 | Full Disk Access | FDA 배너 확인 | N/A |
 | 클립보드 | `pbcopy` (경로), NSPasteboard (파일) | `cmd /C clip` |
@@ -754,11 +578,10 @@ macOS에서 시작 시 `check_full_disk_access()` 확인. 미부여 시 개인�
 | `EVENT_ID_FLUSH_INTERVAL` | 30s | event_id / usn_next DB 저장 주기 |
 | `STATUS_EMIT_MIN_INTERVAL` | 2s | 상태 업데이트 스로틀 |
 | `DB_BUSY_RETRY_DELAY` | 3s | DB busy 시 재시도 지연 |
-| `SEARCH_DEBOUNCE_MS` (FE) | 200ms | 프론트엔드 검색 디바운스 |
-| `PAGE_SIZE` (FE) | 500 | 프론트엔드 페이지 크기 |
-| `rowHeight` (FE) | 26px | 가상 스크롤 행 높이 |
-| `ICON_CACHE_MAX` (FE) | 500 | 프론트엔드 아이콘 캐시 제한 |
-| `HIGHLIGHT_CACHE_MAX` (FE) | 300 | 프론트엔드 하이라이트 캐시 제한 |
+| Search debounce | 200ms leading + trailing | `ui/mod.rs` |
+| Page size | 500 / 한 글자 100 | `ui/mod.rs` |
+| Row height | 27px | GPUI uniform_list |
+| Native icon cache | 512 | 프론트엔드 아이콘 캐시 제한 |
 
 ## macOS 데몬-writer 아키텍처
 

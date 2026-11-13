@@ -1,0 +1,146 @@
+[
+  {
+    "renderer": "tauri",
+    "theme": "dark",
+    "state": "empty",
+    "file": "tauri-dark-empty.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "dark",
+    "state": "results",
+    "file": "tauri-dark-results.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "dark",
+    "state": "selected",
+    "file": "tauri-dark-selected.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "dark",
+    "state": "rename",
+    "file": "tauri-dark-rename.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "dark",
+    "state": "trash",
+    "file": "tauri-dark-trash.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "dark",
+    "state": "no-results",
+    "file": "tauri-dark-no-results.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "light",
+    "state": "empty",
+    "file": "tauri-light-empty.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "light",
+    "state": "results",
+    "file": "tauri-light-results.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "light",
+    "state": "selected",
+    "file": "tauri-light-selected.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "light",
+    "state": "rename",
+    "file": "tauri-light-rename.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "light",
+    "state": "trash",
+    "file": "tauri-light-trash.png"
+  },
+  {
+    "renderer": "tauri",
+    "theme": "light",
+    "state": "no-results",
+    "file": "tauri-light-no-results.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "dark",
+    "state": "empty",
+    "file": "gpui-dark-empty.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "dark",
+    "state": "results",
+    "file": "gpui-dark-results.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "dark",
+    "state": "selected",
+    "file": "gpui-dark-selected.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "dark",
+    "state": "rename",
+    "file": "gpui-dark-rename.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "dark",
+    "state": "trash",
+    "file": "gpui-dark-trash.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "dark",
+    "state": "no-results",
+    "file": "gpui-dark-no-results.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "light",
+    "state": "empty",
+    "file": "gpui-light-empty.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "light",
+    "state": "results",
+    "file": "gpui-light-results.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "light",
+    "state": "selected",
+    "file": "gpui-light-selected.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "light",
+    "state": "rename",
+    "file": "gpui-light-rename.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "light",
+    "state": "trash",
+    "file": "gpui-light-trash.png"
+  },
+  {
+    "renderer": "gpui",
+    "theme": "light",
+    "state": "no-results",
+    "file": "gpui-light-no-results.png"
+  }
+]

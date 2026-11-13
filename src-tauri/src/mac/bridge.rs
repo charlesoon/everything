@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter};
+use crate::runtime::EventSink;
 
 use crate::daemon_ipc::{self, DaemonStatus};
 use crate::{
@@ -94,7 +94,7 @@ fn map_status(s: &DaemonStatus) -> (&'static str, Option<String>) {
     }
 }
 
-pub fn start_macos_readonly(app: AppHandle, state: AppState) {
+pub fn start_macos_readonly(app: EventSink, state: AppState) {
     // Instant Ready if the daemon already built an index; the poll refines.
     set_ready_with_cached_counts(&app, &state);
 
@@ -130,8 +130,7 @@ pub fn start_macos_readonly(app: AppHandle, state: AppState) {
                     last_revival_attempt = None;
                     last_health_check = None;
 
-                    if !state.db_ready.load(Ordering::Acquire) && macos_db_usable(&state.db_path)
-                    {
+                    if !state.db_ready.load(Ordering::Acquire) && macos_db_usable(&state.db_path) {
                         state.db_ready.store(true, Ordering::Release);
                         eprintln!("[bridge] daemon DB is readable; leaving Spotlight fallback");
                     }
@@ -218,9 +217,7 @@ pub fn start_macos_readonly(app: AppHandle, state: AppState) {
                                     // outlive it. fts_ready can flip either
                                     // way (reset → dirty; finalize → rebuilt).
                                     state.search_conn_pool.lock().clear();
-                                    state
-                                        .fts_ready
-                                        .store(fts_usable(c), Ordering::Release);
+                                    state.fts_ready.store(fts_usable(c), Ordering::Release);
                                     crate::emit_index_updated(
                                         &app,
                                         s.entries_count,
@@ -323,7 +320,10 @@ fn version_lt(a: &str, b: &str) -> bool {
     };
     let (a, b) = (parse(a), parse(b));
     for i in 0..a.len().max(b.len()) {
-        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
         if x != y {
             return x < y;
         }
@@ -353,7 +353,10 @@ mod tests {
         };
         let (label, msg) = map_status(&s);
         assert_eq!(label, "Indexing");
-        assert!(msg.unwrap().starts_with("Catchup:"), "non-fresh build is a catchup");
+        assert!(
+            msg.unwrap().starts_with("Catchup:"),
+            "non-fresh build is a catchup"
+        );
 
         s.is_fresh = true;
         let (label, msg) = map_status(&s);

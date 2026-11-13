@@ -13,7 +13,8 @@ fn prod_db_path() -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
         format!("{home}/Library/Application Support/com.everything.app/index.db")
     } else {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| "C:\\Users\\USER\\AppData\\Roaming".to_string());
+        let appdata = std::env::var("APPDATA")
+            .unwrap_or_else(|_| "C:\\Users\\USER\\AppData\\Roaming".to_string());
         format!("{appdata}/com.everything.app/index.db")
     }
 }
@@ -320,10 +321,8 @@ fn run_search(conn: &Connection, query: &str, limit: u32) -> SearchResult {
             // Phase 2: contains-match with tight time budget (single pass)
             if names.is_empty() {
                 let phase2_start = Instant::now();
-                let _ = conn.progress_handler(
-                    2_000,
-                    Some(move || phase2_start.elapsed().as_millis() > 5),
-                );
+                let _ = conn
+                    .progress_handler(2_000, Some(move || phase2_start.elapsed().as_millis() > 5));
 
                 {
                     let phase2_sql = format!(
@@ -387,7 +386,13 @@ fn run_search(conn: &Connection, query: &str, limit: u32) -> SearchResult {
             let dir_hint = trimmed[..last_slash].trim();
             let home_dir = std::env::var("HOME")
                 .or_else(|_| std::env::var("USERPROFILE"))
-                .unwrap_or_else(|_| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() });
+                .unwrap_or_else(|_| {
+                    if cfg!(windows) {
+                        "C:\\".to_string()
+                    } else {
+                        "/".to_string()
+                    }
+                });
             let home = Path::new(&home_dir);
 
             let resolved = if !dir_hint.is_empty() && !has_glob_chars(dir_hint) {
@@ -876,6 +881,7 @@ fn run_all_benchmarks(conn: &Connection, phase_label: &str) -> Vec<(String, Vec<
 /// Phase 1: Benchmark searches against the existing production DB.
 /// This simulates the "app restart" scenario where index is already built.
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn phase1_warm_search_on_existing_db() {
     let prod_path = prod_db_path();
     let db_path = PathBuf::from(&prod_path);
@@ -903,11 +909,18 @@ fn phase1_warm_search_on_existing_db() {
 /// Phase 2: Fresh index + concurrent search.
 /// Creates a separate bench DB, indexes $HOME, runs searches during indexing.
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn phase2_index_and_concurrent_search() {
     let home_dir = PathBuf::from(
         std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() }),
+            .unwrap_or_else(|_| {
+                if cfg!(windows) {
+                    "C:\\".to_string()
+                } else {
+                    "/".to_string()
+                }
+            }),
     );
     let bench_dir = PathBuf::from(bench_db_dir());
     let _ = fs::remove_dir_all(&bench_dir);
@@ -1010,6 +1023,7 @@ fn phase2_index_and_concurrent_search() {
 /// Phase 3: Simulate "restart" by closing and reopening the production DB.
 /// Measures cold-start overhead (no mmap warm cache).
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn phase3_restart_simulation() {
     let prod_path = prod_db_path();
     let db_path = PathBuf::from(&prod_path);
@@ -1209,22 +1223,32 @@ impl LikePat {
         let rem = &val[vp..];
         match &segs[si] {
             LikeSeg::Literal(lit) => {
-                if !rem.starts_with(lit.as_str()) { return false; }
+                if !rem.starts_with(lit.as_str()) {
+                    return false;
+                }
                 Self::do_match(segs, val, si + 1, vp + lit.len())
             }
             LikeSeg::Single => {
-                if rem.is_empty() { return false; }
+                if rem.is_empty() {
+                    return false;
+                }
                 let clen = rem.chars().next().unwrap().len_utf8();
                 Self::do_match(segs, val, si + 1, vp + clen)
             }
             LikeSeg::Any => {
                 let ns = si + 1;
-                if ns >= segs.len() { return true; }
+                if ns >= segs.len() {
+                    return true;
+                }
                 let mut pos = vp;
-                if Self::do_match(segs, val, ns, pos) { return true; }
+                if Self::do_match(segs, val, ns, pos) {
+                    return true;
+                }
                 for ch in rem.chars() {
                     pos += ch.len_utf8();
-                    if Self::do_match(segs, val, ns, pos) { return true; }
+                    if Self::do_match(segs, val, ns, pos) {
+                        return true;
+                    }
                 }
                 false
             }
@@ -1272,7 +1296,13 @@ impl MemSearchIndex {
             idxs.sort_unstable_by(|&a, &b| names_lower[a as usize].cmp(&names_lower[b as usize]));
         }
 
-        MemSearchIndex { entries, names_lower, sorted_names, ext_map, dir_map }
+        MemSearchIndex {
+            entries,
+            names_lower,
+            sorted_names,
+            ext_map,
+            dir_map,
+        }
     }
 }
 
@@ -1300,7 +1330,9 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
     // Empty mode: use sorted_names directly (no filter/sort needed)
     if matches!(mode, SearchMode::Empty) {
         let end = effective_limit as usize;
-        let page: Vec<String> = idx.sorted_names.iter()
+        let page: Vec<String> = idx
+            .sorted_names
+            .iter()
             .take(end)
             .map(|(_, i)| idx.entries[*i as usize].name.clone())
             .collect();
@@ -1315,7 +1347,10 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
         let names = match idx.ext_map.get(&ext_lower) {
             Some(idxs) => {
                 let end = (effective_limit as usize).min(idxs.len());
-                idxs[..end].iter().map(|&i| idx.entries[i as usize].name.clone()).collect()
+                idxs[..end]
+                    .iter()
+                    .map(|&i| idx.entries[i as usize].name.clone())
+                    .collect()
             }
             None => Vec::new(),
         };
@@ -1330,25 +1365,33 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
             let q_lower = query.trim().to_lowercase();
             let cap = effective_limit as usize;
             // Phase 1: exact
-            let lo = idx.sorted_names.partition_point(|(n, _)| n.as_str() < q_lower.as_str());
+            let lo = idx
+                .sorted_names
+                .partition_point(|(n, _)| n.as_str() < q_lower.as_str());
             let mut exact: Vec<u32> = Vec::new();
             let mut i = lo;
             while i < idx.sorted_names.len() && idx.sorted_names[i].0 == q_lower {
                 exact.push(idx.sorted_names[i].1);
                 i += 1;
             }
-            if exact.len() >= cap { exact.truncate(cap); exact }
-            else {
+            if exact.len() >= cap {
+                exact.truncate(cap);
+                exact
+            } else {
                 // Phase 2: prefix
                 let end_str = increment_str(&q_lower);
                 let hi = match &end_str {
-                    Some(es) => idx.sorted_names.partition_point(|(n, _)| n.as_str() < es.as_str()),
+                    Some(es) => idx
+                        .sorted_names
+                        .partition_point(|(n, _)| n.as_str() < es.as_str()),
                     None => idx.sorted_names.len(),
                 };
                 let mut prefix: Vec<u32> = Vec::new();
                 for j in i..hi {
                     prefix.push(idx.sorted_names[j].1);
-                    if exact.len() + prefix.len() >= cap { break; }
+                    if exact.len() + prefix.len() >= cap {
+                        break;
+                    }
                 }
                 if exact.len() + prefix.len() >= cap {
                     exact.extend(prefix);
@@ -1357,17 +1400,24 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
                 } else {
                     // Phase 3: contains (with time budget)
                     let remaining = cap - exact.len() - prefix.len();
-                    let ep_set: std::collections::HashSet<u32> = exact.iter().chain(prefix.iter()).copied().collect();
+                    let ep_set: std::collections::HashSet<u32> =
+                        exact.iter().chain(prefix.iter()).copied().collect();
                     let scan_start = Instant::now();
                     let mut contains: Vec<u32> = Vec::new();
                     for (j, nl) in idx.names_lower.iter().enumerate() {
                         let j = j as u32;
-                        if ep_set.contains(&j) { continue; }
+                        if ep_set.contains(&j) {
+                            continue;
+                        }
                         if nl.contains(&q_lower) {
                             contains.push(j);
-                            if contains.len() >= remaining { break; }
+                            if contains.len() >= remaining {
+                                break;
+                            }
                         }
-                        if j & 0x3FFF == 0 && scan_start.elapsed().as_millis() > SCAN_BUDGET_MS { break; }
+                        if j & 0x3FFF == 0 && scan_start.elapsed().as_millis() > SCAN_BUDGET_MS {
+                            break;
+                        }
                     }
                     exact.extend(prefix);
                     exact.extend(contains);
@@ -1380,10 +1430,14 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
             // Optimization: if pattern starts with literal prefix, use binary search
             if let Some(prefix) = pat.literal_prefix() {
                 if !prefix.is_empty() {
-                    let lo = idx.sorted_names.partition_point(|(n, _)| n.as_str() < prefix.as_str());
+                    let lo = idx
+                        .sorted_names
+                        .partition_point(|(n, _)| n.as_str() < prefix.as_str());
                     let prefix_end = increment_str(&prefix);
                     let hi = match &prefix_end {
-                        Some(es) => idx.sorted_names.partition_point(|(n, _)| n.as_str() < es.as_str()),
+                        Some(es) => idx
+                            .sorted_names
+                            .partition_point(|(n, _)| n.as_str() < es.as_str()),
                         None => idx.sorted_names.len(),
                     };
                     let mut results: Vec<u32> = Vec::new();
@@ -1391,12 +1445,17 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
                         let (ref nl, i) = idx.sorted_names[j];
                         if pat.matches_lowered(nl) {
                             results.push(i);
-                            if results.len() >= effective_limit as usize { break; }
+                            if results.len() >= effective_limit as usize {
+                                break;
+                            }
                         }
                     }
                     let count = results.len();
-                    let first_names: Vec<String> = results.iter().take(5)
-                        .map(|&i| idx.entries[i as usize].name.clone()).collect();
+                    let first_names: Vec<String> = results
+                        .iter()
+                        .take(5)
+                        .map(|&i| idx.entries[i as usize].name.clone())
+                        .collect();
                     return MemSearchResult { count, first_names };
                 }
             }
@@ -1407,7 +1466,12 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
                 if pat.matches_lowered(nl) {
                     results.push(i as u32);
                 }
-                if (i as u32) & 0x3FFF == 0 && i > 0 && scan_start.elapsed().as_millis() > SCAN_BUDGET_MS { break; }
+                if (i as u32) & 0x3FFF == 0
+                    && i > 0
+                    && scan_start.elapsed().as_millis() > SCAN_BUDGET_MS
+                {
+                    break;
+                }
             }
             results
         }
@@ -1425,9 +1489,13 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
             for (dk, idxs) in &idx.dir_map {
                 if dk.ends_with(&dir_suffix) || dk.contains(&dir_infix) {
                     result.extend_from_slice(idxs);
-                    if result.len() >= collect_cap { break; }
+                    if result.len() >= collect_cap {
+                        break;
+                    }
                 }
-                if scan_start.elapsed().as_millis() > SCAN_BUDGET_MS { break; }
+                if scan_start.elapsed().as_millis() > SCAN_BUDGET_MS {
+                    break;
+                }
             }
             if name_like != "%" {
                 let name_pat = LikePat::new(name_like);
@@ -1441,17 +1509,24 @@ fn mem_search(idx: &MemSearchIndex, query: &str, limit: u32) -> MemSearchResult 
     let lim = effective_limit as usize;
     if indices.len() > lim * 3 {
         let k = lim.min(indices.len());
-        let cmp = |a: &u32, b: &u32| idx.names_lower[*a as usize].cmp(&idx.names_lower[*b as usize]);
+        let cmp =
+            |a: &u32, b: &u32| idx.names_lower[*a as usize].cmp(&idx.names_lower[*b as usize]);
         indices.select_nth_unstable_by(k - 1, cmp);
         indices.truncate(k);
         indices.sort_unstable_by(cmp);
     } else {
-        indices.sort_unstable_by(|&a, &b| idx.names_lower[a as usize].cmp(&idx.names_lower[b as usize]));
+        indices.sort_unstable_by(|&a, &b| {
+            idx.names_lower[a as usize].cmp(&idx.names_lower[b as usize])
+        });
         indices.truncate(lim);
     }
 
     let count = indices.len();
-    let first_names: Vec<String> = indices.iter().take(5).map(|&i| idx.entries[i as usize].name.clone()).collect();
+    let first_names: Vec<String> = indices
+        .iter()
+        .take(5)
+        .map(|&i| idx.entries[i as usize].name.clone())
+        .collect();
     MemSearchResult { count, first_names }
 }
 
@@ -1486,6 +1561,7 @@ fn bench_mem_query(idx: &MemSearchIndex, query: &str) -> BenchResult {
 /// Phase 4: In-memory search benchmark.
 /// Loads all entries from prod DB into Vec, benchmarks search without DB.
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn phase4_mem_search_benchmark() {
     let prod_path = prod_db_path();
     let db_path = PathBuf::from(&prod_path);
@@ -1517,7 +1593,10 @@ fn phase4_mem_search_benchmark() {
 
     let sep = "=".repeat(80);
     println!("\n{sep}");
-    println!("  PHASE 4: In-Memory Search Benchmark ({} entries)", idx.entries.len());
+    println!(
+        "  PHASE 4: In-Memory Search Benchmark ({} entries)",
+        idx.entries.len()
+    );
     println!("{sep}");
 
     // Warmup

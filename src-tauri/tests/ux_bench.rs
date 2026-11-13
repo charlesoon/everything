@@ -1,6 +1,6 @@
 /// UI-less end-to-end benchmark: indexing, restart, and search latency profiling.
 ///
-/// Run:  cargo test --manifest-path src-tauri/Cargo.toml --test ux_bench -- --nocapture
+/// Run:  cargo test --manifest-path src-tauri/Cargo.toml --test ux_bench -- --ignored --nocapture
 ///
 /// Uses the production DB when available, otherwise builds a fresh one.
 use std::collections::HashMap;
@@ -13,8 +13,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 use walkdir::WalkDir;
 
-const PROD_DB_PATH: &str =
-    "/Users/al02402336/Library/Application Support/com.everything.app/index.db";
+fn prod_db_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("EVERYTHING_BENCH_DB") {
+        return path.into();
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/com.everything.app/index.db")
+    } else {
+        std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .unwrap_or(home)
+            .join("com.everything.app/data/index.db")
+    }
+}
 const BENCH_DB_DIR: &str = "/tmp/everything_ux_bench";
 const DEFAULT_LIMIT: u32 = 300;
 const SHORT_QUERY_LIMIT: u32 = 100;
@@ -170,10 +185,19 @@ fn extract_ext_from_like(like_pattern: &str) -> Option<String> {
 #[allow(dead_code)]
 enum SearchMode {
     Empty,
-    NameSearch { name_like: String },
-    GlobName { name_like: String },
-    ExtSearch { ext: String },
-    PathSearch { path_like: String, name_like: String },
+    NameSearch {
+        name_like: String,
+    },
+    GlobName {
+        name_like: String,
+    },
+    ExtSearch {
+        ext: String,
+    },
+    PathSearch {
+        path_like: String,
+        name_like: String,
+    },
 }
 
 fn parse_query(query: &str) -> SearchMode {
@@ -332,10 +356,10 @@ fn run_search_sorted(
             // Phase 2a: quick existence probe (tight budget)
             if names.is_empty() {
                 let probe_start = Instant::now();
-                let _ = conn.progress_handler(5_000, Some(move || probe_start.elapsed().as_millis() > 8));
+                let _ = conn
+                    .progress_handler(5_000, Some(move || probe_start.elapsed().as_millis() > 8));
 
-                let probe_sql =
-                    "SELECT 1 FROM entries
+                let probe_sql = "SELECT 1 FROM entries
                      WHERE name LIKE ?1 ESCAPE '\\'
                        AND name COLLATE NOCASE != ?2
                        AND name NOT LIKE ?3 ESCAPE '\\'
@@ -351,7 +375,8 @@ fn run_search_sorted(
                 // Phase 2b: full fetch only when probe found a match
                 if has_match {
                     let start = Instant::now();
-                    let _ = conn.progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
+                    let _ = conn
+                        .progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
 
                     let sql = format!(
                         "SELECT name FROM entries
@@ -397,9 +422,7 @@ fn run_search_sorted(
             );
             let mut stmt = conn.prepare_cached(&sql).unwrap();
             let rows = stmt
-                .query_map(params![ext, effective_limit], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_map(params![ext, effective_limit], |row| row.get::<_, String>(0))
                 .unwrap();
             for r in rows.flatten() {
                 names.push(r);
@@ -443,7 +466,13 @@ fn run_search_sorted(
                 let mut stmt = conn.prepare_cached(&sql).unwrap();
                 let rows = stmt
                     .query_map(
-                        params![dir_exact, dir_prefix, dir_prefix_end, name_like, effective_limit],
+                        params![
+                            dir_exact,
+                            dir_prefix,
+                            dir_prefix_end,
+                            name_like,
+                            effective_limit
+                        ],
                         |row| row.get::<_, String>(0),
                     )
                     .unwrap();
@@ -508,7 +537,10 @@ fn run_search_sorted(
                     // Phase B: time-budgeted contains fallback if prefix found too few
                     if (names.len() as i64) < effective_limit as i64 {
                         let start = Instant::now();
-                        let _ = conn.progress_handler(10_000, Some(move || start.elapsed().as_millis() > 30));
+                        let _ = conn.progress_handler(
+                            10_000,
+                            Some(move || start.elapsed().as_millis() > 30),
+                        );
 
                         let sql = format!(
                             "SELECT e.name FROM entries e \
@@ -693,9 +725,7 @@ fn index_row_from_entry(entry: &walkdir::DirEntry) -> Option<IndexRow> {
     let path = entry.path();
     let metadata = entry.metadata().ok()?;
     let is_dir = metadata.is_dir();
-    let name = path
-        .file_name()
-        .map(|v| v.to_string_lossy().to_string())?;
+    let name = path.file_name().map(|v| v.to_string_lossy().to_string())?;
     let dir = path
         .parent()
         .map(|p| p.to_string_lossy().to_string())
@@ -747,8 +777,7 @@ fn upsert_batch(conn: &mut Connection, rows: &[IndexRow], run_id: i64) {
         let now = now_epoch();
         for row in rows {
             let _ = stmt.execute(params![
-                row.path, row.name, row.dir, row.is_dir, row.ext, row.mtime, row.size, now,
-                run_id,
+                row.path, row.name, row.dir, row.is_dir, row.ext, row.mtime, row.size, now, run_id,
             ]);
         }
     }
@@ -1187,7 +1216,10 @@ fn run_test_cases(conn: &Connection, label: &str) -> Vec<CaseResult> {
         let scenario = tc.id.split('_').next().unwrap_or("");
         if scenario != current_scenario {
             current_scenario = scenario;
-            println!("  ── {} ──", tc.description.split('\'').next().unwrap_or(tc.description));
+            println!(
+                "  ── {} ──",
+                tc.description.split('\'').next().unwrap_or(tc.description)
+            );
         }
 
         let mut timings = Vec::with_capacity(tc.runs);
@@ -1311,11 +1343,7 @@ fn run_test_cases(conn: &Connection, label: &str) -> Vec<CaseResult> {
     if !slow_queries.is_empty() {
         println!("\n  ── Slow Query Diagnosis (>{SLO_OK_MS}ms avg) ──");
         for (query, avg) in &slow_queries {
-            let q_display = if query.is_empty() {
-                "(empty)"
-            } else {
-                query
-            };
+            let q_display = if query.is_empty() { "(empty)" } else { query };
             println!("\n    Query: {:?}  avg={:.2}ms", q_display, avg);
             explain_search(conn, query);
         }
@@ -1325,10 +1353,7 @@ fn run_test_cases(conn: &Connection, label: &str) -> Vec<CaseResult> {
     println!("\n  ── Per-mode Latency ──");
     let mut mode_map: HashMap<String, Vec<f64>> = HashMap::new();
     for r in &results {
-        mode_map
-            .entry(r.mode.clone())
-            .or_default()
-            .push(r.avg_ms);
+        mode_map.entry(r.mode.clone()).or_default().push(r.avg_ms);
     }
     let mut modes: Vec<_> = mode_map.into_iter().collect();
     modes.sort_by_key(|(k, _)| k.clone());
@@ -1353,6 +1378,7 @@ fn run_test_cases(conn: &Connection, label: &str) -> Vec<CaseResult> {
 /// Scenario A: Index from scratch with detailed progress logging.
 /// Measures: total time, throughput, progress snapshots.
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn scenario_a_fresh_index() {
     let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
     let (bench_dir, db_path) = make_bench_db_path("scenario_a_fresh_index");
@@ -1428,18 +1454,20 @@ fn scenario_a_fresh_index() {
     );
 
     if !snapshots.is_empty() {
-        println!("\n  ── Progress Snapshots ({} captured) ──", snapshots.len());
+        println!(
+            "\n  ── Progress Snapshots ({} captured) ──",
+            snapshots.len()
+        );
         for (i, snap) in snapshots.iter().enumerate() {
             if i % 5 == 0 || i == snapshots.len() - 1 {
                 let home = home_dir.to_string_lossy();
-                let short = snap.current_path.strip_prefix(home.as_ref()).unwrap_or(&snap.current_path);
+                let short = snap
+                    .current_path
+                    .strip_prefix(home.as_ref())
+                    .unwrap_or(&snap.current_path);
                 println!(
                     "    [{:>5}ms] scanned={:<10} indexed={:<10} db={:<10} path=~{}",
-                    snap.elapsed_ms,
-                    snap.scanned,
-                    snap.indexed,
-                    snap.db_entries,
-                    short,
+                    snap.elapsed_ms, snap.scanned, snap.indexed, snap.db_entries, short,
                 );
             }
         }
@@ -1455,10 +1483,11 @@ fn scenario_a_fresh_index() {
 /// Scenario B: Restart simulation — open existing production DB and search immediately.
 /// Measures: cold-start latency, warm-up curve, sort variation impact.
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn scenario_b_restart_and_search() {
-    let db_path = PathBuf::from(PROD_DB_PATH);
+    let db_path = prod_db_path();
     if !db_path.exists() {
-        println!("SKIP: Production DB not found at {PROD_DB_PATH}");
+        println!("SKIP: Production DB not found at {}", db_path.display());
         return;
     }
 
@@ -1468,7 +1497,7 @@ fn scenario_b_restart_and_search() {
     println!("{sep}");
 
     let size = db_size_mb(&db_path);
-    println!("  DB path: {PROD_DB_PATH}");
+    println!("  DB path: {}", db_path.display());
     println!("  DB size: {size:.1} MB");
 
     // ── B1: Cold open (no perf pragmas) ──
@@ -1545,6 +1574,7 @@ fn scenario_b_restart_and_search() {
 /// Scenario C: Search during active indexing.
 /// Measures: search latency degradation under concurrent write load.
 #[test]
+#[ignore = "manual stress benchmark: scans HOME or opens a production index"]
 fn scenario_c_search_during_indexing() {
     let home_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
     let (bench_dir, db_path) = make_bench_db_path("scenario_c_search_during_indexing");

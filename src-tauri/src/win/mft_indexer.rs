@@ -7,25 +7,23 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::runtime::EventSink;
 use rusqlite::params;
-use tauri::AppHandle;
 
 use super::path_resolver::PathResolver;
 use super::volume;
 use crate::{
-    cached_effective_ignore_rules,
-    cleanup_entries_gc_tables, db_connection, emit_index_progress, emit_index_state, emit_index_updated,
-    get_meta, invalidate_search_caches, matches_ignore_pattern, now_epoch,
-    mem_search::CompactEntry,
-    refresh_and_emit_status_counts,
+    cached_effective_ignore_rules, cleanup_entries_gc_tables, db_connection, emit_index_progress,
+    emit_index_state, emit_index_updated, get_meta, invalidate_search_caches,
+    matches_ignore_pattern, mem_search::CompactEntry, now_epoch, refresh_and_emit_status_counts,
     restore_normal_pragmas, set_indexing_pragmas, set_meta, set_progress, set_state,
-    update_status_counts, upsert_rows,
-    AppState, IgnorePattern, IndexRow, IndexState, BUILTIN_SKIP_NAMES,
+    update_status_counts, upsert_rows, AppState, IgnorePattern, IndexRow, IndexState,
+    BUILTIN_SKIP_NAMES,
 };
 
 use windows::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE};
-use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::FSCTL_ENUM_USN_DATA;
+use windows::Win32::System::IO::DeviceIoControl;
 
 const MFT_BATCH_SIZE: usize = 50_000;
 const EMIT_INTERVAL: Duration = Duration::from_millis(200);
@@ -66,7 +64,7 @@ struct MftFileEntry {
 /// searcher and must not report Ready mid-scan.
 fn publish_progressive_ready(
     state: &AppState,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     dir_results: &[CompactEntry],
     scanned: u64,
     indexed: u64,
@@ -98,7 +96,7 @@ fn publish_progressive_ready(
 /// passes `false` and upserts straight from the raw entries (R5).
 pub fn scan_mft(
     state: &AppState,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     build_mem_index: bool,
 ) -> Result<MftScanResult, String> {
     use std::sync::atomic::Ordering as AtomicOrdering;
@@ -121,9 +119,7 @@ pub fn scan_mft(
     // the caller then falls back to starting the watcher at the current tip.
     let start_journal = volume::query_usn_journal(&vol).ok();
 
-    state
-        .indexing_active
-        .store(true, AtomicOrdering::Release);
+    state.indexing_active.store(true, AtomicOrdering::Release);
 
     // Mark index as incomplete — cleared when background DB finalize succeeds
     if let Ok(c) = db_connection(&state.db_path) {
@@ -179,7 +175,10 @@ pub fn scan_mft(
 
     eprintln!(
         "[win/mft +{}] pass1 done: {} records ({} dirs + {} files) in {}ms",
-        ts(), total_records, total_dirs, file_entries.len(),
+        ts(),
+        total_records,
+        total_dirs,
+        file_entries.len(),
         pass1_started.elapsed().as_millis()
     );
 
@@ -188,9 +187,16 @@ pub fn scan_mft(
     let (ignored_roots, ignored_patterns) = cached_effective_ignore_rules(state);
 
     // Build enhanced skip names: BUILTIN_SKIP_NAMES + AnySegment patterns from pathignore
-    let extra_segment_names: Vec<String> = ignored_patterns.iter().filter_map(|p| {
-        if let IgnorePattern::AnySegment { segment, .. } = p { Some(segment.clone()) } else { None }
-    }).collect();
+    let extra_segment_names: Vec<String> = ignored_patterns
+        .iter()
+        .filter_map(|p| {
+            if let IgnorePattern::AnySegment { segment, .. } = p {
+                Some(segment.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut all_skip_names: Vec<&str> = BUILTIN_SKIP_NAMES.to_vec();
     for name in &extra_segment_names {
         all_skip_names.push(name.as_str());
@@ -215,8 +221,12 @@ pub fn scan_mft(
             eprintln!(
                 "[win/mft +{}] pass1.5: scan_root FRN={} dir_subtree={} dirs \
                  (pruned from {} total dirs) skip_names={} skip_frns={} in {}ms",
-                ts(), frn, subtree.len(), total_dirs,
-                all_skip_names.len(), skip_frns.len(),
+                ts(),
+                frn,
+                subtree.len(),
+                total_dirs,
+                all_skip_names.len(),
+                skip_frns.len(),
                 subtree_started.elapsed().as_millis()
             );
             subtree
@@ -224,7 +234,8 @@ pub fn scan_mft(
         None => {
             eprintln!(
                 "[win/mft +{}] pass1.5: scan_root not found in MFT ({}), using all dirs",
-                ts(), scan_path_win
+                ts(),
+                scan_path_win
             );
             dir_entries.iter().map(|(frn, _)| *frn).collect()
         }
@@ -239,7 +250,9 @@ pub fn scan_mft(
     }
     eprintln!(
         "[win/mft +{}] pre-resolved {} dir paths in {}ms",
-        ts(), dir_subtree.len(), preresolve_started.elapsed().as_millis()
+        ts(),
+        dir_subtree.len(),
+        preresolve_started.elapsed().as_millis()
     );
 
     // All subtree dirs are now in path_cache — frn_map no longer needed
@@ -258,10 +271,12 @@ pub fn scan_mft(
         .collect();
 
     // Pre-compute backslash versions of BUILTIN_SKIP_PATHS for Windows path matching
-    let skip_path_infixes: Vec<String> = crate::BUILTIN_SKIP_PATHS.iter()
+    let skip_path_infixes: Vec<String> = crate::BUILTIN_SKIP_PATHS
+        .iter()
         .map(|p| format!("\\{}\\", p.replace('/', "\\")))
         .collect();
-    let skip_path_suffixes: Vec<String> = crate::BUILTIN_SKIP_PATHS.iter()
+    let skip_path_suffixes: Vec<String> = crate::BUILTIN_SKIP_PATHS
+        .iter()
         .map(|p| format!("\\{}", p.replace('/', "\\")))
         .collect();
 
@@ -272,8 +287,10 @@ pub fn scan_mft(
         .filter_map(|(frn, timestamp)| {
             let full_path = path_cache.get(frn)?;
             if should_skip_dir_in_pruned_subtree(
-                full_path, &glob_patterns,
-                &skip_path_infixes, &skip_path_suffixes,
+                full_path,
+                &glob_patterns,
+                &skip_path_infixes,
+                &skip_path_suffixes,
             ) {
                 return None;
             }
@@ -282,15 +299,24 @@ pub fn scan_mft(
                 Some(pos) => (&full_path[..pos], &full_path[pos + 1..]),
                 None => ("", full_path.as_str()),
             };
-            if name.is_empty() { return None; }
+            if name.is_empty() {
+                return None;
+            }
             Some(CompactEntry {
-                name: name.to_string(), dir: Arc::from(dir),
-                is_dir: true, ext: None, mtime: *timestamp, size: None,
+                name: name.to_string(),
+                dir: Arc::from(dir),
+                is_dir: true,
+                ext: None,
+                mtime: *timestamp,
+                size: None,
             })
         })
         .collect();
 
-    let dirs_in_subtree = dir_entries.iter().filter(|(frn, _)| dir_subtree.contains(frn)).count() as u64;
+    let dirs_in_subtree = dir_entries
+        .iter()
+        .filter(|(frn, _)| dir_subtree.contains(frn))
+        .count() as u64;
     let dir_indexed = dir_results.len() as u64;
     let mut scanned: u64 = dirs_in_subtree;
     let mut indexed: u64 = dir_indexed;
@@ -299,7 +325,8 @@ pub fn scan_mft(
     eprintln!(
         "[win/mft +{}] dirs done: scanned={scanned} indexed={indexed} \
          skip={filtered_skip} resolve_fail=0 in {}ms",
-        ts(), pass2_started.elapsed().as_millis()
+        ts(),
+        pass2_started.elapsed().as_millis()
     );
 
     // Progressive Ready is a GUI-only accelerator (partial searcher + early
@@ -308,13 +335,17 @@ pub fn scan_mft(
     let early_idx = if build_mem_index {
         eprintln!("[win/mft +{}] building partial MemIndex...", ts());
         let idx = publish_progressive_ready(state, app, &dir_results, scanned, indexed);
-        eprintln!("[win/mft +{}] progressive Ready emitted ({indexed} dirs)", ts());
+        eprintln!(
+            "[win/mft +{}] progressive Ready emitted ({indexed} dirs)",
+            ts()
+        );
         Some(idx)
     } else {
         None
     };
 
-    let mut mem_entries: Vec<CompactEntry> = Vec::with_capacity(dir_subtree.len() + file_entries.len());
+    let mut mem_entries: Vec<CompactEntry> =
+        Vec::with_capacity(dir_subtree.len() + file_entries.len());
     mem_entries.extend(dir_results);
 
     // --- Process files (parallel + stat) ---
@@ -332,9 +363,7 @@ pub fn scan_mft(
         .filter(|entry| dir_subtree.contains(&entry.parent_frn))
         .filter_map(|entry| {
             let parent_path = arc_dir_cache.get(&entry.parent_frn)?;
-            if should_skip_file_in_pruned_subtree(
-                parent_path, &entry.name, &glob_patterns,
-            ) {
+            if should_skip_file_in_pruned_subtree(parent_path, &entry.name, &glob_patterns) {
                 return None;
             }
 
@@ -369,7 +398,8 @@ pub fn scan_mft(
 
     eprintln!(
         "[win/mft +{}] files done: {} files in subtree, indexed={file_indexed} skip={} in {}ms",
-        ts(), files_in_subtree,
+        ts(),
+        files_in_subtree,
         files_in_subtree - file_indexed,
         pass2_files_started.elapsed().as_millis()
     );
@@ -383,9 +413,9 @@ pub fn scan_mft(
         .collect();
 
     // Free large temporaries before building MemIndex
-    drop(file_entries);   // ~100MB+
-    drop(dir_entries);    // ~2MB
-    drop(dir_subtree);    // ~2MB
+    drop(file_entries); // ~100MB+
+    drop(dir_entries); // ~2MB
+    drop(dir_subtree); // ~2MB
 
     let frn_cache = resolver.into_path_cache(); // also drops resolver.frn_map
 
@@ -416,7 +446,9 @@ pub fn scan_mft(
 
     eprintln!(
         "[win/mft +{}] passing {} FRN path entries + {} outside-scan FRNs to USN watcher",
-        ts(), frn_cache.len(), outside_scan_frns.len()
+        ts(),
+        frn_cache.len(),
+        outside_scan_frns.len()
     );
 
     let bg_started = started;
@@ -444,7 +476,10 @@ pub fn scan_mft(
             }
         }
         let scan = if bg_build_mem {
-            eprintln!("[win/mft/bg +{}] building full MemIndex ({entry_count} entries)...", ts());
+            eprintln!(
+                "[win/mft/bg +{}] building full MemIndex ({entry_count} entries)...",
+                ts()
+            );
             let idx = Arc::new(crate::mem_search::MemIndex::build(mem_entries));
             eprintln!("[win/mft/bg +{}] full MemIndex built", ts());
             *bg_state.mem_index.write() = Some(Arc::clone(&idx));
@@ -454,20 +489,32 @@ pub fn scan_mft(
         };
 
         // DB upsert — entries come from whichever owner we built above.
-        eprintln!("[win/mft/bg +{}] starting DB upsert ({entry_count} entries)", ts());
+        eprintln!(
+            "[win/mft/bg +{}] starting DB upsert ({entry_count} entries)",
+            ts()
+        );
         let bulk_result = background_db_bulk_insert(&bg_state, scan.entries(), bg_started);
 
         let bg_ok = match bulk_result {
             Ok((conn, current_run_id)) => {
                 if let Err(e) = background_db_finalize(
-                    conn, &bg_state, bg_app.as_ref(), bg_start_journal.clone(), current_run_id, entry_count > 0, bg_started,
+                    conn,
+                    &bg_state,
+                    bg_app.as_ref(),
+                    bg_start_journal.clone(),
+                    current_run_id,
+                    entry_count > 0,
+                    bg_started,
                     || {
                         // Free the scan's in-memory entries once the DB name
                         // index is ready (the mem_index clear is a no-op for the
                         // service, which never published one).
                         *bg_state.mem_index.write() = None;
                         drop(scan);
-                        eprintln!("[win/mft/bg +{}] scan entries freed (name index ready)", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
+                        eprintln!(
+                            "[win/mft/bg +{}] scan entries freed (name index ready)",
+                            format!("{:.1}s", bg_started.elapsed().as_secs_f32())
+                        );
                     },
                 ) {
                     eprintln!("[win/mft/bg +{}] DB finalize FAILED: {e}", ts());
@@ -525,7 +572,10 @@ pub fn scan_mft(
             ),
         };
         if let Err(e) = watcher_result {
-            eprintln!("[win/mft/bg +{}] USN watcher failed ({e}), trying RDCW fallback", format!("{:.1}s", bg_started.elapsed().as_secs_f32()));
+            eprintln!(
+                "[win/mft/bg +{}] USN watcher failed ({e}), trying RDCW fallback",
+                format!("{:.1}s", bg_started.elapsed().as_secs_f32())
+            );
             if let Err(e2) = super::rdcw_watcher::start(bg_app, bg_state) {
                 eprintln!("[win/mft/bg] RDCW watcher also failed ({e2}), no live updates");
             }
@@ -542,13 +592,11 @@ pub fn scan_mft(
 /// Batch-retrieve file size and mtime per directory using FindFirstFileW/FindNextFileW.
 /// Returns dir_path → (name_lowercase → (size, mtime)).
 /// Much faster than per-file fs::metadata() because it reads one directory listing at a time.
-fn build_dir_stat_cache(
-    entries: &[CompactEntry],
-) -> HashMap<String, HashMap<String, (i64, i64)>> {
+fn build_dir_stat_cache(entries: &[CompactEntry]) -> HashMap<String, HashMap<String, (i64, i64)>> {
+    use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
         FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
     };
-    use windows::core::PCWSTR;
 
     // Collect unique parent dirs from file entries
     let unique_dirs: HashSet<&str> = entries
@@ -596,7 +644,9 @@ fn build_dir_stat_cache(
                 }
             }
 
-            unsafe { let _ = FindClose(handle); }
+            unsafe {
+                let _ = FindClose(handle);
+            }
             Some((dir_path.to_string(), dir_map))
         })
         .collect();
@@ -643,7 +693,9 @@ fn background_db_bulk_insert(
     let dir_stat_cache = build_dir_stat_cache(entries);
     eprintln!(
         "[win/mft/bg +{}] dir_stat_cache built: {} dirs in {}ms",
-        ts(), dir_stat_cache.len(), cache_started.elapsed().as_millis()
+        ts(),
+        dir_stat_cache.len(),
+        cache_started.elapsed().as_millis()
     );
 
     let upsert_started = Instant::now();
@@ -652,7 +704,10 @@ fn background_db_bulk_insert(
         // S7: cooperative cancellation between batches (service STOP / journal-
         // loss rescan preemption). Err leaves index_complete unset; the caller
         // heals the incomplete build on the next pass.
-        if state.cancel_index.load(std::sync::atomic::Ordering::Acquire) {
+        if state
+            .cancel_index
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err("index upsert cancelled".to_string());
         }
         let chunk_rows: Vec<IndexRow> = chunk
@@ -688,7 +743,12 @@ fn background_db_bulk_insert(
             .collect();
         upsert_rows(&mut conn, &chunk_rows)?;
     }
-    eprintln!("[win/mft/bg +{}] upsert done: {} entries in {}ms", ts(), entries.len(), upsert_started.elapsed().as_millis());
+    eprintln!(
+        "[win/mft/bg +{}] upsert done: {} entries in {}ms",
+        ts(),
+        entries.len(),
+        upsert_started.elapsed().as_millis()
+    );
 
     Ok((conn, current_run_id))
 }
@@ -699,7 +759,7 @@ fn background_db_bulk_insert(
 fn background_db_finalize(
     conn: rusqlite::Connection,
     state: &AppState,
-    app: Option<&AppHandle>,
+    app: Option<&EventSink>,
     start_journal: Option<volume::UsnJournalData>,
     current_run_id: i64,
     has_entries: bool,
@@ -722,7 +782,11 @@ fn background_db_finalize(
         params![current_run_id],
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[win/mft/bg +{}] cleanup: deleted={deleted_count} in {}ms", ts(), cleanup_started.elapsed().as_millis());
+    eprintln!(
+        "[win/mft/bg +{}] cleanup: deleted={deleted_count} in {}ms",
+        ts(),
+        cleanup_started.elapsed().as_millis()
+    );
 
     set_meta(&conn, "last_run_id", &current_run_id.to_string())?;
 
@@ -732,7 +796,11 @@ fn background_db_finalize(
         "CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);",
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[win/mft/bg +{}] name index created in {}ms", ts(), idx_started.elapsed().as_millis());
+    eprintln!(
+        "[win/mft/bg +{}] name index created in {}ms",
+        ts(),
+        idx_started.elapsed().as_millis()
+    );
 
     // Free MemIndex now — DB search can use the name index
     free_mem_index();
@@ -747,7 +815,11 @@ fn background_db_finalize(
         "#,
     )
     .map_err(|e| e.to_string())?;
-    eprintln!("[win/mft/bg +{}] remaining indexes in {}ms", ts(), idx2_started.elapsed().as_millis());
+    eprintln!(
+        "[win/mft/bg +{}] remaining indexes in {}ms",
+        ts(),
+        idx2_started.elapsed().as_millis()
+    );
 
     let _ = restore_normal_pragmas(&conn);
     if let Err(e) = cleanup_entries_gc_tables(&conn) {
@@ -803,15 +875,22 @@ fn should_skip_dir_in_pruned_subtree(
     skip_path_suffixes: &[String],
 ) -> bool {
     // BUILTIN_SKIP_PATHS: pre-computed backslash patterns (no allocation)
-    if skip_path_infixes.iter().any(|infix| full_path.contains(infix.as_str()))
-        || skip_path_suffixes.iter().any(|suffix| full_path.ends_with(suffix.as_str()))
+    if skip_path_infixes
+        .iter()
+        .any(|infix| full_path.contains(infix.as_str()))
+        || skip_path_suffixes
+            .iter()
+            .any(|suffix| full_path.ends_with(suffix.as_str()))
     {
         return true;
     }
 
     // BUILTIN_SKIP_SUFFIXES: check last path segment
     if let Some(last_seg) = full_path.rsplit('\\').next() {
-        if crate::BUILTIN_SKIP_SUFFIXES.iter().any(|suf| last_seg.ends_with(suf)) {
+        if crate::BUILTIN_SKIP_SUFFIXES
+            .iter()
+            .any(|suf| last_seg.ends_with(suf))
+        {
             return true;
         }
     }
@@ -826,8 +905,16 @@ fn should_skip_dir_in_pruned_subtree(
             buf.clear();
             buf.push_str(full_path);
             // SAFETY: replacing ASCII '\' (0x5C) with '/' (0x2F) preserves UTF-8 validity.
-            unsafe { buf.as_bytes_mut().iter_mut().for_each(|b| if *b == b'\\' { *b = b'/'; }); }
-            glob_patterns.iter().any(|pat| matches_ignore_pattern(&buf, pat))
+            unsafe {
+                buf.as_bytes_mut().iter_mut().for_each(|b| {
+                    if *b == b'\\' {
+                        *b = b'/';
+                    }
+                });
+            }
+            glob_patterns
+                .iter()
+                .any(|pat| matches_ignore_pattern(&buf, pat))
         });
     }
 
@@ -860,7 +947,13 @@ fn should_skip_file_in_pruned_subtree(
 
         // Check Glob patterns only (AnySegment handled by subtree pruning)
         // SAFETY: replacing ASCII '\' (0x5C) with '/' (0x2F) preserves UTF-8 validity.
-        unsafe { buf.as_bytes_mut().iter_mut().for_each(|b| if *b == b'\\' { *b = b'/'; }); }
+        unsafe {
+            buf.as_bytes_mut().iter_mut().for_each(|b| {
+                if *b == b'\\' {
+                    *b = b'/';
+                }
+            });
+        }
         for pat in glob_patterns {
             if matches_ignore_pattern(&buf, pat) {
                 return true;
@@ -957,8 +1050,7 @@ fn parse_usn_record_v2(data: &[u8]) -> Option<MftRecord> {
     }
 
     let frn = u64::from_le_bytes(data[8..16].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
-    let parent_frn =
-        u64::from_le_bytes(data[16..24].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
+    let parent_frn = u64::from_le_bytes(data[16..24].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
 
     // Bytes 32-40: TimeStamp (FILETIME) — last modification time from USN record
     let filetime_raw = i64::from_le_bytes(data[32..40].try_into().ok()?);

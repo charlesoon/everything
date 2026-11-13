@@ -1,0 +1,35 @@
+{
+  "date": "2026-11-14T00:52:12+0900",
+  "app": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app",
+  "dmg": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/dmg/Everything_0.6.0_aarch64.dmg",
+  "checks": {
+    "bundleMetadataAndLaunchAgent": true,
+    "fontLicenses": true,
+    "noWebKitLink": true,
+    "cliHelpAndVersion": true,
+    "dmgChecksum": true,
+    "mountedDmgVersionAndSignature": true,
+    "dmgContentsAndApplicationsLink": true,
+    "packagedAppFirstFrameAnd500Rows": true,
+    "productionAutomationSocketAbsent": true
+  },
+  "codesignVerify": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app: valid on disk\n/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app: satisfies its Designated Requirement\n",
+  "signature": "Executable=/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app/Contents/MacOS/everything\nIdentifier=com.everything.app\nFormat=app bundle with Mach-O thin (arm64)\nCodeDirectory v=20500 size=30707 flags=0x10002(adhoc,runtime) hashes=949+7 location=embedded\nSignature=adhoc\nInfo.plist entries=17\nTeamIdentifier=not set\nRuntime Version=26.5.0\nSealed Resources version=2 rules=13 files=4\nInternal requirements count=0 size=12\n",
+  "linkedLibraries": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app/Contents/MacOS/everything:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)\n\t/System/Library/Frameworks/ServiceManagement.framework/Versions/A/ServiceManagement (compatibility version 1.0.0, current version 3102.120.13)\n\t/System/Library/Frameworks/Security.framework/Versions/A/Security (compatibility version 1.0.0, current version 61901.120.67)\n\t/System/Library/Frameworks/Carbon.framework/Versions/A/Carbon (compatibility version 2.0.0, current version 170.0.0)\n\t/System/Library/Frameworks/CoreGraphics.framework/Versions/A/CoreGraphics (compatibility version 64.0.0, current version 1965.5.1)\n\t/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation (compatibility version 150.0.0, current version 5026.5.4)\n\t/System/Library/Frameworks/AppKit.framework/Versions/C/AppKit (compatibility version 45.0.0, current version 2685.60.104)\n\t/System/Library/Frameworks/CoreVideo.framework/Versions/A/CoreVideo (compatibility version 1.2.0, current version 734.4.0)\n\t/System/Library/Frameworks/CoreData.framework/Versions/A/CoreData (compatibility version 1.0.0, current version 1526.0.0)\n\t/System/Library/Frameworks/CoreText.framework/Versions/A/CoreText (compatibility version 1.0.0, current version 877.4.0)\n\t/System/Library/Frameworks/CoreImage.framework/Versions/A/CoreImage (compatibility version 1.0.1, current version 7.0.0)\n\t/System/Library/Frameworks/CloudKit.framework/Versions/A/CloudKit (compatibility version 1.0.0, current version 2360.120.2)\n\t/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore (compatibility version 1.2.0, current version 1195.14.4)\n\t/System/Library/Frameworks/Metal.framework/Versions/A/Metal (compatibility version 1.0.0, current version 373.2.0)\n\t/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation (compatibility version 300.0.0, current version 5026.5.4)\n\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n\t/System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices (compatibility version 1.0.0, current version 1226.0.0)\n\t/System/Library/Frameworks/ApplicationServices.framework/Versions/A/ApplicationServices (compatibility version 1.0.0, current version 66.0.0)\n\t/System/Library/Frameworks/OpenGL.framework/Versions/A/OpenGL (compatibility version 1.0.0, current version 1.0.0)\n\t/System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration (compatibility version 1.0.0, current version 1405.120.5)\n\t/usr/lib/libiconv.2.dylib (compatibility version 7.0.0, current version 7.0.0)\n\t/System/Library/Frameworks/ColorSync.framework/Versions/A/ColorSync (compatibility version 1.0.0, current version 3813.5.1)\n",
+  "architecture": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app/Contents/MacOS/everything: Mach-O 64-bit executable arm64",
+  "version": "everything 0.6.0",
+  "dmgVerify": "Protective Master Boot Record(MBR : 0) 체크섬 처리 중…\nProtective Master Boot Record(MBR : : 확인됨 CRC32 $0ED55CBF\nGPT Header(Primary GPT Header : 1) 체크섬 처리 중…\n  GPT Header(Primary GPT Header : 1): 확인됨 CRC32 $8BE84B10\nGPT Partition Data(Primary GPT Table : 2) 체크섬 처리 중…\nGPT Partition Data(Primary GPT Table: 확인됨 CRC32 $EE3001F7\n(Apple_Free : 3) 체크섬 처리 중…\n                    (Apple_Free : 3): 확인됨 CRC32 $00000000\ndisk image(Apple_APFS : 4) 체크섬 처리 중…\n          disk image(Apple_APFS : 4): 확인됨 CRC32 $AC895228\n(Apple_Free : 5) 체크섬 처리 중…\n                    (Apple_Free : 5): 확인됨 CRC32 $00000000\nGPT Partition Data(Backup GPT Table : 6) 체크섬 처리 중…\nGPT Partition Data(Backup GPT Table : 확인됨 CRC32 $EE3001F7\nGPT Header(Backup GPT Header : 7) 체크섬 처리 중…\n   GPT Header(Backup GPT Header : 7): 확인됨 CRC32 $8B262E3D\n확인됨 CRC32 $A4BBBD68\nhdiutil: verify: checksum of \"/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/dmg/Everything_0.6.0_aarch64.dmg\" is VALID\n",
+  "smokeState": {
+    "loaded": 500,
+    "total": 500018,
+    "query": "",
+    "error": null,
+    "width": 900.0,
+    "height": 560.0,
+    "theme": "dark"
+  },
+  "binarySha256": "34a6214cae2ff25a68490e42d2433ee101f0a2227bd7b19881072958166a41d8",
+  "dmgSha256": "77ff6e21743a9696851be3552e6a8c7311cd9f8a6e1dbb7c6ebd2e27407e5973",
+  "dmgBytes": 7620910,
+  "dmgModifiedAt": "2026-11-14T00:52:05+0900"
+}

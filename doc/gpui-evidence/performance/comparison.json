@@ -1,0 +1,2853 @@
+{
+  "date": "2026-11-14T00:45:41+0900",
+  "platform": "macOS-26.7.3-arm64-arm-64bit",
+  "machine": "arm64",
+  "fixture": {
+    "root": "/private/tmp/everything-gpui-validation",
+    "data": "/private/tmp/everything-gpui-validation/data",
+    "files": "/private/tmp/everything-gpui-validation/files",
+    "entries": 500018,
+    "virtualEntries": 500000,
+    "realFiles": [
+      "Alpha report.txt",
+      "alpha-summary.TXT",
+      "report final 2026.pdf",
+      "한글 보고서.txt",
+      "space name.txt",
+      "unicode-École.md",
+      "notes.md",
+      "gpui-tc-open.txt",
+      "gpui-tc-rename.txt",
+      "gpui-tc-trash.txt",
+      "gpui-tc-collision.txt",
+      "folder-demo/child.txt",
+      "folder-demo-other/keep.txt",
+      "Demo.app/Contents/Info.plist"
+    ],
+    "schemaVersion": 7,
+    "createdAt": 1794581226.329302
+  },
+  "binaries": {
+    "tauri": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+    "gpui": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything"
+  },
+  "binarySha256": {
+    "tauri": "6f702edf8410d04daf7a14a9a27b40c8c106d6a3994c8ba2b4894491eca94a4c",
+    "gpui": "2b6d53abdfcaacc26e346657c20d1888476d295dafaf926f8a8623eca3679c9d"
+  },
+  "engine": {
+    "cases": 36,
+    "allEqual": true,
+    "comparisons": [
+      {
+        "id": "empty",
+        "equal": true,
+        "count": 300,
+        "total": 500018,
+        "mode": "empty",
+        "pathsSha256": "4230be8e447b761fc7175077ab94df671ce434ab63b253819a2067d4ec4f3cae",
+        "tauriP50Ms": 0.585875,
+        "gpuiP50Ms": 0.5445
+      },
+      {
+        "id": "name",
+        "equal": true,
+        "count": 300,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "01caa34793cc7f4a229c63289eccae4366d5ec64bfd2380e49dd617deab5c168",
+        "tauriP50Ms": 6.667625,
+        "gpuiP50Ms": 6.707584
+      },
+      {
+        "id": "case",
+        "equal": true,
+        "count": 300,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "01caa34793cc7f4a229c63289eccae4366d5ec64bfd2380e49dd617deab5c168",
+        "tauriP50Ms": 6.642291,
+        "gpuiP50Ms": 6.697
+      },
+      {
+        "id": "alpha",
+        "equal": true,
+        "count": 2,
+        "total": 2,
+        "mode": "name",
+        "pathsSha256": "0ca7f8bcb6370d2a7a42e855cb21636ac6104be9433605b7ce69e74ce08aaa49",
+        "tauriP50Ms": 0.023958999999999998,
+        "gpuiP50Ms": 0.024583
+      },
+      {
+        "id": "korean",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "name",
+        "pathsSha256": "c0bba95dae6be73debb5a64aab8dadcf24044cdf72d2a91490c43a5b595efa1a",
+        "tauriP50Ms": 0.022042,
+        "gpuiP50Ms": 0.022500000000000003
+      },
+      {
+        "id": "spaces",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "name",
+        "pathsSha256": "8c4254d4fee16233b4707a1b38d77f72dd96acfd9e1eb6b8792104b2b7e53fed",
+        "tauriP50Ms": 0.020874999999999998,
+        "gpuiP50Ms": 0.021542000000000002
+      },
+      {
+        "id": "multi-term",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "name",
+        "pathsSha256": "dfeb15e7b500237bfc80cd5a7a6a48f99186cdffd70586ec44c43a17ed7af8c0",
+        "tauriP50Ms": 0.022042,
+        "gpuiP50Ms": 0.022708
+      },
+      {
+        "id": "unicode",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "name",
+        "pathsSha256": "ddac503428976238b67614c66f47a2171acd29a043f16952af204f29770dee34",
+        "tauriP50Ms": 0.021167,
+        "gpuiP50Ms": 0.022791
+      },
+      {
+        "id": "extension",
+        "equal": true,
+        "count": 300,
+        "total": 62502,
+        "mode": "ext",
+        "pathsSha256": "e58b8176474acba3577d00378799cbad3de82dbec5100941bd937b58ed965760",
+        "tauriP50Ms": 1.237833,
+        "gpuiP50Ms": 1.2866659999999999
+      },
+      {
+        "id": "extension-case",
+        "equal": true,
+        "count": 300,
+        "total": 62510,
+        "mode": "ext",
+        "pathsSha256": "5629fdb1a76eff05dd74807ed3c9d34a25287ab5bc6aa5d07f576c98f47d75e6",
+        "tauriP50Ms": 1.2413750000000001,
+        "gpuiP50Ms": 1.269833
+      },
+      {
+        "id": "glob-question",
+        "equal": true,
+        "count": 2,
+        "total": 2,
+        "mode": "glob",
+        "pathsSha256": "62cfeb66250496748f281995ab77a80221cf1effa304a06bc53aa62dd9999ba3",
+        "tauriP50Ms": 0.019542,
+        "gpuiP50Ms": 0.018416000000000002
+      },
+      {
+        "id": "glob-contains",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "glob",
+        "pathsSha256": "dfeb15e7b500237bfc80cd5a7a6a48f99186cdffd70586ec44c43a17ed7af8c0",
+        "tauriP50Ms": 0.030209000000000003,
+        "gpuiP50Ms": 0.029292
+      },
+      {
+        "id": "glob-mixed",
+        "equal": true,
+        "count": 300,
+        "total": 62501,
+        "mode": "glob",
+        "pathsSha256": "d0476c8e64f521050fbb1ee71118e175f89a451fac3eb6ca79cb16b7362c6dd4",
+        "tauriP50Ms": 18.785,
+        "gpuiP50Ms": 19.10325
+      },
+      {
+        "id": "no-result",
+        "equal": true,
+        "count": 0,
+        "total": 0,
+        "mode": "name_neg_cache",
+        "pathsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "tauriP50Ms": 0.0028339999999999997,
+        "gpuiP50Ms": 0.003042
+      },
+      {
+        "id": "short",
+        "equal": true,
+        "count": 100,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "df27e41ae3c3abbd23d9945326707d03894f799bfd870b4d17c321fd4139e811",
+        "tauriP50Ms": 5.547,
+        "gpuiP50Ms": 5.374458000000001
+      },
+      {
+        "id": "absolute-directory",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "422b73fd913ec7eff8c75350b5736f68f9bc95bc8302caf5ec470a9bec0d803d",
+        "tauriP50Ms": 0.021291,
+        "gpuiP50Ms": 0.020416
+      },
+      {
+        "id": "absolute-file",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "8c4254d4fee16233b4707a1b38d77f72dd96acfd9e1eb6b8792104b2b7e53fed",
+        "tauriP50Ms": 21.646834000000002,
+        "gpuiP50Ms": 22.115083000000002
+      },
+      {
+        "id": "relative-directory",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "422b73fd913ec7eff8c75350b5736f68f9bc95bc8302caf5ec470a9bec0d803d",
+        "tauriP50Ms": 0.019625,
+        "gpuiP50Ms": 0.019
+      },
+      {
+        "id": "relative-file",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "422b73fd913ec7eff8c75350b5736f68f9bc95bc8302caf5ec470a9bec0d803d",
+        "tauriP50Ms": 0.020583,
+        "gpuiP50Ms": 0.0205
+      },
+      {
+        "id": "sibling-directory",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "fdd98569ea6e16d11141eeb754559ae31355ca278302280127390cf52d508b18",
+        "tauriP50Ms": 0.018458,
+        "gpuiP50Ms": 0.018459
+      },
+      {
+        "id": "home-directory",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "422b73fd913ec7eff8c75350b5736f68f9bc95bc8302caf5ec470a9bec0d803d",
+        "tauriP50Ms": 0.018208,
+        "gpuiP50Ms": 0.018625
+      },
+      {
+        "id": "directory-glob",
+        "equal": true,
+        "count": 1,
+        "total": 1,
+        "mode": "path",
+        "pathsSha256": "422b73fd913ec7eff8c75350b5736f68f9bc95bc8302caf5ec470a9bec0d803d",
+        "tauriP50Ms": 0.021124999999999998,
+        "gpuiP50Ms": 0.021458
+      },
+      {
+        "id": "sort-name-asc",
+        "equal": true,
+        "count": 300,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "01caa34793cc7f4a229c63289eccae4366d5ec64bfd2380e49dd617deab5c168",
+        "tauriP50Ms": 6.595041,
+        "gpuiP50Ms": 6.697291
+      },
+      {
+        "id": "sort-name-desc",
+        "equal": true,
+        "count": 300,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "ea9e676939ac3aa9d6a277bcef13767d8a9cf19ab54fdb87a9eba7d3ab3f22b2",
+        "tauriP50Ms": 6.587917,
+        "gpuiP50Ms": 6.651833
+      },
+      {
+        "id": "sort-dir-asc",
+        "equal": true,
+        "count": 300,
+        "total": 500002,
+        "mode": "name",
+        "pathsSha256": "c9aa134d68c52729ec9981f07207536fce40159e5453bb569d2713608c1a0251",
+        "tauriP50Ms": 87.38583399999999,
+        "gpuiP50Ms": 88.851125
+      },
+      {
+        "id": "sort-dir-desc",
+        "equal": true,
+        "count": 300,
+        "total": 500002,
+        "mode": "name",
+        "pathsSha256": "8d10f0d6e6185d6a2cc9aee3001d60eae8859510de4d1070d54e4e7688be9883",
+        "tauriP50Ms": 87.183417,
+        "gpuiP50Ms": 88.309292
+      },
+      {
+        "id": "sort-size-asc",
+        "equal": true,
+        "count": 300,
+        "total": 500002,
+        "mode": "name",
+        "pathsSha256": "89774cde89fd6ffb26ed691ac67bfaada52e2d6d2b1515ac3cc2b89fbfc4f93a",
+        "tauriP50Ms": 77.69387499999999,
+        "gpuiP50Ms": 78.788542
+      },
+      {
+        "id": "sort-size-desc",
+        "equal": true,
+        "count": 300,
+        "total": 500002,
+        "mode": "name",
+        "pathsSha256": "00b56a0a6198da1b973ec0711925c34474cc8f193d6e6d527ce05f4632db4d1b",
+        "tauriP50Ms": 78.763333,
+        "gpuiP50Ms": 80.18424999999999
+      },
+      {
+        "id": "sort-mtime-asc",
+        "equal": true,
+        "count": 300,
+        "total": 500002,
+        "mode": "name",
+        "pathsSha256": "d70bb48348fc85ee4b9d0d4d5222d649f2f73f487467ecec49e360e7420de3fd",
+        "tauriP50Ms": 119.622208,
+        "gpuiP50Ms": 129.355
+      },
+      {
+        "id": "sort-mtime-desc",
+        "equal": true,
+        "count": 300,
+        "total": 500002,
+        "mode": "name",
+        "pathsSha256": "a3e33142a71885297082f1fa7138e79d33730393cc191f032d56cc47d39418e5",
+        "tauriP50Ms": 75.840542,
+        "gpuiP50Ms": 79.415166
+      },
+      {
+        "id": "page-0",
+        "equal": true,
+        "count": 300,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "01caa34793cc7f4a229c63289eccae4366d5ec64bfd2380e49dd617deab5c168",
+        "tauriP50Ms": 6.761541,
+        "gpuiP50Ms": 6.9824589999999995
+      },
+      {
+        "id": "page-300",
+        "equal": true,
+        "count": 300,
+        "total": null,
+        "mode": "name",
+        "pathsSha256": "6ad8d8a6fa6890ebc014f7d99b9770894ac76768766d450a9e5983f34850dd14",
+        "tauriP50Ms": 0.583333,
+        "gpuiP50Ms": 0.5919169999999999
+      },
+      {
+        "id": "page-600",
+        "equal": true,
+        "count": 300,
+        "total": null,
+        "mode": "name",
+        "pathsSha256": "73276718dd62cebda7e2844e4985bd426facc7e0820409f4d1fe61c43ff40ee5",
+        "tauriP50Ms": 0.645875,
+        "gpuiP50Ms": 0.643166
+      },
+      {
+        "id": "page-999",
+        "equal": true,
+        "count": 300,
+        "total": null,
+        "mode": "name",
+        "pathsSha256": "8bdc5cd6c698642129c1ddb6bc5e1f424795b62f7751677c0bda661a2b1e23ff",
+        "tauriP50Ms": 0.6925,
+        "gpuiP50Ms": 0.713625
+      },
+      {
+        "id": "short-next",
+        "equal": true,
+        "count": 100,
+        "total": null,
+        "mode": "name",
+        "pathsSha256": "2ed619c5bf8c6abbe96ef0de81e77c42e42fd046b4f61ed55ba2a6c23306ae46",
+        "tauriP50Ms": 0.19608399999999998,
+        "gpuiP50Ms": 0.20375
+      },
+      {
+        "id": "max-limit",
+        "equal": true,
+        "count": 1000,
+        "total": 500001,
+        "mode": "name",
+        "pathsSha256": "778c84ad3d915ff7f7f68b918841baa90515ff160cd34f4762dfbd4c63e84b5f",
+        "tauriP50Ms": 8.031334,
+        "gpuiP50Ms": 8.241416
+      }
+    ],
+    "tauriMs": {
+      "n": 360,
+      "p50": 0.6726460000000001,
+      "p95": 87.38583399999999,
+      "min": 0.0027089999999999996,
+      "max": 119.992458
+    },
+    "gpuiMs": {
+      "n": 360,
+      "p50": 0.6800835000000001,
+      "p95": 88.562708,
+      "min": 0.0029170000000000003,
+      "max": 131.080791
+    }
+  },
+  "ui": {
+    "tauri": {
+      "startups": [
+        {
+          "callbackMs": 367,
+          "wallToCallbackMs": 381.8967499999992
+        },
+        {
+          "callbackMs": 377,
+          "wallToCallbackMs": 387.75874999999974
+        },
+        {
+          "callbackMs": 368,
+          "wallToCallbackMs": 378.16087499999895
+        },
+        {
+          "callbackMs": 382,
+          "wallToCallbackMs": 394.78695800000094
+        },
+        {
+          "callbackMs": 347,
+          "wallToCallbackMs": 357.5092079999997
+        },
+        {
+          "callbackMs": 378,
+          "wallToCallbackMs": 388.5720830000032
+        },
+        {
+          "callbackMs": 366,
+          "wallToCallbackMs": 377.8342919999993
+        }
+      ],
+      "startupWallMs": {
+        "n": 7,
+        "p50": 381.8967499999992,
+        "p95": 394.78695800000094,
+        "min": 357.5092079999997,
+        "max": 394.78695800000094
+      },
+      "startupCallbackMs": {
+        "n": 7,
+        "p50": 368,
+        "p95": 382,
+        "min": 347,
+        "max": 382
+      },
+      "searchFrames": [
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 19.00000000000091,
+          "elapsedMs": 243,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 256.01895800000204
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 3,
+          "elapsedMs": 222,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 237.08183299999774
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 1.9999999999990905,
+          "elapsedMs": 214.9999999999991,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 231.4138750000012
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8,
+          "elapsedMs": 235,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 258.53791600000164
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 4,
+          "elapsedMs": 231,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 248.10087499999867
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2,
+          "elapsedMs": 220,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 244.56525000000084
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 20,
+          "elapsedMs": 245,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 262.8467919999977
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 2,
+          "elapsedMs": 221,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 233.46837500000106
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 2.9999999999990905,
+          "elapsedMs": 218,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 236.61679199999952
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 6,
+          "elapsedMs": 229,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 248.0309160000047
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.9999999999990904,
+          "elapsedMs": 222,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 231.1175419999998
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2,
+          "elapsedMs": 212.0000000000009,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 224.90254099999873
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 13,
+          "elapsedMs": 230,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 241.726749999998
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 1,
+          "elapsedMs": 222,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 234.18020799999795
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 2,
+          "elapsedMs": 214,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 229.35616699999883
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 5.999999999998181,
+          "elapsedMs": 227,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 234.3050830000024
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.999999999998181,
+          "elapsedMs": 224,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 236.7943339999954
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2,
+          "elapsedMs": 216,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 233.17545799999806
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 16,
+          "elapsedMs": 238,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 248.13199999999824
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 1,
+          "elapsedMs": 220,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 231.44895899999796
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 2.000000000001819,
+          "elapsedMs": 215,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 227.63112500000204
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 6,
+          "elapsedMs": 229,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 238.71591600000386
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 1,
+          "elapsedMs": 223.00000000000185,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 232.68470899999727
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 1.000000000001819,
+          "elapsedMs": 218.00000000000185,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 234.62166699999898
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 13,
+          "elapsedMs": 237,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 249.01150000000172
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 1,
+          "elapsedMs": 224,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 235.65866600000618
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 2.000000000001819,
+          "elapsedMs": 213,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 224.90787499999954
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 7.999999999998181,
+          "elapsedMs": 237,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 250.68524999999653
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 1,
+          "elapsedMs": 235,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 246.12066699999957
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2,
+          "elapsedMs": 214,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 235.20833300000277
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 18.99999999999818,
+          "elapsedMs": 246,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 255.22295900000103
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 3,
+          "elapsedMs": 238,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 252.1930420000018
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 3,
+          "elapsedMs": 221,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 231.49141599999723
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8,
+          "elapsedMs": 244,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 258.26820800000405
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 2.999999999998181,
+          "elapsedMs": 237,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 253.37083399999472
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2,
+          "elapsedMs": 215.99999999999815,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 237.61825000000414
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 19,
+          "elapsedMs": 250,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 265.4168339999998
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 3,
+          "elapsedMs": 237,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 255.19016700000208
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 1.999999999998181,
+          "elapsedMs": 222,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 239.7053330000034
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8,
+          "elapsedMs": 243,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 256.7199579999979
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 4,
+          "elapsedMs": 235.00000000000185,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 248.4485409999948
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2.000000000001819,
+          "elapsedMs": 221,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 243.22804199999837
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 20,
+          "elapsedMs": 250,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 264.40929099999977
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 1.999999999998181,
+          "elapsedMs": 220.99999999999815,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 234.25337500000154
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 1.999999999998181,
+          "elapsedMs": 218,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 228.35520900000006
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 6.999999999998181,
+          "elapsedMs": 238,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 250.95283400000312
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 6,
+          "elapsedMs": 235.00000000000364,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 255.09166700000208
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 1.999999999996362,
+          "elapsedMs": 221.00000000000185,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 238.05049999999994
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 18,
+          "elapsedMs": 246,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 268.4745000000035
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 1.999999999996362,
+          "elapsedMs": 233,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 245.5816249999998
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 2,
+          "elapsedMs": 222,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 242.58287499999653
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 7,
+          "elapsedMs": 243.00000000000364,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 255.59337500000368
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 3,
+          "elapsedMs": 219,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 233.8020830000005
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 2,
+          "elapsedMs": 220,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 243.37908300000066
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 21,
+          "elapsedMs": 252,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 266.9272079999985
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 3,
+          "elapsedMs": 238,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 250.84820899999727
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 2.000000000003638,
+          "elapsedMs": 222,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 237.99683399999338
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 7,
+          "elapsedMs": 235.99999999999636,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 247.97537500000288
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 3,
+          "elapsedMs": 235.99999999999636,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 251.48579199999688
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 3,
+          "elapsedMs": 217,
+          "rows": 0,
+          "includeTotal": true,
+          "wallToCallbackMs": 241.67558399999933
+        }
+      ],
+      "inputToFrameMs": {
+        "n": 60,
+        "p50": 225.5,
+        "p95": 246,
+        "min": 212.0000000000009,
+        "max": 252
+      },
+      "backendCallMs": {
+        "n": 60,
+        "p50": 3.0,
+        "p95": 19.00000000000091,
+        "min": 0.999999999998181,
+        "max": 21
+      },
+      "wallInputToCallbackMs": {
+        "n": 60,
+        "p50": 242.90545849999745,
+        "p95": 264.40929099999977,
+        "min": 224.90254099999873,
+        "max": 268.4745000000035
+      },
+      "idleCpuPercent": 3.7131646771782165,
+      "memory": {
+        "empty": [
+          {
+            "at": 1794584769.831797,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 109008,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 111624192,
+                "physicalFootprintBytes": 27788464,
+                "cpuTicks": 5497236,
+                "cpuNs": 229051500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 36784,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 37666816,
+                "physicalFootprintBytes": 117081000,
+                "cpuTicks": 2403949,
+                "cpuNs": 100164541,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13744,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14073856,
+                "physicalFootprintBytes": 4997720,
+                "cpuTicks": 882876,
+                "cpuNs": 36786500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 63968,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 65519616,
+                "physicalFootprintBytes": 65127192,
+                "cpuTicks": 4937031,
+                "cpuNs": 205709625,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 218.265625,
+            "footprintMiB": 205.03461456298828,
+            "cpuNs": 571712166
+          },
+          {
+            "at": 1794584769.8798091,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 109008,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 111624192,
+                "physicalFootprintBytes": 27788464,
+                "cpuTicks": 5511259,
+                "cpuNs": 229635791,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 36784,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 37666816,
+                "physicalFootprintBytes": 117146536,
+                "cpuTicks": 2419817,
+                "cpuNs": 100825708,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13744,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14073856,
+                "physicalFootprintBytes": 4997720,
+                "cpuTicks": 882876,
+                "cpuNs": 36786500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 63984,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 65519616,
+                "physicalFootprintBytes": 65127192,
+                "cpuTicks": 4951744,
+                "cpuNs": 206322666,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 218.28125,
+            "footprintMiB": 205.09711456298828,
+            "cpuNs": 573570665
+          },
+          {
+            "at": 1794584769.9223769,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 109008,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 111624192,
+                "physicalFootprintBytes": 27788464,
+                "cpuTicks": 5522050,
+                "cpuNs": 230085416,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 36784,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 37666816,
+                "physicalFootprintBytes": 117179304,
+                "cpuTicks": 2432580,
+                "cpuNs": 101357500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13744,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14073856,
+                "physicalFootprintBytes": 4997720,
+                "cpuTicks": 883137,
+                "cpuNs": 36797375,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 63984,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 65519616,
+                "physicalFootprintBytes": 65012504,
+                "cpuTicks": 4967102,
+                "cpuNs": 206962583,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 218.28125,
+            "footprintMiB": 205.01898956298828,
+            "cpuNs": 575202874
+          }
+        ],
+        "results": [
+          {
+            "at": 1794584788.9632661,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 121824,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 124747776,
+                "physicalFootprintBytes": 28919008,
+                "cpuTicks": 31573190,
+                "cpuNs": 1315549583,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 42624,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 43646976,
+                "physicalFootprintBytes": 123143320,
+                "cpuTicks": 13900727,
+                "cpuNs": 579196958,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13776,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14106624,
+                "physicalFootprintBytes": 4801112,
+                "cpuTicks": 1608513,
+                "cpuNs": 67021375,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 116080,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 118865920,
+                "physicalFootprintBytes": 557056840,
+                "cpuTicks": 50037017,
+                "cpuNs": 2084875708,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 287.40625,
+            "footprintMiB": 680.8474349975586,
+            "cpuNs": 4046643624
+          },
+          {
+            "at": 1794584789.008328,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 121824,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 124747776,
+                "physicalFootprintBytes": 28919008,
+                "cpuTicks": 31573190,
+                "cpuNs": 1315549583,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 42624,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 43646976,
+                "physicalFootprintBytes": 123143320,
+                "cpuTicks": 13900727,
+                "cpuNs": 579196958,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13776,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14106624,
+                "physicalFootprintBytes": 4801112,
+                "cpuTicks": 1609078,
+                "cpuNs": 67044916,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 116080,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 118865920,
+                "physicalFootprintBytes": 557056840,
+                "cpuTicks": 50038113,
+                "cpuNs": 2084921375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 287.40625,
+            "footprintMiB": 680.8474349975586,
+            "cpuNs": 4046712832
+          },
+          {
+            "at": 1794584789.049741,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 121824,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 124747776,
+                "physicalFootprintBytes": 28919008,
+                "cpuTicks": 31573190,
+                "cpuNs": 1315549583,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 42624,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 43646976,
+                "physicalFootprintBytes": 123143320,
+                "cpuTicks": 13901190,
+                "cpuNs": 579216250,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13776,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14106624,
+                "physicalFootprintBytes": 4801112,
+                "cpuTicks": 1609078,
+                "cpuNs": 67044916,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 116080,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 118865920,
+                "physicalFootprintBytes": 557056840,
+                "cpuTicks": 50038113,
+                "cpuNs": 2084921375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 287.40625,
+            "footprintMiB": 680.8474349975586,
+            "cpuNs": 4046732124
+          },
+          {
+            "at": 1794584789.090104,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 121824,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 124747776,
+                "physicalFootprintBytes": 28919008,
+                "cpuTicks": 31573190,
+                "cpuNs": 1315549583,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 42624,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 43646976,
+                "physicalFootprintBytes": 123110552,
+                "cpuTicks": 13901190,
+                "cpuNs": 579216250,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13776,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14106624,
+                "physicalFootprintBytes": 4801112,
+                "cpuTicks": 1609078,
+                "cpuNs": 67044916,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 116080,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 118865920,
+                "physicalFootprintBytes": 553386824,
+                "cpuTicks": 50038113,
+                "cpuNs": 2084921375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 287.40625,
+            "footprintMiB": 677.3161849975586,
+            "cpuNs": 4046732124
+          },
+          {
+            "at": 1794584789.130646,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 121824,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 124747776,
+                "physicalFootprintBytes": 28919008,
+                "cpuTicks": 31573190,
+                "cpuNs": 1315549583,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 42624,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 43646976,
+                "physicalFootprintBytes": 123110552,
+                "cpuTicks": 13902295,
+                "cpuNs": 579262291,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13776,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14106624,
+                "physicalFootprintBytes": 4801112,
+                "cpuTicks": 1609416,
+                "cpuNs": 67059000,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 116080,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 118865920,
+                "physicalFootprintBytes": 553386824,
+                "cpuTicks": 50044015,
+                "cpuNs": 2085167291,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 287.40625,
+            "footprintMiB": 677.3161849975586,
+            "cpuNs": 4047038165
+          }
+        ],
+        "after120Queries": [
+          {
+            "at": 1794584822.317821,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 123744,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 126713856,
+                "physicalFootprintBytes": 28624120,
+                "cpuTicks": 75592155,
+                "cpuNs": 3149673125,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 43072,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 44105728,
+                "physicalFootprintBytes": 120685720,
+                "cpuTicks": 33609572,
+                "cpuNs": 1400398833,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13824,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14155776,
+                "physicalFootprintBytes": 4784728,
+                "cpuTicks": 2687827,
+                "cpuNs": 111992791,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 122752,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 125698048,
+                "physicalFootprintBytes": 1296515912,
+                "cpuTicks": 117114773,
+                "cpuNs": 4879782208,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 296.28125,
+            "footprintMiB": 1383.4099578857422,
+            "cpuNs": 9541846957
+          },
+          {
+            "at": 1794584822.364515,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 123744,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 126713856,
+                "physicalFootprintBytes": 28624120,
+                "cpuTicks": 75592155,
+                "cpuNs": 3149673125,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 43072,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 44105728,
+                "physicalFootprintBytes": 120685720,
+                "cpuTicks": 33613538,
+                "cpuNs": 1400564083,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13824,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14155776,
+                "physicalFootprintBytes": 4784728,
+                "cpuTicks": 2688461,
+                "cpuNs": 112019208,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 122752,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 125698048,
+                "physicalFootprintBytes": 1296204616,
+                "cpuTicks": 117116553,
+                "cpuNs": 4879856375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 296.28125,
+            "footprintMiB": 1383.1130828857422,
+            "cpuNs": 9542112791
+          },
+          {
+            "at": 1794584822.401483,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 123744,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 126713856,
+                "physicalFootprintBytes": 28624120,
+                "cpuTicks": 75592155,
+                "cpuNs": 3149673125,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 43072,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 44105728,
+                "physicalFootprintBytes": 120685720,
+                "cpuTicks": 33613908,
+                "cpuNs": 1400579500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13824,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14155776,
+                "physicalFootprintBytes": 4784728,
+                "cpuTicks": 2688461,
+                "cpuNs": 112019208,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 122752,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 125698048,
+                "physicalFootprintBytes": 1296204616,
+                "cpuTicks": 117116553,
+                "cpuNs": 4879856375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 296.28125,
+            "footprintMiB": 1383.1130828857422,
+            "cpuNs": 9542128208
+          },
+          {
+            "at": 1794584822.440398,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 123744,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 126713856,
+                "physicalFootprintBytes": 28624120,
+                "cpuTicks": 75592155,
+                "cpuNs": 3149673125,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 43072,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 44105728,
+                "physicalFootprintBytes": 120685720,
+                "cpuTicks": 33613908,
+                "cpuNs": 1400579500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13824,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14155776,
+                "physicalFootprintBytes": 4784728,
+                "cpuTicks": 2688768,
+                "cpuNs": 112032000,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 122752,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 125698048,
+                "physicalFootprintBytes": 1296204616,
+                "cpuTicks": 117117345,
+                "cpuNs": 4879889375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 296.28125,
+            "footprintMiB": 1383.1130828857422,
+            "cpuNs": 9542174000
+          },
+          {
+            "at": 1794584822.475592,
+            "processes": [
+              {
+                "pid": 17373,
+                "ppid": 16880,
+                "rssKiB": 123744,
+                "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+                "residentBytes": 126713856,
+                "physicalFootprintBytes": 28624120,
+                "cpuTicks": 75592155,
+                "cpuNs": 3149673125,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17374,
+                "ppid": 1,
+                "rssKiB": 43072,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+                "residentBytes": 44105728,
+                "physicalFootprintBytes": 120685720,
+                "cpuTicks": 33613908,
+                "cpuNs": 1400579500,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17375,
+                "ppid": 1,
+                "rssKiB": 13824,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+                "residentBytes": 14155776,
+                "physicalFootprintBytes": 4784728,
+                "cpuTicks": 2688768,
+                "cpuNs": 112032000,
+                "responsiblePid": 44128
+              },
+              {
+                "pid": 17376,
+                "ppid": 1,
+                "rssKiB": 122752,
+                "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "residentBytes": 125698048,
+                "physicalFootprintBytes": 1296204616,
+                "cpuTicks": 117117345,
+                "cpuNs": 4879889375,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 296.28125,
+            "footprintMiB": 1383.1130828857422,
+            "cpuNs": 9542174000
+          }
+        ]
+      },
+      "associatedProcesses": [
+        {
+          "pid": 17373,
+          "ppid": 16880,
+          "rssKiB": 109008,
+          "command": "/private/tmp/everything-tauri-baseline-68e4ddf/src-tauri/target/release/everything",
+          "association": "main or descendant",
+          "aliveAfterAppExit": false
+        },
+        {
+          "pid": 17374,
+          "ppid": 1,
+          "rssKiB": 36784,
+          "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+          "association": "new WebKit XPC during isolated app run",
+          "aliveAfterAppExit": false
+        },
+        {
+          "pid": 17375,
+          "ppid": 1,
+          "rssKiB": 13744,
+          "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking",
+          "association": "new WebKit XPC during isolated app run",
+          "aliveAfterAppExit": false
+        },
+        {
+          "pid": 17376,
+          "ppid": 1,
+          "rssKiB": 63968,
+          "command": "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+          "association": "new WebKit XPC during isolated app run",
+          "aliveAfterAppExit": false
+        }
+      ]
+    },
+    "gpui": {
+      "startups": [
+        {
+          "callbackMs": 159.856167,
+          "wallToCallbackMs": 169.92479199999977
+        },
+        {
+          "callbackMs": 170.67670900000002,
+          "wallToCallbackMs": 183.85800000000074
+        },
+        {
+          "callbackMs": 150.140459,
+          "wallToCallbackMs": 160.42070900000027
+        },
+        {
+          "callbackMs": 170.95775,
+          "wallToCallbackMs": 184.37441699999724
+        },
+        {
+          "callbackMs": 159.78620800000002,
+          "wallToCallbackMs": 171.49720799999812
+        },
+        {
+          "callbackMs": 158.423708,
+          "wallToCallbackMs": 170.93374999999966
+        },
+        {
+          "callbackMs": 165.960791,
+          "wallToCallbackMs": 178.1238330000008
+        }
+      ],
+      "startupWallMs": {
+        "n": 7,
+        "p50": 171.49720799999812,
+        "p95": 184.37441699999724,
+        "min": 160.42070900000027,
+        "max": 184.37441699999724
+      },
+      "startupCallbackMs": {
+        "n": 7,
+        "p50": 159.856167,
+        "p95": 170.95775,
+        "min": 150.140459,
+        "max": 170.95775
+      },
+      "searchFrames": [
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 22.42125,
+          "elapsedMs": 239.508667,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 255.10979199999895
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.440917,
+          "elapsedMs": 218.25116599999998,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 229.14112499999817
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.553292,
+          "elapsedMs": 218.126667,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 232.90408399999762
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 6.226916,
+          "elapsedMs": 221.596833,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 243.34658300000456
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.439042,
+          "elapsedMs": 215.470708,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 242.79450000000224
+        },
+        {
+          "iteration": 0,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.1775,
+          "elapsedMs": 215.29654100000002,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 232.6784580000094
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 25.205916,
+          "elapsedMs": 240.938959,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 252.53833300000395
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.6160840000000001,
+          "elapsedMs": 218.071542,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 236.8264579999959
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.556875,
+          "elapsedMs": 217.075875,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 238.3465829999949
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 6.989959,
+          "elapsedMs": 216.74175000000002,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 230.34870799999396
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.510417,
+          "elapsedMs": 215.114958,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 235.83424999999636
+        },
+        {
+          "iteration": 1,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.194125,
+          "elapsedMs": 216.18537500000002,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 237.4609589999892
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 25.745333,
+          "elapsedMs": 244.992375,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 263.43699999999615
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.565416,
+          "elapsedMs": 217.844542,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 243.74520900001073
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.465667,
+          "elapsedMs": 216.391208,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 227.54595900001107
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 7.842667,
+          "elapsedMs": 225.744167,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 244.5666659999972
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.568459,
+          "elapsedMs": 214.060208,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 231.51133300000026
+        },
+        {
+          "iteration": 2,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.17508300000000002,
+          "elapsedMs": 215.485875,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 234.20379100001298
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 24.028958,
+          "elapsedMs": 241.58433300000002,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 255.9315840000096
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.434583,
+          "elapsedMs": 216.165583,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 232.77158300000167
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.6014160000000001,
+          "elapsedMs": 212.500958,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 234.59191700000304
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 6.867083,
+          "elapsedMs": 220.9715,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 239.44899999999336
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.60275,
+          "elapsedMs": 214.22150000000002,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 232.4807910000004
+        },
+        {
+          "iteration": 3,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.17283300000000001,
+          "elapsedMs": 214.005625,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 228.74354200000369
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 25.481542,
+          "elapsedMs": 239.797083,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 251.57825000000855
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.544208,
+          "elapsedMs": 217.917209,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 233.2391670000078
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.352458,
+          "elapsedMs": 215.832583,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 235.0317920000009
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8.306292,
+          "elapsedMs": 225.190833,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 248.43041699999446
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 3.282209,
+          "elapsedMs": 224.263875,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 240.66487499999312
+        },
+        {
+          "iteration": 4,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.045166,
+          "elapsedMs": 212.22925,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 232.37016699999913
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 16.425542,
+          "elapsedMs": 232.61162499999998,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 240.13949999999795
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.438458,
+          "elapsedMs": 212.194875,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 227.01299999999947
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.498917,
+          "elapsedMs": 212.713125,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 222.1358749999922
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8.9875,
+          "elapsedMs": 223.68991699999998,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 245.3301249999953
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.525209,
+          "elapsedMs": 213.00475,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 228.7230420000128
+        },
+        {
+          "iteration": 5,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.188625,
+          "elapsedMs": 213.01524999999998,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 227.06199999998944
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 25.062375000000003,
+          "elapsedMs": 241.060625,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 257.06366600000763
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.506791,
+          "elapsedMs": 217.83725,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 235.48700000000622
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.555875,
+          "elapsedMs": 214.252333,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 232.24154199999703
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 7.884416999999999,
+          "elapsedMs": 223.560417,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 236.5668330000119
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.555375,
+          "elapsedMs": 215.369,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 234.60133300000052
+        },
+        {
+          "iteration": 6,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.189875,
+          "elapsedMs": 216.39766699999998,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 232.49858399999823
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 23.206791000000003,
+          "elapsedMs": 233.28725,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 251.39529099999436
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.5720000000000001,
+          "elapsedMs": 208.40125,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 222.81562499999552
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.42525,
+          "elapsedMs": 218.3415,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 235.02487499999347
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8.4945,
+          "elapsedMs": 226.263875,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 250.13104100000305
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.45645800000000003,
+          "elapsedMs": 217.731042,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 239.40233300000102
+        },
+        {
+          "iteration": 7,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.174792,
+          "elapsedMs": 214.012166,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 231.96645800000226
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 24.665667,
+          "elapsedMs": 241.122292,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 264.84429100000284
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.5369160000000001,
+          "elapsedMs": 218.23000000000002,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 240.11579199999744
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.365417,
+          "elapsedMs": 216.342083,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 246.72837500000355
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 2.753041,
+          "elapsedMs": 217.09758300000001,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 235.63749999999573
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.582584,
+          "elapsedMs": 222.159875,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 240.82766600000127
+        },
+        {
+          "iteration": 8,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.163167,
+          "elapsedMs": 215.94483400000001,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 242.8614170000003
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "report",
+          "backendMs": 25.085541,
+          "elapsedMs": 241.53908299999998,
+          "rows": 500,
+          "first": "report final 2026.pdf",
+          "includeTotal": true,
+          "wallToCallbackMs": 258.0850840000011
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "한글",
+          "backendMs": 0.533375,
+          "elapsedMs": 215.129,
+          "rows": 1,
+          "first": "한글 보고서.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 233.38074999999492
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "Alpha",
+          "backendMs": 0.570041,
+          "elapsedMs": 216.705,
+          "rows": 2,
+          "first": "Alpha report.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 233.5080830000038
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "*.md",
+          "backendMs": 8.448125000000001,
+          "elapsedMs": 225.609417,
+          "rows": 500,
+          "first": "notes.md",
+          "includeTotal": true,
+          "wallToCallbackMs": 246.8834999999956
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "space name",
+          "backendMs": 0.548417,
+          "elapsedMs": 214.368208,
+          "rows": 1,
+          "first": "space name.txt",
+          "includeTotal": true,
+          "wallToCallbackMs": 233.689499999997
+        },
+        {
+          "iteration": 9,
+          "event": "searchFrame",
+          "query": "no-such-gpui-file-xyz",
+          "backendMs": 0.175167,
+          "elapsedMs": 218.06129199999998,
+          "rows": 0,
+          "first": null,
+          "includeTotal": true,
+          "wallToCallbackMs": 241.85695799999962
+        }
+      ],
+      "inputToFrameMs": {
+        "n": 60,
+        "p50": 217.4143125,
+        "p95": 241.122292,
+        "min": 208.40125,
+        "max": 244.992375
+      },
+      "backendCallMs": {
+        "n": 60,
+        "p50": 0.5563750000000001,
+        "p95": 25.085541,
+        "min": 0.045166,
+        "max": 25.745333
+      },
+      "wallInputToCallbackMs": {
+        "n": 60,
+        "p50": 236.20054150000414,
+        "p95": 257.06366600000763,
+        "min": 222.1358749999922,
+        "max": 264.84429100000284
+      },
+      "idleCpuPercent": 1.4763376856873744,
+      "memory": {
+        "empty": [
+          {
+            "at": 1794584824.718019,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 100096,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 102547456,
+                "physicalFootprintBytes": 163939408,
+                "cpuTicks": 4480008,
+                "cpuNs": 186667000,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 97.75,
+            "footprintMiB": 156.3448028564453,
+            "cpuNs": 186667000
+          },
+          {
+            "at": 1794584824.761835,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 100144,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 102547456,
+                "physicalFootprintBytes": 163939408,
+                "cpuTicks": 4483086,
+                "cpuNs": 186795250,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 97.796875,
+            "footprintMiB": 156.3448028564453,
+            "cpuNs": 186795250
+          },
+          {
+            "at": 1794584824.802318,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 100144,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 102547456,
+                "physicalFootprintBytes": 163939408,
+                "cpuTicks": 4486283,
+                "cpuNs": 186928458,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 97.796875,
+            "footprintMiB": 156.3448028564453,
+            "cpuNs": 186928458
+          }
+        ],
+        "results": [
+          {
+            "at": 1794584843.467989,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119904,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122781696,
+                "physicalFootprintBytes": 207078480,
+                "cpuTicks": 71339469,
+                "cpuNs": 2972477875,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.09375,
+            "footprintMiB": 197.4854278564453,
+            "cpuNs": 2972477875
+          },
+          {
+            "at": 1794584843.5082922,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119904,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122781696,
+                "physicalFootprintBytes": 207078480,
+                "cpuTicks": 71341897,
+                "cpuNs": 2972579041,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.09375,
+            "footprintMiB": 197.4854278564453,
+            "cpuNs": 2972579041
+          },
+          {
+            "at": 1794584843.546668,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119904,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122781696,
+                "physicalFootprintBytes": 207078480,
+                "cpuTicks": 71344712,
+                "cpuNs": 2972696333,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.09375,
+            "footprintMiB": 197.4854278564453,
+            "cpuNs": 2972696333
+          },
+          {
+            "at": 1794584843.587242,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119904,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122781696,
+                "physicalFootprintBytes": 207078480,
+                "cpuTicks": 71349134,
+                "cpuNs": 2972880583,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.09375,
+            "footprintMiB": 197.4854278564453,
+            "cpuNs": 2972880583
+          },
+          {
+            "at": 1794584843.629427,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119904,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122781696,
+                "physicalFootprintBytes": 207078480,
+                "cpuTicks": 71352711,
+                "cpuNs": 2973029625,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.09375,
+            "footprintMiB": 197.4854278564453,
+            "cpuNs": 2973029625
+          }
+        ],
+        "after120Queries": [
+          {
+            "at": 1794584875.735271,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119952,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122830848,
+                "physicalFootprintBytes": 207127632,
+                "cpuTicks": 179764861,
+                "cpuNs": 7490202541,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.140625,
+            "footprintMiB": 197.5323028564453,
+            "cpuNs": 7490202541
+          },
+          {
+            "at": 1794584875.7842681,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119952,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122830848,
+                "physicalFootprintBytes": 207127632,
+                "cpuTicks": 179768639,
+                "cpuNs": 7490359958,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.140625,
+            "footprintMiB": 197.5323028564453,
+            "cpuNs": 7490359958
+          },
+          {
+            "at": 1794584875.823138,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119952,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122830848,
+                "physicalFootprintBytes": 207127632,
+                "cpuTicks": 179770304,
+                "cpuNs": 7490429333,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.140625,
+            "footprintMiB": 197.5323028564453,
+            "cpuNs": 7490429333
+          },
+          {
+            "at": 1794584875.86374,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119952,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122830848,
+                "physicalFootprintBytes": 207127632,
+                "cpuTicks": 179773572,
+                "cpuNs": 7490565500,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.140625,
+            "footprintMiB": 197.5323028564453,
+            "cpuNs": 7490565500
+          },
+          {
+            "at": 1794584875.904609,
+            "processes": [
+              {
+                "pid": 18084,
+                "ppid": 16880,
+                "rssKiB": 119952,
+                "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+                "residentBytes": 122830848,
+                "physicalFootprintBytes": 207127632,
+                "cpuTicks": 179777538,
+                "cpuNs": 7490730750,
+                "responsiblePid": 44128
+              }
+            ],
+            "rssMiB": 117.140625,
+            "footprintMiB": 197.5323028564453,
+            "cpuNs": 7490730750
+          }
+        ]
+      },
+      "associatedProcesses": [
+        {
+          "pid": 18084,
+          "ppid": 16880,
+          "rssKiB": 100096,
+          "command": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+          "association": "main or descendant",
+          "aliveAfterAppExit": false
+        }
+      ]
+    }
+  }
+}

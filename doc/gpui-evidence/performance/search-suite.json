@@ -1,0 +1,177 @@
+{
+  "warmups": 3,
+  "iterations": 10,
+  "queries": [
+    {
+      "id": "empty",
+      "query": ""
+    },
+    {
+      "id": "name",
+      "query": "report"
+    },
+    {
+      "id": "case",
+      "query": "REPORT"
+    },
+    {
+      "id": "alpha",
+      "query": "Alpha"
+    },
+    {
+      "id": "korean",
+      "query": "한글"
+    },
+    {
+      "id": "spaces",
+      "query": "space name"
+    },
+    {
+      "id": "multi-term",
+      "query": "report final"
+    },
+    {
+      "id": "unicode",
+      "query": "unicode-École"
+    },
+    {
+      "id": "extension",
+      "query": "*.md"
+    },
+    {
+      "id": "extension-case",
+      "query": "*.TXT"
+    },
+    {
+      "id": "glob-question",
+      "query": "report_000000?.txt"
+    },
+    {
+      "id": "glob-contains",
+      "query": "*final*"
+    },
+    {
+      "id": "glob-mixed",
+      "query": "report*pdf"
+    },
+    {
+      "id": "no-result",
+      "query": "no-such-gpui-file-xyz"
+    },
+    {
+      "id": "short",
+      "query": "r"
+    },
+    {
+      "id": "absolute-directory",
+      "query": "/private/tmp/everything-gpui-validation/files/folder-demo/"
+    },
+    {
+      "id": "absolute-file",
+      "query": "/private/tmp/everything-gpui-validation/files/space name.txt"
+    },
+    {
+      "id": "relative-directory",
+      "query": "folder-demo/"
+    },
+    {
+      "id": "relative-file",
+      "query": "folder-demo/child"
+    },
+    {
+      "id": "sibling-directory",
+      "query": "folder-demo-other/"
+    },
+    {
+      "id": "home-directory",
+      "query": "~/folder-demo/"
+    },
+    {
+      "id": "directory-glob",
+      "query": "/private/tmp/everything-gpui-validation/files/folder-demo/*.txt"
+    },
+    {
+      "id": "sort-name-asc",
+      "query": "report",
+      "sortBy": "name",
+      "sortDir": "asc"
+    },
+    {
+      "id": "sort-name-desc",
+      "query": "report",
+      "sortBy": "name",
+      "sortDir": "desc"
+    },
+    {
+      "id": "sort-dir-asc",
+      "query": "report",
+      "sortBy": "dir",
+      "sortDir": "asc"
+    },
+    {
+      "id": "sort-dir-desc",
+      "query": "report",
+      "sortBy": "dir",
+      "sortDir": "desc"
+    },
+    {
+      "id": "sort-size-asc",
+      "query": "report",
+      "sortBy": "size",
+      "sortDir": "asc"
+    },
+    {
+      "id": "sort-size-desc",
+      "query": "report",
+      "sortBy": "size",
+      "sortDir": "desc"
+    },
+    {
+      "id": "sort-mtime-asc",
+      "query": "report",
+      "sortBy": "mtime",
+      "sortDir": "asc"
+    },
+    {
+      "id": "sort-mtime-desc",
+      "query": "report",
+      "sortBy": "mtime",
+      "sortDir": "desc"
+    },
+    {
+      "id": "page-0",
+      "query": "report",
+      "offset": 0,
+      "limit": 300
+    },
+    {
+      "id": "page-300",
+      "query": "report",
+      "offset": 300,
+      "limit": 300
+    },
+    {
+      "id": "page-600",
+      "query": "report",
+      "offset": 600,
+      "limit": 300
+    },
+    {
+      "id": "page-999",
+      "query": "report",
+      "offset": 999,
+      "limit": 300
+    },
+    {
+      "id": "short-next",
+      "query": "r",
+      "offset": 100,
+      "limit": 300
+    },
+    {
+      "id": "max-limit",
+      "query": "report",
+      "limit": 1000
+    }
+  ]
+}

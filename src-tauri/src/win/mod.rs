@@ -1,19 +1,19 @@
 pub mod com_guard;
-pub mod volume;
-pub mod path_resolver;
-pub mod mft_indexer;
-pub mod usn_watcher;
+pub mod context_menu;
 pub mod dir_rescan;
-pub mod service_paths;
-pub mod service_log;
-pub mod service_security;
-pub mod service_pipe;
+pub mod icon;
+pub mod legacy_cleanup;
+pub mod mft_indexer;
+pub mod path_resolver;
+pub mod rdcw_watcher;
 pub mod service;
 pub mod service_client;
-pub mod legacy_cleanup;
-pub mod rdcw_watcher;
-pub mod context_menu;
-pub mod icon;
+pub mod service_log;
+pub mod service_paths;
+pub mod service_pipe;
+pub mod service_security;
+pub mod usn_watcher;
+pub mod volume;
 
 pub const EARLY_MEM_INDEX_LIMIT: usize = 200_000;
 
@@ -22,7 +22,7 @@ pub const EARLY_MEM_INDEX_LIMIT: usize = 200_000;
 /// poll tick.
 const HEALTH_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
-use tauri::{AppHandle, Emitter};
+use crate::runtime::EventSink;
 
 use crate::{db_connection, set_ready_with_cached_counts, AppState};
 
@@ -33,7 +33,7 @@ use crate::{db_connection, set_ready_with_cached_counts, AppState};
 /// changes. When the pipe is unreachable, classify service health via SCM and
 /// emit a `service_health` banner event — auto-starting a stopped service (the
 /// D2 DACL grant lets INTERACTIVE start it without UAC).
-pub fn start_windows_readonly(app: AppHandle, state: AppState) {
+pub fn start_windows_readonly(app: EventSink, state: AppState) {
     // Instant Ready if the service already has an index; the poll loop refines.
     set_ready_with_cached_counts(&app, &state);
 
@@ -103,10 +103,7 @@ pub fn start_windows_readonly(app: AppHandle, state: AppState) {
                     // attempted only once the transfer actually reaches the service;
                     // a transient pipe failure must be retried on a later poll, not
                     // silently skipped until GUI restart.
-                    if version_ok
-                        && !migrate_attempted
-                        && s.sidecar_migrated == Some(false)
-                    {
+                    if version_ok && !migrate_attempted && s.sidecar_migrated == Some(false) {
                         if migrate_old_sidecars().is_ok() {
                             migrate_attempted = true;
                         }
@@ -122,7 +119,12 @@ pub fn start_windows_readonly(app: AppHandle, state: AppState) {
                                 c.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
                             {
                                 if last_dv.is_some() && last_dv != Some(dv) {
-                                    crate::emit_index_updated(&app, s.indexed, crate::now_epoch(), 0);
+                                    crate::emit_index_updated(
+                                        &app,
+                                        s.indexed,
+                                        crate::now_epoch(),
+                                        0,
+                                    );
                                 }
                                 last_dv = Some(dv);
                             }
@@ -140,9 +142,8 @@ pub fn start_windows_readonly(app: AppHandle, state: AppState) {
                             // once per episode, not every tick.
                             if !start_requested {
                                 start_requested = true;
-                                let _ = sc_command()
-                                    .args(["start", service::SERVICE_NAME])
-                                    .output();
+                                let _ =
+                                    sc_command().args(["start", service::SERVICE_NAME]).output();
                             }
                         } else {
                             start_requested = false;
@@ -177,10 +178,7 @@ fn sc_command() -> std::process::Command {
 /// Classify the service for the GUI health banner (D5) via SCM. `sc query`
 /// exit 1060 = not installed; otherwise parse the reported state.
 fn classify_service_health() -> &'static str {
-    match sc_command()
-        .args(["query", service::SERVICE_NAME])
-        .output()
-    {
+    match sc_command().args(["query", service::SERVICE_NAME]).output() {
         Ok(o) if o.status.code() == Some(1060) => "not_installed",
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout);

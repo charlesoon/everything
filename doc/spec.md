@@ -1,4 +1,7 @@
-This document is the final implementation-ready design/spec for development with Tauri (v2) + Svelte. (Quick Look excluded, "search speed" is top priority, Enter=Rename on macOS / Enter=Open on Windows, Double click=Open)
+GPUI migration contract: preserve the running Tauri UI and behavior (baseline `68e4ddf`). Enter=Open on both platforms; F2=Rename.
+
+
+GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration decisions](gpui-migration-plan.md).
 
 ---
 
@@ -6,7 +9,7 @@ This document is the final implementation-ready design/spec for development with
 
 - **Product name (tentative):** Everything
 - **Platform:** macOS, Windows
-- **Tech stack:** Tauri v2 + Rust + Svelte 5
+- **Tech stack:** GPUI + Rust + gpui-component
 - **Goal:** Ultrafast file/folder "name-based" search on par with Everything (Windows)
 - **UI direction:** Everything (Windows) clone style — simple, dense interface centered on a search bar + result table
 - **Window behavior:** Standard app window + instant activation via global shortcut (Cmd+Shift+Space on macOS)
@@ -29,7 +32,7 @@ This document is the final implementation-ready design/spec for development with
   - Copy Path
   - Copy Files (macOS: NSPasteboard clipboard)
   - Move to Trash / Recycle Bin
-  - Rename (Enter on macOS, F2 cross-platform)
+  - Rename (F2 cross-platform)
   - Quick Look (macOS: Space key)
 
 ### 1.2 Non-Goals (not in this version)
@@ -46,7 +49,7 @@ This document is the final implementation-ready design/spec for development with
 
 ### 2.1 Main Screen Layout
 
-- **Top:** Title bar (drag region) + theme toggle
+- **Top:** Original 30px title bar (drag region), system appearance
 - **Below title bar:** Search input (auto-focused on app launch)
 - **Center:** Result table (virtual scroll)
   - Name (file icon + name)
@@ -63,7 +66,7 @@ This document is the final implementation-ready design/spec for development with
 ### 2.2 Input/Interaction Rules (finalized)
 
 - **Double click:** Open
-- **Enter (macOS, selected, not editing):** Rename (start inline edit)
+- **Enter (macOS, selected, not editing):** Open
 - **Enter (Windows, selected, not editing):** Open
 - **Enter (while editing):** Confirm rename
 - **Esc (while editing):** Cancel rename
@@ -83,13 +86,13 @@ Multi-select:
 - `PageUp/PageDown` — Quick navigation (selection)
 - `Cmd+O` / `Ctrl+O` — Open
 - `Cmd+Enter` / `Ctrl+Enter` — Reveal in Finder/Explorer
-- `Cmd+C` / `Ctrl+C` — Copy Path
+- `Alt+Cmd+C` (macOS) / `Ctrl+C` (Windows) — Copy Path; `Cmd+C` (macOS) — Copy Files
 - `Cmd+F` / `Ctrl+F` — Focus search input
 - `Del` or `Cmd+Backspace` — Move to Trash
 - `F2` — Rename
 - `Space` — Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` — Select all
-- `Enter` — Open (Windows) / Rename (macOS)
+- `Enter` — Open (macOS / Windows)
 
 ### 2.4 Right-Click Context Menu (required)
 
@@ -116,7 +119,7 @@ Multi-select:
 
 - Backend response after input: p95 < 30ms
 - Perceived with UI render: < 50ms
-- Result limit: default limit=300 (configurable 100–1000)
+- Result limit: default limit=500 (configurable 100–1000)
 
 ### 3.2 Indexing
 
@@ -131,7 +134,7 @@ Multi-select:
 
 ### 4.1 Components
 
-- **Frontend (Svelte 5):** UI, input events, virtual scroll, context menu, OverlayScrollbars
+- **Native UI (GPUI):** UI, input events, virtual scroll, context menu, GPUI uniform_list / gpui-component Scrollbar
 - **Backend (Rust):**
   - Indexer (scan + DB upsert)
     - macOS: jwalk incremental 2-pass scan
@@ -152,7 +155,7 @@ Multi-select:
    - macOS: jwalk scan of `$HOME`
    - Windows: MFT enumeration of `C:\` (with MemIndex for immediate search)
 2. User searches → Rust checks MemIndex first, then queries SQLite (LIKE-based, multi-mode) → returns top N results
-3. Svelte renders list
+3. GPUI renders the native list
 4. File changes occur → watcher queue → path-level upsert/delete
    - macOS: FSEvents
    - Windows: USN journal / ReadDirectoryChangesW
@@ -163,7 +166,7 @@ Multi-select:
 
 ### 5.1 DB File Location
 
-- `AppDataDir/index.db` (Tauri app data dir)
+- `AppDataDir/index.db` (platform app data directory)
 
 ### 5.2 Schema (finalized)
 
@@ -222,9 +225,9 @@ Behavior rules:
 
 ### 6.3 Short Input Optimization (required policy)
 
-- Query length 0: recent items/favorites (optional) or empty screen
-- Query length 1: search is performed but with lower limit (e.g., 100) + UI debounce (50ms)
-- Query length 2+: normal limit (300)
+- Query length 0: first page of all indexed entries, matching the running baseline
+- Query length 1: search is performed but with lower limit (e.g., 100) + UI scheduling (200ms leading + trailing)
+- Query length 2+: normal limit (500)
 
 ---
 
@@ -345,12 +348,12 @@ Options:
 
 ### 8.8 Rename
 
-Rename only works in single-select mode. F2 starts rename on both platforms. Enter starts rename on macOS only.
+Rename only works in single-select mode. F2 starts rename on both platforms. Enter opens on both platforms.
 
 Rename includes filesystem change + DB update + watcher duplicate suppression.
 
 Behavior definition:
-- F2 / Enter (macOS) -> inline edit
+- F2 -> inline edit
 - Enter while editing -> confirm
 - On confirm:
   1. Validate new name (no empty string, no path separators)
@@ -382,7 +385,7 @@ Without this, "flickering" or "duplicate delete/upsert" frequently occurs after 
 
 ---
 
-## 10. Tauri Command API (finalized)
+## 10. Direct Rust UI API (finalized)
 
 ### 10.1 Commands
 
@@ -405,7 +408,7 @@ Without this, "flickering" or "duplicate delete/upsert" frequently occurs after 
 - `quick_look(path: String)` (macOS only)
 - `check_full_disk_access() -> bool` (macOS only)
 - `open_privacy_settings()` (macOS only)
-- `set_native_theme(theme: String)` (dark/light)
+- System appearance is observed directly by GPUI (dark/light)
 - `mark_frontend_ready()` (signals frontend initialization complete)
 - `frontend_log(msg: String)` (debug logging)
 
@@ -422,7 +425,7 @@ DTO minimum fields (performance):
 
 ---
 
-## 11. Frontend (Svelte 5) Implementation Spec
+## 11. Native UI (GPUI) Implementation Spec
 
 ### 11.1 State Model
 
@@ -443,15 +446,16 @@ DTO minimum fields (performance):
 
 - Search input onInput:
   - Debounce 200ms (leading + trailing edge)
-  - `invoke('search', { query, limit, sort_by, sort_dir, include_total })`
+  - `search(..., &AppState)` on a background worker
 - List keydown:
-  - Enter (macOS): startRename() / Enter (Windows): openSelected()
+  - Enter (both platforms): openSelected()
   - Enter while editing: confirm rename
   - F2: startRename()
   - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder
-  - Cmd+C / Ctrl+C: copy_paths
+  - macOS Cmd+C: copy_files; Alt+Cmd+C: copy_paths
+  - Windows Ctrl+C: copy_paths
   - Cmd+F / Ctrl+F: focus search input
   - Esc: cancel edit
   - Double click row: open(path)
@@ -459,16 +463,16 @@ DTO minimum fields (performance):
   - Shift+Click: range select
   - Cmd+Click / Ctrl+Click: toggle select
 - Right-click:
-  - Windows: `invoke('show_context_menu', { paths, x, y })` (native Shell API)
-  - macOS: custom frontend context menu
+  - Windows: `win::context_menu::show(...)` (native Shell API)
+  - macOS: original muda/AppKit native context menu
 
 ### 11.3 Virtual Scroll (required)
 
 - Smooth performance even with hundreds of results
-- Fixed row height: 26px
+- Fixed row height: 27px
 - Icon cache (max 500 entries)
 - Highlight cache (max 300 entries)
-- OverlayScrollbars for styled scrollbar
+- GPUI uniform_list / gpui-component Scrollbar for styled scrollbar
 
 ### 11.4 Inline Rename UI (required)
 
@@ -494,13 +498,13 @@ Common:
 - Cache key: extension string (e.g., "pdf", "txt", "app")
 - Folders: cache a single folder icon
 - Files without extension: use default document icon
-- Frontend maintains icon cache as `Map<string, dataURL>` (max 500)
+- Frontend maintains icon cache as `HashMap<String, Arc<Image>>` (max 512)
 
 ### 11.6 Column Header Sort UI
 
 - Clicking Name, Size, or Modified column header toggles sort direction
 - Current sort column shows direction indicator: ▲ (ASC) / ▼ (DESC)
-- Path column does not support sorting
+- Path column sorts by parent directory
 
 ### 11.7 Result Columns
 
@@ -530,7 +534,7 @@ Common:
 
 ## 13. Settings (options)
 
-- Limit (default 300)
+- Limit (default 500)
 - Include hidden files
 - Edit exclusion patterns (`.pathignore`)
 - Trash confirmation dialog on/off
@@ -544,7 +548,7 @@ Common:
 1. SQLite init + entries schema + indexes
 2. Full scan indexer (macOS: jwalk, Windows: MFT + WalkDir fallback)
 3. Search command (LIKE-based multi-mode + limit + ORDER BY)
-4. Svelte UI (search bar + results + virtual scroll + file icons)
+4. GPUI UI (search bar + results + virtual scroll + file icons)
 5. Double click open
 6. Status bar index status
 7. Column header sort (Name/Size/Modified)
@@ -571,4 +575,4 @@ Common:
 22. Copy Files (macOS NSPasteboard)
 23. In-memory MemIndex (Windows, instant search during DB upsert)
 24. Non-admin WalkDir fallback (Windows)
-25. Theme toggle + native theme sync
+25. Preserve system theme sync (no theme toggle)

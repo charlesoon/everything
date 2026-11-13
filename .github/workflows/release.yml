@@ -3,120 +3,75 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
-  build-macos:
+  macos:
     runs-on: macos-latest
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@master
         with:
-          node-version: 20
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+          workspaces: src-tauri
+      - name: Install Metal compiler
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Check and test native application
+        run: |
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build native app and DMG
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_SIGNING_IDENTITY: "-"
+          APPLE_SIGNING_IDENTITY: '-'
+        run: python3 scripts/bundle_macos.py --dmg
+      - uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Everything ${{ github.ref_name }}"
-          releaseBody: |
-            File search app
+          name: macos-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
 
-            ## macOS Installation
-            1. Download the DMG file
-            2. Open the DMG and drag `Everything.app` to the Applications folder
-            3. If you see an "Unidentified Developer" warning on first launch:
-               - Go to `System Settings > Privacy & Security` and click "Open Anyway"
-               - Or run in Terminal: `xattr -cr /Applications/Everything.app`
-
-            ## Windows Installation
-            1. Download the Windows installer file (`*-setup.exe`)
-            2. Run the installer to install the app
-            3. Do not use other Windows `.exe` assets (portable/runtime files) for installation
-            4. Launch it from the Start menu or desktop shortcut
-          releaseDraft: true
-          prerelease: false
-
-  build-windows:
+  windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: dtolnay/rust-toolchain@master
         with:
-          node-version: 20
-          cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+          toolchain: '1.97.1'
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~\.cargo\registry
-            ~\.cargo\git
-            src-tauri\target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          workspaces: src-tauri
+      - name: Install NSIS
+        run: choco install nsis --no-progress -y
+      - name: Check and test native application
+        run: |
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build native installer
+        run: ./scripts/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
 
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+      - name: Attach artifacts to draft release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Everything ${{ github.ref_name }}"
-          releaseBody: |
-            File search app
-
-            ## macOS Installation
-            1. Download the DMG file
-            2. Open the DMG and drag `Everything.app` to the Applications folder
-            3. If you see an "Unidentified Developer" warning on first launch:
-               - Go to `System Settings > Privacy & Security` and click "Open Anyway"
-               - Or run in Terminal: `xattr -cr /Applications/Everything.app`
-
-            ## Windows Installation
-            1. Download the Windows installer file (`*-setup.exe`)
-            2. Run the installer to install the app
-            3. Do not use other Windows `.exe` assets (portable/runtime files) for installation
-            4. Launch it from the Start menu or desktop shortcut
-          args: --bundles nsis
-          releaseDraft: true
-          prerelease: false
-
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" || gh release create "$RELEASE_TAG" --draft --title "Everything $RELEASE_TAG" --notes-file .github/release-notes.md
+          gh release upload "$RELEASE_TAG" release-artifacts/* --clobber

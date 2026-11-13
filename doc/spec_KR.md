@@ -1,4 +1,7 @@
-아래 문서는 Tauri(v2) + Svelte로 바로 개발에 들어갈 수 있도록 정리한 최종 설계/스펙(implementation-ready) 입니다. (Quick Look 포함, "검색 속도" 최우선, macOS: Enter=Rename / Windows: Enter=Open, Double click=Open 반영)
+GPUI migration contract: preserve the running Tauri UI and behavior (baseline `68e4ddf`). Enter=Open on both platforms; F2=Rename.
+
+
+GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration decisions](gpui-migration-plan.md).
 
 ---
 
@@ -6,7 +9,7 @@
 
 - **제품명(가칭):** Everything
 - **플랫폼:** macOS, Windows
-- **기술 스택:** Tauri v2 + Rust + Svelte 5
+- **기술 스택:** GPUI + Rust + gpui-component
 - **목표:** Everything급(체감) 초고속 파일/폴더 "이름 기반" 검색
 - **UI 방향:** Everything(Windows) 클론 스타일 — 검색창 + 결과 테이블 중심의 단순하고 밀도 높은 인터페이스
 - **윈도우 동작:** 일반 앱 윈도우 + 글로벌 단축키(macOS: Cmd+Shift+Space)로 즉시 활성화
@@ -29,7 +32,7 @@
   - Copy Path
   - Copy Files (macOS: NSPasteboard 클립보드)
   - Move to Trash / 휴지통
-  - Rename (macOS: Enter, 공통: F2)
+  - Rename (양 플랫폼 F2)
   - Quick Look (macOS: Space 키)
 
 ### 1.2 비목표(이번 버전에서 하지 않음)
@@ -46,7 +49,7 @@
 
 ### 2.1 메인 화면 구성
 
-- **상단:** 타이틀 바 (드래그 영역) + 테마 토글
+- **상단:** 기존 30px 타이틀 바 (드래그 영역), 시스템 테마
 - **타이틀 바 아래:** 검색 입력창(앱 시작 시 자동 포커스)
 - **중앙:** 결과 테이블(가상 스크롤)
   - Name (파일 아이콘 + 이름)
@@ -63,7 +66,7 @@
 ### 2.2 입력/조작 규칙(확정)
 
 - **Double click:** Open
-- **Enter(macOS, 선택 상태, 편집 아님):** Rename(인라인 편집 시작)
+- **Enter(macOS, 선택 상태, 편집 아님):** Open
 - **Enter(Windows, 선택 상태, 편집 아님):** Open
 - **Enter(편집 중):** Rename 확정
 - **Esc(편집 중):** Rename 취소
@@ -83,13 +86,13 @@
 - `PageUp/PageDown` : 빠른 이동(선택)
 - `Cmd+O` / `Ctrl+O` : Open
 - `Cmd+Enter` / `Ctrl+Enter` : Reveal in Finder/Explorer
-- `Cmd+C` / `Ctrl+C` : Copy Path
+- `Alt+Cmd+C`(macOS) / `Ctrl+C`(Windows) : Copy Path; `Cmd+C`(macOS) : Copy Files
 - `Cmd+F` / `Ctrl+F` : 검색 입력 포커스
 - `Del` 또는 `Cmd+Backspace` : Move to Trash
 - `F2` : Rename
 - `Space` : Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` : 전체 선택
-- `Enter` : Open (Windows) / Rename (macOS)
+- `Enter` : Open (macOS / Windows)
 
 ### 2.4 우클릭 메뉴(필수)
 
@@ -116,7 +119,7 @@
 
 - 입력 후 결과 응답(백엔드): p95 < 30ms
 - UI 렌더 포함 체감: < 50ms
-- 반환 결과 제한: 기본 limit=300 (설정 가능 100~1000)
+- 반환 결과 제한: 기본 limit=500 (설정 가능 100~1000)
 
 ### 3.2 인덱싱
 
@@ -131,7 +134,7 @@
 
 ### 4.1 구성 요소
 
-- **Frontend(Svelte 5):** UI, 입력 이벤트, 가상 스크롤, 컨텍스트 메뉴, OverlayScrollbars
+- **Native UI(GPUI):** UI, 입력 이벤트, 가상 스크롤, 컨텍스트 메뉴, GPUI uniform_list / gpui-component Scrollbar
 - **Backend(Rust):**
   - 인덱서(스캔 + DB upsert)
     - macOS: jwalk 증분 2-pass 스캔
@@ -152,7 +155,7 @@
    - macOS: `$HOME` jwalk 스캔
    - Windows: `C:\` MFT 열거 (MemIndex로 즉시 검색 가능)
 2. 사용자가 검색 → Rust가 MemIndex 먼저 확인, 그 다음 SQLite LIKE 기반 다중 모드 쿼리 → 상위 N개 반환
-3. Svelte가 리스트 렌더
+3. GPUI가 네이티브 리스트 렌더
 4. 파일 변경 발생 → watcher 큐 → (경로 단위) upsert/delete 반영
    - macOS: FSEvents
    - Windows: USN 저널 / ReadDirectoryChangesW
@@ -163,7 +166,7 @@
 
 ### 5.1 DB 파일 위치
 
-- `AppDataDir/index.db` (Tauri app data dir)
+- `AppDataDir/index.db` (platform app data directory)
 
 ### 5.2 스키마(확정)
 
@@ -222,9 +225,9 @@
 
 ### 6.3 짧은 입력 최적화(필수 정책)
 
-- query 길이 0: 최근 항목/즐겨찾기(옵션) 또는 빈 화면
-- query 길이 1: 기본은 검색 수행하되 limit 낮춤(예: 100) + UI 디바운스(50ms)
-- query 길이 2 이상: 정상 limit(300)
+- query 길이 0: 기존 실행 화면과 동일하게 전체 인덱스 첫 페이지 표시
+- query 길이 1: 기본은 검색 수행하되 limit 낮춤(예: 100) + UI 스케줄링(200ms leading + trailing)
+- query 길이 2 이상: 정상 limit(500)
 
 ---
 
@@ -345,12 +348,12 @@
 
 ### 8.8 Rename
 
-Rename은 단일 선택 상태에서만 동작한다. F2는 양 플랫폼 공통. Enter는 macOS에서만 Rename 시작.
+Rename은 단일 선택 상태에서만 동작한다. F2는 양 플랫폼 공통. Enter는 양 플랫폼에서 Open.
 
 Rename은 파일 시스템 변경 + DB 갱신 + watcher 중복 억제까지 포함합니다.
 
 동작 정의:
-- F2 / Enter (macOS) → 인라인 편집
+- F2 → 인라인 편집
 - 편집 중 Enter → 확정
 - 확정 시:
   1. 새 이름 정합성 검사(빈 문자열 금지, 경로 구분자 금지)
@@ -382,7 +385,7 @@ Rename/Trash/Open 등 앱이 직접 수행한 작업은 watcher 이벤트로도 
 
 ---
 
-## 10. Tauri Command API(확정)
+## 10. Direct Rust UI API(확정)
 
 ### 10.1 Commands
 
@@ -405,7 +408,7 @@ Rename/Trash/Open 등 앱이 직접 수행한 작업은 watcher 이벤트로도 
 - `quick_look(path: String)` (macOS 전용)
 - `check_full_disk_access() -> bool` (macOS 전용)
 - `open_privacy_settings()` (macOS 전용)
-- `set_native_theme(theme: String)` (dark/light)
+- 시스템 테마 변경은 GPUI에서 직접 관측 (dark/light)
 - `mark_frontend_ready()` (프론트엔드 초기화 완료 신호)
 - `frontend_log(msg: String)` (디버그 로깅)
 
@@ -422,7 +425,7 @@ DTO 최소 필드(성능):
 
 ---
 
-## 11. 프론트엔드(Svelte 5) 구현 스펙
+## 11. 네이티브 UI(GPUI) 구현 스펙
 
 ### 11.1 상태 모델
 
@@ -442,16 +445,17 @@ DTO 최소 필드(성능):
 ### 11.2 입력 이벤트 처리(상태 머신)
 
 - 검색창 onInput:
-  - debounce 200ms (leading + trailing edge)
-  - `invoke('search', { query, limit, sort_by, sort_dir, include_total })`
+  - 200ms leading + trailing, identical to the Tauri baseline
+  - `search(..., &AppState)` on a background worker
 - 리스트 키다운:
-  - Enter (macOS): startRename() / Enter (Windows): openSelected()
+  - Enter (both platforms): openSelected()
   - 편집 중 Enter: rename 확정
   - F2: startRename()
   - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder
-  - Cmd+C / Ctrl+C: copy_paths
+  - macOS Cmd+C: copy_files; Alt+Cmd+C: copy_paths
+  - Windows Ctrl+C: copy_paths
   - Cmd+F / Ctrl+F: 검색 입력 포커스
   - Esc: 편집 취소
   - Double click row: open(path)
@@ -459,16 +463,16 @@ DTO 최소 필드(성능):
   - Shift+클릭: 범위 선택
   - Cmd+클릭 / Ctrl+클릭: 토글 선택
 - 우클릭:
-  - Windows: `invoke('show_context_menu', { paths, x, y })` (네이티브 Shell API)
-  - macOS: 커스텀 프론트엔드 컨텍스트 메뉴
+  - Windows: `win::context_menu::show(...)` (네이티브 Shell API)
+  - macOS: 기존 muda/AppKit 네이티브 컨텍스트 메뉴
 
 ### 11.3 가상 스크롤(필수)
 
 - 결과가 수백 개여도 부드럽게
-- row 높이 고정: 26px
-- 아이콘 캐시 (최대 500개)
+- row 높이 고정: 27px
+- 아이콘 캐시 (최대 512개)
 - 하이라이트 캐시 (최대 300개)
-- OverlayScrollbars로 스타일 스크롤바
+- GPUI uniform_list / gpui-component Scrollbar로 스타일 스크롤바
 
 ### 11.4 인라인 Rename UI(필수)
 
@@ -494,13 +498,13 @@ DTO 최소 필드(성능):
 - 캐시 키: 확장자 문자열 (예: "pdf", "txt", "app")
 - 폴더: 별도 폴더 아이콘 1개 캐시
 - 확장자 없는 파일: 기본 문서 아이콘 사용
-- 프론트엔드에서 `Map<string, dataURL>` 형태로 아이콘 캐시 유지 (최대 500개)
+- 프론트엔드에서 `HashMap<String, Arc<Image>>` 형태로 아이콘 캐시 유지 (최대 512개)
 
 ### 11.6 컬럼 헤더 정렬 UI
 
 - Name, Size, Modified 컬럼 헤더 클릭 시 정렬 전환
 - 현재 정렬 컬럼에 방향 표시: ▲(ASC) / ▼(DESC)
-- Path 컬럼은 정렬 미지원
+- Path 컬럼도 디렉토리 기준 정렬 지원
 
 ### 11.7 결과 컬럼
 
@@ -530,11 +534,11 @@ DTO 최소 필드(성능):
 
 ## 13. 설정(옵션)
 
-- limit(기본 300)
+- limit(기본 500)
 - 숨김 파일 포함
 - 제외 패턴 편집 (`.pathignore`)
 - Trash 확인 다이얼로그 on/off
-- 테마 토글 (dark/light)
+- 시스템 테마 추종 (dark/light)
 
 ---
 
@@ -544,7 +548,7 @@ DTO 최소 필드(성능):
 1. SQLite 초기화 + entries 스키마 + 인덱스
 2. full scan 인덱서 (macOS: jwalk, Windows: MFT + WalkDir fallback)
 3. search command (LIKE 기반 다중 모드 + limit + ORDER BY)
-4. Svelte UI(검색창+결과+가상스크롤+파일아이콘)
+4. GPUI UI(검색창+결과+가상스크롤+파일아이콘)
 5. Double click open
 6. 상태바 index status
 7. 컬럼 헤더 정렬(Name/Size/Modified)
@@ -571,4 +575,4 @@ DTO 최소 필드(성능):
 22. Copy Files (macOS NSPasteboard)
 23. 인메모리 MemIndex (Windows, DB upsert 중 즉시 검색)
 24. Non-admin WalkDir fallback (Windows)
-25. 테마 토글 + 네이티브 테마 동기화
+25. 기존 시스템 테마 동기화(토글 없음)
