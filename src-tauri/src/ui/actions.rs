@@ -8,6 +8,7 @@ pub(super) enum UiAction {
     CopyPaths,
     CopyFiles,
     Trash,
+    TrashImmediately,
     Rename,
     QuickLook,
     Package,
@@ -149,6 +150,7 @@ impl EverythingView {
                 | UiAction::CopyFiles
                 | UiAction::QuickLook
                 | UiAction::Package
+                | UiAction::TrashImmediately
         ) && paths.is_empty()
         {
             return;
@@ -247,12 +249,11 @@ impl EverythingView {
                         crate::reset_index(sink, &backend).await?;
                         Ok(Outcome::Done)
                     }
-                    UiAction::Confirm => match confirm {
-                        Some(Modal::Trash(_)) => crate::move_to_trash(paths, sink, &backend)
+                    UiAction::TrashImmediately | UiAction::Confirm => {
+                        crate::move_to_trash(paths, sink, &backend)
                             .await
-                            .map(Outcome::Trash),
-                        _ => Ok(Outcome::Refresh),
-                    },
+                            .map(Outcome::Trash)
+                    }
                     _ => Ok(Outcome::Refresh),
                 }
             }
@@ -653,6 +654,12 @@ impl EverythingView {
                         window,
                         cx,
                     );
+                    true
+                }
+                "delete" | "backspace"
+                    if cfg!(target_os = "macos") && modifiers.platform && !input_focused =>
+                {
+                    self.action(UiAction::TrashImmediately, window, cx);
                     true
                 }
                 "delete" if !input_focused => {

@@ -1,7 +1,7 @@
 {
-  "binary": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/deps/everything-9da13177aac79960",
+  "binary": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
   "fixture": "/private/tmp/everything-gpui-validation",
-  "date": "2026-11-14T01:28:00+0900",
+  "date": "2026-11-14T01:42:16+0900",
   "passed": 14,
   "failed": 0,
   "cases": [
@@ -9,85 +9,85 @@
       "id": "UI-01",
       "title": "Startup focus, Korean committed text, clear input",
       "status": "pass",
-      "elapsedMs": 612.5527079999999
+      "elapsedMs": 623.407791
     },
     {
       "id": "UI-02",
       "title": "Name/case/space/Korean/glob/relative and absolute path/empty result",
       "status": "pass",
-      "elapsedMs": 2380.550416
+      "elapsedMs": 2372.3951669999997
     },
     {
       "id": "UI-03",
       "title": "Rapid replacement rejects stale results; single character cap",
       "status": "pass",
-      "elapsedMs": 501.3281660000004
+      "elapsedMs": 490.2917089999996
     },
     {
       "id": "UI-04",
       "title": "Actual keyboard scrolling and next-page load",
       "status": "pass",
-      "elapsedMs": 569.7952919999998
+      "elapsedMs": 448.77916699999963
     },
     {
       "id": "UI-05",
       "title": "Server sort, header drag resize, sort/resize hit testing",
       "status": "pass",
-      "elapsedMs": 466.60650000000015
+      "elapsedMs": 448.2606250000005
     },
     {
       "id": "UI-06",
       "title": "Mouse/keyboard multi-selection and real path/file pasteboard",
       "status": "pass",
-      "elapsedMs": 263.3088749999999
+      "elapsedMs": 491.33862500000004
     },
     {
       "id": "UI-07",
       "title": "Context menu keyboard navigation and Copy Path",
       "status": "pass",
-      "elapsedMs": 1208.7462910000006
+      "elapsedMs": 1165.8951250000005
     },
     {
       "id": "UI-08",
       "title": "Click Rename, stem selection, collision/empty/slash errors, success",
       "status": "pass",
-      "elapsedMs": 2874.432833000001
+      "elapsedMs": 2849.483875000001
     },
     {
       "id": "UI-14",
       "title": "macOS selected-click delay, F2 disabled, Escape/double-click/focus/activation cancellation",
       "status": "pass",
-      "elapsedMs": 3370.6925420000007
+      "elapsedMs": 3373.8964579999993
     },
     {
       "id": "UI-09",
-      "title": "Safe default Trash cancel, keyboard confirm, real filesystem removal and suppression",
+      "title": "Delete confirmation, immediate Cmd+Delete/Backspace single/multi Trash, text editing and result suppression",
       "status": "pass",
-      "elapsedMs": 637.6574589999997
+      "elapsedMs": 2417.160666999999
     },
     {
       "id": "UI-10",
       "title": "System light/dark, isolated Reset guard, minimum size and responsive confirmation",
       "status": "pass",
-      "elapsedMs": 762.2197919999998
+      "elapsedMs": 684.3408750000002
     },
     {
       "id": "UI-11",
       "title": "OS Open/Reveal/Quick Look requests on a fixture file",
       "status": "pass",
-      "elapsedMs": 566.6382910000003
+      "elapsedMs": 339.11345900000003
     },
     {
       "id": "UI-12",
       "title": "Column/window persistence and no size growth across two restarts",
       "status": "pass",
-      "elapsedMs": 709.0908750000011
+      "elapsedMs": 767.8470419999996
     },
     {
       "id": "UI-13",
       "title": "First-run modal keyboard trap, Later choice and dismissible FDA banner",
       "status": "pass",
-      "elapsedMs": 579.2632910000002
+      "elapsedMs": 606.2970000000014
     }
   ]
 }

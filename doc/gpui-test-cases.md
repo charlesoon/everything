@@ -26,7 +26,7 @@ python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-ui-fixture \
 | UI-06 | Cmd/Shift 마우스 선택, Shift 방향키, 전체 선택, 실제 경로/파일 pasteboard | 통과 |
 | UI-07 | 실제 macOS 네이티브 메뉴 열기, 방향키로 Copy Path 선택, clipboard 확인 | 통과 |
 | UI-08 | 선택한 항목 다시 클릭으로 이름 변경, 확장자 제외 선택, 충돌·빈 이름·슬래시 오류, Enter/포커스 이탈 확정, 실제 파일 내용/경로 확인 | 통과 |
-| UI-09 | 휴지통 기본 Cancel, Tab+Enter 확인, 실제 삭제와 pending-trash 결과 억제 | 통과 |
+| UI-09 | 일반 Delete 기본 Cancel·Tab+Enter 확인, Cmd+Delete/Backspace 단일·다중 항목 즉시 휴지통 이동, 입력창 텍스트 삭제와 pending-trash 결과 억제 | 통과 |
 | UI-10 | 앱에만 적용한 시스템 light/dark, fixture Reset 차단, 400×300 창과 확인창 | 통과 |
 | UI-11 | Enter/Cmd+O 열기, Cmd+Enter 표시, Space Quick Look의 OS 요청 완료 | 통과 |
 | UI-12 | 컬럼/창 크기 저장, 두 번 재시작 후 크기 증가 없음 | 통과 |
@@ -60,11 +60,13 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 후속 병합에서는 `npm test -- --release --features ui-automation -j4`와 전체 Rust 테스트를 다시 실행했다. 추가된 네이티브 휴지통 테스트도 명시적으로 실행해 **1 통과**를 확인했다. 고유한 이름의 임시 파일 여러 개와 하위 파일이 있는 폴더를 휴지통으로 옮긴 뒤 복원·정리한다. 첫 UI 실행에서는 UI-01의 시작 직후 문자 입력이 한 번 실패했고, 포커스 구현 변경 없이 독립 실행 6회에서 재현되지 않았다. 이후 전체 UI suite를 재실행했다. [병합 검증 기록](gpui-evidence/merge-results.json)에 결과와 이력을 기록했다.
 
+Cmd+Delete 즉시 휴지통 이동 변경 후에도 `npm test`, 전체 Rust 테스트 **136 통과**와 UI suite **14 통과**를 확인했다. UI-09는 두 Command 단축키의 단일·다중 항목 이동, 확인창 부재와 삭제 결과 억제를 검사한다. 검색창과 이름 편집에서는 Command 단축키가 텍스트만 삭제하는지도 확인했다.
+
 Tauri/GPUI의 실제 production search engine에 동일한 36개 케이스를 넣고 반환 경로 전체, 결과 수와 mode를 비교했다. **36개 모두 일치**한다. 케이스당 warmup 3회 후 10회 측정했다. [측정 보고서](gpui-performance.md)와 [원시 검색 결과](gpui-evidence/performance/gpui-engine.json)를 참고한다.
 
 ## macOS 배포 패키지
 
-병합 전 `0.6.0` 소스를 기본 기능의 production release로 빌드해 `.app`과 arm64 DMG를 만들었다. `ui-automation`을 넣은 성능 측정 바이너리와 구분한다. 후속 병합의 검증 결과는 위 병합 검증 기록에 별도로 남겼다.
+macOS 파일 작업·이름 변경 병합과 Cmd+Delete 즉시 휴지통 이동을 반영한 `0.6.0` 소스를 기본 기능의 production release로 빌드해 `.app`과 arm64 DMG를 다시 만들었다. `ui-automation` 기능은 배포 패키지에 포함하지 않는다.
 
 ```sh
 python3 scripts/bundle_macos.py --dmg

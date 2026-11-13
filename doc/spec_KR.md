@@ -89,7 +89,8 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 - `Cmd+Enter` / `Ctrl+Enter` : Reveal in Finder/Explorer
 - `Alt+Cmd+C`(macOS) / `Ctrl+C`(Windows) : Copy Path; `Cmd+C`(macOS) : Copy Files
 - `Cmd+F` / `Ctrl+F` : 검색 입력 포커스
-- `Del` 또는 `Cmd+Backspace` : Move to Trash
+- `Cmd+Delete` / `Cmd+Backspace` (macOS) : 확인 없이 바로 휴지통으로 이동
+- `Del` : 확인 후 휴지통으로 이동
 - `F2` (Windows) : Rename
 - `Space` : Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` : 전체 선택
@@ -342,9 +343,9 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 
 ### 8.7 Move to Trash
 
-- 휴지통으로 이동 (`trash` 크레이트로 크로스 플랫폼 지원)
-- 기본: 확인 다이얼로그 ON
-- 다중 선택 시: "N개 항목을 휴지통으로 이동하시겠습니까?" 확인
+- 휴지통으로 이동 (macOS는 네이티브 NSFileManager, Windows는 `trash` 크레이트 사용)
+- macOS `Cmd+Delete` / `Cmd+Backspace`: 선택한 항목을 확인 다이얼로그 없이 바로 휴지통으로 이동
+- 일반 `Del`과 컨텍스트 메뉴: 다중 선택을 포함해 "N개 항목을 휴지통으로 이동하시겠습니까?" 확인
 - (Shift 누르면 확인 없이 삭제 같은 UX는 추후 옵션)
 
 ### 8.8 Rename

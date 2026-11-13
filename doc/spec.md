@@ -89,7 +89,8 @@ Multi-select:
 - `Cmd+Enter` / `Ctrl+Enter` — Reveal in Finder/Explorer
 - `Alt+Cmd+C` (macOS) / `Ctrl+C` (Windows) — Copy Path; `Cmd+C` (macOS) — Copy Files
 - `Cmd+F` / `Ctrl+F` — Focus search input
-- `Del` or `Cmd+Backspace` — Move to Trash
+- `Cmd+Delete` / `Cmd+Backspace` (macOS) — Move to Trash immediately
+- `Del` — Confirm Move to Trash
 - `F2` (Windows) — Rename
 - `Space` — Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` — Select all
@@ -342,9 +343,9 @@ Options:
 
 ### 8.7 Move to Trash
 
-- Move to Trash / Recycle Bin (uses `trash` crate for cross-platform support)
-- Default: confirmation dialog ON
-- Multi-select: "Move N items to Trash?" confirmation
+- Move to Trash / Recycle Bin (native NSFileManager on macOS; `trash` crate on Windows)
+- macOS `Cmd+Delete` / `Cmd+Backspace`: move selected items to Trash without a confirmation dialog
+- Plain `Del` and the context menu: confirmation dialog ON, including multi-select ("Move N items to Trash?")
 - (Shift to skip confirmation is a future option)
 
 ### 8.8 Rename

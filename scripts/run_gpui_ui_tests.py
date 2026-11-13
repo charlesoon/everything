@@ -241,7 +241,7 @@ def run(binary, fixture, output):
                 s=d.wait(lambda s:not s['actionBusy'] and (s['toast'] or '')!='Renamed')
                 assert s['renamePath'] is not None,s
                 capture('08-rename-collision')
-                d.key('cmd-a');d.key('backspace');d.key('enter')
+                d.key('cmd-a');d.key('cmd-backspace');d.key('enter')
                 d.wait(lambda s:s['renameValue']=='' and not s['actionBusy'])
                 assert d.state()['renamePath'] is not None
                 d.key('cmd-a');d.text('bad/name.txt');d.key('enter')
@@ -301,7 +301,13 @@ def run(binary, fixture, output):
 
             def trash():
                 selected_one('gpui-tc-trash.txt')
+                d.key('cmd-f')
                 d.key('cmd-backspace')
+                s=d.wait(lambda s:s['query']=='' and not s['busy'])
+                assert s['modal'] is None and (files/'gpui-tc-trash.txt').exists(),s
+
+                selected_one('gpui-tc-trash.txt')
+                d.key('delete')
                 d.wait(lambda s:s['modal']=='trash')
                 d.key('enter')
                 d.wait(lambda s:s['modal'] is None)
@@ -314,7 +320,36 @@ def run(binary, fixture, output):
                 assert not (files/'gpui-tc-trash.txt').exists(),s
                 query('gpui-tc-',3,3)
                 assert all(r['name']!='gpui-tc-trash.txt' for r in d.state()['rows'])
-            case('UI-09','Safe default Trash cancel, keyboard confirm, real filesystem removal and suppression',trash)
+
+                def restore_trash_file():
+                    (files/'gpui-tc-trash.txt').write_bytes(originals['gpui-tc-trash.txt'])
+                    # Change the query so a fresh search retires the restored
+                    # path's pending-trash tombstone before the next assertion.
+                    query('gpui-tc-trash')
+
+                def immediately_trashed(s,remaining):
+                    assert s['modal'] is None,s
+                    return not s['actionBusy'] and s['completedAction']=='TrashImmediately' and s['loaded']==remaining and not s['selected']
+
+                restore_trash_file()
+                selected_one('gpui-tc-trash.txt')
+                d.key('cmd-backspace')
+                s=d.wait(lambda s:immediately_trashed(s,0))
+                assert not (files/'gpui-tc-trash.txt').exists(),s
+                capture('09-trash-immediate')
+                query('gpui-tc-',3,3)
+
+                restore_trash_file()
+                query('gpui-tc-',4,4)
+                d.click(90,174)
+                d.click(90,201,modifiers=['cmd'])
+                d.wait(lambda s:len(s['selected'])==2)
+                d.key('cmd-delete')
+                s=d.wait(lambda s:immediately_trashed(s,2))
+                assert not (files/'gpui-tc-rename.txt').exists(),s
+                assert not (files/'gpui-tc-trash.txt').exists(),s
+                query('gpui-tc-',2,2)
+            case('UI-09','Delete confirmation, immediate Cmd+Delete/Backspace single/multi Trash, text editing and result suppression',trash)
 
             def themes_and_dialog():
                 for theme in ['light','dark']:

@@ -72,7 +72,8 @@ tests use temporary fixtures.
 | Alt+Cmd+C (macOS) / Ctrl+C (Windows) | Copy Path |
 | Cmd+Shift+C | Copy Files (macOS) |
 | Space | Quick Look (macOS) |
-| Delete, Cmd+Backspace | Confirm Move to Trash |
+| Cmd+Delete / Cmd+Backspace (macOS) | Move to Trash immediately |
+| Delete | Confirm Move to Trash |
 | Escape | Cancel editing/menu/dialog, clear selection |
 
 Search inputs keep their normal text selection and clipboard shortcuts.

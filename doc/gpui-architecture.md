@@ -34,8 +34,12 @@ File actions call the shared Rust APIs on worker threads. The existing read-only
 GUI rule remains: rename/trash change the filesystem; the daemon/service updates
 the index. Pending-trash tombstones hide a removed subtree while that update is
 in flight. A failed rename retains its input. Trash reports successes and
-individual failures. Dialog keyboard handling traps normal shortcuts, defaults
-to Cancel and supports Tab/arrows, Enter/Space and Escape. The macOS menu uses the same muda/AppKit implementation and separators as Tauri; Windows uses the existing Explorer Shell menu directly.
+individual failures. macOS Cmd+Delete/Backspace moves the selection to Trash
+immediately; plain Delete and the context menu ask for confirmation. Dialog
+keyboard handling traps normal shortcuts, defaults to Cancel and supports
+Tab/arrows, Enter/Space and Escape. The macOS menu uses the same muda/AppKit
+implementation and separators as Tauri; Windows uses the existing Explorer
+Shell menu directly.
 
 The text input and rename editor use gpui-component InputState for selection,
 clipboard and IME integration. Table shortcuts apply when the table has focus.
