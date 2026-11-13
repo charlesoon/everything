@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "everything"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "chrono",
  "fs2",
@@ -880,6 +880,7 @@ dependencies = [
  "libc",
  "notify",
  "objc2",
+ "objc2-app-kit",
  "objc2-foundation",
  "objc2-service-management",
  "parking_lot",

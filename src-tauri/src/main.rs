@@ -24,6 +24,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 mod fd_search;
+mod file_actions;
 mod daemon;
 #[cfg(target_os = "macos")]
 mod daemon_ipc;
@@ -35,6 +36,7 @@ mod mem_search;
 mod pathindexing;
 mod query;
 mod rescan;
+mod ui_gate;
 #[cfg(target_os = "windows")]
 mod win;
 use fd_search::{FdSearchCache, FdSearchResultDto};
@@ -2450,7 +2452,21 @@ pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppRe
     Ok(deleted)
 }
 
+// Every `index_*` emit runs through the visibility gate: Tauri delivers events
+// by evaluating JS in the page, which on macOS wakes a WebContent process
+// WebKit has suspended, only for it to be re-suspended (and its layer tree
+// re-hidden) before it can paint. While the page reports itself hidden the
+// payload is held and flushed on the way back. See `ui_gate`.
+
 pub(crate) fn emit_index_state(app: &AppHandle, state: &str, message: Option<String>) {
+    if !ui_gate::is_visible() {
+        ui_gate::hold_state(state.to_string(), message);
+        return;
+    }
+    emit_index_state_now(app, state, message);
+}
+
+pub(crate) fn emit_index_state_now(app: &AppHandle, state: &str, message: Option<String>) {
     let is_catchup = message.as_ref().map_or(false, |m| m.starts_with("Catchup:"));
     let _ = app.emit(
         "index_state",
@@ -2468,6 +2484,19 @@ pub(crate) fn emit_index_updated(
     last_updated: i64,
     permission_errors: u64,
 ) {
+    if !ui_gate::is_visible() {
+        ui_gate::hold_updated(entries_count, last_updated, permission_errors);
+        return;
+    }
+    emit_index_updated_now(app, entries_count, last_updated, permission_errors);
+}
+
+pub(crate) fn emit_index_updated_now(
+    app: &AppHandle,
+    entries_count: u64,
+    last_updated: i64,
+    permission_errors: u64,
+) {
     let _ = app.emit(
         "index_updated",
         IndexUpdatedEvent {
@@ -2479,6 +2508,19 @@ pub(crate) fn emit_index_updated(
 }
 
 pub(crate) fn emit_index_progress(app: &AppHandle, scanned: u64, indexed: u64, current_path: String) {
+    if !ui_gate::is_visible() {
+        ui_gate::hold_progress(scanned, indexed, current_path);
+        return;
+    }
+    emit_index_progress_now(app, scanned, indexed, current_path);
+}
+
+pub(crate) fn emit_index_progress_now(
+    app: &AppHandle,
+    scanned: u64,
+    indexed: u64,
+    current_path: String,
+) {
     let _ = app.emit(
         "index_progress",
         IndexProgressEvent {
@@ -7772,37 +7814,9 @@ fn copy_paths(paths: Vec<String>) -> AppResult<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn copy_files_to_clipboard(paths: &[String]) -> AppResult<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let file_exprs: Vec<String> = paths
-        .iter()
-        .map(|p| {
-            let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("POSIX file \"{}\"", escaped)
-        })
-        .collect();
-    let script = if file_exprs.len() == 1 {
-        format!("set the clipboard to {}", file_exprs[0])
-    } else {
-        format!("set the clipboard to {{{}}}", file_exprs.join(", "))
-    };
-    let status = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Failed to copy files to clipboard".to_string());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 #[tauri::command]
 fn copy_files(paths: Vec<String>) -> AppResult<()> {
-    copy_files_to_clipboard(&paths)
+    mac::clipboard::copy_files(&paths)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -7878,39 +7892,46 @@ async fn move_to_trash(
     paths: Vec<String>,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> AppResult<()> {
+) -> AppResult<file_actions::TrashResult> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         // Windows/macOS (D4): the indexer service/daemon owns index.db (this
         // process is read-only) and reflects the deletion through its own
         // watcher, so the GUI performs only the filesystem operation and keeps
         // no recent-ops cache. Linux still reflects the change in the DB here.
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let mut deleted_targets = Vec::new();
-
-        for path in &paths {
-            trash::delete(path).map_err(|e| e.to_string())?;
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                remember_op(&state, "trash", Some(path.clone()), None);
-                deleted_targets.push(path.clone());
-            }
-        }
+        let result = file_actions::move_to_trash(&paths);
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
+            for path in &result.removed_paths {
+                remember_op(&state, "trash", Some(path.clone()), None);
+            }
             let mut conn = db_connection(&state.db_path)?;
-            let _ = delete_paths(&mut conn, &deleted_targets)?;
+            let _ = delete_paths(&mut conn, &result.removed_paths)?;
             invalidate_search_caches(&state);
             refresh_and_emit_status_counts(Some(&app), &state)?;
         }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let _ = (&app, &state);
 
-        Ok(())
+        Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_pending_trash_paths(
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<String>> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db_connection_for_search(&state.db_path)?;
+        file_actions::pending_trash_paths(&conn, &paths)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -8121,6 +8142,20 @@ fn mark_frontend_ready(state: State<'_, AppState>) {
     if cfg!(debug_assertions) {
         eprintln!("[startup] frontend_ready=true");
     }
+}
+
+/// Frontend `visibilitychange` relay. Closing the gate keeps `index_*` emits
+/// from waking a webview macOS has suspended; opening it flushes what was held.
+#[tauri::command]
+fn set_webview_visible(app: AppHandle, visible: bool) {
+    ui_gate::set_visible(&app, visible);
+}
+
+/// Answer to `ui_repaint_probe`, sent from inside a `requestAnimationFrame` so
+/// it proves the page rendered a frame — not merely that its JS ran.
+#[tauri::command]
+fn note_webview_painted(seq: u64) {
+    ui_gate::note_painted(seq);
 }
 
 #[tauri::command]
@@ -9252,6 +9287,14 @@ pub fn run() {
     }
 
     builder
+        .on_window_event(|window, event| {
+            // Focus is the one signal that survives the failure in `ui_gate`:
+            // it is an AppKit key-window event, not the window-occlusion state
+            // WebKit had stopped re-evaluating while the window sat blank.
+            if let tauri::WindowEvent::Focused(true) = event {
+                ui_gate::on_window_focused(window.app_handle());
+            }
+        })
         .on_page_load(|window, payload| {
             eprintln!(
                 "[startup/page +{}ms] on_page_load label={} event={:?} url={}",
@@ -9281,6 +9324,7 @@ pub fn run() {
             copy_paths,
             copy_files,
             move_to_trash,
+            get_pending_trash_paths,
             rename,
             get_file_icons,
             get_platform,
@@ -9288,6 +9332,8 @@ pub fn run() {
             set_native_theme,
             frontend_log,
             mark_frontend_ready,
+            set_webview_visible,
+            note_webview_painted,
             check_full_disk_access,
             open_privacy_settings,
             open_login_items_settings,
