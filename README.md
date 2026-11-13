@@ -55,6 +55,10 @@ Node is optional. Existing npm entry points are dependency-free aliases:
 Legacy HOME/production-index stress benchmarks require `--ignored`; normal
 tests use temporary fixtures.
 
+Pushes to `gpui-ui` run [Windows Build](https://github.com/charlesoon/everything/actions/workflows/windows.yml),
+which tests the release build and uploads the executable and NSIS installer as
+the `everything-windows-x64` artifact.
+
 ## Shortcuts
 
 | Shortcut | Action |
