@@ -73,7 +73,9 @@ tests use temporary fixtures.
 | Cmd+Shift+C | Copy Files (macOS) |
 | Space | Quick Look (macOS) |
 | Cmd+Delete / Cmd+Backspace (macOS) | Move to Trash immediately |
-| Delete | Confirm Move to Trash |
+| Delete (macOS) | Confirm Move to Trash |
+| Delete (Windows) | Move to Recycle Bin without confirmation |
+| Shift+Delete (Windows) | Permanently delete without confirmation |
 | Escape | Cancel editing/menu/dialog, clear selection |
 
 Search inputs keep their normal text selection and clipboard shortcuts.
@@ -88,6 +90,7 @@ Confirmation dialogs default to Cancel; Tab/arrow keys select an action.
 - [Migration plan](doc/gpui-migration-plan.md)
 - [Native architecture](doc/gpui-architecture.md)
 - [Test cases and results](doc/gpui-test-cases.md)
+- [Windows native verification](doc/gpui-windows-validation.md)
 - [Performance comparison](doc/gpui-performance.md)
 
 Product specs remain in `doc/spec.md` and `doc/spec_KR.md`. Migration decisions,

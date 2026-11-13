@@ -90,7 +90,8 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 - `Alt+Cmd+C`(macOS) / `Ctrl+C`(Windows) : Copy Path; `Cmd+C`(macOS) : Copy Files
 - `Cmd+F` / `Ctrl+F` : 검색 입력 포커스
 - `Cmd+Delete` / `Cmd+Backspace` (macOS) : 확인 없이 바로 휴지통으로 이동
-- `Del` : 확인 후 휴지통으로 이동
+- `Delete` (macOS) : 확인 후 휴지통으로 이동
+- Windows: `Delete`는 확인 없이 휴지통으로 이동, `Shift+Delete`는 확인 없이 영구 삭제.
 - `F2` (Windows) : Rename
 - `Space` : Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` : 전체 선택
@@ -334,7 +335,7 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 - 경로를 클립보드에 복사
 - 단일 선택: 해당 경로 1줄
 - 다중 선택: 각 경로를 개행(LF, `\n`)으로 구분하여 복사
-- macOS: `pbcopy`, Windows: `cmd /C clip`, Linux: `wl-copy` / `xclip` / `xsel`
+- macOS: `pbcopy`, Windows: Win32 `CF_UNICODETEXT`, Linux: `wl-copy` / `xclip` / `xsel`
 
 ### 8.6 Copy Files (macOS 전용)
 
@@ -345,8 +346,9 @@ GPUI runtime contracts: [native architecture](gpui-architecture.md), [migration 
 
 - 휴지통으로 이동 (macOS는 네이티브 NSFileManager, Windows는 `trash` 크레이트 사용)
 - macOS `Cmd+Delete` / `Cmd+Backspace`: 선택한 항목을 확인 다이얼로그 없이 바로 휴지통으로 이동
-- 일반 `Del`과 컨텍스트 메뉴: 다중 선택을 포함해 "N개 항목을 휴지통으로 이동하시겠습니까?" 확인
-- (Shift 누르면 확인 없이 삭제 같은 UX는 추후 옵션)
+- Windows 키보드: `Delete`는 확인창 없이 휴지통으로 이동하고, `Shift+Delete`는 확인창 없이 영구 삭제한다.
+- macOS의 일반 `Delete`와 컨텍스트 메뉴는 다중 선택을 포함해 확인창을 표시하며 기본 선택은 취소다.
+- 두 삭제 방식 모두 다중 파일·폴더 선택, 중복 하위 항목 제거, 항목별 실패 보고를 지원한다.
 
 ### 8.8 Rename
 

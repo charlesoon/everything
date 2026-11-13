@@ -7,7 +7,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
         Arc, OnceLock,
@@ -28,6 +28,8 @@ mod ui_prefs;
 mod ui_search_bench;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(not(target_os = "windows"))]
+use std::process::Stdio;
 mod daemon;
 #[cfg(target_os = "macos")]
 mod daemon_ipc;
@@ -7797,6 +7799,7 @@ fn reveal_in_finder_impl(paths: Vec<String>) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn copy_with_command(program: &str, args: &[&str], text: &str) -> AppResult<()> {
     let mut child = Command::new(program)
         .args(args)
@@ -7830,7 +7833,7 @@ fn copy_text_to_clipboard(text: &str) -> AppResult<()> {
 
 #[cfg(target_os = "windows")]
 fn copy_text_to_clipboard(text: &str) -> AppResult<()> {
-    copy_with_command("cmd", &["/C", "clip"], text)
+    win::clipboard::copy_text(text)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -9192,14 +9195,14 @@ mod tests {
         // collapse they would be the whole rescan set instead of one prefix.
         assert_eq!(
             denied_prefix_for(Path::new("/Users/u/Library/Containers/com.a.b/Data"), home),
-            "/Users/u/Library/Containers"
+            "/Users/u/Library/Containers".replace('/', std::path::MAIN_SEPARATOR_STR)
         );
         assert_eq!(
             denied_prefix_for(
                 Path::new("/Users/u/Library/Group Containers/ABC.com.x/Library"),
                 home
             ),
-            "/Users/u/Library/Group Containers"
+            "/Users/u/Library/Group Containers".replace('/', std::path::MAIN_SEPARATOR_STR)
         );
         // Already at or above the depth cap: kept whole.
         assert_eq!(
@@ -9227,7 +9230,7 @@ mod tests {
         }
         assert_eq!(
             denied.lock().iter().cloned().collect::<Vec<_>>(),
-            vec!["/Users/u/Library/Containers".to_string()],
+            vec!["/Users/u/Library/Containers".replace('/', std::path::MAIN_SEPARATOR_STR)],
             "per-app denials must collapse onto one prefix"
         );
         for i in 0..DENIED_PREFIX_LIMIT * 2 {
@@ -9470,7 +9473,7 @@ mod tests {
             !should_skip_path(Path::new(root), roots, patterns),
             "test root {root} must itself be vetted"
         );
-        let mut dir = root.to_string();
+        let mut dir = normalize_slashes(root.to_string());
         let mut scratch = String::new();
         for (depth, name) in segments.iter().enumerate() {
             let child = Path::new(&dir).join(name);
@@ -9485,7 +9488,7 @@ mod tests {
             if fast {
                 return Some(depth);
             }
-            dir = child.to_string_lossy().to_string();
+            dir = normalize_slashes(child.to_string_lossy().to_string());
         }
         None
     }

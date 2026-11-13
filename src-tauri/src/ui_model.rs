@@ -167,15 +167,18 @@ impl SearchModel {
 pub(crate) fn fixture_runtime(
     dir: &Path,
 ) -> AppResult<(AppState, EventSink, async_channel::Receiver<()>)> {
-    if std::env::var_os("EVERYTHING_DATA_DIR").is_none() {
-        return Err("EVERYTHING_UI_TEST requires an isolated EVERYTHING_DATA_DIR".into());
-    }
+    let fixture_data = std::env::var_os("EVERYTHING_DATA_DIR")
+        .ok_or("EVERYTHING_UI_TEST requires an isolated EVERYTHING_DATA_DIR")?;
+    // app_data_dir is canonicalized, which adds a verbatim \\?\ prefix on
+    // Windows. Keep the fixture home in the same spelling as its indexed paths.
+    let fixture_data = std::path::absolute(fixture_data).map_err(|e| e.to_string())?;
     let db_path = dir.join(crate::DB_FILE_NAME);
     if !db_path.is_file() {
         return Err(format!("Fixture index missing: {}", db_path.display()));
     }
     crate::set_db_readonly();
-    let state = crate::build_app_state(db_path, dir.parent().unwrap_or(dir).join("files"), dir);
+    let home = fixture_data.parent().unwrap_or(dir).join("files");
+    let state = crate::build_app_state(db_path, home, dir);
     state.db_ready.store(true, Ordering::Release);
     state.frontend_ready.store(true, Ordering::Release);
     let conn = crate::db_connection_for_search(&state.db_path)?;

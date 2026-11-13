@@ -922,6 +922,8 @@ mod tests {
             ("/home/u/notes.txt", "notes.txt", "/home/u", 0, Some("txt")),
         ];
         for (i, (path, name, dir, is_dir, ext)) in rows.iter().enumerate() {
+            let path = path.replace('/', std::path::MAIN_SEPARATOR_STR);
+            let dir = dir.replace('/', std::path::MAIN_SEPARATOR_STR);
             conn.execute(
                 "INSERT INTO entries(path, name, dir, is_dir, ext, mtime, size, indexed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
@@ -1012,8 +1014,8 @@ mod tests {
 
         let (text, is_error) = call_search(&mut server, json!({ "query": "report" }));
         assert!(!is_error);
-        assert!(text.contains("/home/u/docs/report.pdf"));
-        assert!(text.contains("/home/u/docs/report_final.pdf"));
+        assert!(text.contains(&"/home/u/docs/report.pdf".replace('/', std::path::MAIN_SEPARATOR_STR)));
+        assert!(text.contains(&"/home/u/docs/report_final.pdf".replace('/', std::path::MAIN_SEPARATOR_STR)));
 
         let (text, _) = call_search(&mut server, json!({ "query": "report*.pdf" }));
         assert!(text.contains("mode: glob"));
@@ -1025,12 +1027,12 @@ mod tests {
 
         let (text, _) = call_search(&mut server, json!({ "query": "docs/report" }));
         assert!(text.contains("mode: path"));
-        assert!(text.contains("/home/u/docs/report.pdf"));
+        assert!(text.contains(&"/home/u/docs/report.pdf".replace('/', std::path::MAIN_SEPARATOR_STR)));
         assert!(!text.contains("main.rs"));
 
         // Directory entries are marked with a trailing separator.
         let (text, _) = call_search(&mut server, json!({ "query": "docs" }));
-        let dir_line = format!("/home/u/docs{}", std::path::MAIN_SEPARATOR);
+        let dir_line = "/home/u/docs/".replace('/', std::path::MAIN_SEPARATOR_STR);
         assert!(text.contains(&dir_line));
 
         let (text, is_error) = call_search(&mut server, json!({ "query": "zzz_nothing" }));

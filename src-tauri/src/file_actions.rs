@@ -31,10 +31,35 @@ pub(crate) fn move_to_trash(paths: &[String]) -> TrashResult {
         context
     };
 
-    trash_paths_with(paths, |path| match context.delete(path) {
+    remove_paths_with(paths, |path| match context.delete(path) {
         Ok(()) => Ok(()),
         Err(_) if is_missing(Path::new(path)) => Ok(()),
         Err(error) => Err(error.to_string()),
+    })
+}
+
+/// Windows Shift+Delete: remove the sources directly, bypassing the Recycle Bin.
+/// Share subtree deduplication and per-item errors with normal Trash handling.
+pub(crate) fn delete_permanently(paths: &[String]) -> TrashResult {
+    remove_paths_with(paths, |path| {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::FileTypeExt;
+            if metadata.file_type().is_symlink_dir() {
+                return fs::remove_dir(path).map_err(|error| error.to_string());
+            }
+        }
+        if metadata.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        }
+        .map_err(|error| error.to_string())
     })
 }
 
@@ -42,13 +67,13 @@ fn is_missing(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
 }
 
-fn trash_paths_with(
+fn remove_paths_with(
     paths: &[String],
-    mut trash_path: impl FnMut(&str) -> AppResult<()>,
+    mut remove_path: impl FnMut(&str) -> AppResult<()>,
 ) -> TrashResult {
     let mut seen = HashSet::new();
     let mut targets: Vec<&String> = paths.iter().filter(|path| seen.insert(*path)).collect();
-    // A selected directory can contain other selected results. Trash it first
+    // A selected directory can contain other selected results. Remove it first
     // and count its descendants as removed instead of failing on missing files.
     targets.sort_by_key(|path| Path::new(path).components().count());
     let mut removed_dirs = Vec::new();
@@ -59,7 +84,7 @@ fn trash_paths_with(
             .iter()
             .any(|dir| Path::new(path).starts_with(dir));
         let is_dir = fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
-        let outcome = if covered { Ok(()) } else { trash_path(path) };
+        let outcome = if covered { Ok(()) } else { remove_path(path) };
         match outcome {
             Ok(()) => {
                 if is_dir {
@@ -107,10 +132,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn permanent_delete_removes_files_and_subtrees_but_preserves_siblings() {
+        let root = crate::temp_case_dir("permanent_delete");
+        let folder = root.join("folder");
+        let child = folder.join("child.txt");
+        let sibling = root.join("folder-other").join("keep.txt");
+        let unicode = root.join("한글 École.txt");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        for path in [&child, &sibling, &unicode] {
+            fs::write(path, "fixture content").unwrap();
+        }
+        let paths: Vec<String> = [&child, &folder, &folder, &unicode, &root.join("missing")]
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert!(root.is_absolute() && paths.iter().all(|p| Path::new(p).starts_with(&root)));
+        let result = delete_permanently(&paths);
+        assert!(result.failures.is_empty(), "{result:?}");
+        assert_eq!(result.removed_paths.len(), 4);
+        assert!(!folder.exists() && !unicode.exists());
+        assert_eq!(fs::read_to_string(sibling).unwrap(), "fixture content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn permanent_delete_reports_locked_file_and_continues() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = crate::temp_case_dir("permanent_delete_locked");
+        fs::create_dir_all(&root).unwrap();
+        let locked = root.join("locked.txt");
+        let removable = root.join("removable.txt");
+        fs::write(&locked, "locked").unwrap();
+        fs::write(&removable, "removable").unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+        let paths = vec![
+            locked.to_string_lossy().into_owned(),
+            removable.to_string_lossy().into_owned(),
+        ];
+        assert!(root.is_absolute() && paths.iter().all(|p| Path::new(p).starts_with(&root)));
+        let result = delete_permanently(&paths);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].path, paths[0]);
+        assert_eq!(result.removed_paths, vec![paths[1].clone()]);
+        assert!(locked.exists() && !removable.exists());
+        drop(handle);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn trash_continues_after_failure_and_reports_each_result() {
         let paths = vec!["/locked.txt".into(), "/ok.txt".into(), "/other.txt".into()];
         let mut attempted = Vec::new();
-        let result = trash_paths_with(&paths, |path| {
+        let result = remove_paths_with(&paths, |path| {
             attempted.push(path.to_string());
             if path == "/locked.txt" {
                 Err("Permission denied".into())
@@ -133,7 +213,7 @@ mod tests {
         let child = dir.join("child.txt").to_string_lossy().into_owned();
         let sibling = root.join("folder-other").to_string_lossy().into_owned();
         let mut attempted = Vec::new();
-        let result = trash_paths_with(
+        let result = remove_paths_with(
             &[
                 child.clone(),
                 parent.clone(),

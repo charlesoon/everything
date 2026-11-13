@@ -76,6 +76,8 @@ python3 scripts/bundle_macos.py --dmg
 
 ## Windows 빌드 확인의 한계
 
+2026-11-14에 Windows 네이티브 빌드와 실제 창 검증을 추가로 완료했다. 최신 결과와 Windows 삭제 키 동작은 [Windows 검증 보고서](gpui-windows-validation.md)를 참고한다. 아래 내용은 이전 macOS 호스트에서 시도했던 교차 빌드 기록이다.
+
 이 Mac에 설치된 Rust `x86_64-pc-windows-msvc` target으로 다음 교차 검사를 시도했다.
 
 ```sh

@@ -51,7 +51,7 @@ class Driver:
             raise RuntimeError('No UI state file configured')
         for _ in range(20):
             try:
-                return json.loads(self.state_path.read_text())
+                return json.loads(self.state_path.read_text(encoding='utf-8'))
             except (FileNotFoundError, json.JSONDecodeError):
                 time.sleep(0.01)
         raise RuntimeError('UI state file is unavailable')
@@ -68,7 +68,7 @@ class Driver:
 
     def wait_query(self, text, **values):
         self.query(text)
-        return self.wait(lambda s: s['query'] == text and not s['busy'] and (s['totalKnown'] or not text), **values)
+        return self.wait(lambda s: s['query'] == text and not s['busy'] and s['totalKnown'], **values)
 
 
 if __name__ == '__main__':

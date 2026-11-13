@@ -282,15 +282,14 @@ mod tests {
         assert_eq!(deleted, 1, "a.txt removed");
 
         let paths = db_paths(&conn);
-        let root_str = root.to_string_lossy();
-        assert!(!paths.contains(&format!("{root_str}/a.txt")));
-        assert!(paths.contains(&format!("{root_str}/b.txt")));
-        assert!(paths.contains(&format!("{root_str}/c.txt")));
+        assert!(!paths.contains(&root.join("a.txt").to_string_lossy().to_string()));
+        assert!(paths.contains(&root.join("b.txt").to_string_lossy().to_string()));
+        assert!(paths.contains(&root.join("c.txt").to_string_lossy().to_string()));
 
         let keep_indexed_at: i64 = conn
             .query_row(
                 "SELECT indexed_at FROM entries WHERE path = ?1",
-                params![format!("{root_str}/keep.txt")],
+                params![root.join("keep.txt").to_string_lossy()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -299,7 +298,7 @@ mod tests {
         let b_size: i64 = conn
             .query_row(
                 "SELECT size FROM entries WHERE path = ?1",
-                params![format!("{root_str}/b.txt")],
+                params![root.join("b.txt").to_string_lossy()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -354,19 +353,21 @@ mod tests {
     fn subtree_diff_only_covers_prefix() {
         let conn = test_conn();
         conn.execute_batch(
-            "INSERT INTO entries(path, name, dir, is_dir, mtime, size, indexed_at) VALUES
+            &"INSERT INTO entries(path, name, dir, is_dir, mtime, size, indexed_at) VALUES
                 ('/t/sub', 'sub', '/t', 1, 1, NULL, 1),
                 ('/t/sub/file', 'file', '/t/sub', 0, 1, 1, 1),
-                ('/t/subling/file', 'file', '/t/subling', 0, 1, 1, 1);",
+                ('/t/subling/file', 'file', '/t/subling', 0, 1, 1, 1);"
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
         )
         .unwrap();
 
-        let diff = SubtreeDiff::load(&conn, "/t/sub");
-        let mut vanished = diff.leftover_paths(&conn, "/t/sub");
+        let prefix = "/t/sub".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let diff = SubtreeDiff::load(&conn, &prefix);
+        let mut vanished = diff.leftover_paths(&conn, &prefix);
         vanished.sort();
         assert_eq!(
             vanished,
-            vec!["/t/sub".to_string(), "/t/sub/file".to_string()],
+            vec![prefix.clone(), Path::new(&prefix).join("file").to_string_lossy().to_string()],
             "sibling '/t/subling' must not be treated as part of the subtree"
         );
     }
@@ -375,19 +376,21 @@ mod tests {
     fn errored_prefixes_are_excluded_from_deletion() {
         let conn = test_conn();
         conn.execute_batch(
-            "INSERT INTO entries(path, name, dir, is_dir, mtime, size, indexed_at) VALUES
+            &"INSERT INTO entries(path, name, dir, is_dir, mtime, size, indexed_at) VALUES
                 ('/t/sub/locked', 'locked', '/t/sub', 1, 1, NULL, 1),
                 ('/t/sub/locked/file', 'file', '/t/sub/locked', 0, 1, 1, 1),
-                ('/t/sub/gone.txt', 'gone.txt', '/t/sub', 0, 1, 1, 1);",
+                ('/t/sub/gone.txt', 'gone.txt', '/t/sub', 0, 1, 1, 1);"
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
         )
         .unwrap();
 
-        let mut diff = SubtreeDiff::load(&conn, "/t/sub");
-        diff.mark_errored(Path::new("/t/sub/locked"));
-        let vanished = diff.leftover_paths(&conn, "/t/sub");
+        let prefix = "/t/sub".replace('/', std::path::MAIN_SEPARATOR_STR);
+        let mut diff = SubtreeDiff::load(&conn, &prefix);
+        diff.mark_errored(&Path::new(&prefix).join("locked"));
+        let vanished = diff.leftover_paths(&conn, &prefix);
         assert_eq!(
             vanished,
-            vec!["/t/sub/gone.txt".to_string()],
+            vec![Path::new(&prefix).join("gone.txt").to_string_lossy().to_string()],
             "rows under an unreadable prefix must be kept, not deleted"
         );
     }

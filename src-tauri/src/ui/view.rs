@@ -431,7 +431,11 @@ impl EverythingView {
             .flex_shrink_0()
             .on_mouse_down(MouseButton::Left, |event, window, _| {
                 if event.click_count == 2 {
-                    window.titlebar_double_click();
+                    if cfg!(target_os = "windows") {
+                        toggle_maximized(window);
+                    } else {
+                        window.titlebar_double_click();
+                    }
                 } else {
                     window.start_window_move();
                 }
@@ -464,7 +468,7 @@ impl EverythingView {
                         .h_full()
                         .flex()
                         .child(
-                            window_control("minimize", "everything/minimize.svg", false)
+                            window_control("minimize", "everything/minimize.svg", false, p.text)
                                 .on_click(|_, window, _| window.minimize_window()),
                         )
                         .child(
@@ -476,11 +480,12 @@ impl EverythingView {
                                     "everything/maximize.svg"
                                 },
                                 false,
+                                p.text,
                             )
-                            .on_click(|_, window, _| window.zoom_window()),
+                            .on_click(|_, window, _| toggle_maximized(window)),
                         )
                         .child(
-                            window_control("close", "everything/close.svg", true)
+                            window_control("close", "everything/close.svg", true, p.text)
                                 .on_click(|_, window, _| window.remove_window()),
                         ),
                 )
@@ -983,7 +988,33 @@ impl Render for EverythingView {
     }
 }
 
-fn window_control(id: &'static str, path: &'static str, close: bool) -> Stateful<Div> {
+fn toggle_maximized(window: &Window) {
+    // GPUI 0.2.2's Windows zoom() always maximizes; it cannot restore a window.
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows::Win32::{
+            Foundation::HWND,
+            UI::WindowsAndMessaging::{ShowWindowAsync, SW_MAXIMIZE, SW_RESTORE},
+        };
+        if let Ok(handle) = HasWindowHandle::window_handle(window) {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                let command = if window.is_maximized() {
+                    SW_RESTORE
+                } else {
+                    SW_MAXIMIZE
+                };
+                unsafe {
+                    let _ = ShowWindowAsync(HWND(handle.hwnd.get() as *mut _), command);
+                }
+                return;
+            }
+        }
+    }
+    window.zoom_window();
+}
+
+fn window_control(id: &'static str, path: &'static str, close: bool, color: Hsla) -> Stateful<Div> {
     div()
         .id(id)
         .w(px(46.))
@@ -999,7 +1030,7 @@ fn window_control(id: &'static str, path: &'static str, close: bool) -> Stateful
                 rgba(0x88888820)
             })
         })
-        .child(svg().path(path).size(px(12.)))
+        .child(svg().path(path).size(px(12.)).text_color(color))
 }
 
 impl EverythingView {

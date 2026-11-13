@@ -90,7 +90,8 @@ Multi-select:
 - `Alt+Cmd+C` (macOS) / `Ctrl+C` (Windows) — Copy Path; `Cmd+C` (macOS) — Copy Files
 - `Cmd+F` / `Ctrl+F` — Focus search input
 - `Cmd+Delete` / `Cmd+Backspace` (macOS) — Move to Trash immediately
-- `Del` — Confirm Move to Trash
+- `Delete` (macOS) — Confirm Move to Trash
+- Windows: `Delete` moves to the Recycle Bin without confirmation; `Shift+Delete` permanently deletes without confirmation.
 - `F2` (Windows) — Rename
 - `Space` — Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` — Select all
@@ -334,7 +335,7 @@ Options:
 - Copy path to clipboard
 - Single select: one path line
 - Multi-select: paths separated by newline (LF, `\n`)
-- macOS: `pbcopy`, Windows: `cmd /C clip`, Linux: `wl-copy` / `xclip` / `xsel`
+- macOS: `pbcopy`, Windows: Win32 `CF_UNICODETEXT`, Linux: `wl-copy` / `xclip` / `xsel`
 
 ### 8.6 Copy Files (macOS only)
 
@@ -345,8 +346,9 @@ Options:
 
 - Move to Trash / Recycle Bin (native NSFileManager on macOS; `trash` crate on Windows)
 - macOS `Cmd+Delete` / `Cmd+Backspace`: move selected items to Trash without a confirmation dialog
-- Plain `Del` and the context menu: confirmation dialog ON, including multi-select ("Move N items to Trash?")
-- (Shift to skip confirmation is a future option)
+- Windows keyboard: `Delete` moves the selection to the Recycle Bin without a dialog; `Shift+Delete` permanently deletes it without a dialog.
+- macOS plain `Delete` and the context menu: confirmation defaults to Cancel, including multi-select ("Move N items to Trash?").
+- Both deletion modes support multiple files and directories, skip duplicate descendants, and report per-item failures.
 
 ### 8.8 Rename
 

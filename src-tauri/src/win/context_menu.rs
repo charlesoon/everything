@@ -1,7 +1,6 @@
-use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
@@ -230,16 +229,10 @@ fn reveal_paths(paths: &[String]) {
 
 fn copy_paths_to_clipboard(paths: &[String]) {
     let text = paths.join("\r\n");
-    let child = Command::new("cmd")
-        .args(["/C", "clip"])
-        .stdin(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
-
-    if let Ok(mut child) = child {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+    // Share the Unicode-safe encoder with Ctrl+C, off the UI thread.
+    std::thread::spawn(move || {
+        if let Err(error) = crate::copy_text_to_clipboard(&text) {
+            eprintln!("[context_menu] Copy Path failed: {error}");
         }
-        let _ = child.wait();
-    }
+    });
 }

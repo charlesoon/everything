@@ -9,6 +9,7 @@ pub(super) enum UiAction {
     CopyFiles,
     Trash,
     TrashImmediately,
+    DeletePermanently,
     Rename,
     QuickLook,
     Package,
@@ -151,6 +152,7 @@ impl EverythingView {
                 | UiAction::QuickLook
                 | UiAction::Package
                 | UiAction::TrashImmediately
+                | UiAction::DeletePermanently
         ) && paths.is_empty()
         {
             return;
@@ -198,6 +200,14 @@ impl EverythingView {
                             .await
                             .map_err(|e| e.to_string())??;
                         Ok(Outcome::Message(format!("Copied {count} item(s)")))
+                    }
+                    UiAction::DeletePermanently => {
+                        crate::runtime::spawn_blocking(move || {
+                            crate::file_actions::delete_permanently(&paths)
+                        })
+                        .await
+                        .map(Outcome::Trash)
+                        .map_err(|error| error.to_string())
                     }
                     UiAction::Add => {
                         crate::runtime::spawn_blocking(move || crate::open_pathindexing(&backend))
@@ -267,7 +277,11 @@ impl EverythingView {
                     Ok(Outcome::Trash(result)) => {
                         this.model.remove_paths(&result.removed_paths);
                         let message = if result.failures.is_empty() {
-                            format!("Moved {} item(s) to Trash.", result.removed_paths.len())
+                            if matches!(action, UiAction::DeletePermanently) {
+                                format!("Deleted {} item(s) permanently.", result.removed_paths.len())
+                            } else {
+                                format!("Moved {} item(s) to Trash.", result.removed_paths.len())
+                            }
                         } else {
                             let first = &result.failures[0];
                             format!(
@@ -663,7 +677,16 @@ impl EverythingView {
                     true
                 }
                 "delete" if !input_focused => {
-                    self.action(UiAction::Trash, window, cx);
+                    let action = if cfg!(target_os = "windows") {
+                        if modifiers.shift {
+                            UiAction::DeletePermanently
+                        } else {
+                            UiAction::TrashImmediately
+                        }
+                    } else {
+                        UiAction::Trash
+                    };
+                    self.action(action, window, cx);
                     true
                 }
                 "backspace" if meta && !input_focused => {

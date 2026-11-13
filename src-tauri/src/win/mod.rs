@@ -1,3 +1,4 @@
+pub mod clipboard;
 pub mod com_guard;
 pub mod context_menu;
 pub mod dir_rescan;
