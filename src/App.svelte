@@ -77,6 +77,8 @@
   };
 
   let renameOverlay = { top: 0, left: 0, maxWidth: 0 };
+  let renameClickTimer = null;
+  let doubleClickIntervalMs = 500;
 
   let indexStatus = {
     state: 'Indexing',
@@ -584,6 +586,7 @@
   }
 
   function clearSelection() {
+    cancelPendingRename();
     selectedIndices = new Set();
     selectionAnchor = -1;
     lastSelectedIndex = -1;
@@ -607,12 +610,14 @@
   }
 
   function selectSingle(index) {
+    cancelPendingRename();
     selectedIndices = new Set([index]);
     selectionAnchor = index;
     lastSelectedIndex = index;
   }
 
   function selectToggle(index) {
+    cancelPendingRename();
     const next = new Set(selectedIndices);
     if (next.has(index)) {
       next.delete(index);
@@ -625,6 +630,7 @@
   }
 
   function selectRange(index) {
+    cancelPendingRename();
     const anchor = selectionAnchor >= 0 ? selectionAnchor : index;
     const [from, to] = [Math.min(anchor, index), Math.max(anchor, index)];
     const next = new Set();
@@ -890,6 +896,9 @@
   function handleRowClick(event, index) {
     contextMenu.visible = false;
     event.currentTarget?.focus({ preventScroll: true });
+    const renameOnClick = platform === 'macos' && event.detail === 1
+      && !event.altKey && !editing.active && !rowWasDragged
+      && selectedIndices.size === 1 && selectedIndices.has(index);
 
     if (event.shiftKey) {
       selectRange(index);
@@ -902,6 +911,15 @@
     }
 
     selectSingle(index);
+    if (renameOnClick) {
+      const path = results[index]?.path;
+      // Wait for macOS's double-click interval before treating this as rename.
+      renameClickTimer = setTimeout(() => {
+        renameClickTimer = null;
+        if (!editing.active && !trashDialogEl?.open && selectedIndices.size === 1
+          && primaryEntry()?.path === path) void startRename();
+      }, doubleClickIntervalMs + 50);
+    }
   }
 
   function handleRowContextMenu(event, index) {
@@ -935,6 +953,7 @@
   }
 
   async function handleRowA11yKeydown(event, index) {
+    cancelPendingRename();
     if (event.key === 'Enter') {
       if (event.metaKey || event.ctrlKey) return;
       event.preventDefault();
@@ -951,6 +970,7 @@
 
   const DRAG_THRESHOLD = 5;
   let dragCleanup = null;
+  let rowWasDragged = false;
   const dragImgCache = new Map();
 
   function dragPathsForIndex(index) {
@@ -1071,6 +1091,7 @@
   }
 
   function handleRowMouseDown(event, index) {
+    rowWasDragged = false;
     if (event.button !== 0) return;
     if (event.metaKey || event.ctrlKey || event.shiftKey) return;
     if (editing.active) return;
@@ -1088,6 +1109,7 @@
       if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
 
       dragging = true;
+      rowWasDragged = true;
       cleanup();
 
       if (!selectedIndices.has(index)) {
@@ -1115,6 +1137,7 @@
   }
 
   async function handleRowDoubleClick(index) {
+    cancelPendingRename();
     if (!selectedIndices.has(index) || selectedIndices.size > 1) {
       selectSingle(index);
       await tick();
@@ -1361,7 +1384,13 @@
     }
   }
 
+  function cancelPendingRename() {
+    clearTimeout(renameClickTimer);
+    renameClickTimer = null;
+  }
+
   async function startRename() {
+    cancelPendingRename();
     if (isMultiSelected()) {
       return;
     }
@@ -1505,6 +1534,7 @@
   }
 
   async function handleKeydown(event) {
+    cancelPendingRename();
     if (trashDialogEl?.open) return;
     const isMetaSelectAll = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a';
     const isMetaCopy = (event.metaKey || event.ctrlKey)
@@ -1581,7 +1611,7 @@
       return;
     }
 
-    if (event.key === 'F2') {
+    if (event.key === 'F2' && platform !== 'macos') {
       event.preventDefault();
       await startRename();
       return;
@@ -1776,6 +1806,7 @@
     platform = await step('invoke(get_platform)', () => invoke('get_platform'));
 
     if (platform === 'macos') {
+      doubleClickIntervalMs = await invoke('get_double_click_interval').catch(() => 500);
       onboarding = await invoke('get_onboarding_state').catch(() => null);
       if (onboarding && !onboarding.recorded) {
         // First run: the daemon idles in WaitingOnboarding (no build, no TCC
@@ -1963,6 +1994,7 @@
       let scrollTimeoutX = null;
 
       const onScroll = () => {
+        cancelPendingRename();
         scrollTop = osViewport.scrollTop;
         headerScrollLeft = osViewport.scrollLeft;
         if (editing.active) void commitRename();
@@ -2028,6 +2060,7 @@
   });
 
   onDestroy(async () => {
+    cancelPendingRename();
     resolveTrashDialog?.(false);
     clearTimeout(searchTimer);
     clearTimeout(toastTimer);
@@ -2058,7 +2091,12 @@
   });
 </script>
 
-<svelte:window on:keydown={handleKeydown} on:copy={handleCopy} />
+<svelte:window
+  on:keydown={handleKeydown}
+  on:copy={handleCopy}
+  on:mousedown|capture={cancelPendingRename}
+  on:blur={cancelPendingRename}
+/>
 
 <div class="app-shell" data-theme={theme} data-platform={platform}>
   <div class="title-bar" role="presentation" data-tauri-drag-region on:mousedown={onTitleBarMouseDown}>

@@ -642,7 +642,8 @@ DOM:
 | `↑` / `↓` | 선택 이동 (Shift: 범위 선택) |
 | `PageUp` / `PageDown` | 페이지 단위 이동 |
 | `Enter` | 선택한 파일 열기·실행 (macOS / Windows) |
-| `F2` | 인라인 이름 변경 시작 |
+| 선택한 항목을 잠시 후 다시 클릭 (macOS) | 인라인 이름 변경 시작; 더블클릭은 열기 |
+| `F2` (Windows) | 인라인 이름 변경 시작 |
 | `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | 선택 항목 열기 |
 | `Cmd+Enter` / `Ctrl+Enter` | Finder/Explorer에서 보기 |

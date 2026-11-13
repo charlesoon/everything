@@ -8114,6 +8114,18 @@ fn get_platform() -> String {
     }
 }
 
+#[tauri::command]
+fn get_double_click_interval() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        (objc2_app_kit::NSEvent::doubleClickInterval() * 1000.0).ceil() as u64
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        500
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[tauri::command]
 async fn show_context_menu(
@@ -9265,6 +9277,7 @@ pub fn run() {
             rename,
             get_file_icons,
             get_platform,
+            get_double_click_interval,
             show_context_menu,
             set_native_theme,
             frontend_log,

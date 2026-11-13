@@ -29,7 +29,7 @@ This document is the final implementation-ready design/spec for development with
   - Copy Path
   - Copy Files (macOS: NSPasteboard clipboard)
   - Move to Trash / Recycle Bin
-  - Rename (F2 cross-platform)
+  - Rename (macOS: click selected item again after a pause; Windows: F2)
   - Quick Look (macOS: Space key)
 
 ### 1.2 Non-Goals (not in this version)
@@ -63,6 +63,7 @@ This document is the final implementation-ready design/spec for development with
 ### 2.2 Input/Interaction Rules (finalized)
 
 - **Double click:** Open
+- **Click an already selected item again after a pause (macOS):** Rename. Wait for the system double-click interval before editing; another click, key press, drag, or scroll cancels the pending rename.
 - **Enter (macOS, selected, not editing):** Open
 - **Enter (Windows, selected, not editing):** Open
 - **Enter (while editing):** Confirm rename
@@ -86,7 +87,7 @@ Multi-select:
 - `Cmd+C` / `Ctrl+C` — Copy Path
 - `Cmd+F` / `Ctrl+F` — Focus search input
 - `Del` or `Cmd+Backspace` — Move to Trash
-- `F2` — Rename
+- `F2` (Windows) — Rename
 - `Space` — Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` — Select all
 - `Enter` — Open selected files (macOS / Windows)
@@ -345,12 +346,12 @@ Options:
 
 ### 8.8 Rename
 
-Rename only works in single-select mode. F2 starts rename on both platforms. Enter opens selected files while not editing.
+Rename only works in single-select mode. On macOS, click the selected item again after a pause to start rename; F2 does not start rename. F2 starts rename on Windows. Enter opens selected files while not editing.
 
 Rename includes filesystem change + DB update + watcher duplicate suppression.
 
 Behavior definition:
-- F2 -> inline edit
+- Click selected item again after a pause (macOS) / F2 (Windows) -> inline edit
 - Enter while editing -> confirm
 - On confirm:
   1. Validate new name (no empty string, no path separators)
@@ -447,7 +448,7 @@ DTO minimum fields (performance):
 - List keydown:
   - Enter (macOS / Windows): openSelected()
   - Enter while editing: confirm rename
-  - F2: startRename()
+  - Click selected item again after a pause (macOS) / F2 (Windows): startRename()
   - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder

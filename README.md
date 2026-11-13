@@ -82,7 +82,8 @@ npm run lint
 |----------|--------|
 | `Cmd+Shift+Space` | Global — Activate app / focus search (macOS) |
 | `Enter` | Open selected files (macOS / Windows) |
-| `F2` | Rename (inline edit) |
+| Click selected item again after a pause (macOS) | Rename (inline edit) |
+| `F2` (Windows) | Rename (inline edit) |
 | `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | Open |
 | `Cmd+Enter` / `Ctrl+Enter` | Reveal in Finder/Explorer |
