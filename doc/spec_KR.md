@@ -1,4 +1,4 @@
-아래 문서는 Tauri(v2) + Svelte로 바로 개발에 들어갈 수 있도록 정리한 최종 설계/스펙(implementation-ready) 입니다. (Quick Look 포함, "검색 속도" 최우선, macOS: Enter=Rename / Windows: Enter=Open, Double click=Open 반영)
+아래 문서는 Tauri(v2) + Svelte로 바로 개발에 들어갈 수 있도록 정리한 최종 설계/스펙(implementation-ready) 입니다. (Quick Look 포함, "검색 속도" 최우선, macOS / Windows: Enter=Open, Double click=Open 반영)
 
 ---
 
@@ -29,7 +29,7 @@
   - Copy Path
   - Copy Files (macOS: NSPasteboard 클립보드)
   - Move to Trash / 휴지통
-  - Rename (macOS: Enter, 공통: F2)
+  - Rename (공통: F2)
   - Quick Look (macOS: Space 키)
 
 ### 1.2 비목표(이번 버전에서 하지 않음)
@@ -63,7 +63,7 @@
 ### 2.2 입력/조작 규칙(확정)
 
 - **Double click:** Open
-- **Enter(macOS, 선택 상태, 편집 아님):** Rename(인라인 편집 시작)
+- **Enter(macOS, 선택 상태, 편집 아님):** Open
 - **Enter(Windows, 선택 상태, 편집 아님):** Open
 - **Enter(편집 중):** Rename 확정
 - **Esc(편집 중):** Rename 취소
@@ -89,7 +89,7 @@
 - `F2` : Rename
 - `Space` : Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` : 전체 선택
-- `Enter` : Open (Windows) / Rename (macOS)
+- `Enter` : 선택한 파일 열기·실행 (macOS / Windows)
 
 ### 2.4 우클릭 메뉴(필수)
 
@@ -345,12 +345,12 @@
 
 ### 8.8 Rename
 
-Rename은 단일 선택 상태에서만 동작한다. F2는 양 플랫폼 공통. Enter는 macOS에서만 Rename 시작.
+Rename은 단일 선택 상태에서만 동작한다. F2는 양 플랫폼 공통. 편집 중이 아닐 때 Enter는 선택한 파일을 열거나 실행한다.
 
 Rename은 파일 시스템 변경 + DB 갱신 + watcher 중복 억제까지 포함합니다.
 
 동작 정의:
-- F2 / Enter (macOS) → 인라인 편집
+- F2 → 인라인 편집
 - 편집 중 Enter → 확정
 - 확정 시:
   1. 새 이름 정합성 검사(빈 문자열 금지, 경로 구분자 금지)
@@ -445,13 +445,13 @@ DTO 최소 필드(성능):
   - debounce 200ms (leading + trailing edge)
   - `invoke('search', { query, limit, sort_by, sort_dir, include_total })`
 - 리스트 키다운:
-  - Enter (macOS): startRename() / Enter (Windows): openSelected()
+  - Enter (macOS / Windows): openSelected()
   - 편집 중 Enter: rename 확정
   - F2: startRename()
   - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder
-  - Cmd+C / Ctrl+C: copy_paths
+  - Cmd+C (macOS): 파일 복사; Cmd+Option+C (macOS) / Ctrl+C (Windows): 경로 복사
   - Cmd+F / Ctrl+F: 검색 입력 포커스
   - Esc: 편집 취소
   - Double click row: open(path)

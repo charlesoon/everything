@@ -34,6 +34,7 @@ export function computeSearchFetchLimit({
   return Math.min(target, MAX_PRESERVE_FETCH_LIMIT);
 }
 
-export function shouldApplyPreserveResults(entriesLength, viewportStart, viewportRows) {
-  return entriesLength >= (viewportStart + viewportRows + 1);
+export function shouldApplyPreserveResults(entriesLength, viewportStart) {
+  // Deletions can shrink the list below one viewport, including to zero.
+  return viewportStart === 0 || entriesLength > viewportStart;
 }

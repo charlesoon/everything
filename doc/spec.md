@@ -1,4 +1,4 @@
-This document is the final implementation-ready design/spec for development with Tauri (v2) + Svelte. (Quick Look excluded, "search speed" is top priority, Enter=Rename on macOS / Enter=Open on Windows, Double click=Open)
+This document is the final implementation-ready design/spec for development with Tauri (v2) + Svelte. (Quick Look excluded, "search speed" is top priority, Enter=Open on macOS and Windows, Double click=Open)
 
 ---
 
@@ -29,7 +29,7 @@ This document is the final implementation-ready design/spec for development with
   - Copy Path
   - Copy Files (macOS: NSPasteboard clipboard)
   - Move to Trash / Recycle Bin
-  - Rename (Enter on macOS, F2 cross-platform)
+  - Rename (F2 cross-platform)
   - Quick Look (macOS: Space key)
 
 ### 1.2 Non-Goals (not in this version)
@@ -63,7 +63,7 @@ This document is the final implementation-ready design/spec for development with
 ### 2.2 Input/Interaction Rules (finalized)
 
 - **Double click:** Open
-- **Enter (macOS, selected, not editing):** Rename (start inline edit)
+- **Enter (macOS, selected, not editing):** Open
 - **Enter (Windows, selected, not editing):** Open
 - **Enter (while editing):** Confirm rename
 - **Esc (while editing):** Cancel rename
@@ -89,7 +89,7 @@ Multi-select:
 - `F2` — Rename
 - `Space` — Quick Look (macOS)
 - `Cmd+A` / `Ctrl+A` — Select all
-- `Enter` — Open (Windows) / Rename (macOS)
+- `Enter` — Open selected files (macOS / Windows)
 
 ### 2.4 Right-Click Context Menu (required)
 
@@ -345,12 +345,12 @@ Options:
 
 ### 8.8 Rename
 
-Rename only works in single-select mode. F2 starts rename on both platforms. Enter starts rename on macOS only.
+Rename only works in single-select mode. F2 starts rename on both platforms. Enter opens selected files while not editing.
 
 Rename includes filesystem change + DB update + watcher duplicate suppression.
 
 Behavior definition:
-- F2 / Enter (macOS) -> inline edit
+- F2 -> inline edit
 - Enter while editing -> confirm
 - On confirm:
   1. Validate new name (no empty string, no path separators)
@@ -445,13 +445,13 @@ DTO minimum fields (performance):
   - Debounce 200ms (leading + trailing edge)
   - `invoke('search', { query, limit, sort_by, sort_dir, include_total })`
 - List keydown:
-  - Enter (macOS): startRename() / Enter (Windows): openSelected()
+  - Enter (macOS / Windows): openSelected()
   - Enter while editing: confirm rename
   - F2: startRename()
   - Space: Quick Look
   - Cmd+O / Ctrl+O: open(selected paths)
   - Cmd+Enter / Ctrl+Enter: reveal_in_finder
-  - Cmd+C / Ctrl+C: copy_paths
+  - Cmd+C (macOS): copy_files; Cmd+Option+C (macOS) / Ctrl+C (Windows): copy_paths
   - Cmd+F / Ctrl+F: focus search input
   - Esc: cancel edit
   - Double click row: open(path)

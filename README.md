@@ -81,12 +81,13 @@ npm run lint
 | Shortcut | Action |
 |----------|--------|
 | `Cmd+Shift+Space` | Global — Activate app / focus search (macOS) |
-| `Enter` | Open (Windows) / Rename (macOS) |
+| `Enter` | Open selected files (macOS / Windows) |
 | `F2` | Rename (inline edit) |
 | `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | Open |
 | `Cmd+Enter` / `Ctrl+Enter` | Reveal in Finder/Explorer |
-| `Cmd+C` / `Ctrl+C` | Copy Path |
+| `Cmd+C` (macOS) | Copy files |
+| `Cmd+Option+C` (macOS) / `Ctrl+C` (Windows) | Copy paths |
 | `Cmd+F` / `Ctrl+F` | Focus search input |
 | `Cmd+Backspace` / `Delete` | Move to Trash |
 | `↑` / `↓` | Navigate selection |

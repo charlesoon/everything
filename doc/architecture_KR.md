@@ -641,12 +641,13 @@ DOM:
 | `Escape` | 선택 해제, 검색 입력 포커스 / 이름 변경 취소 |
 | `↑` / `↓` | 선택 이동 (Shift: 범위 선택) |
 | `PageUp` / `PageDown` | 페이지 단위 이동 |
-| `Enter` | 열기 (Windows) / 인라인 이름 변경 시작 (macOS) |
+| `Enter` | 선택한 파일 열기·실행 (macOS / Windows) |
 | `F2` | 인라인 이름 변경 시작 |
 | `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | 선택 항목 열기 |
 | `Cmd+Enter` / `Ctrl+Enter` | Finder/Explorer에서 보기 |
-| `Cmd+C` / `Ctrl+C` | 경로 복사 |
+| `Cmd+C` (macOS) | 파일 복사 |
+| `Cmd+Option+C` (macOS) / `Ctrl+C` (Windows) | 경로 복사 |
 | `Cmd+A` / `Ctrl+A` | 전체 선택 |
 | `Cmd+F` / `Ctrl+F` | 검색 입력 포커스 |
 | `Delete` / `Cmd+⌫` | 휴지통 이동 |

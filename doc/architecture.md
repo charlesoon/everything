@@ -641,12 +641,13 @@ DOM:
 | `Escape` | Deselect, focus search input / cancel rename |
 | `Up` / `Down` | Move selection (Shift: range select) |
 | `PageUp` / `PageDown` | Page-level navigation |
-| `Enter` | Open (Windows) / Start inline rename (macOS) |
+| `Enter` | Open selected files (macOS / Windows) |
 | `F2` | Start inline rename |
 | `Space` | Quick Look (macOS) |
 | `Cmd+O` / `Ctrl+O` | Open selected items |
 | `Cmd+Enter` / `Ctrl+Enter` | Reveal in Finder/Explorer |
-| `Cmd+C` / `Ctrl+C` | Copy paths |
+| `Cmd+C` (macOS) | Copy files |
+| `Cmd+Option+C` (macOS) / `Ctrl+C` (Windows) | Copy paths |
 | `Cmd+A` / `Ctrl+A` | Select all |
 | `Cmd+F` / `Ctrl+F` | Focus search input |
 | `Delete` / `Cmd+Backspace` | Move to trash |

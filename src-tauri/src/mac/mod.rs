@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod clipboard;
 pub mod cpu_monitor;
 pub mod fsevent_watcher;
 pub mod launch_agent;

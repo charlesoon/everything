@@ -24,6 +24,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 mod fd_search;
+mod file_actions;
 mod daemon;
 #[cfg(target_os = "macos")]
 mod daemon_ipc;
@@ -7772,37 +7773,9 @@ fn copy_paths(paths: Vec<String>) -> AppResult<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn copy_files_to_clipboard(paths: &[String]) -> AppResult<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let file_exprs: Vec<String> = paths
-        .iter()
-        .map(|p| {
-            let escaped = p.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("POSIX file \"{}\"", escaped)
-        })
-        .collect();
-    let script = if file_exprs.len() == 1 {
-        format!("set the clipboard to {}", file_exprs[0])
-    } else {
-        format!("set the clipboard to {{{}}}", file_exprs.join(", "))
-    };
-    let status = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err("Failed to copy files to clipboard".to_string());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
 #[tauri::command]
 fn copy_files(paths: Vec<String>) -> AppResult<()> {
-    copy_files_to_clipboard(&paths)
+    mac::clipboard::copy_files(&paths)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -7878,39 +7851,46 @@ async fn move_to_trash(
     paths: Vec<String>,
     app: AppHandle,
     state: State<'_, AppState>,
-) -> AppResult<()> {
+) -> AppResult<file_actions::TrashResult> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         // Windows/macOS (D4): the indexer service/daemon owns index.db (this
         // process is read-only) and reflects the deletion through its own
         // watcher, so the GUI performs only the filesystem operation and keeps
         // no recent-ops cache. Linux still reflects the change in the DB here.
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        let mut deleted_targets = Vec::new();
-
-        for path in &paths {
-            trash::delete(path).map_err(|e| e.to_string())?;
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                remember_op(&state, "trash", Some(path.clone()), None);
-                deleted_targets.push(path.clone());
-            }
-        }
+        let result = file_actions::move_to_trash(&paths);
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
+            for path in &result.removed_paths {
+                remember_op(&state, "trash", Some(path.clone()), None);
+            }
             let mut conn = db_connection(&state.db_path)?;
-            let _ = delete_paths(&mut conn, &deleted_targets)?;
+            let _ = delete_paths(&mut conn, &result.removed_paths)?;
             invalidate_search_caches(&state);
             refresh_and_emit_status_counts(Some(&app), &state)?;
         }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let _ = (&app, &state);
 
-        Ok(())
+        Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_pending_trash_paths(
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<String>> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db_connection_for_search(&state.db_path)?;
+        file_actions::pending_trash_paths(&conn, &paths)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -9281,6 +9261,7 @@ pub fn run() {
             copy_paths,
             copy_files,
             move_to_trash,
+            get_pending_trash_paths,
             rename,
             get_file_icons,
             get_platform,

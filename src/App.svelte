@@ -6,6 +6,7 @@
   import { startDrag } from '@crabnebula/tauri-plugin-drag';
   import 'overlayscrollbars/overlayscrollbars.css';
   import { OverlayScrollbars } from 'overlayscrollbars';
+  import { excludeTrashedEntries } from './file-actions';
   import {
     SEARCH_DEBOUNCE_MS,
     computeSearchFetchLimit,
@@ -62,6 +63,12 @@
   let selectedIndices = new Set();
   let selectionAnchor = -1;
   let lastSelectedIndex = -1;
+  let pendingTrashedPaths = new Set();
+  let loadedResultCount = 0;
+  let trashInFlight = false;
+  let trashDialogEl;
+  let trashItemCount = 0;
+  let resolveTrashDialog = null;
   let editing = {
     active: false,
     path: '',
@@ -582,6 +589,23 @@
     lastSelectedIndex = -1;
   }
 
+  function replaceResults(entries) {
+    const keepPaths = new Set(selectedPaths());
+    const anchorPath = results[selectionAnchor]?.path;
+    const primaryPath = results[lastSelectedIndex]?.path;
+    results = entries;
+    selectedIndices = new Set();
+    selectionAnchor = -1;
+    lastSelectedIndex = -1;
+    for (let i = 0; i < results.length; i += 1) {
+      if (keepPaths.has(results[i].path)) selectedIndices.add(i);
+      if (results[i].path === anchorPath) selectionAnchor = i;
+      if (results[i].path === primaryPath) lastSelectedIndex = i;
+    }
+    if (!selectedIndices.has(lastSelectedIndex)) lastSelectedIndex = [...selectedIndices].at(-1) ?? -1;
+    if (!selectedIndices.has(selectionAnchor)) selectionAnchor = lastSelectedIndex;
+  }
+
   function selectSingle(index) {
     selectedIndices = new Set([index]);
     selectionAnchor = index;
@@ -736,54 +760,64 @@
     const searchSortBy = sortBy;
     const searchSortDir = sortDir;
     try {
-      const keepPaths = new Set(selectedPaths());
-      const next = await invoke('search', {
-        query: searchQuery,
-        limit: fetchLimit,
-        offset: 0,
-        sortBy: searchSortBy,
-        sortDir: searchSortDir,
-        includeTotal
-      });
+      const removedAtStart = new Set(pendingTrashedPaths);
+      const [next, stillPending] = await Promise.all([
+        invoke('search', {
+          query: searchQuery,
+          limit: fetchLimit,
+          offset: 0,
+          sortBy: searchSortBy,
+          sortDir: searchSortDir,
+          includeTotal
+        }),
+        removedAtStart.size > 0
+          ? invoke('get_pending_trash_paths', { paths: [...removedAtStart] }).catch(() => [...removedAtStart])
+          : Promise.resolve([])
+      ]);
 
       if (gen !== searchGeneration) return;
 
       dbLastQuery = searchQuery;
       const entries = Array.isArray(next.entries) ? next.entries : [];
+      // Include the starting snapshot even if the watcher has just caught up:
+      // this search may have read the DB before the deletion was committed.
+      const visibleEntries = excludeTrashedEntries(
+        entries, new Set([...removedAtStart, ...pendingTrashedPaths]), platform
+      );
       searchModeLabel = next.modeLabel || '';
 
-      if (preserveScroll && !shouldApplyPreserveResults(entries.length, viewportStart, viewportRows)) return;
+      if (preserveScroll && !shouldApplyPreserveResults(visibleEntries.length, viewportStart)) {
+        void runSearch(false, includeTotal);
+        return;
+      }
 
       if (preserveScroll && tableContainer) scrollTop = getScrollEl().scrollTop;
-      results = entries;
+      replaceResults(visibleEntries);
+      loadedResultCount = entries.length;
+      const pending = new Set(stillPending);
+      pendingTrashedPaths = new Set(
+        [...pendingTrashedPaths].filter((path) => !removedAtStart.has(path) || pending.has(path))
+      );
       if (next.totalKnown) {
-        totalResults = next.totalCount;
+        totalResults = Math.max(0, next.totalCount - (entries.length - visibleEntries.length));
         totalResultsKnown = true;
         totalResultsQuery = searchQuery;
       } else if (!(totalResultsKnown && totalResultsQuery === searchQuery)) {
         // Keep the last exact total while a countless refresh (e.g. the
         // index_updated leading edge) runs for the same query; the trailing
         // includeTotal search corrects it moments later.
-        totalResults = entries.length;
+        totalResults = visibleEntries.length;
         totalResultsKnown = false;
       }
       hasMore = totalResultsKnown ? results.length < totalResults : entries.length >= fetchLimit;
       if (!preserveScroll && tableContainer) getScrollEl().scrollTop = 0;
-
-      const restored = new Set();
-      for (let i = 0; i < results.length; i += 1) {
-        if (keepPaths.has(results[i].path)) {
-          restored.add(i);
-        }
-      }
-      selectedIndices = restored;
 
       updateViewportHeight();
     } catch (err) {
       if (gen !== searchGeneration) return;
       showToast(`Search failed: ${String(err)}`);
     } finally {
-      searchPending = false;
+      if (gen === searchGeneration) searchPending = false;
     }
   }
 
@@ -795,16 +829,19 @@
       const batch = await invoke('search', {
         query,
         limit: PAGE_SIZE,
-        offset: results.length,
+        offset: loadedResultCount,
         sortBy: sortBy,
         sortDir: sortDir,
         includeTotal: false
       });
       if (gen !== searchGeneration) return;
       const arr = Array.isArray(batch.entries) ? batch.entries : [];
+      const visibleEntries = excludeTrashedEntries(arr, pendingTrashedPaths, platform);
+      loadedResultCount += arr.length;
       if (arr.length > 0) {
         if (tableContainer) scrollTop = getScrollEl().scrollTop;
-        results = [...results, ...arr];
+        results = [...results, ...visibleEntries];
+        if (totalResultsKnown) totalResults = Math.max(0, totalResults - (arr.length - visibleEntries.length));
       }
       hasMore = totalResultsKnown ? results.length < totalResults : arr.length >= PAGE_SIZE;
     } catch (err) {
@@ -814,7 +851,7 @@
     }
   }
 
-  function moveSelection(delta, withRange = false) {
+  async function moveSelection(delta, withRange = false) {
     if (results.length === 0) {
       return;
     }
@@ -835,6 +872,8 @@
     } else if (bottom > scrollTop + viewportHeight) {
       if (tableContainer) getScrollEl().scrollTop = bottom - viewportHeight;
     }
+    await tick();
+    tableContainer?.querySelector(`[data-row-index="${next}"]`)?.focus({ preventScroll: true });
   }
 
   function handleHeaderSort(column) {
@@ -850,6 +889,7 @@
 
   function handleRowClick(event, index) {
     contextMenu.visible = false;
+    event.currentTarget?.focus({ preventScroll: true });
 
     if (event.shiftKey) {
       selectRange(index);
@@ -866,6 +906,7 @@
 
   function handleRowContextMenu(event, index) {
     event.preventDefault();
+    event.currentTarget?.focus({ preventScroll: true });
 
     if (!selectedIndices.has(index)) {
       selectSingle(index);
@@ -893,8 +934,16 @@
     };
   }
 
-  function handleRowA11yKeydown(event, index) {
-    if (event.key === ' ' || event.key === 'Enter') {
+  async function handleRowA11yKeydown(event, index) {
+    if (event.key === 'Enter') {
+      if (event.metaKey || event.ctrlKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!selectedIndices.has(index)) selectSingle(index);
+      await openSelected();
+      return;
+    }
+    if (event.key === ' ') {
       event.preventDefault();
       handleRowClick(event, index);
     }
@@ -1150,28 +1199,57 @@
   }
 
   async function trashSelected() {
+    if (trashInFlight) return;
     const paths = selectedPaths();
     if (paths.length === 0) {
       return;
     }
 
-    const message =
-      paths.length === 1
-        ? 'Move selected item to Trash?'
-        : `Move ${paths.length} items to Trash?`;
-
-    if (!window.confirm(message)) {
-      return;
-    }
-
+    trashInFlight = true;
     try {
-      await invoke('move_to_trash', { paths });
-      showToast('Moved to Trash.');
-      clearSelection();
-      await runSearch();
+      trashItemCount = paths.length;
+      // WKWebView does not implement window.confirm without a UI delegate.
+      // A modal HTML dialog also keeps keyboard events out of the result list.
+      const confirmed = await new Promise((resolve) => {
+        resolveTrashDialog = resolve;
+        trashDialogEl.returnValue = 'cancel';
+        trashDialogEl.showModal();
+      });
+      if (!confirmed) return;
+
+      const outcome = await invoke('move_to_trash', { paths });
+      const removedPaths = outcome.removedPaths;
+      if (removedPaths.length > 0) {
+        pendingTrashedPaths = new Set([...pendingTrashedPaths, ...removedPaths]);
+        // Discard searches/pages started before the filesystem operation.
+        searchGeneration += 1;
+        scheduleGeneration += 1;
+        clearTimeout(searchTimer);
+        searchPending = false;
+        const entries = excludeTrashedEntries(results, removedPaths, platform);
+        totalResults = Math.max(0, totalResults - (results.length - entries.length));
+        replaceResults(entries);
+        await tick();
+        scrollTop = getScrollEl()?.scrollTop ?? 0;
+        updateViewportHeight();
+      }
+      if (outcome.failures.length > 0) {
+        const first = outcome.failures[0];
+        showToast(`${removedPaths.length} removed, ${outcome.failures.length} failed: ${first.path}: ${first.error}`);
+      } else {
+        showToast(`Moved ${removedPaths.length} item(s) to Trash.`);
+      }
+      if (removedPaths.length > 0) await runSearch(true);
     } catch (err) {
       showToast(`Failed to move to Trash: ${String(err)}`);
+    } finally {
+      trashInFlight = false;
     }
+  }
+
+  function closeTrashDialog() {
+    resolveTrashDialog?.(trashDialogEl.returnValue === 'trash');
+    resolveTrashDialog = null;
   }
 
   async function resetIndex() {
@@ -1419,9 +1497,18 @@
     );
   }
 
+  function handleCopy(event) {
+    if (trashDialogEl?.open || isTextInputTarget(event.target)
+      || isTextInputTarget(document.activeElement) || selectedIndices.size === 0) return;
+    event.preventDefault();
+    void (platform === 'macos' ? copyFiles() : copySelectedPaths());
+  }
+
   async function handleKeydown(event) {
+    if (trashDialogEl?.open) return;
     const isMetaSelectAll = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'a';
-    const isMetaCopy = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'c';
+    const isMetaCopy = (event.metaKey || event.ctrlKey)
+      && (event.code === 'KeyC' || event.key.toLowerCase() === 'c');
     const target = event.target;
     const isTextInput = isTextInputTarget(target);
 
@@ -1529,9 +1616,13 @@
       return;
     }
 
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'c') {
+    if (isMetaCopy) {
       event.preventDefault();
-      await copySelectedPaths();
+      if (platform === 'macos' && !event.altKey) {
+        await copyFiles();
+      } else {
+        await copySelectedPaths();
+      }
       return;
     }
 
@@ -1937,6 +2028,7 @@
   });
 
   onDestroy(async () => {
+    resolveTrashDialog?.(false);
     clearTimeout(searchTimer);
     clearTimeout(toastTimer);
     clearTimeout(snapTimer);
@@ -1966,7 +2058,7 @@
   });
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window on:keydown={handleKeydown} on:copy={handleCopy} />
 
 <div class="app-shell" data-theme={theme} data-platform={platform}>
   <div class="title-bar" role="presentation" data-tauri-drag-region on:mousedown={onTitleBarMouseDown}>
@@ -2188,6 +2280,7 @@
             {@const index = startIndex + localIndex}
             <div
               class="row {selectedIndices.has(index) ? 'selected' : ''}"
+              data-row-index={index}
               on:mousedown={(event) => handleRowMouseDown(event, index)}
               on:click={(event) => handleRowClick(event, index)}
               on:keydown={(event) => handleRowA11yKeydown(event, index)}
@@ -2316,12 +2409,57 @@
     </div>
   {/if}
 
+  <dialog class="trash-dialog" bind:this={trashDialogEl} on:close={closeTrashDialog} aria-labelledby="trash-dialog-title">
+    <form method="dialog">
+      <h2 id="trash-dialog-title">{trashItemCount === 1 ? 'Move selected item to Trash?' : `Move ${trashItemCount} items to Trash?`}</h2>
+      <div class="trash-dialog-actions">
+        <button value="cancel">Cancel</button>
+        <button value="trash">Move to Trash</button>
+      </div>
+    </form>
+  </dialog>
+
   {#if toast}
     <div class="toast">{toast}</div>
   {/if}
 </div>
 
 <style>
+  .trash-dialog {
+    max-width: min(360px, calc(100vw - 48px));
+    padding: 24px;
+    border: 1px solid var(--menu-border);
+    border-radius: 12px;
+    background: var(--menu-bg);
+    color: var(--text-primary);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  }
+
+  .trash-dialog::backdrop {
+    background: rgba(0, 0, 0, 0.25);
+  }
+
+  .trash-dialog h2 {
+    margin: 0 0 24px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .trash-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .trash-dialog-actions button {
+    padding: 6px 12px;
+    border: 1px solid var(--button-border);
+    border-radius: 6px;
+    background: var(--button-bg);
+    color: var(--button-text);
+    cursor: pointer;
+  }
+
   :global(:root) {
     color-scheme: light dark;
     --bg-app: transparent;
