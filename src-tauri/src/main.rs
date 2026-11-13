@@ -178,8 +178,7 @@ pub(crate) const BUILTIN_SKIP_PATHS: &[&str] = &[
     "Library/Logs",
     // Cross-platform
     ".vscode/extensions",
-    // Windows: noisy system directories under AppData
-    "AppData/Local/Temp",
+    // Windows: noisy application directories under AppData; keep Temp searchable.
     "AppData/Local/Microsoft",
     "AppData/Local/Google",
     "AppData/Local/Packages",
@@ -1632,13 +1631,12 @@ fn macos_tcc_ignore_roots(_home_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Directories under home that generate heavy background I/O on Windows
-/// (browser caches, Windows Update temp files, UWP package state, etc.).
+/// (browser caches, UWP package state, etc.).
 /// Pruning these from the MFT subtree eliminates noisy USN records.
 #[cfg(target_os = "windows")]
 fn windows_noisy_roots(home_dir: &Path) -> Vec<PathBuf> {
     let local = home_dir.join("AppData").join("Local");
     let dirs = vec![
-        local.join("Temp"),
         local.join("Microsoft"),
         local.join("Google"),
         local.join("Packages"),
@@ -9456,6 +9454,32 @@ mod tests {
         );
 
         assert!(should_skip_path(target, &ignored, &[]));
+    }
+
+    #[test]
+    fn windows_temp_documents_are_not_skipped() {
+        let document = Path::new(
+            r"C:\Users\test-user\AppData\Local\Temp\claude\session\scratchpad\add_comment_args.json",
+        );
+        assert!(!should_skip_path(document, &[], &[]));
+        assert_eq!(
+            walk_child_checks(
+                "C:/Users/test-user",
+                &[
+                    "AppData",
+                    "Local",
+                    "Temp",
+                    "claude",
+                    "session",
+                    "scratchpad",
+                    "add_comment_args.json",
+                ],
+                &[],
+                &[],
+            ),
+            None,
+            "full scans must descend into Temp documents"
+        );
     }
 
     /// Mirror of the walker's invariant: descend from `root` along `segments`,

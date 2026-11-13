@@ -256,6 +256,44 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_temp_documents_are_indexed_unless_explicitly_ignored() {
+        let root = temp_dir("windows_temp_documents");
+        let home = root.join("home");
+        let scratchpad = home
+            .join("AppData")
+            .join("Local")
+            .join("Temp")
+            .join("claude")
+            .join("session")
+            .join("scratchpad");
+        fs::create_dir_all(&scratchpad).unwrap();
+        let document = scratchpad.join("add_comment_args.json");
+        fs::write(&document, b"{}").unwrap();
+        let config = home.join(".pathignore");
+        fs::write(&config, "").unwrap();
+
+        let (roots, patterns) = crate::effective_ignore_rules(&config, &home, &home, &[], &[]);
+        let mut conn = test_conn();
+        rescan_subtree(&mut conn, &home, &roots, &patterns).unwrap();
+        let document_path = document.to_string_lossy().to_string();
+        assert!(
+            db_paths(&conn).contains(&document_path),
+            "default rules must index a real document in the user's Temp"
+        );
+
+        fs::write(&config, "**/Temp\n").unwrap();
+        let (roots, patterns) = crate::effective_ignore_rules(&config, &home, &home, &[], &[]);
+        rescan_subtree(&mut conn, &home, &roots, &patterns).unwrap();
+        assert!(
+            !db_paths(&conn).contains(&document_path),
+            "an explicit Temp exclusion must still take effect"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn rescan_inserts_updates_and_deletes() {
         let root = temp_dir("iud");
