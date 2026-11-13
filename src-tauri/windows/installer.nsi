@@ -14,6 +14,7 @@ SetCompressor /SOLID lzma
 Icon "${ICON}"
 UninstallIcon "${ICON}"
 !define MUI_ABORTWARNING
+!define MUI_CUSTOMFUNCTION_ABORT RestoreIndexerOnAbort
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
 !insertmacro MUI_PAGE_WELCOME
@@ -32,6 +33,14 @@ Function .onInit
   ${EndIf}
   SetRegView 64
   SetShellVarContext all
+FunctionEnd
+
+Function RestoreIndexerOnAbort
+  !insertmacro NSIS_HOOK_RESTORE_INDEXER
+FunctionEnd
+
+Function .onInstFailed
+  !insertmacro NSIS_HOOK_RESTORE_INDEXER
 FunctionEnd
 
 Section "Everything" SEC_MAIN

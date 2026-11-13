@@ -795,14 +795,21 @@ fn pooled_search_connection(state: &AppState) -> AppResult<PooledSearchConn> {
 }
 
 pub(crate) fn set_indexing_pragmas(conn: &Connection) -> AppResult<()> {
-    conn.execute_batch(
+    // Windows installers may have to terminate an old indexer that cannot
+    // drain. Keep WAL checkpoint ordering crash-safe during bulk indexing too.
+    let synchronous = if cfg!(target_os = "windows") {
+        "NORMAL"
+    } else {
+        "OFF"
+    };
+    conn.execute_batch(&format!(
         r#"
-        PRAGMA synchronous = OFF;
+        PRAGMA synchronous = {synchronous};
         PRAGMA cache_size = -131072;
         PRAGMA mmap_size = 536870912;
         PRAGMA wal_autocheckpoint = 0;
         "#,
-    )
+    ))
     .map_err(|e| e.to_string())
 }
 
@@ -9116,6 +9123,100 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_bulk_writer_survives_forced_stop() {
+        const CHILD_FIXTURE: &str = "EVERYTHING_WAL_CRASH_FIXTURE";
+        const MARKER: &str = ".everything-wal-crash-fixture";
+        if let Some(root) = std::env::var_os(CHILD_FIXTURE) {
+            let root = PathBuf::from(root);
+            assert!(root.is_absolute() && root.join(MARKER).is_file());
+            let conn = db_connection(&root.join("crash.db")).unwrap();
+            set_indexing_pragmas(&conn).unwrap();
+            assert_eq!(
+                conn.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "wal"
+            );
+            assert_eq!(
+                conn.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            conn.execute_batch("CREATE TABLE durable(value BLOB); INSERT INTO durable VALUES ('committed'); PRAGMA cache_size=2; PRAGMA cache_spill=2;").unwrap();
+            let wal = root.join("crash.db-wal");
+            let committed_size = fs::metadata(&wal).unwrap().len();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            conn.execute(
+                "INSERT INTO durable VALUES (?1)",
+                params![vec![42u8; 1024 * 1024]],
+            )
+            .unwrap();
+            assert!(
+                fs::metadata(wal).unwrap().len() > committed_size,
+                "uncommitted pages must reach WAL before the forced stop"
+            );
+            fs::write(root.join("ready"), "ready").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+
+        let root = temp_case_dir("wal_crash");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(MARKER), "isolated crash recovery test").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::windows_bulk_writer_survives_forced_stop",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_FIXTURE, &root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !root.join("ready").exists() {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "crash fixture exited early: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("crash fixture did not become ready");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // On Windows Child::kill uses TerminateProcess, matching the installer's
+        // fallback rather than letting SQLite close or checkpoint the writer.
+        child.kill().unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        let conn = db_connection(&root.join("crash.db")).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let values: Vec<String> = conn
+            .prepare("SELECT value FROM durable")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, vec!["committed"]);
+        drop(conn);
+        assert!(root.is_absolute() && root.join(MARKER).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// The invariant the fans depend on. `UTILITY` measurably does not keep work
     /// off performance cores (see `mac::sched`), so the multi-threaded walk must

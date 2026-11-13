@@ -8,7 +8,10 @@
 ;   * Destructive cleanup of a previous install runs ONLY after every fatal step
 ;     succeeds, so a mid-way failure leaves the old install intact — recoverable
 ;     via the in-app `--register-service` banner (D5).
-;   * sc stop/start are async, so every state change is confirmed by polling.
+;   * Preinstall bounds graceful stop, then verifies and terminates the actual
+;     indexer PID if needed, preserving DB/WAL/SHM and preventing restarts.
+;     Startup settings are restored on install failure or cancellation.
+;   * sc start is async, so every state change is confirmed by polling.
 ;     Only exit code 1060 (ERROR_SERVICE_DOES_NOT_EXIST) counts as "not
 ;     installed"; any other sc failure Aborts rather than being mistaken for
 ;     stopped (so a partial/corrupt SCM state is never papered over).
@@ -140,13 +143,25 @@
 ; ---------------------------------------------------------------------------
 
 !macro NSIS_HOOK_PREINSTALL
-  ; Stop our own running GUI by path, then stop the service so its files can
-  ; be replaced. Cleanup of a previous install is deferred to POSTINSTALL.
-  !insertmacro KILL_OUR_PROCESSES_BY_PATH "pre"
-  nsExec::Exec 'cmd /c sc stop ${EVERYTHING_SERVICE}'
+  InitPluginsDir
+  File /oname=$PLUGINSDIR\prepare-upgrade.ps1 "${__FILEDIR__}\prepare-upgrade.ps1"
+  DetailPrint "Stopping EverythingIndexer before replacing files..."
+  nsExec::ExecToLog /TIMEOUT=60000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\prepare-upgrade.ps1" -InstallDir "$INSTDIR" -StateFile "$PLUGINSDIR\upgrade-state.json"'
   Pop $0
+  ${If} $0 != 0
+    Abort "Could not stop EverythingIndexer safely (exit=$0). See installation details."
+  ${EndIf}
   SetShellVarContext all
-  !insertmacro WAIT_SERVICE_STOPPED "pre"
+!macroend
+
+!macro NSIS_HOOK_RESTORE_INDEXER
+  ${If} $PLUGINSDIR != ""
+    ${If} ${FileExists} "$PLUGINSDIR\upgrade-state.json"
+      DetailPrint "Restoring the previous EverythingIndexer startup setting..."
+      nsExec::ExecToLog /TIMEOUT=15000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\prepare-upgrade.ps1" -Mode Restore -StateFile "$PLUGINSDIR\upgrade-state.json"'
+      Pop $0
+    ${EndIf}
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -209,6 +224,7 @@
   nsExec::Exec 'cmd /c sc start ${EVERYTHING_SERVICE}'
   Pop $0
   ${If} $0 != 0
+  ${AndIf} $0 != 1056
     Abort "Service start failed (sc start exit=$0)"
   ${EndIf}
   !insertmacro WAIT_SERVICE_RUNNING "post"
@@ -220,6 +236,7 @@
   ;       cleaned by each user's first GUI run (§5 ②). Our own running processes
   ;       are already path-scope-killed in PRE(UN)INSTALL. --
   !insertmacro CLEANUP_OLD_PERUSER
+  Delete "$PLUGINSDIR\upgrade-state.json"
 !macroend
 
 ; ---------------------------------------------------------------------------
