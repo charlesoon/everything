@@ -201,6 +201,8 @@ python3 scripts/bundle_macos.py --dmg
 
 Lucide 배율 팝오버와 100%에서 버튼 숨김을 반영한 최신 `0.6.2` 패키지도 같은 스크립트로 빌드·서명·공증했으며 Gatekeeper와 DMG 무결성 검사를 통과했다. 이 패키지의 해시와 공증 ID는 같은 검증 요약의 `zoomPopover.productionRelease`에 기록했다.
 
+`0.6.3`의 DMG 자동 복사·메타데이터 갱신은 `scripts/build_dmg.sh`를 실제 실행해 확인했다. 워크트리와 기본 체크아웃의 `releases/`에 동일한 DMG·`latest-mac.yml`을 생성했고 최종 파일의 SHA-512·크기·버전과 YAML이 일치했다. Apple 공증·티켓 검증, Gatekeeper와 DMG 무결성 검사를 통과했으며, 격리된 Git 워크트리 회귀 검사를 포함한 패키징 테스트도 **11 통과 / 0 실패**였다. 기본 체크아웃의 다른 수정과 스테이징 상태는 보존했다. 실제 실행 결과와 최신 패키지 해시는 같은 검증 요약의 `worktreeReleasePublication`에 기록했다.
+
 ## Windows 빌드 확인의 한계
 
 2026-11-14에 Windows 네이티브 빌드와 실제 창 검증을 추가로 완료했다. 최신 결과와 Windows 삭제 키 동작은 [Windows 검증 보고서](gpui-windows-validation.md)를 참고한다. 아래 내용은 이전 macOS 호스트에서 시도했던 교차 빌드 기록이다.

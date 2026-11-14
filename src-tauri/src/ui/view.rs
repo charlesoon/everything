@@ -97,7 +97,7 @@ impl EverythingView {
         let entry = &self.model.rows[index];
         let selected = self.model.selected.contains(&index);
         let p = Palette::get(cx);
-        let editing = self.rename_path.as_deref() == Some(&entry.path);
+        let editing = !self.rename_in_tree && self.rename_path.as_deref() == Some(&entry.path);
         let style = HighlightStyle {
             font_weight: Some(FontWeight::BOLD),
             ..Default::default()
@@ -147,11 +147,13 @@ impl EverythingView {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     if this.modal.is_some()
-                        || this.rename_path.as_deref() == Some(&this.model.rows[index].path)
+                        || (!this.rename_in_tree
+                            && this.rename_path.as_deref() == Some(&this.model.rows[index].path))
                     {
                         return;
                     }
                     this.context_menu = None;
+                    this.target_tree = false;
                     this.rename_click_candidate = (cfg!(target_os = "macos")
                         && event.click_count == 1
                         && !event.modifiers.alt
@@ -206,6 +208,7 @@ impl EverythingView {
                     if !this.model.selected.contains(&index) {
                         this.model.select(index, false, false);
                     }
+                    this.target_tree = false;
                     this.reveal_result_in_tree();
                     this.table_focus.focus(window);
                     this.open_context_menu(event.position, window, cx);
@@ -773,13 +776,13 @@ impl EverythingView {
                                 svg()
                                     .path("everything/search.svg")
                                     .size(px(14.))
-                                    .text_color(p.accent),
+                                    .text_color(p.muted),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
                                     .line_height(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.muted)
                                     .child("Everything"),
                             ),
                     ),
@@ -1205,7 +1208,7 @@ impl Render for EverythingView {
                             .max(COLUMN_MIN[index] * this.prefs.zoom);
                     }
                     cx.notify();
-                } else if event.dragging() {
+                } else if event.dragging() && !this.tree_drag_move(event.position, window, cx) {
                     if let Some((start, index)) = this.drag_start {
                         if f32::from(event.position.x - start.x).abs()
                             + f32::from(event.position.y - start.y).abs()

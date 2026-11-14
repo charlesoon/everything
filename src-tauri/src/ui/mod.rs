@@ -135,6 +135,11 @@ struct EverythingView {
     menu_selection: usize,
     modal_selection: usize,
     rename_path: Option<String>,
+    /// The inline rename editor lives in the file tree row, not the results row.
+    rename_in_tree: bool,
+    /// File actions (copy, trash, rename, context menu) target the file tree
+    /// selection instead of the results selection.
+    target_tree: bool,
     rename_click_candidate: Option<String>,
     rename_click_task: Option<Task<()>>,
     action_busy: bool,
@@ -197,6 +202,8 @@ impl EverythingView {
             menu_selection: 0,
             modal_selection: 0,
             rename_path: None,
+            rename_in_tree: false,
+            target_tree: false,
             rename_click_candidate: None,
             rename_click_task: None,
             action_busy: false,
@@ -237,6 +244,7 @@ impl EverythingView {
                 }
                 InputEvent::Focus => {
                     this.cancel_pending_rename();
+                    this.target_tree = false;
                     this.model.clear_selection();
                     cx.notify();
                 }

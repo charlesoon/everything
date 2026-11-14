@@ -63,6 +63,8 @@ Every successful DMG build copies the final image into `releases/` and updates
 date. This happens after signing and any notarization/stapling; a failed build
 or notarization leaves the previous release files in place. Generated DMGs are
 ignored by Git; the update manifest remains tracked.
+Builds from a linked Git worktree also update the main checkout's `releases/`
+directory with the same DMG and manifest.
 
 Node is optional. Existing npm entry points are dependency-free aliases:
 `npm run dev`, `npm run build`, `npm run bundle`, `npm run bundle:dmg`,

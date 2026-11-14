@@ -25,18 +25,24 @@ def run(*args, **kwargs):
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
 
 
+def main_checkout_root():
+    try:
+        common = Path(subprocess.check_output(
+            ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+            cwd=ROOT, stderr=subprocess.DEVNULL, text=True).strip())
+        if common.name == '.git':
+            return common.parent
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return ROOT
+
+
 def signing_settings(env):
     if env.get('APPLE_SIGNING_IDENTITY') == '-':
         return '-', {}
     config = ROOT / 'certificates/import.json'
     if not config.is_file():
-        try:
-            common = subprocess.check_output(
-                ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-                cwd=ROOT, stderr=subprocess.DEVNULL, text=True).strip()
-            config = Path(common).parent / 'certificates/import.json'
-        except (OSError, subprocess.CalledProcessError):
-            pass
+        config = main_checkout_root() / 'certificates/import.json'
     apple = {}
     if config.is_file():
         try:
@@ -82,32 +88,33 @@ def notarize(dmg, env, apple):
 
 
 def publish_dmg(dmg, version):
-    releases = ROOT / 'releases'
-    releases.mkdir(parents=True, exist_ok=True)
-    destination = releases / dmg.name
-    manifest = releases / 'latest-mac.yml'
-    with tempfile.TemporaryDirectory(prefix='.mac-release-', dir=releases) as temporary:
-        staged_dmg = Path(temporary) / dmg.name
-        shutil.copy2(dmg, staged_dmg)
-        digest = hashlib.sha512()
-        with staged_dmg.open('rb') as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b''):
-                digest.update(chunk)
-        sha512 = base64.b64encode(digest.digest()).decode('ascii')
-        release_date = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-        staged_manifest = Path(temporary) / manifest.name
-        staged_manifest.write_text(
-            f'version: {version}\n'
-            f'files:\n'
-            f'  - url: {dmg.name}\n'
-            f'    sha512: {sha512}\n'
-            f'    size: {staged_dmg.stat().st_size}\n'
-            f'path: {dmg.name}\n'
-            f'sha512: {sha512}\n'
-            f"releaseDate: '{release_date}'\n",
-            encoding='utf-8')
-        staged_dmg.replace(destination)
-        staged_manifest.replace(manifest)
+    directories = list(dict.fromkeys([ROOT / 'releases', main_checkout_root() / 'releases']))
+    release_date = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    for releases in directories:
+        releases.mkdir(parents=True, exist_ok=True)
+        destination = releases / dmg.name
+        manifest = releases / 'latest-mac.yml'
+        with tempfile.TemporaryDirectory(prefix='.mac-release-', dir=releases) as temporary:
+            staged_dmg = Path(temporary) / dmg.name
+            shutil.copy2(dmg, staged_dmg)
+            digest = hashlib.sha512()
+            with staged_dmg.open('rb') as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            sha512 = base64.b64encode(digest.digest()).decode('ascii')
+            staged_manifest = Path(temporary) / manifest.name
+            staged_manifest.write_text(
+                f'version: {version}\n'
+                f'files:\n'
+                f'  - url: {dmg.name}\n'
+                f'    sha512: {sha512}\n'
+                f'    size: {staged_dmg.stat().st_size}\n'
+                f'path: {dmg.name}\n'
+                f'sha512: {sha512}\n'
+                f"releaseDate: '{release_date}'\n",
+                encoding='utf-8')
+            staged_dmg.replace(destination)
+            staged_manifest.replace(manifest)
     return destination, manifest
 
 

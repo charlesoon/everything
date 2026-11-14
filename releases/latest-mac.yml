@@ -1,8 +1,8 @@
-version: 0.6.3
+version: 0.6.4
 files:
-  - url: Everything_0.6.3_aarch64.dmg
-    sha512: TgJUuMB1pGEOHIektUvTqzQxEr3/f7vYFmIDoJjdDt/xpmq29+4Qr+wUJVgn3c23tOgIpeujJRjrCjHMUWM7hQ==
-    size: 7809179
-path: Everything_0.6.3_aarch64.dmg
-sha512: TgJUuMB1pGEOHIektUvTqzQxEr3/f7vYFmIDoJjdDt/xpmq29+4Qr+wUJVgn3c23tOgIpeujJRjrCjHMUWM7hQ==
-releaseDate: '2026-11-14T13:28:36.756Z'
+  - url: Everything_0.6.4_aarch64.dmg
+    sha512: 3xG2sQgRwFes++Hk1VclbZJt/IdHqnMsRKwe0wZ5aiUB9zxVpDkXGb4hwQHsK+vtxyXWrDfKgnE0KzK+jUbmxA==
+    size: 7816013
+path: Everything_0.6.4_aarch64.dmg
+sha512: 3xG2sQgRwFes++Hk1VclbZJt/IdHqnMsRKwe0wZ5aiUB9zxVpDkXGb4hwQHsK+vtxyXWrDfKgnE0KzK+jUbmxA==
+releaseDate: '2026-11-14T14:00:51.308Z'

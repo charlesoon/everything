@@ -121,6 +121,8 @@ class ReleaseTests(unittest.TestCase):
         })
 
         def output(args, **kwargs):
+            if args[0] == 'git':
+                return str(root / '.git')
             return APPLE['developer_id'] if args[0] == 'security' else metadata
 
         def command(*args, **kwargs):
@@ -194,6 +196,31 @@ class ReleaseTests(unittest.TestCase):
             name = 'Everything_1.2.3_x86_64.dmg'
             self.assertTrue((root / 'releases' / name).is_file())
             self.assertIn(f'path: {name}\n', (root / 'releases/latest-mac.yml').read_text())
+
+    def test_worktree_build_also_refreshes_main_checkout_releases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            main = (Path(temporary) / 'main').resolve()
+            worktree = (Path(temporary) / 'worktree').resolve()
+            subprocess.run(['git', 'init', '-q', str(main)], check=True)
+            subprocess.run([
+                'git', '-C', str(main), '-c', 'user.name=Bundle Test',
+                '-c', 'user.email=bundle@example.invalid', '-c', 'commit.gpgsign=false',
+                'commit', '--allow-empty', '-qm', 'Fixture',
+            ], check=True)
+            subprocess.run(['git', '-C', str(main), 'worktree', 'add', '-qb',
+                            'release-test', str(worktree)], check=True)
+            (main / 'releases').mkdir()
+            (main / 'releases/latest-mac.yml').write_text('version: 1.2.2\n')
+            dmg = worktree / 'Everything_1.2.3_aarch64.dmg'
+            dmg.write_bytes(b'Final notarized DMG fixture')
+            with patch.object(bundle_macos, 'ROOT', worktree):
+                image, manifest = bundle_macos.publish_dmg(dmg, '1.2.3')
+            self.assertEqual(image, main / 'releases' / dmg.name)
+            self.assertEqual(manifest, main / 'releases/latest-mac.yml')
+            self.assertEqual(image.read_bytes(), dmg.read_bytes())
+            self.assertEqual(image.read_bytes(), (worktree / 'releases' / dmg.name).read_bytes())
+            self.assertEqual(manifest.read_bytes(), (worktree / 'releases/latest-mac.yml').read_bytes())
+            self.assertIn('version: 1.2.3\n', manifest.read_text())
 
 
 if __name__ == '__main__':
