@@ -773,13 +773,13 @@ impl EverythingView {
                                 svg()
                                     .path("everything/search.svg")
                                     .size(px(14.))
-                                    .text_color(p.accent),
+                                    .text_color(p.muted),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
                                     .line_height(px(12.))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(p.muted)
                                     .child("Everything"),
                             ),
                     ),
