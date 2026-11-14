@@ -15,6 +15,7 @@ pub(super) struct State {
     visible_rows: std::ops::Range<usize>,
     result_selection: Option<PathBuf>,
     resizing: Option<(Point<Pixels>, f32)>,
+    drag_start: Option<Point<Pixels>>,
 }
 
 impl State {
@@ -26,6 +27,7 @@ impl State {
             visible_rows: 0..0,
             result_selection: None,
             resizing: None,
+            drag_start: None,
         }
     }
 
@@ -77,6 +79,7 @@ impl State {
 impl EverythingView {
     pub(super) fn reveal_result_in_tree(&mut self) {
         self.file_tree.result_selection = None;
+        self.file_tree.model.selection.clear();
     }
 
     pub(super) fn file_tree_width(&self, window: &Window) -> f32 {
@@ -399,7 +402,9 @@ impl EverythingView {
                     .child(div().truncate().child(message));
             }
         };
-        let selected = self.file_tree.model.selected.as_ref() == Some(&entry.path);
+        let selected = self.tree_selected_paths().contains(&entry.path);
+        let full = entry.path.to_string_lossy();
+        let editing = self.rename_in_tree && self.rename_path.as_deref() == Some(full.as_ref());
         let expanded = self.file_tree.model.is_expanded(&entry.path);
         let path = entry.path.clone();
         let full_path = path.to_string_lossy().into_owned();
@@ -409,18 +414,77 @@ impl EverythingView {
             .hover(|row| row.bg(if selected { p.selected } else { p.hover }))
             .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, _| {
+            .on_mouse_down(MouseButton::Left, {
+                let path = path.clone();
+                let full = path.to_string_lossy().into_owned();
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if this.modal.is_some()
+                        || (this.rename_in_tree && this.rename_path.as_deref() == Some(&full))
+                    {
+                        return;
+                    }
+                    if this.rename_path.is_some() {
+                        this.commit_rename(window, cx);
+                    }
+                    this.context_menu = None;
+                    this.target_tree = true;
                     this.file_tree.focus.focus(window);
-                }),
-            )
+                    let m = event.modifiers;
+                    let plain = !(m.shift || m.platform || m.control || m.alt);
+                    let current = this.tree_selected_paths();
+                    // Slow second click on the selected file renames it, as in
+                    // the results list. Folders keep click-to-expand.
+                    this.rename_click_candidate = (cfg!(target_os = "macos")
+                        && plain
+                        && event.click_count == 1
+                        && !is_dir
+                        && this.rename_path.is_none()
+                        && current == [path.clone()])
+                    .then(|| full.clone());
+                    // Keep a multi-selection on plain press so it can be dragged;
+                    // the click (release) narrows it.
+                    if !plain || !current.contains(&path) || current.len() == 1 {
+                        this.tree_click_select(path.clone(), m);
+                    }
+                    this.file_tree.drag_start = Some(event.position);
+                    cx.notify();
+                })
+            })
+            .on_mouse_down(MouseButton::Right, {
+                let path = path.clone();
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if this.modal.is_some() || this.rename_path.is_some() {
+                        return;
+                    }
+                    if !this.tree_selected_paths().contains(&path) {
+                        this.tree_click_select(path.clone(), Modifiers::default());
+                    }
+                    this.target_tree = true;
+                    this.file_tree.focus.focus(window);
+                    this.open_context_menu(event.position, window, cx);
+                    cx.stop_propagation();
+                })
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.file_tree.model.selected = Some(path.clone());
-                this.file_tree.model.reveal_pending = false;
-                if is_dir && event.click_count() == 1 {
-                    this.file_tree.model.toggle(&path);
+                let m = event.modifiers();
+                if (this.rename_in_tree && this.rename_path.is_some())
+                    || m.shift
+                    || m.platform
+                    || m.control
+                {
+                    return;
+                }
+                if event.click_count() == 1 {
+                    let rename = this.rename_click_candidate.take();
+                    this.tree_click_select(path.clone(), Modifiers::default());
+                    if is_dir {
+                        this.file_tree.model.toggle(&path);
+                    }
+                    if let Some(rename) = rename {
+                        this.schedule_click_rename(rename, window, cx);
+                    }
                 } else if !is_dir && event.click_count() == 2 {
+                    this.cancel_pending_rename();
                     this.open_tree_file(window, cx);
                 }
                 cx.notify();
@@ -453,14 +517,34 @@ impl EverythingView {
                     .flex_shrink_0()
                     .text_color(p.muted),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .when(row.depth == 0, |name| name.font_weight(FontWeight::MEDIUM))
-                    .child(entry.name.clone()),
-            )
+            .when(!editing, |row_el| {
+                row_el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when(row.depth == 0, |name| name.font_weight(FontWeight::MEDIUM))
+                        .child(entry.name.clone()),
+                )
+            })
+            .when(editing, |row_el| {
+                row_el.child(
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.rename_input)
+                            .appearance(false)
+                            .w_full()
+                            .h(scaled_px(22.))
+                            .px(scaled_px(4.))
+                            .py_0()
+                            .font_family(design::SANS)
+                            .text_size(scaled_px(12.))
+                            .bg(p.input)
+                            .border(scaled_px(1.5))
+                            .border_color(p.accent)
+                            .rounded(scaled_px(4.)),
+                    ),
+                )
+            })
     }
 
     pub(super) fn resize_file_tree(
@@ -482,9 +566,58 @@ impl EverythingView {
     }
 
     pub(super) fn finish_file_tree_resize(&mut self, cx: &mut Context<Self>) {
+        self.file_tree.drag_start = None;
         if self.file_tree.resizing.take().is_some() {
             self.save_preferences(cx);
         }
+    }
+
+    /// Starts a native drag of the tree selection once the pointer moves 5px.
+    pub(super) fn tree_drag_move(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(start) = self.file_tree.drag_start else {
+            return false;
+        };
+        if f32::from(position.x - start.x).abs() + f32::from(position.y - start.y).abs() > 5. {
+            self.file_tree.drag_start = None;
+            self.cancel_pending_rename();
+            self.native_drag(window, cx);
+        }
+        true
+    }
+
+    pub(super) fn tree_selected_paths(&self) -> Vec<PathBuf> {
+        self.file_tree.model.selected_paths()
+    }
+
+    fn tree_click_select(&mut self, path: PathBuf, m: Modifiers) {
+        self.file_tree
+            .model
+            .click_select(path, m.platform || m.control, m.shift);
+    }
+
+    /// The selected tree entry as (path, name, is_dir).
+    pub(super) fn tree_selected_entry(&self) -> Option<(PathBuf, String, bool)> {
+        let index = self.file_tree.model.selected_index()?;
+        let entry = self.file_tree.model.rows[index].entry()?;
+        Some((entry.path.clone(), entry.name.clone(), entry.is_dir))
+    }
+
+    pub(super) fn select_in_tree(&mut self, path: PathBuf) {
+        self.file_tree.model.selected = Some(path);
+        if let Some(index) = self.file_tree.model.selected_index() {
+            self.file_tree
+                .scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+    }
+
+    pub(super) fn focus_file_tree(&self, window: &mut Window) {
+        self.file_tree.focus.focus(window);
     }
 
     pub(super) fn file_tree_focused(&self, window: &Window) -> bool {
@@ -534,6 +667,9 @@ impl EverythingView {
                         .entry()
                         .unwrap()
                         .clone();
+                    if key == "space" && !entry.is_dir {
+                        return false; // Quick Look, like the results list
+                    }
                     let expanded = self.file_tree.model.is_expanded(&entry.path);
                     if entry.is_dir
                         && ((key == "left" && expanded)
@@ -575,9 +711,15 @@ impl EverythingView {
                     }
                 }
             }
-            "escape" | "tab" => self.table_focus.focus(window),
+            "escape" | "tab" => {
+                self.table_focus.focus(window);
+                cx.notify();
+                return true;
+            }
             _ => return false,
         }
+        self.file_tree.model.selection.clear();
+        self.file_tree.model.anchor = self.file_tree.model.selected.clone();
         cx.notify();
         true
     }

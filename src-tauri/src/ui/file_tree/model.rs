@@ -65,6 +65,10 @@ pub(super) struct FileTree {
     pub selected: Option<PathBuf>,
     pub rows: Vec<Row>,
     pub reveal_pending: bool,
+    /// Multi-selection (includes `selected`); empty or stale = single.
+    pub selection: Vec<PathBuf>,
+    /// Shift-click range anchor.
+    pub anchor: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     directories: HashMap<PathBuf, Directory>,
     invalidated: HashSet<PathBuf>,
@@ -72,6 +76,60 @@ pub(super) struct FileTree {
 }
 
 impl FileTree {
+    /// Every selected path; a stale multi-selection (the primary moved
+    /// elsewhere, e.g. by following a result) falls back to the primary.
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        let primary = self.selected.as_ref();
+        if self.selection.len() > 1 && primary.is_some_and(|p| self.selection.contains(p)) {
+            self.selection.clone()
+        } else {
+            primary.cloned().into_iter().collect()
+        }
+    }
+
+    /// Finder-style click selection: plain replaces, `toggle` (Cmd/Ctrl)
+    /// adds/removes, `range` (Shift) selects the visible rows from the anchor.
+    pub fn click_select(&mut self, path: PathBuf, toggle: bool, range: bool) {
+        self.reveal_pending = false;
+        if range {
+            let entries: Vec<&PathBuf> = self
+                .rows
+                .iter()
+                .filter_map(|row| row.entry().map(|entry| &entry.path))
+                .collect();
+            let anchor = self.anchor.as_ref().or(self.selected.as_ref());
+            let from = anchor.and_then(|a| entries.iter().position(|p| *p == a));
+            let to = entries.iter().position(|p| **p == path);
+            self.selection = match (from, to) {
+                (Some(a), Some(b)) => entries[a.min(b)..=a.max(b)]
+                    .iter()
+                    .map(|p| (*p).clone())
+                    .collect(),
+                _ => vec![path.clone()],
+            };
+            self.selected = Some(path);
+        } else if toggle {
+            let mut set = self.selected_paths();
+            match set.iter().position(|p| *p == path) {
+                Some(i) => {
+                    set.remove(i);
+                }
+                None => set.push(path.clone()),
+            }
+            self.selected = if set.contains(&path) {
+                Some(path.clone())
+            } else {
+                set.last().cloned()
+            };
+            self.anchor = Some(path);
+            self.selection = set;
+        } else {
+            self.selection.clear();
+            self.anchor = Some(path.clone());
+            self.selected = Some(path);
+        }
+    }
+
     /// Keep a useful browsing context while revealing every ancestor of the
     /// result. A result outside that context starts at its immediate parent.
     pub fn follow(&mut self, path: PathBuf, is_dir: bool) {
@@ -509,5 +567,29 @@ mod tests {
         assert!(!entries.iter().any(|entry| entry.name == "child.txt"));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(read_directory(&root).is_err());
+    }
+
+    #[test]
+    fn click_selection_toggles_ranges_and_falls_back_when_stale() {
+        let root = context();
+        let paths: Vec<PathBuf> = (0..4).map(|i| root.join(format!("{i}.txt"))).collect();
+        let mut tree = FileTree::default();
+        tree.follow(paths[0].clone(), false);
+        let request = tree.requests().pop().unwrap();
+        tree.apply(request, Ok(paths.iter().cloned().map(file).collect()));
+
+        tree.click_select(paths[1].clone(), false, false);
+        assert_eq!(tree.selected_paths(), [paths[1].clone()]);
+        tree.click_select(paths[3].clone(), false, true);
+        assert_eq!(tree.selected_paths(), paths[1..=3]);
+        tree.click_select(paths[2].clone(), true, false);
+        assert_eq!(tree.selected_paths(), [paths[1].clone(), paths[3].clone()]);
+        tree.click_select(paths[0].clone(), true, false);
+        assert_eq!(tree.selected_paths().len(), 3);
+        // Moving the primary outside the set (keyboard, follow) drops it.
+        tree.selected = Some(paths[2].clone());
+        assert_eq!(tree.selected_paths(), [paths[2].clone()]);
+        tree.click_select(paths[0].clone(), false, false);
+        assert_eq!(tree.selected_paths(), [paths[0].clone()]);
     }
 }

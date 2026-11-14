@@ -77,7 +77,8 @@ impl EverythingView {
                     self.modal = None;
                 }
                 self.rename_path = None;
-                self.table_focus.focus(window);
+                self.rename_in_tree = false;
+                self.focus_action_target(window);
                 cx.notify();
                 return;
             }
@@ -115,7 +116,7 @@ impl EverythingView {
             return;
         }
         if matches!(action, UiAction::Trash) {
-            let paths = self.model.paths();
+            let paths = self.action_paths();
             if !paths.is_empty() {
                 self.modal = Some(Modal::Trash(paths));
                 self.modal_selection = 0;
@@ -146,7 +147,7 @@ impl EverythingView {
             status.message = None;
             self.update_status(status, cx);
         }
-        let mut paths = self.model.paths();
+        let mut paths = self.action_paths();
         let confirm = self.modal.clone();
         if matches!(action, UiAction::Confirm) {
             match &confirm {
@@ -325,6 +326,27 @@ impl EverythingView {
         cx.notify();
     }
 
+    /// Paths the file actions apply to: the file tree selection when the tree
+    /// was the last list interacted with, otherwise the results selection.
+    pub(super) fn action_paths(&self) -> Vec<String> {
+        if self.target_tree {
+            self.tree_selected_paths()
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            self.model.paths()
+        }
+    }
+
+    fn focus_action_target(&self, window: &mut Window) {
+        if self.target_tree && self.prefs.file_tree_visible {
+            self.focus_file_tree(window);
+        } else {
+            self.table_focus.focus(window);
+        }
+    }
+
     pub(super) fn cancel_pending_rename(&mut self) -> bool {
         self.rename_click_candidate = None;
         self.rename_click_task.take().is_some()
@@ -350,11 +372,11 @@ impl EverythingView {
                 this.rename_click_task = None;
                 cx.notify();
                 if window.is_window_active()
-                    && this.table_focus.is_focused(window)
+                    && (this.table_focus.is_focused(window) || this.file_tree_focused(window))
                     && this.rename_path.is_none()
                     && this.modal.is_none()
                     && this.context_menu.is_none()
-                    && this.model.paths() == [path]
+                    && this.action_paths() == [path]
                 {
                     this.start_rename(window, cx);
                 }
@@ -364,33 +386,42 @@ impl EverythingView {
 
     pub(super) fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_pending_rename();
-        if self.model.selected.len() != 1 {
-            return;
-        }
-        let Some(index) = self.model.primary else {
-            return;
-        };
-        let entry = self.model.rows[index].clone();
-        self.rename_path = Some(entry.path.clone());
-        if !self.visible_rows.contains(&index) {
-            self.list_scroll
-                .scroll_to_item(index, ScrollStrategy::Center);
-        }
-        let stem_end = if entry.is_dir {
-            entry.name.len()
+        let (path, name, is_dir) = if self.target_tree {
+            if self.tree_selected_paths().len() != 1 {
+                return;
+            }
+            let Some((path, name, is_dir)) = self.tree_selected_entry() else {
+                return;
+            };
+            self.select_in_tree(path.clone()); // scrolls it into view
+            (path.to_string_lossy().into_owned(), name, is_dir)
         } else {
-            entry
-                .name
-                .rfind('.')
-                .filter(|dot| *dot > 0)
-                .unwrap_or(entry.name.len())
+            if self.model.selected.len() != 1 {
+                return;
+            }
+            let Some(index) = self.model.primary else {
+                return;
+            };
+            let entry = self.model.rows[index].clone();
+            if !self.visible_rows.contains(&index) {
+                self.list_scroll
+                    .scroll_to_item(index, ScrollStrategy::Center);
+            }
+            (entry.path, entry.name, entry.is_dir)
         };
-        let selection_end = entry.name[..stem_end].encode_utf16().count();
+        self.rename_path = Some(path);
+        self.rename_in_tree = self.target_tree;
+        let stem_end = if is_dir {
+            name.len()
+        } else {
+            name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len())
+        };
+        let selection_end = name[..stem_end].encode_utf16().count();
         self.rename_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.replace_and_mark_text_in_range(
                 Some(0..0),
-                &entry.name,
+                &name,
                 Some(0..selection_end),
                 window,
                 cx,
@@ -424,12 +455,16 @@ impl EverythingView {
                 this.action_busy = false;
                 match result {
                     Ok(entry) => {
+                        if this.rename_in_tree {
+                            this.select_in_tree(PathBuf::from(&entry.path));
+                        }
                         if let Some(row) = this.model.rows.iter_mut().find(|e| e.path == path) {
                             *row = entry;
                         }
                         this.rename_path = None;
+                        this.rename_in_tree = false;
                         if !this.input.focus_handle(cx).is_focused(window) {
-                            this.table_focus.focus(window);
+                            this.focus_action_target(window);
                         }
                         this.toast = None;
                         this.refresh_file_tree(cx);
@@ -622,8 +657,14 @@ impl EverythingView {
                 _ => false,
             }
         } else if self.file_tree_focused(window) {
-            self.file_tree_key_down(key, window, cx)
+            self.target_tree = true;
+            (!meta && self.file_tree_key_down(key, window, cx))
+                || shortcut_action(key, modifiers).is_some_and(|action| {
+                    self.action(action, window, cx);
+                    true
+                })
         } else {
+            self.target_tree = false;
             match key {
                 "down" | "up" | "pagedown" | "pageup" => {
                     if !self.model.rows.is_empty() {
@@ -667,69 +708,31 @@ impl EverythingView {
                     cx.notify();
                     true
                 }
-                "o" if meta => {
+                "enter" if !meta && !input_focused => {
                     self.action(UiAction::Open, window, cx);
                     true
                 }
-                "enter" if meta => {
-                    self.action(UiAction::Reveal, window, cx);
-                    true
-                }
-                "enter" if !input_focused => {
-                    self.action(UiAction::Open, window, cx);
-                    true
-                }
-                "f2" if !cfg!(target_os = "macos") => {
-                    self.action(UiAction::Rename, window, cx);
-                    true
-                }
-                "space" if !input_focused => {
-                    if cfg!(target_os = "macos") {
-                        self.action(UiAction::QuickLook, window, cx);
-                    }
-                    true
-                }
+                "space" if !input_focused && !cfg!(target_os = "macos") => true,
                 "a" if meta && !input_focused => {
                     self.model.selected = (0..self.model.rows.len()).collect();
                     cx.notify();
                     true
                 }
-                "c" if meta && !input_focused => {
-                    self.action(
-                        if cfg!(target_os = "macos") && !modifiers.alt {
-                            UiAction::CopyFiles
-                        } else {
-                            UiAction::CopyPaths
-                        },
-                        window,
-                        cx,
-                    );
-                    true
-                }
-                "delete" | "backspace"
-                    if cfg!(target_os = "macos") && modifiers.platform && !input_focused =>
-                {
-                    self.action(UiAction::TrashImmediately, window, cx);
-                    true
-                }
-                "delete" if !input_focused => {
-                    let action = if cfg!(target_os = "windows") {
-                        if modifiers.shift {
-                            UiAction::DeletePermanently
-                        } else {
-                            UiAction::TrashImmediately
-                        }
-                    } else {
-                        UiAction::Trash
-                    };
-                    self.action(action, window, cx);
-                    true
-                }
-                "backspace" if meta && !input_focused => {
-                    self.action(UiAction::Trash, window, cx);
-                    true
-                }
-                _ => false,
+                _ => match shortcut_action(key, modifiers) {
+                    // Only open/reveal/rename while typing in the search box;
+                    // the rest belong to the text field there.
+                    Some(action)
+                        if !input_focused
+                            || matches!(
+                                action,
+                                UiAction::Open | UiAction::Reveal | UiAction::Rename
+                            ) =>
+                    {
+                        self.action(action, window, cx);
+                        true
+                    }
+                    _ => false,
+                },
             }
         };
         if handled {
@@ -759,13 +762,17 @@ impl EverythingView {
     }
 
     pub(super) fn context_actions(&self) -> Vec<(&'static str, UiAction, &'static str)> {
-        let single = self.model.selected.len() == 1;
+        let single = self.action_paths().len() == 1;
         let package = single
-            && self
-                .model
-                .primary
-                .and_then(|i| self.model.rows.get(i))
-                .is_some_and(view::is_package);
+            && if self.target_tree {
+                self.tree_selected_entry()
+                    .is_some_and(|(path, _, is_dir)| is_package_path(is_dir, &path))
+            } else {
+                self.model
+                    .primary
+                    .and_then(|i| self.model.rows.get(i))
+                    .is_some_and(view::is_package)
+            };
         let reveal = if cfg!(target_os = "macos") {
             "Reveal in Finder"
         } else {
@@ -810,7 +817,7 @@ impl EverythingView {
                     let x = (f32::from(b.origin.x + position.x) * scale) as i32;
                     let y = (f32::from(b.origin.y + position.y) * scale) as i32;
                     if let Err(error) =
-                        crate::win::context_menu::show(handle.hwnd.get(), &self.model.paths(), x, y)
+                        crate::win::context_menu::show(handle.hwnd.get(), &self.action_paths(), x, y)
                     {
                         self.notify_message(error, cx);
                     }
@@ -845,8 +852,7 @@ impl EverythingView {
 
     pub(super) fn native_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self
-            .model
-            .paths()
+            .action_paths()
             .into_iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
@@ -863,5 +869,37 @@ impl EverythingView {
         ) {
             self.notify_message(error.to_string(), cx);
         }
+    }
+}
+
+/// File-action shortcuts shared by the results list and the file tree.
+fn shortcut_action(key: &str, modifiers: Modifiers) -> Option<UiAction> {
+    let meta = modifiers.platform || modifiers.control;
+    let mac = cfg!(target_os = "macos");
+    Some(match key {
+        "o" if meta => UiAction::Open,
+        "enter" if meta => UiAction::Reveal,
+        "f2" if !mac => UiAction::Rename,
+        "space" if mac => UiAction::QuickLook,
+        "c" if meta && mac && !modifiers.alt => UiAction::CopyFiles,
+        "c" if meta => UiAction::CopyPaths,
+        "delete" | "backspace" if mac && modifiers.platform => UiAction::TrashImmediately,
+        "delete" if cfg!(target_os = "windows") && modifiers.shift => UiAction::DeletePermanently,
+        "delete" if cfg!(target_os = "windows") => UiAction::TrashImmediately,
+        "delete" => UiAction::Trash,
+        "backspace" if meta => UiAction::Trash,
+        _ => return None,
+    })
+}
+
+fn is_package_path(is_dir: bool, path: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        is_dir && crate::has_package_extension(&path.to_string_lossy())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (is_dir, path);
+        false
     }
 }
