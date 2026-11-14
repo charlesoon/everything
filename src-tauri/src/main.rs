@@ -43,7 +43,6 @@ mod mem_search;
 mod pathindexing;
 mod query;
 mod rescan;
-mod ui_gate;
 #[cfg(target_os = "windows")]
 mod win;
 use fd_search::{FdSearchCache, FdSearchResultDto};
@@ -2517,14 +2516,7 @@ pub(crate) fn delete_paths(conn: &mut Connection, raw_paths: &[String]) -> AppRe
     Ok(deleted)
 }
 
-// Coalesce index updates while the native window is inactive, then flush the
-// latest payload on activation. The daemon does not depend on a window.
-
 pub(crate) fn emit_index_state(app: &EventSink, state: &str, message: Option<String>) {
-    if !ui_gate::is_visible() {
-        ui_gate::hold_state(state.to_string(), message);
-        return;
-    }
     emit_index_state_now(app, state, message);
 }
 
@@ -2548,10 +2540,6 @@ pub(crate) fn emit_index_updated(
     last_updated: i64,
     permission_errors: u64,
 ) {
-    if !ui_gate::is_visible() {
-        ui_gate::hold_updated(entries_count, last_updated, permission_errors);
-        return;
-    }
     emit_index_updated_now(app, entries_count, last_updated, permission_errors);
 }
 
@@ -2577,10 +2565,6 @@ pub(crate) fn emit_index_progress(
     indexed: u64,
     current_path: String,
 ) {
-    if !ui_gate::is_visible() {
-        ui_gate::hold_progress(scanned, indexed, current_path);
-        return;
-    }
     emit_index_progress_now(app, scanned, indexed, current_path);
 }
 

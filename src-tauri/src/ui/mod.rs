@@ -291,7 +291,6 @@ impl EverythingView {
                     this.cancel_pending_rename();
                     this.close_zoom_popover(cx);
                 }
-                crate::ui_gate::set_visible(&this.sink, window.is_window_active());
                 if window.is_window_active() {
                     this.update_status(crate::get_index_status(&this.backend), cx);
                     this.refresh_file_tree(cx);
