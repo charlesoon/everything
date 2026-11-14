@@ -13,6 +13,7 @@ pub(super) struct State {
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
     visible_rows: std::ops::Range<usize>,
+    layout_count: usize,
     result_selection: Option<PathBuf>,
     resizing: Option<(Point<Pixels>, f32)>,
 }
@@ -24,6 +25,7 @@ impl State {
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             visible_rows: 0..0,
+            layout_count: 0,
             result_selection: None,
             resizing: None,
         }
@@ -302,6 +304,7 @@ impl EverythingView {
                                 row_count,
                                 cx.processor(
                                     move |this, range: std::ops::Range<usize>, window, cx| {
+                                        this.file_tree.layout_count = row_count;
                                         let changed = this.file_tree.visible_rows != range;
                                         this.file_tree.visible_rows = range.clone();
                                         if changed
@@ -615,6 +618,11 @@ impl EverythingView {
             "focused": self.file_tree.focus.is_focused(window),
             "visibleRange": [self.file_tree.visible_rows.start, self.file_tree.visible_rows.end],
             "listBounds": [f32::from(bounds.origin.x), f32::from(bounds.origin.y), f32::from(bounds.size.width), f32::from(bounds.size.height)],
+            // UniformList stores the viewport as `item`; these unpadded rows
+            // are measured by dividing the content height by the row count.
+            "rowHeight": scroll.last_item_size.filter(|_| self.file_tree.layout_count > 0)
+                .map(|size|f32::from(size.contents.height) / self.file_tree.layout_count as f32)
+                .unwrap_or(self.row_height()),
             "scrollOffset": f32::from(scroll.base_handle.offset().y),
             "rowCount": self.file_tree.model.rows.len(),
             "selectedIndex": self.file_tree.model.selected_index(),

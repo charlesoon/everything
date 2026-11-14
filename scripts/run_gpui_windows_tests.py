@@ -69,7 +69,7 @@ foreach ($path in $paths) {
 
 
 class App:
-    def __init__(self, binary, fixture, output):
+    def __init__(self, binary, fixture, output, **extra):
         token = str(time.time_ns())
         self.state_path = output / f'state-{token}.json'
         self.log_path = output / f'app-{token}.log'
@@ -79,7 +79,7 @@ class App:
                 env.pop(name)
         env.update(EVERYTHING_UI_TEST='1', EVERYTHING_DATA_DIR=str(fixture / 'data'),
                    EVERYTHING_UI_STATE=str(self.state_path),
-                   EVERYTHING_UI_METRICS=str(output / f'metrics-{token}.jsonl'))
+                   EVERYTHING_UI_METRICS=str(output / f'metrics-{token}.jsonl'), **extra)
         self.log = self.log_path.open('w', encoding='utf-8')
         self.process = subprocess.Popen([str(binary)], env=env, stdout=self.log,
                                         stderr=subprocess.STDOUT,
@@ -153,6 +153,14 @@ def run(binary, fixture, output):
         d.key('down')
         return d.wait(lambda s: len(s['selected']) == 1)
 
+    def row_y(index=0):
+        s = d.state()
+        return s['resultsTop'] + s.get('measuredRowHeight', s['rowHeight']) * (index + 0.5)
+
+    def header_y():
+        s = d.state()
+        return s['resultsTop'] - 12.5 * s['zoom']
+
     def removed_without_dialog(paths, action):
         def done(s):
             assert s['modal'] is None, 'Windows deletion must not display a confirmation'
@@ -210,32 +218,32 @@ def run(binary, fixture, output):
             capture('04-pagination')
         case('WIN-04', 'PageDown scrolling and incremental result loading', pagination)
 
-        # The Windows content has a 30px custom title, 44px search and 25px header.
+        # Read the current layout so titlebar and zoom changes keep clicks aligned.
         def sorting():
             query('gpui-tc-', 4)
-            d.click(70, 85)
+            d.click(70, header_y())
             s = d.wait(lambda s: s['sortBy'] == 'name' and s['sortDir'] == 'desc' and not s['busy'])
             assert s['rows'][0]['name'] == 'gpui-tc-trash.txt', s
             widths = s['columns']
-            d.click(sum(widths[:2])+30, 85)
+            d.click(sum(widths[:2])+30, header_y())
             s = d.wait(lambda s: s['sortBy'] == 'size' and not s['busy'])
             assert [r['size'] for r in s['rows']] == sorted(r['size'] for r in s['rows']), s
-            d.click(70, 85)
+            d.click(70, header_y())
             d.wait(lambda s: s['sortBy'] == 'name' and s['sortDir'] == 'asc' and not s['busy'])
             width = d.state()['columns'][0]
-            d.send('down', x=width-2, y=85)
-            d.send('move', x=width+78, y=85)
-            d.send('up', x=width+78, y=85)
+            d.send('down', x=width-2, y=header_y())
+            d.send('move', x=width+78, y=header_y())
+            d.send('up', x=width+78, y=header_y())
             d.wait(lambda s: s['columns'][0] >= width+70)
             capture('05-columns')
         case('WIN-05', 'Server sorting and native mouse column resize', sorting)
 
         def selection():
             query('gpui-tc-', 4)
-            d.click(90, 112)
-            d.click(90, 166, modifiers=['ctrl'])
+            d.click(90, row_y(0))
+            d.click(90, row_y(2), modifiers=['ctrl'])
             d.wait(lambda s: len(s['selected']) == 2)
-            d.click(90, 193, modifiers=['shift'])
+            d.click(90, row_y(3), modifiers=['shift'])
             d.wait(lambda s: len(s['selected']) == 2)
             d.key('shift-up')
             d.key('ctrl-a')
@@ -257,7 +265,7 @@ def run(binary, fixture, output):
 
         def context_menu():
             s = selected('한글 보고서.txt')
-            d.click(100, 112, button='right')
+            d.click(100, row_y(), button='right')
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 try:
@@ -314,7 +322,11 @@ def run(binary, fixture, output):
 
         def minimum_window():
             s = d.state()
-            d.click(s['width']-48, s['height']-14)
+            d.click(s['width']-29*s['zoom'], s['height']-16*s['zoom'])
+            d.wait(lambda s: s['modal'] == 'settings')
+            d.key('down')
+            d.key('down')
+            d.key('enter')
             d.wait(lambda s: 'disabled in isolated' in (s['toast'] or ''))
             d.resize(400, 300)
             d.wait(lambda s: s['width'] == 400 and s['height'] == 300)
@@ -347,7 +359,7 @@ def run(binary, fixture, output):
         def merged_gestures():
             selected('gpui-tc-open.txt')
             time.sleep(u.GetDoubleClickTime()/1000 + 0.1)
-            d.click(90, 112)
+            d.click(90, row_y())
             time.sleep(d.state()['renameDelayMs']/1000 + 0.1)
             s = d.state()
             assert s['renamePath'] is None and not s['renamePending'], s
@@ -360,7 +372,7 @@ def run(binary, fixture, output):
                 d.wait(lambda s: not s['actionBusy'] and s['completedAction'] == action)
             d.activate()
             time.sleep(u.GetDoubleClickTime()/1000 + 0.1)
-            d.click(90, 112, count=2)
+            d.click(90, row_y(), count=2)
             d.wait(lambda s: not s['actionBusy'] and s['completedAction'] == 'Open')
             time.sleep(d.state()['renameDelayMs']/1000 + 0.1)
             s = d.state()
@@ -380,7 +392,7 @@ def run(binary, fixture, output):
             rows = d.state()['rows']
             for i, name in enumerate(names):
                 index = next(i for i, row in enumerate(rows) if row['name'] == name)
-                d.click(90, 99+27*index+13, modifiers=['ctrl'] if i else [])
+                d.click(90, row_y(index), modifiers=['ctrl'] if i else [])
             s = d.wait(lambda s: len(s['selected']) == 4)
             assert set(s['selected']) == {str(files/name) for name in
                                           ['folder-demo/child.txt', 'folder-demo', 'notes.md', 'Alpha report.txt']}, s
@@ -409,7 +421,7 @@ def run(binary, fixture, output):
             rows = d.state()['rows']
             for i, name in enumerate(['Info.plist', 'Contents', 'Demo.app']):
                 index = next(i for i, row in enumerate(rows) if row['name'] == name)
-                d.click(90, 99+27*index+13, modifiers=['ctrl'] if i else [])
+                d.click(90, row_y(index), modifiers=['ctrl'] if i else [])
             d.wait(lambda s: len(s['selected']) == 3)
             d.key('shift-delete')
             removed_without_dialog([files/'Demo.app'], 'DeletePermanently')
@@ -428,7 +440,7 @@ def run(binary, fixture, output):
         def titlebar_drag():
             d.resize(1010, 610)
             d.wait(lambda s: s['width'] == 1010 and s['height'] == 610)
-            for x, dx in [(120, 90), (505, -60)]:
+            for x, dx in [(120, 90), (60, -60)]:
                 assert d.hit_test(x, 15) == 2, 'Title text and background must be native HTCAPTION'
                 before = d.bounds()
                 d.drag(x, 15, dx, 50)

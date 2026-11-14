@@ -237,7 +237,10 @@ impl EverythingView {
                     .text_color(p.muted)
                     .overflow_hidden()
                     .flex() // lets the path shrink below its full width
-                    .child(middle_text::middle_path(display_path(&entry.dir, &self.backend.home_dir))),
+                    .child(middle_text::middle_path(display_path(
+                        &entry.dir,
+                        &self.backend.home_dir,
+                    ))),
             )
             .child(
                 div()
@@ -791,8 +794,10 @@ impl EverythingView {
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(p.border)
-                        .child(self.file_tree_toggle(cx))
-                        .child(self.file_tree_resize_handle(tree_width, cx)),
+                        .child(self.file_tree_resize_handle(tree_width, cx))
+                        // At high zoom in a narrow Windows window the divider
+                        // can overlap the toggle. Keep the button above it.
+                        .child(self.file_tree_toggle(cx)),
                 )
             })
             .when(!self.prefs.file_tree_visible, |title| {
@@ -1109,6 +1114,7 @@ impl Render for EverythingView {
                                     row_count,
                                     cx.processor(
                                         move |this, range: std::ops::Range<usize>, window, cx| {
+                                            this.list_layout_count = row_count;
                                             this.visible_rows = range.clone();
                                             if this.model.loaded_count > 0
                                                 && range.end + 30 >= this.model.rows.len()
@@ -1527,7 +1533,7 @@ impl EverythingView {
                 "buttonBounds":[f32::from(zoom_button.origin.x),f32::from(zoom_button.origin.y),f32::from(zoom_button.size.width),f32::from(zoom_button.size.height)],
                 "bounds":[f32::from(zoom_popover.origin.x),f32::from(zoom_popover.origin.y),f32::from(zoom_popover.size.width),f32::from(zoom_popover.size.height)],
             });
-            let state = serde_json::json!({
+            let mut state = serde_json::json!({
                 "query":self.model.query,"rows":self.model.rows.iter().take(35).map(|e|serde_json::json!({"name":e.name,"path":e.path,"dir":e.dir,"size":e.size,"isDir":e.is_dir})).collect::<Vec<_>>(),
                 "loaded":self.model.rows.len(),"total":self.model.total,"totalKnown":self.model.total_known,"busy":self.model.busy,"paging":self.model.paging,
                 "selected":self.model.paths(),"primary":self.model.primary,"sortBy":self.sort_by,"sortDir":self.sort_dir,
@@ -1535,7 +1541,7 @@ impl EverythingView {
                 "renamePending":self.rename_click_task.is_some(),"renameDelayMs":Self::rename_delay().as_millis() as u64,
                 "modal":self.modal.as_ref().map(|m|match m{Modal::Trash(_)=>"trash",Modal::Onboarding=>"onboarding",Modal::Settings=>"settings"}),
                 "modalSelection":self.modal_selection,"contextMenu":self.context_menu.is_some(),"menuSelection":self.menu_selection,
-                "fdaOk":self.fda_ok,"fdaDismissed":self.prefs.fda_dismissed,"fdaSettingsOpened":self.status_display.fda_settings_opened,"pathignoreBanner":self.status_display.pathignore_changed,"pathindexingBanner":self.status_display.pathindexing_changed,"tableFocused":self.table_focus.is_focused(window),
+                "fdaOk":self.fda_ok,"fdaDismissed":self.prefs.fda_dismissed,"fdaSettingsOpened":self.status_display.fda_settings_opened,"pathignoreBanner":self.status_display.pathignore_changed,"pathindexingBanner":self.status_display.pathindexing_changed,"tableFocused":self.table_focus.is_focused(window),"searchFocused":self.input.focus_handle(cx).is_focused(window),
                 "horizontalOffset":f32::from(self.horizontal_scroll.offset().x),"visibleRange":[self.visible_rows.start,self.visible_rows.end],
                 "fileTree":self.file_tree_test_state(window),
                 "toast":self.toast.as_ref().map(|(s,_)|s),"theme":if cx.theme().is_dark(){"dark"}else{"light"},"columns":self.table_columns,"error":self.model.error,"actionBusy":self.action_busy,"completedAction":self.completed_action.map(|action|format!("{action:?}")),
@@ -1544,20 +1550,30 @@ impl EverythingView {
                 "resultsTop":f32::from(self.list_scroll.0.borrow().base_handle.bounds().origin.y),
                 "zoomPopover":zoom_state,
             });
+            // Model results can change before the next layout. Match the
+            // measured content height with its own count, not the new model.
+            state["measuredRowHeight"] = self
+                .list_scroll
+                .0
+                .borrow()
+                .last_item_size
+                .filter(|_| self.list_layout_count > 0)
+                .map(|size| f32::from(size.contents.height) / self.list_layout_count as f32)
+                .unwrap_or(self.row_height())
+                .into();
             let _ = std::fs::write(path, state.to_string());
         }
     }
 }
 
 pub(super) fn display_path(path: &str, home: &std::path::Path) -> String {
-    let home = home.to_string_lossy();
-    if path == home.as_ref() {
-        "~".into()
-    } else if path.starts_with(&format!("{home}/")) {
-        format!("~{}", &path[home.len()..])
-    } else {
-        path.into()
+    if let Ok(relative) = std::path::Path::new(path).strip_prefix(home) {
+        if relative.as_os_str().is_empty() {
+            return "~".into();
+        }
+        return format!("~{}{}", std::path::MAIN_SEPARATOR, relative.display());
     }
+    path.into()
 }
 fn format_size(entry: &EntryDto) -> String {
     if entry.is_dir {
@@ -1644,4 +1660,27 @@ fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod path_display_tests {
+    #[test]
+    fn home_paths_use_native_separators_without_shortening_sibling_prefixes() {
+        let home = std::path::PathBuf::from("users").join("alex");
+        let child = home.join("work").join("한글");
+        assert_eq!(super::display_path(&home.to_string_lossy(), &home), "~");
+        assert_eq!(
+            super::display_path(&child.to_string_lossy(), &home),
+            format!(
+                "~{}work{}한글",
+                std::path::MAIN_SEPARATOR,
+                std::path::MAIN_SEPARATOR
+            )
+        );
+        let sibling = home.with_file_name("alex-other").join("work");
+        assert_eq!(
+            super::display_path(&sibling.to_string_lossy(), &home),
+            sibling.to_string_lossy()
+        );
+    }
 }

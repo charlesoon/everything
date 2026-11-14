@@ -118,6 +118,7 @@ struct EverythingView {
     sort_by: String,
     sort_dir: String,
     list_scroll: UniformListScrollHandle,
+    list_layout_count: usize,
     horizontal_scroll: ScrollHandle,
     file_tree: file_tree::State,
     zoom_popover: zoom::Popover,
@@ -181,6 +182,7 @@ impl EverythingView {
             sort_by: "name".into(),
             sort_dir: "asc".into(),
             list_scroll: UniformListScrollHandle::new(),
+            list_layout_count: 0,
             horizontal_scroll: ScrollHandle::new(),
             file_tree: file_tree::State::new(cx),
             zoom_popover: zoom::Popover::default(),
@@ -524,7 +526,23 @@ impl EverythingView {
     }
 
     fn apply_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
-        Theme::sync_system_appearance(Some(window), cx);
+        // Opt-in fixture launches can render both palettes without changing
+        // Windows' actual theme or the user's saved preferences.
+        let fixture_theme =
+            if cfg!(feature = "ui-automation") && crate::env_truthy("EVERYTHING_UI_TEST") {
+                match std::env::var("EVERYTHING_UI_TEST_THEME").as_deref() {
+                    Ok("light") => Some(gpui_component::ThemeMode::Light),
+                    Ok("dark") => Some(gpui_component::ThemeMode::Dark),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        if let Some(mode) = fixture_theme {
+            Theme::change(mode, Some(window), cx);
+        } else {
+            Theme::sync_system_appearance(Some(window), cx);
+        }
         let p = design::Palette::get(cx);
         let theme = Theme::global_mut(cx);
         theme.font_family = design::SANS.into();

@@ -62,6 +62,8 @@ u.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, c.c_int]
 u.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
 u.BringWindowToTop.argtypes = [w.HWND]
 u.SetFocus.argtypes = [w.HWND]
+u.WindowFromPoint.argtypes = [w.POINT]
+u.WindowFromPoint.restype = w.HWND
 u.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 u.SendMessageW.restype = c.c_ssize_t
 u.GetMenuItemCount.argtypes = [w.HMENU]
@@ -108,27 +110,48 @@ class WindowsDriver(Driver):
             handles = [h for h in windows(pid) if title(h) == 'Everything']
             if handles and Path(state_path).exists():
                 self.hwnd = handles[0]
-                self.activate()
-                return
+                try:
+                    self.activate()
+                    return
+                except RuntimeError:
+                    # Startup activation and the first GPU frame may cross.
+                    # Keep the input guard and retry while this window exists.
+                    pass
             time.sleep(0.05)
         raise TimeoutError(f'GPUI window did not appear for PID {pid}')
 
     def activate(self):
+        if u.GetForegroundWindow() == self.hwnd and not u.IsIconic(self.hwnd):
+            return
         u.ShowWindow(self.hwnd, 9 if u.IsIconic(self.hwnd) else 5)
         u.SetForegroundWindow(self.hwnd)
         time.sleep(0.05)
         if u.GetForegroundWindow() != self.hwnd:
             current = k.GetCurrentThreadId()
             foreground = u.GetWindowThreadProcessId(u.GetForegroundWindow(), None)
-            attached = current != foreground and u.AttachThreadInput(current, foreground, True)
+            target = u.GetWindowThreadProcessId(self.hwnd, None)
+            attached = [thread for thread in {foreground, target} if thread and thread != current
+                        and u.AttachThreadInput(current, thread, True)]
             try:
                 u.BringWindowToTop(self.hwnd)
                 u.SetForegroundWindow(self.hwnd)
                 u.SetFocus(self.hwnd)
             finally:
-                if attached:
-                    u.AttachThreadInput(current, foreground, False)
+                for thread in reversed(attached):
+                    u.AttachThreadInput(current, thread, False)
             time.sleep(0.05)
+        if u.GetForegroundWindow() != self.hwnd:
+            # Windows can deny background foreground requests (notably while
+            # Settings is active). Raise without activation, then click only
+            # after verifying the pointer is over this exact test window.
+            u.SetWindowPos(self.hwnd, None, 0, 0, 0, 0, 0x13)
+            pt = self.point(120, 19)
+            if u.WindowFromPoint(pt) == self.hwnd:
+                u.SetCursorPos(pt.x, pt.y)
+                time.sleep(0.075)
+                values = (Input * 2)(*(Input(type=0, mi=MouseInput(0, 0, 0, f, 0, 0)) for f in [2, 4]))
+                u.SendInput(2, values, c.sizeof(Input))
+                time.sleep(0.1)
         if u.GetForegroundWindow() != self.hwnd:
             raise RuntimeError('Cannot focus the test HWND; refusing global input')
 
@@ -148,15 +171,32 @@ class WindowsDriver(Driver):
         name = parts[-1]
         keys = dict(enter=13, escape=27, backspace=8, delete=46, down=40,
                     up=38, left=37, right=39, pagedown=34, pageup=33,
-                    f2=113, space=32, tab=9)
+                    f2=113, space=32, tab=9, home=36, end=35,
+                    equals=187, plus=187, minus=189)
         vk = keys.get(name, ord(name.upper()) if len(name) == 1 else None)
         if vk is None:
             raise ValueError(f'Unsupported key: {combination}')
         modifiers = [dict(ctrl=17, cmd=17, shift=16, alt=18)[p] for p in parts[:-1]]
-        extended = 1 if name in ['delete', 'down', 'up', 'left', 'right', 'pagedown', 'pageup'] else 0
-        self.inputs([*(self.keyboard(v) for v in modifiers),
-                     self.keyboard(vk, flags=extended), self.keyboard(vk, up=True, flags=extended),
-                     *(self.keyboard(v, up=True) for v in reversed(modifiers))])
+        if name == 'plus' and 16 not in modifiers:
+            modifiers.append(16)
+        extended = 1 if name in ['delete', 'down', 'up', 'left', 'right', 'pagedown', 'pageup', 'home', 'end'] else 0
+        for modifier in modifiers:
+            self.inputs([self.keyboard(modifier)], settle=0.01)
+        self.inputs([self.keyboard(vk, flags=extended)], settle=0.01)
+        self.inputs([self.keyboard(vk, up=True, flags=extended)], settle=0.01)
+        for modifier in reversed(modifiers):
+            self.inputs([self.keyboard(modifier, up=True)], settle=0.01)
+        time.sleep(0.035)
+
+    def query(self, text):
+        self.key('ctrl-f')
+        if 'searchFocused' in self.state():
+            self.wait(lambda s: s['searchFocused'])
+        self.key('ctrl-a')
+        if text:
+            self.text(text)
+        else:
+            self.key('backspace')
 
     def text(self, text):
         encoded = text.encode('utf-16-le')
@@ -281,6 +321,13 @@ class WindowsDriver(Driver):
         self.inputs([Input(type=0, mi=MouseInput(0, 0, 0, f, 0, 0)) for f in [2, 4]])
 
     def send(self, op, **values):
+        if op == 'window':
+            return self.bounds()
+        if op == 'activate':
+            return self.activate()
+        if op == 'hide':
+            u.ShowWindow(self.hwnd, 6)
+            return
         if op in ['click', 'down', 'up', 'move']:
             return self.mouse(op, **values)
         if op == 'capture':
