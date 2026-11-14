@@ -25,7 +25,26 @@ const HEALTH_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 use crate::runtime::EventSink;
 
-use crate::{db_connection, set_ready_with_cached_counts, AppState};
+use crate::{db_connection, AppState, IndexState, IndexStatus};
+
+fn mirror_service_status(snapshot: &mut IndexStatus, service: &service_client::ServiceStatus) {
+    snapshot.state = match service.state.as_str() {
+        "Ready" => IndexState::Ready,
+        "Error" => IndexState::Error,
+        _ => IndexState::Indexing,
+    };
+    snapshot.scanned = service.scanned;
+    snapshot.indexed = service.indexed;
+    if let Some(entries) = service.entries_count {
+        snapshot.entries_count = entries;
+    }
+    if service.last_updated.is_some() {
+        snapshot.last_updated = service.last_updated;
+    }
+    snapshot.permission_errors = service.permission_errors;
+    snapshot.current_path = service.current_path.clone();
+    snapshot.message = service.message.clone();
+}
 
 /// Read-only Windows GUI startup (§3.3 / D4 / D5): the GUI never indexes — the
 /// service owns writes. Seed Ready from the service's DB, then poll the service
@@ -35,8 +54,17 @@ use crate::{db_connection, set_ready_with_cached_counts, AppState};
 /// emit a `service_health` banner event — auto-starting a stopped service (the
 /// D2 DACL grant lets INTERACTIVE start it without UAC).
 pub fn start_windows_readonly(app: EventSink, state: AppState) {
-    // Instant Ready if the service already has an index; the poll loop refines.
-    set_ready_with_cached_counts(&app, &state);
+    // A cached count is useful while connecting, but is not proof that the
+    // service has finished rebuilding its search indexes.
+    if let Ok(conn) = db_connection(&state.db_path) {
+        let (count, updated) = crate::load_cached_counts(&conn);
+        let mut snapshot = state.status.lock();
+        snapshot.entries_count = count.unwrap_or(0);
+        snapshot.last_updated = updated;
+        snapshot.state = IndexState::Indexing;
+        snapshot.message = Some("Connecting to indexer".into());
+    }
+    crate::emit_index_state(&app, "Indexing", Some("Connecting to indexer".into()));
 
     std::thread::spawn(move || {
         use std::time::Instant;
@@ -68,6 +96,13 @@ pub fn start_windows_readonly(app: EventSink, state: AppState) {
                     start_requested = false;
                     last_health_check = None;
 
+                    // GPUI pulls get_index_status on every event. Keep that
+                    // snapshot in sync before publishing the service events.
+                    mirror_service_status(&mut state.status.lock(), &s);
+                    state
+                        .indexing_active
+                        .store(s.state == "Indexing", std::sync::atomic::Ordering::Release);
+
                     if last_progress != Some((s.scanned, s.indexed)) {
                         crate::emit_index_progress(&app, s.scanned, s.indexed, String::new());
                         last_progress = Some((s.scanned, s.indexed));
@@ -76,6 +111,14 @@ pub fn start_windows_readonly(app: EventSink, state: AppState) {
                         .as_ref()
                         .map_or(true, |(st, msg)| st != &s.state || msg != &s.message)
                     {
+                        crate::diag::log(format!(
+                            "service status state={} scanned={} indexed={} entries={} phase={:?}",
+                            s.state,
+                            s.scanned,
+                            s.indexed,
+                            s.entries_count.unwrap_or(0),
+                            s.message
+                        ));
                         crate::emit_index_state(&app, &s.state, s.message.clone());
                         last_state = Some((s.state.clone(), s.message.clone()));
                     }
@@ -162,6 +205,50 @@ pub fn start_windows_readonly(app: EventSink, state: AppState) {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     });
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn service_progress_replaces_cached_ready_before_gui_pulls_status() {
+        let mut snapshot = IndexStatus {
+            state: IndexState::Ready,
+            entries_count: 10,
+            ..IndexStatus::default()
+        };
+        let progress = serde_json::from_str(r#"{"ok":true,"state":"Indexing","scanned":1200,"indexed":1100,"entriesCount":1050,"message":"Reading file metadata","currentPath":"C:\\work","lastUpdated":42}"#).unwrap();
+        mirror_service_status(&mut snapshot, &progress);
+        assert_eq!(snapshot.state.as_str(), "Indexing");
+        assert_eq!(
+            (snapshot.scanned, snapshot.indexed, snapshot.entries_count),
+            (1200, 1100, 1050)
+        );
+        assert_eq!(snapshot.message.as_deref(), Some("Reading file metadata"));
+        assert_eq!(snapshot.current_path, "C:\\work");
+        assert_eq!(snapshot.last_updated, Some(42));
+
+        let ready =
+            serde_json::from_str(r#"{"state":"Ready","entriesCount":1100,"lastUpdated":43}"#)
+                .unwrap();
+        mirror_service_status(&mut snapshot, &ready);
+        assert_eq!(snapshot.state.as_str(), "Ready");
+        assert_eq!(snapshot.entries_count, 1100);
+        assert!(snapshot.message.is_none());
+        let failed = serde_json::from_str(
+            r#"{"state":"Error","message":"volume unavailable","permissionErrors":2}"#,
+        )
+        .unwrap();
+        mirror_service_status(&mut snapshot, &failed);
+        assert_eq!(snapshot.state.as_str(), "Error");
+        assert_eq!(snapshot.message.as_deref(), Some("volume unavailable"));
+        assert_eq!(snapshot.permission_errors, 2);
+        assert_eq!(
+            snapshot.entries_count, 1100,
+            "older status replies must not erase cached counts"
+        );
+    }
 }
 
 /// A `sc.exe` command that spawns no console window. The read-only GUI is a

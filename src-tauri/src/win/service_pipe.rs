@@ -21,7 +21,9 @@ use serde_json::json;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE};
-use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX};
+use windows::Win32::Storage::FileSystem::{
+    FlushFileBuffers, ReadFile, WriteFile, PIPE_ACCESS_DUPLEX,
+};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -240,7 +242,7 @@ fn dispatch(line: &str, ctx: &PipeContext, pid: u32, session: u32) -> String {
 }
 
 fn status_response(ctx: &PipeContext) -> String {
-    let (state_str, scanned, indexed, entries, message) = {
+    let (state_str, scanned, indexed, entries, message, updated, errors, current_path) = {
         let s = ctx.state.status.lock();
         (
             format!("{:?}", s.state),
@@ -248,6 +250,9 @@ fn status_response(ctx: &PipeContext) -> String {
             s.indexed,
             s.entries_count,
             s.message.clone(),
+            s.last_updated,
+            s.permission_errors,
+            s.current_path.clone(),
         )
     };
     json!({
@@ -258,6 +263,9 @@ fn status_response(ctx: &PipeContext) -> String {
         "entriesCount": entries,
         "message": message,
         "version": env!("CARGO_PKG_VERSION"),
+        "lastUpdated": updated,
+        "permissionErrors": errors,
+        "currentPath": current_path,
         "sidecarMigrated": marker_path(&ctx.state).exists(),
     })
     .to_string()

@@ -43,6 +43,7 @@ pub(super) fn run() {
         }
     };
     let prefs = Preferences::load();
+    crate::logging::subscribe(sink.clone());
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
@@ -150,6 +151,9 @@ struct EverythingView {
     search_task: Option<Task<()>>,
     preference_task: Option<Task<()>>,
     input_started: Instant,
+    search_started: Instant,
+    startup_started: Instant,
+    first_results_logged: bool,
     last_search_ms: f64,
     last_search_fired: Option<Instant>,
     displayed_query: String,
@@ -215,6 +219,9 @@ impl EverythingView {
             search_task: None,
             preference_task: None,
             input_started: started,
+            search_started: started,
+            startup_started: started,
+            first_results_logged: false,
             last_search_ms: 0.,
             last_search_fired: None,
             displayed_query: String::new(),
@@ -366,19 +373,54 @@ impl EverythingView {
     }
 
     fn update_status(&mut self, next: IndexStatusDto, cx: &mut Context<Self>) {
-        let was_indexing = self.status.state == "Indexing";
         self.status_display
             .update(&self.status, &next, Instant::now());
         self.status = next;
-        if self.status.state != "Indexing" {
+        self.refresh_activity_timer(cx);
+    }
+
+    fn search_activity(&self) -> Option<String> {
+        if self.model.busy || self.model.paging {
+            Some(format!(
+                "{} · {}s",
+                if self.model.rows.is_empty() {
+                    "Loading files"
+                } else if self.model.paging {
+                    "Loading more"
+                } else {
+                    "Searching"
+                },
+                self.search_started.elapsed().as_secs()
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn empty_results_text(&self) -> String {
+        if let Some(error) = &self.model.error {
+            format!("Search failed: {error}")
+        } else if let Some(activity) = self.search_activity() {
+            activity
+        } else if self.status.state == "Indexing" {
+            "Indexing files…".into()
+        } else if self.model.query.is_empty() {
+            "No indexed files".into()
+        } else {
+            "No matching files".into()
+        }
+    }
+
+    fn refresh_activity_timer(&mut self, cx: &mut Context<Self>) {
+        if self.status.state != "Indexing" && !self.model.busy && !self.model.paging {
             self.status_task = None;
-        } else if !was_indexing || self.status_task.is_none() {
+        } else if self.status_task.is_none() {
             self.status_task = Some(cx.spawn(async move |view, cx| loop {
                 Timer::after(Duration::from_secs(1)).await;
                 if !view
                     .update(cx, |this, cx| {
                         cx.notify();
-                        this.status.state == "Indexing"
+                        this.status.state == "Indexing" || this.model.busy || this.model.paging
                     })
                     .unwrap_or(false)
                 {
@@ -444,6 +486,8 @@ impl EverythingView {
         } else {
             self.model.busy = true;
         }
+        self.search_started = Instant::now();
+        self.refresh_activity_timer(cx);
         let state = self.backend.clone();
         let sink = self.sink.clone();
         let query = self.model.query.clone();
@@ -495,8 +539,19 @@ impl EverythingView {
                             if offset==0 {
                                 let rows=this.model.rows.len();
                                 let first=this.model.rows.first().map(|r|r.name.clone());
+                                let first_results = rows > 0 && !this.first_results_logged;
+                                this.first_results_logged |= first_results;
+                                let startup_started = this.startup_started;
                                 cx.on_next_frame(window,move |_,window,cx| {
-                                    window.on_next_frame(move |_,_|telemetry(serde_json::json!({"event":"searchFrame","query":query,"backendMs":elapsed,"elapsedMs":input_started.elapsed().as_secs_f64()*1000.,"rows":rows,"first":first,"includeTotal":include_total})));
+                                    window.on_next_frame(move |_,cx| {
+                                        telemetry(serde_json::json!({"event":"searchFrame","query":query,"backendMs":elapsed,"elapsedMs":input_started.elapsed().as_secs_f64()*1000.,"rows":rows,"first":first,"includeTotal":include_total}));
+                                        if first_results {
+                                            let elapsed = startup_started.elapsed().as_millis();
+                                            cx.background_executor().spawn(async move {
+                                                crate::diag::log(format!("phase=gui.first_results event=end elapsed_ms={elapsed} rows={rows}"));
+                                            }).detach();
+                                        }
+                                    });
                                     cx.notify();
                                 });
                             }
@@ -508,6 +563,7 @@ impl EverythingView {
                         if offset==0 {this.model.rows.clear();this.model.loaded_count=0;this.model.clear_selection();}
                     }
                 }
+                this.refresh_activity_timer(cx);
                 cx.notify();
             });
         }).detach();

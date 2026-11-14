@@ -286,9 +286,13 @@ fn quick_prep(data_dir: &Path) -> Result<Prepared, String> {
     let config_dir = service_paths::config_dir().ok_or("cannot resolve config dir")?;
     let _ = std::fs::create_dir_all(&config_dir);
     let db_path = service_paths::db_path().ok_or("cannot resolve db path")?;
+    service_log::file(data_dir, "service startup preparation");
+    let prepare_phase = crate::diag::Phase::begin("service.prepare");
 
     // The service owns all writes → it initializes the schema.
+    let schema_phase = crate::diag::Phase::begin("service.open_database");
     init_db_tables(&db_path)?;
+    schema_phase.finish("schema=ready");
 
     // D6: hold daemon.lock for our lifetime so a stray `--daemon` self-exits.
     let daemon_lock = crate::daemon::try_acquire_daemon_lock(&db_path);
@@ -339,6 +343,7 @@ fn quick_prep(data_dir: &Path) -> Result<Prepared, String> {
         pipe_stop.clone(),
     );
 
+    prepare_phase.finish("worker=started control_pipe=started");
     Ok(Prepared {
         state,
         index_tx,
@@ -458,6 +463,17 @@ fn run_pass(state: &AppState, stop: &Arc<AtomicBool>, data_dir: &Path) -> bool {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
+            }
+            if stop.load(Ordering::Acquire) {
+                service_log::file(data_dir, "index pass cancelled by service stop");
+                return false;
+            }
+            if matches!(state.status.lock().state, crate::IndexState::Error) {
+                service_log::file(
+                    data_dir,
+                    "index pass FAILED during database finalization; see phase error",
+                );
+                return false;
             }
             service_log::file(
                 data_dir,

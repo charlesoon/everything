@@ -17,6 +17,7 @@ pub(super) enum UiAction {
     Ignore,
     Reset,
     Settings,
+    ToggleLogging,
     FdaSettings,
     LoginSettings,
     Register,
@@ -178,10 +179,22 @@ impl EverythingView {
             .is_some_and(|s| !s.opted_out && s.registration == "enabled");
         let backend = self.backend.clone();
         let sink = self.sink.clone();
+        let logging_enabled = !crate::logging::enabled();
         self.action_busy = true;
         cx.spawn_in(window, async move |view, cx| {
             let result: crate::AppResult<Outcome> = async {
                 match action {
+                    UiAction::ToggleLogging => {
+                        crate::runtime::spawn_blocking(move || {
+                            crate::logging::set_enabled(logging_enabled)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())??;
+                        Ok(Outcome::Message(format!(
+                            "Log {}",
+                            if logging_enabled { "on" } else { "off" }
+                        )))
+                    }
                     UiAction::Open => {
                         crate::open(paths).await?;
                         Ok(Outcome::Done)
@@ -816,9 +829,12 @@ impl EverythingView {
                     let scale = window.scale_factor();
                     let x = (f32::from(b.origin.x + position.x) * scale) as i32;
                     let y = (f32::from(b.origin.y + position.y) * scale) as i32;
-                    if let Err(error) =
-                        crate::win::context_menu::show(handle.hwnd.get(), &self.action_paths(), x, y)
-                    {
+                    if let Err(error) = crate::win::context_menu::show(
+                        handle.hwnd.get(),
+                        &self.action_paths(),
+                        x,
+                        y,
+                    ) {
                         self.notify_message(error, cx);
                     }
                     return;

@@ -50,7 +50,8 @@ fn send(request: &str) -> Option<String> {
     }
 
     // Wrap the handle in a File so it's closed on drop (also on early return).
-    let mut file = unsafe { std::fs::File::from_raw_handle(handle.0 as std::os::windows::io::RawHandle) };
+    let mut file =
+        unsafe { std::fs::File::from_raw_handle(handle.0 as std::os::windows::io::RawHandle) };
 
     let mut msg = request.to_string();
     msg.push('\n');
@@ -74,8 +75,8 @@ fn send(request: &str) -> Option<String> {
 }
 
 /// The service's status reply (the typed half of the control protocol, mirroring
-/// the `PipeRequest` enum on the request side). Unknown fields (e.g. the
-/// GUI-unused `entriesCount`) are ignored; a missing `state` or an `{"ok":false}`
+/// the `PipeRequest` enum on the request side). Unknown fields are ignored;
+/// a missing `state` or an `{"ok":false}`
 /// error envelope fails to parse / is rejected, so the caller degrades to the
 /// health-banner path instead of misreading it.
 #[derive(serde::Deserialize)]
@@ -88,6 +89,14 @@ pub(crate) struct ServiceStatus {
     pub(crate) scanned: u64,
     #[serde(default)]
     pub(crate) indexed: u64,
+    #[serde(default)]
+    pub(crate) entries_count: Option<u64>,
+    #[serde(default)]
+    pub(crate) last_updated: Option<i64>,
+    #[serde(default)]
+    pub(crate) permission_errors: u64,
+    #[serde(default)]
+    pub(crate) current_path: String,
     #[serde(default)]
     pub(crate) message: Option<String>,
     #[serde(default)]

@@ -8,19 +8,17 @@
 //! stderr and a Finder-launched GUI loses its stderr too, so the app records
 //! its own anomalies here for after-the-fact reconstruction.
 //!
-//! Discipline: state transitions, index-pass boundaries, and anomaly `ALERT`s
-//! only — never per-event chatter. A pass logs O(1) lines and the watcher logs
-//! only when a threshold trips, so the file stays small and readable.
+//! Logging is opt-in on Windows. Record state transitions, timed phases,
+//! bounded progress summaries and anomaly `ALERT`s, never per-file chatter.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
-/// Rotate when the log exceeds this. Checked only at process start (`init`),
-/// so the active pair is `everything.log` + `everything.log.1` and a
-/// long-lived process keeps appending to its (possibly rotated-away) inode
-/// harmlessly until it restarts.
+/// Rotate on open and while writing so a long-lived diagnostic session stays
+/// bounded to the active file and one previous file.
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 struct Diag {
@@ -50,17 +48,20 @@ pub(crate) fn append_handle(app_data_dir: &Path) -> Option<File> {
 /// Initialize once per process; `component` ("gui" | "daemon" | "mcp") tags
 /// every line so interleaved writers stay attributable. Later calls no-op.
 pub(crate) fn init(app_data_dir: &Path, component: &'static str) {
-    let path = log_path(app_data_dir);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    init_named(app_data_dir, component, "everything.log");
+}
+
+pub(crate) fn init_named(app_data_dir: &Path, component: &'static str, name: &'static str) {
+    if DIAG.get().is_some() {
+        return;
     }
-    if fs::metadata(&path)
-        .map(|m| m.len() > MAX_LOG_BYTES)
-        .unwrap_or(false)
-    {
-        let _ = fs::rename(&path, path.with_extension("log.1"));
-    }
-    let file = OpenOptions::new().create(true).append(true).open(&path).ok();
+    crate::logging::init();
+    let path = app_data_dir.join("logs").join(name);
+    let file = if crate::logging::enabled() {
+        open_log(&path)
+    } else {
+        None
+    };
     if DIAG
         .set(Diag {
             component,
@@ -77,11 +78,27 @@ pub(crate) fn init(app_data_dir: &Path, component: &'static str) {
     }
 }
 
+fn open_log(path: &Path) -> Option<File> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::metadata(&path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = fs::rename(&path, path.with_extension("log.1"));
+    }
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
 /// Append one timestamped line. Mirrors to stderr only when stderr is a
 /// terminal — a detached daemon's stderr IS this file, so an unconditional
 /// mirror would double every line. Never panics; a failed write drops the
 /// handle so the next call reopens it.
 pub(crate) fn log(msg: impl AsRef<str>) {
+    if !crate::logging::enabled() {
+        return;
+    }
     let msg = msg.as_ref();
     if std::io::stderr().is_terminal() {
         eprintln!("[diag] {msg}");
@@ -94,16 +111,58 @@ pub(crate) fn log(msg: impl AsRef<str>) {
         msg
     );
     let mut file = diag.file.lock().unwrap_or_else(|e| e.into_inner());
+    if file
+        .as_ref()
+        .is_some_and(|file| file.metadata().is_ok_and(|meta| meta.len() > MAX_LOG_BYTES))
+    {
+        *file = None;
+    }
     if file.is_none() {
-        *file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&diag.path)
-            .ok();
+        *file = open_log(&diag.path);
     }
     if let Some(f) = file.as_mut() {
         if f.write_all(line.as_bytes()).is_err() {
             *file = None;
+        }
+    }
+}
+
+/// A phase records a start and an elapsed completion (or early-abort) line.
+pub(crate) struct Phase {
+    name: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl Phase {
+    pub(crate) fn begin(name: &'static str) -> Self {
+        log(format!("phase={name} event=start"));
+        Self {
+            name,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self, details: impl AsRef<str>) {
+        self.finished = true;
+        log(format!(
+            "phase={} event=end elapsed_ms={} {}",
+            self.name,
+            self.started.elapsed().as_millis(),
+            details.as_ref()
+        ));
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        if !self.finished {
+            log(format!(
+                "phase={} event=aborted elapsed_ms={}",
+                self.name,
+                self.started.elapsed().as_millis()
+            ));
         }
     }
 }

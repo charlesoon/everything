@@ -34,6 +34,7 @@ mod daemon;
 #[cfg(target_os = "macos")]
 mod daemon_ipc;
 mod diag;
+mod logging;
 mod fd_search;
 mod file_actions;
 #[cfg(target_os = "macos")]
@@ -6532,7 +6533,7 @@ pub(crate) fn reset_index_storage(conn: &Connection) -> AppResult<()> {
 }
 
 fn log_search(db_path: &Path, query: &str, mode: &str, results: &[EntryDto]) {
-    if !search_log_enabled() {
+    if !logging::enabled() || !search_log_enabled() {
         return;
     }
 
@@ -7555,9 +7556,24 @@ async fn search(
     let state = state.clone();
     runtime::spawn_blocking(move || {
         let rpc_started = Instant::now();
+        let execute_phase = diag::Phase::begin("search.execute");
+        diag::log(format!("search request query_chars={} sort={}/{} limit={} offset={}",
+            query.chars().count(), sort_by.as_deref().unwrap_or("name"),sort_dir.as_deref().unwrap_or("asc"),limit.unwrap_or(DEFAULT_LIMIT),offset.unwrap_or(0)));
         let execute_started = Instant::now();
-        let execution = execute_search(&state, query, limit, offset, sort_by, sort_dir)?;
+        // Controlled latency for real-window fixture tests; never active in
+        // a production launch or a build without ui-automation.
+        if cfg!(feature = "ui-automation") && env_truthy("EVERYTHING_UI_TEST") {
+            if let Some(delay) = std::env::var("EVERYTHING_UI_TEST_SEARCH_DELAY_MS").ok()
+                .and_then(|value|value.parse::<u64>().ok()).filter(|value|*value>0) {
+                std::thread::sleep(Duration::from_millis(delay.min(10_000)));
+            }
+        }
+        let execution = execute_search(&state, query, limit, offset, sort_by, sort_dir).map_err(|error|{
+            diag::log(format!("search failed error={error}"));
+            error
+        })?;
         let execute_elapsed_ms = execute_started.elapsed().as_secs_f64() * 1000.0;
+        execute_phase.finish(format!("mode={} rows={}",execution.mode_label,execution.results.len()));
 
         log_search(
             &state.db_path,
@@ -7589,6 +7605,7 @@ async fn search(
 
         let include_total = include_total.unwrap_or(true);
         let count_started = Instant::now();
+        let count_phase = diag::Phase::begin("search.count");
         let (total_count, total_known) = if include_total {
             match compute_total_count(&state, &execution) {
                 Some(v) => (v, true),
@@ -7604,6 +7621,8 @@ async fn search(
         };
 
         let rpc_elapsed_ms = rpc_started.elapsed().as_secs_f64() * 1000.0;
+        count_phase.finish(format!("known={total_known} total={total_count}"));
+        diag::log(format!("phase=search.complete event=end elapsed_ms={rpc_elapsed_ms:.1} execute_ms={execute_elapsed_ms:.1} count_ms={count_elapsed_ms:.1} rows={} total={total_count} total_known={total_known}",execution.results.len()));
         if cfg!(debug_assertions) {
             let db_ready = state.db_ready.load(AtomicOrdering::Acquire);
             let indexing_active = state.indexing_active.load(AtomicOrdering::Acquire);
@@ -8695,7 +8714,9 @@ fn setup_native() -> AppResult<(AppState, EventSink, async_channel::Receiver<()>
 
     let app_data_dir = ui_prefs::app_data_dir();
     if env_truthy("EVERYTHING_UI_TEST") {
-        return ui_model::fixture_runtime(&app_data_dir);
+        let fixture = ui_model::fixture_runtime(&app_data_dir)?;
+        diag::init(&app_data_dir, "gui");
+        return Ok(fixture);
     }
     fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
 
@@ -8704,6 +8725,7 @@ fn setup_native() -> AppResult<(AppState, EventSink, async_channel::Receiver<()>
     // field incidents are otherwise unreproducible, and a Finder-launched
     // process has no visible stderr. (db_path is resolved per-platform below.)
     diag::init(&app_data_dir, "gui");
+    let setup_phase = diag::Phase::begin("gui.setup");
     // Field CPU accounting: if this process ever burns fan-relevant power
     // (P-band CPU ≥ ~5W sustained), the episode lands in the diag log with a
     // per-QoS-class split, so a "fans spun up" report is diagnosable from the
@@ -8813,6 +8835,7 @@ fn setup_native() -> AppResult<(AppState, EventSink, async_channel::Receiver<()>
     let native_state = state.clone();
     std::thread::spawn(move || {
         let thread_started = std::time::Instant::now();
+        let init_phase = diag::Phase::begin("gui.backend");
         eprintln!("[startup/thread] init thread started");
 
         // Linux: the GUI may be the writer, so it initializes the schema.
@@ -9082,8 +9105,10 @@ fn setup_native() -> AppResult<(AppState, EventSink, async_channel::Receiver<()>
                 );
             });
         }
+        init_phase.finish("status_bridge=started");
     });
 
+    setup_phase.finish(format!("setup_ms={}",setup_started.elapsed().as_millis()));
     Ok((native_state, ui_sink, receiver))
 }
 

@@ -102,6 +102,7 @@ pub fn scan_mft(
     use std::sync::atomic::Ordering as AtomicOrdering;
 
     let started = Instant::now();
+    let scan_phase = crate::diag::Phase::begin("mft.scan_records");
     let ts = || format!("{:.1}s", started.elapsed().as_secs_f32());
     eprintln!("[win/mft +{}] starting MFT scan", ts());
 
@@ -129,7 +130,7 @@ pub fn scan_mft(
     {
         let mut status = state.status.lock();
         status.state = IndexState::Indexing;
-        status.message = None;
+        status.message = Some("Scanning file records".into());
         status.scanned = 0;
         status.indexed = 0;
         status.current_path.clear();
@@ -140,6 +141,7 @@ pub fn scan_mft(
 
     // ── Pass 1: Enumerate MFT — dirs into resolver, files into Vec ──
     let pass1_started = Instant::now();
+    let enumerate_phase = crate::diag::Phase::begin("mft.enumerate");
     let mut resolver = PathResolver::with_capacity("C:", 300_000);
     let mut total_records: u64 = 0;
     let mut total_dirs: u64 = 0;
@@ -172,6 +174,13 @@ pub fn scan_mft(
             pass1_last_emit = Instant::now();
         }
     })?;
+
+    enumerate_phase.finish(format!(
+        "records={total_records} directories={total_dirs} files={}",
+        file_entries.len()
+    ));
+    set_phase(state, "Resolving file paths");
+    let resolve_phase = crate::diag::Phase::begin("mft.resolve_paths");
 
     eprintln!(
         "[win/mft +{}] pass1 done: {} records ({} dirs + {} files) in {}ms",
@@ -420,6 +429,8 @@ pub fn scan_mft(
     let frn_cache = resolver.into_path_cache(); // also drops resolver.frn_map
 
     let entry_count = mem_entries.len();
+    resolve_phase.finish(format!("entries={entry_count} filtered={filtered_skip}"));
+    scan_phase.finish(format!("scanned={scanned} indexed={indexed}"));
     eprintln!(
         "[win/mft +{}] full index ready: indexed={indexed} skip={filtered_skip} \
          entries={entry_count}",
@@ -517,28 +528,26 @@ pub fn scan_mft(
                         );
                     },
                 ) {
-                    eprintln!("[win/mft/bg +{}] DB finalize FAILED: {e}", ts());
+                    crate::diag::log(format!("phase=mft.finalize event=error error={e}"));
                     false
                 } else {
                     true
                 }
             }
             Err(e) => {
-                eprintln!("[win/mft/bg +{}] DB bulk insert FAILED: {e}", ts());
+                crate::diag::log(format!("phase=mft.upsert event=error error={e}"));
                 *bg_state.mem_index.write() = None;
                 drop(scan);
                 false
             }
         };
 
-        bg_state
-            .indexing_active
-            .store(false, AtomicOrdering::Release);
-
         if bg_ok {
             {
                 let mut status = bg_state.status.lock();
                 status.state = IndexState::Ready;
+                status.message = None;
+                status.current_path.clear();
             }
             if let Some(a) = &bg_app {
                 emit_index_state(a, "Ready", None);
@@ -550,6 +559,15 @@ pub fn scan_mft(
                 emit_index_state(a, "Error", Some(msg));
             }
         }
+        // Publish the final snapshot before releasing the single-flight flag;
+        // the service worker reads it after observing this release.
+        bg_state
+            .indexing_active
+            .store(false, AtomicOrdering::Release);
+        crate::diag::log(format!(
+            "phase=mft.complete event=end elapsed_ms={} ok={bg_ok}",
+            bg_started.elapsed().as_millis()
+        ));
         eprintln!("[win/mft/bg +{}] background work done (ok={})", ts(), bg_ok);
 
         // S5: resume the watcher from the pre-scan journal position so changes
@@ -592,7 +610,10 @@ pub fn scan_mft(
 /// Batch-retrieve file size and mtime per directory using FindFirstFileW/FindNextFileW.
 /// Returns dir_path → (name_lowercase → (size, mtime)).
 /// Much faster than per-file fs::metadata() because it reads one directory listing at a time.
-fn build_dir_stat_cache(entries: &[CompactEntry]) -> HashMap<String, HashMap<String, (i64, i64)>> {
+fn build_dir_stat_cache(
+    state: &AppState,
+    entries: &[CompactEntry],
+) -> HashMap<String, HashMap<String, (i64, i64)>> {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
         FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
@@ -606,11 +627,15 @@ fn build_dir_stat_cache(entries: &[CompactEntry]) -> HashMap<String, HashMap<Str
         .collect();
 
     let dir_list: Vec<&str> = unique_dirs.into_iter().collect();
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    let progress = parking_lot::Mutex::new(Instant::now());
+    let started = Instant::now();
 
     // Parallel enumeration via rayon
     let results: Vec<(String, HashMap<String, (i64, i64)>)> = dir_list
         .par_iter()
         .filter_map(|&dir_path| {
+            let result = (|| {
             let pattern = format!("{}\\*", dir_path);
             let wide: Vec<u16> = pattern.encode_utf16().chain(std::iter::once(0)).collect();
 
@@ -648,6 +673,16 @@ fn build_dir_stat_cache(entries: &[CompactEntry]) -> HashMap<String, HashMap<Str
                 let _ = FindClose(handle);
             }
             Some((dir_path.to_string(), dir_map))
+            })();
+            let done = completed.fetch_add(1,std::sync::atomic::Ordering::Relaxed) + 1;
+            if let Some(mut last) = progress.try_lock() {
+                if last.elapsed() >= std::time::Duration::from_secs(2) {
+                    set_phase(state, format!("Reading file metadata · {done}/{} folders",dir_list.len()));
+                    crate::diag::log(format!("phase=mft.read_metadata event=progress elapsed_ms={} directories={done} total={}",started.elapsed().as_millis(),dir_list.len()));
+                    *last = Instant::now();
+                }
+            }
+            result
         })
         .collect();
 
@@ -658,6 +693,26 @@ fn build_dir_stat_cache(entries: &[CompactEntry]) -> HashMap<String, HashMap<Str
 fn wide_name_to_string(wide: &[u16]) -> String {
     let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..len])
+}
+
+/// Keep the name-order access path available to the read-only GUI throughout
+/// a warm rebuild. Dropping it made a 500-row first page sort millions of rows.
+fn set_phase(state: &AppState, message: impl Into<String>) {
+    let mut status = state.status.lock();
+    status.message = Some(message.into());
+    status.current_path.clear();
+}
+
+fn prepare_bulk_indexes(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_entries_name_nocase ON entries(name COLLATE NOCASE);
+        DROP INDEX IF EXISTS idx_entries_dir_ext_name_nocase;
+        DROP INDEX IF EXISTS idx_entries_mtime;
+        DROP INDEX IF EXISTS idx_entries_ext_name;
+    "#,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Phase 1: Bulk insert entries into DB.
@@ -677,20 +732,17 @@ fn background_db_bulk_insert(
     let current_run_id = last_run_id + 1;
     let indexed_at = now_epoch();
 
-    // Drop indexes for faster bulk insert
-    let _ = conn.execute_batch(
-        r#"
-        DROP INDEX IF EXISTS idx_entries_dir_ext_name_nocase;
-        DROP INDEX IF EXISTS idx_entries_mtime;
-        DROP INDEX IF EXISTS idx_entries_name_nocase;
-        DROP INDEX IF EXISTS idx_entries_ext_name;
-        "#,
-    );
-    eprintln!("[win/mft/bg +{}] indexes dropped", ts());
+    set_phase(state, "Preparing file-name search");
+    let name_phase = crate::diag::Phase::begin("mft.prepare_name_index");
+    prepare_bulk_indexes(&conn)?;
+    name_phase.finish("name_index=available_during_rebuild");
 
     // Build dir stat cache: batch-retrieve file size+mtime via FindFirstFileW per directory
     let cache_started = Instant::now();
-    let dir_stat_cache = build_dir_stat_cache(entries);
+    set_phase(state, "Reading file metadata");
+    let metadata_phase = crate::diag::Phase::begin("mft.read_metadata");
+    let dir_stat_cache = build_dir_stat_cache(state, entries);
+    metadata_phase.finish(format!("directories={}", dir_stat_cache.len()));
     eprintln!(
         "[win/mft/bg +{}] dir_stat_cache built: {} dirs in {}ms",
         ts(),
@@ -699,6 +751,10 @@ fn background_db_bulk_insert(
     );
 
     let upsert_started = Instant::now();
+    set_phase(state, "Updating file database");
+    let upsert_phase = crate::diag::Phase::begin("mft.upsert");
+    let mut written = 0usize;
+    let mut progress_at = Instant::now();
 
     for chunk in entries.chunks(MFT_BATCH_SIZE) {
         // S7: cooperative cancellation between batches (service STOP / journal-
@@ -742,7 +798,21 @@ fn background_db_bulk_insert(
             })
             .collect();
         upsert_rows(&mut conn, &chunk_rows)?;
+        written += chunk_rows.len();
+        if progress_at.elapsed() >= std::time::Duration::from_secs(2) {
+            set_phase(
+                state,
+                format!("Updating file database · {written}/{}", entries.len()),
+            );
+            crate::diag::log(format!(
+                "phase=mft.upsert event=progress elapsed_ms={} written={written} total={}",
+                upsert_started.elapsed().as_millis(),
+                entries.len()
+            ));
+            progress_at = Instant::now();
+        }
     }
+    upsert_phase.finish(format!("written={written}"));
     eprintln!(
         "[win/mft/bg +{}] upsert done: {} entries in {}ms",
         ts(),
@@ -768,6 +838,10 @@ fn background_db_finalize(
 ) -> Result<(), String> {
     let ts = || format!("{:.1}s", scan_started.elapsed().as_secs_f32());
 
+    let finalize_phase = crate::diag::Phase::begin("mft.finalize");
+    set_phase(state, "Removing stale file records");
+    let cleanup_phase = crate::diag::Phase::begin("mft.cleanup");
+
     // Cleanup stale entries
     let cleanup_started = Instant::now();
     let deleted_count: i64 = conn
@@ -789,6 +863,7 @@ fn background_db_finalize(
     );
 
     set_meta(&conn, "last_run_id", &current_run_id.to_string())?;
+    cleanup_phase.finish(format!("deleted={deleted_count}"));
 
     // Create the primary name index FIRST — this allows DB search to work
     let idx_started = Instant::now();
@@ -807,6 +882,8 @@ fn background_db_finalize(
 
     // Create remaining indexes (MemIndex freed, lower peak memory)
     let idx2_started = Instant::now();
+    set_phase(state, "Finishing search indexes");
+    let indexes_phase = crate::diag::Phase::begin("mft.secondary_indexes");
     conn.execute_batch(
         r#"
         CREATE INDEX IF NOT EXISTS idx_entries_dir_ext_name_nocase ON entries(dir, ext, name COLLATE NOCASE);
@@ -815,6 +892,7 @@ fn background_db_finalize(
         "#,
     )
     .map_err(|e| e.to_string())?;
+    indexes_phase.finish("search_indexes=ready");
     eprintln!(
         "[win/mft/bg +{}] remaining indexes in {}ms",
         ts(),
@@ -842,6 +920,10 @@ fn background_db_finalize(
     }
 
     let (entries_count, last_updated) = update_status_counts(state)?;
+    finalize_phase.finish(format!(
+        "entries={entries_count} total_pass_ms={}",
+        scan_started.elapsed().as_millis()
+    ));
     // Persist cached counts for instant startup next time
     let _ = set_meta(&conn, "cached_entries_count", &entries_count.to_string());
     if let Some(lu) = last_updated {
@@ -1095,4 +1177,57 @@ pub fn filetime_to_unix(filetime: i64) -> i64 {
         return 0;
     }
     (filetime - FILETIME_UNIX_DIFF) / 10_000_000
+}
+
+#[cfg(test)]
+mod search_availability_tests {
+    use super::*;
+
+    #[test]
+    fn rebuilding_keeps_global_name_order_on_the_indexed_read_path() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::CREATE_ENTRIES_TABLE_SQL).unwrap();
+        conn.execute_batch(crate::CREATE_ENTRIES_INDEXES_SQL)
+            .unwrap();
+        conn.execute_batch("INSERT INTO entries(path,name,dir,is_dir,indexed_at) VALUES ('c','charlie','',0,0),('a','Alpha','',0,0),('b','beta','',0,0);").unwrap();
+        prepare_bulk_indexes(&conn).unwrap();
+        let plan: Vec<String> = conn.prepare("EXPLAIN QUERY PLAN SELECT path,name,dir,is_dir,ext,size,mtime FROM entries ORDER BY name COLLATE NOCASE LIMIT 2").unwrap()
+            .query_map([],|row|row.get(3)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_entries_name_nocase")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+        let query = || {
+            conn.prepare("SELECT name FROM entries ORDER BY name COLLATE NOCASE LIMIT 2")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(query(), vec!["Alpha", "beta"]);
+        conn.execute(
+            "INSERT INTO entries(path,name,dir,is_dir,indexed_at) VALUES ('0','aardvark','',0,0)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            query(),
+            vec!["aardvark", "Alpha"],
+            "new rows remain globally sorted during the rebuild"
+        );
+
+        // Recovery from an interrupted older build also recreates the name
+        // index before metadata collection and row upserts begin.
+        conn.execute_batch("DROP INDEX idx_entries_name_nocase")
+            .unwrap();
+        prepare_bulk_indexes(&conn).unwrap();
+        assert_eq!(query(), vec!["aardvark", "Alpha"]);
+        assert!(conn.prepare("SELECT name FROM entries INDEXED BY idx_entries_name_nocase ORDER BY name COLLATE NOCASE LIMIT 2").is_ok());
+    }
 }

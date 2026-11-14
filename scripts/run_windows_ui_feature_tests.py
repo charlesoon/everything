@@ -183,11 +183,15 @@ def run(binary, fixture, output):
                 d.key('right'); d.wait(lambda s: not s['fileTree']['loading'])
             d.key('right'); revealed(deep[-1]/'deep-leaf.txt')
             assert not d.state()['fileTree']['selectionError']
-            before=set(p for p in [deep[-1]/'deep-leaf.txt'] if p.exists())
-            d.key('delete'); d.key('shift-delete')
-            assert all(p.exists() for p in before), 'Tree browsing must not dispatch table deletion'
             capture('03-deep-tree')
-        case('NEW-04','24-level folder navigation and tree Delete/Shift+Delete focus guard',nested_tree)
+            # 0.6.4 adds file actions to the tree. They must target the tree
+            # selection while preserving the independently selected result.
+            leaf=deep[-1]/'deep-leaf.txt'
+            assert leaf.is_file()
+            d.key('shift-delete')
+            d.wait(lambda s: not s['actionBusy'] and s['completedAction']=='DeletePermanently' and not leaf.exists())
+            assert (files/'Alpha report.txt').is_file(), 'Tree actions must preserve the selected table result'
+        case('NEW-04','24-level folder navigation and 0.6.4 tree Shift+Delete targets only the tree selection',nested_tree)
 
         def refresh_and_copy():
             select('한글'); s=revealed(files/'한글 보고서.txt')
@@ -203,9 +207,11 @@ def run(binary, fixture, output):
                     before=before['scrollOffset'], after=refreshed['fileTree']['scrollOffset'],
                     rowHeight=before.get('rowHeight',s['rowHeight']))
             s=d.state(); d.click(30,s['height']-16)
+            time.sleep(.15)  # Let the UI finish writing before opening the Windows clipboard.
             d.wait(lambda _: d.clipboard()['text']==str(files/'한글 보고서.txt'))
             s=d.state(); tree=s['fileTree']
             d.click(tree['listBounds'][0]+20,tree['listBounds'][1]-13)
+            time.sleep(.15)
             d.wait(lambda _: d.clipboard()['text']==str(files))
             assert d.state()['selected']==[str(files/'한글 보고서.txt')]
             before=d.state()['fileTree']['scrollOffset']

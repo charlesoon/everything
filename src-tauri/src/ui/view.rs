@@ -406,6 +406,9 @@ impl EverythingView {
             items.extend([UiAction::FdaSettings, UiAction::Autostart]);
         }
         items.extend([UiAction::Add, UiAction::Ignore, UiAction::Reset]);
+        if cfg!(target_os = "windows") {
+            items.push(UiAction::ToggleLogging);
+        }
         items
     }
 
@@ -489,23 +492,25 @@ impl EverythingView {
             "Error" => (0xff5f57, "Error"),
             _ => (0x28c840, "Index ready"),
         };
-        let switch = div()
-            .ml(scaled_px(8.))
-            .w(scaled_px(28.))
-            .h(scaled_px(16.))
-            .p(scaled_px(2.))
-            .flex()
-            .flex_shrink_0()
-            .rounded_full()
-            .bg(if autostart_on { p.accent } else { p.border })
-            .when(autostart_on, |s| s.justify_end())
-            .child(
-                div()
-                    .size(scaled_px(12.))
-                    .rounded_full()
-                    .bg(p.menu)
-                    .shadow_sm(),
-            );
+        let switch = |enabled: bool| {
+            div()
+                .ml(scaled_px(8.))
+                .w(scaled_px(28.))
+                .h(scaled_px(16.))
+                .p(scaled_px(2.))
+                .flex()
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(if enabled { p.accent } else { p.border })
+                .when(enabled, |s| s.justify_end())
+                .child(
+                    div()
+                        .size(scaled_px(12.))
+                        .rounded_full()
+                        .bg(p.menu)
+                        .shadow_sm(),
+                )
+        };
         let popover = div()
             .id("settings-popover")
             .absolute()
@@ -585,7 +590,7 @@ impl EverythingView {
                     )
                     .child(tile("everything/settings.svg"))
                     .child(name("Launch at login"))
-                    .child(switch),
+                    .child(switch(autostart_on)),
                 )
             })
             .child(separator())
@@ -619,7 +624,17 @@ impl EverythingView {
                     )
                     .child(meta("Rebuild from scratch".into()))
                     .child(chevron()),
-            );
+            )
+            .when(cfg!(target_os = "windows"), |pop| {
+                let enabled = crate::logging::enabled();
+                pop.child(separator()).child(
+                    row(UiAction::ToggleLogging, self.action_busy, cx)
+                        .child(tile("everything/settings.svg"))
+                        .child(name("Log"))
+                        .child(meta(if enabled { "On" } else { "Off" }.into()))
+                        .child(switch(enabled)),
+                )
+            });
         // Transparent backdrop: a click anywhere outside closes the popover
         // (and swallows the click, so the gear toggles instead of reopening).
         div()
@@ -914,6 +929,9 @@ impl EverythingView {
                                 .child(state),
                         )
                         .when_some(self.status_display.finished_text(), |d, text| d.child(text))
+                        .when_some(self.search_activity(), |d, text| {
+                            d.child(div().whitespace_nowrap().child(text))
+                        })
                         .when(!self.displayed_query.is_empty(), |d| {
                             d.child(div().whitespace_nowrap().child(format!(
                                 "\"{}\" · {} results",
@@ -930,26 +948,29 @@ impl EverythingView {
                             },
                         ))
                     })
-                    .when_some(self.status.message.clone(), |d, message| {
-                        let color = if status::is_catchup(&self.status) {
-                            p.muted
-                        } else if self.status.state == "Error" {
-                            rgb(if cx.theme().is_dark() {
-                                0xff9d9d
+                    .when_some(
+                        status::inline_message(&self.status, selected.is_empty()),
+                        |d, message| {
+                            let color = if status::is_catchup(&self.status) {
+                                p.muted
+                            } else if self.status.state == "Error" {
+                                rgb(if cx.theme().is_dark() {
+                                    0xff9d9d
+                                } else {
+                                    0xd93025
+                                })
+                                .into()
                             } else {
-                                0xd93025
-                            })
-                            .into()
-                        } else {
-                            rgb(if cx.theme().is_dark() {
-                                0xe0c670
-                            } else {
-                                0xb45309
-                            })
-                            .into()
-                        };
-                        d.child(div().text_color(color).child(message))
-                    }),
+                                rgb(if cx.theme().is_dark() {
+                                    0xe0c670
+                                } else {
+                                    0xb45309
+                                })
+                                .into()
+                            };
+                            d.child(div().text_color(color).child(message))
+                        },
+                    ),
             )
             .child(
                 div()
@@ -1147,6 +1168,21 @@ impl Render for EverythingView {
                         },
                     )),
             )
+            .when(row_count == 0, |area| {
+                area.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .top(px(header_height))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .px(scaled_px(20.))
+                        .text_size(scaled_px(12.))
+                        .text_color(p.muted)
+                        .child(self.empty_results_text()),
+                )
+            })
             .when(row_count > 0, |area| {
                 area.child(div().absolute().inset_0().top(px(header_height)).child(
                     Scrollbar::vertical(&self.list_scroll).scrollbar_show(ScrollbarShow::Always),
@@ -1564,6 +1600,19 @@ impl EverythingView {
                 .map(|size| f32::from(size.contents.height) / self.list_layout_count as f32)
                 .unwrap_or(self.row_height())
                 .into();
+            state["indexStatus"] = serde_json::to_value(&self.status).unwrap_or_default();
+            state["statusText"] = self
+                .status_display
+                .state_text(&self.status, Instant::now())
+                .into();
+            state["inlineIndexMessage"] = serde_json::json!(status::inline_message(
+                &self.status,
+                self.model.paths().is_empty()
+            ));
+            state["searchActivity"] = serde_json::json!(self.search_activity());
+            state["emptyState"] =
+                serde_json::json!((self.model.rows.is_empty()).then(|| self.empty_results_text()));
+            state["loggingEnabled"] = crate::logging::enabled().into();
             let _ = std::fs::write(path, state.to_string());
         }
     }

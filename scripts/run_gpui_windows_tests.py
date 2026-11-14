@@ -69,7 +69,7 @@ foreach ($path in $paths) {
 
 
 class App:
-    def __init__(self, binary, fixture, output, **extra):
+    def __init__(self, binary, fixture, output, wait_ready=True, **extra):
         token = str(time.time_ns())
         self.state_path = output / f'state-{token}.json'
         self.log_path = output / f'app-{token}.log'
@@ -86,7 +86,8 @@ class App:
                                         creationflags=subprocess.CREATE_NO_WINDOW)
         try:
             self.driver = WindowsDriver(self.process.pid, self.state_path)
-            self.driver.wait(lambda s: not s['busy'] and s['loaded'] > 0)
+            if wait_ready:
+                self.driver.wait(lambda s: not s['busy'] and s['loaded'] > 0)
         except Exception:
             self.close()
             raise

@@ -6,32 +6,15 @@
 //! any console). Both are best-effort — a logging failure never aborts the
 //! service.
 
-use std::io::Write;
 use std::path::Path;
 
-const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 const EVENT_SOURCE: &str = super::service::SERVICE_NAME;
 
 /// Append a line to `<data_dir>\logs\service.log`, rolling to `.1` once it
 /// exceeds `MAX_LOG_BYTES`.
 pub(crate) fn file(data_dir: &Path, msg: &str) {
-    let dir = data_dir.join("logs");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("service.log");
-    if std::fs::metadata(&path)
-        .map(|m| m.len() > MAX_LOG_BYTES)
-        .unwrap_or(false)
-    {
-        let _ = std::fs::rename(&path, dir.join("service.log.1"));
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-    eprintln!("[svc] {msg}");
+    crate::diag::init_named(data_dir, "service", "service.log");
+    crate::diag::log(msg);
 }
 
 /// Report a fatal error to the Windows Application event log. Used when the
