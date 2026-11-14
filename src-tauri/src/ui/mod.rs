@@ -31,7 +31,7 @@ use crate::{
 };
 use actions::UiAction;
 
-actions!(everything, [Quit, FocusSearch]);
+actions!(everything, [Quit, FocusSearch, OpenSettings]);
 
 pub(super) fn run() {
     let started = Instant::now();
@@ -53,10 +53,12 @@ pub(super) fn run() {
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("ctrl-q", Quit, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
             ]);
             cx.set_menus(vec![Menu {
                 name: "Everything".into(),
                 items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
                     MenuItem::action("Search", FocusSearch),
                     MenuItem::separator(),
                     MenuItem::action("Quit Everything", Quit),
@@ -300,7 +302,6 @@ impl EverythingView {
                     this.cancel_pending_rename();
                     this.close_zoom_popover(cx);
                 }
-                crate::ui_gate::set_visible(&this.sink, window.is_window_active());
                 if window.is_window_active() {
                     this.update_status(crate::get_index_status(&this.backend), cx);
                     this.refresh_file_tree(cx);

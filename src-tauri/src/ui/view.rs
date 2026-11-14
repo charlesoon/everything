@@ -1228,6 +1228,11 @@ impl Render for EverythingView {
                     this.focus_search(true, window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                if this.modal.is_none() {
+                    this.action(UiAction::Settings, window, cx);
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.resize_file_tree(event, window, cx) {
                     return;

@@ -104,7 +104,10 @@ pub(super) fn phase_text(status: &IndexStatusDto) -> Option<String> {
 }
 
 pub(super) fn inline_message(status: &IndexStatusDto, state_visible: bool) -> Option<String> {
-    if state_visible && phase_text(status).is_some() {
+    // Concrete phases already appear in the main status. Background catchup
+    // yields to a file selection; errors remain visible in either layout.
+    let hidden_catchup = !state_visible && status.state != "Error" && is_catchup(status);
+    if hidden_catchup || (state_visible && phase_text(status).is_some()) {
         None
     } else {
         status.message.clone()
@@ -212,10 +215,14 @@ mod tests {
         state.message = Some("Cannot read index".into());
         assert!(phase_text(&state).is_none());
         assert_eq!(inline_message(&state, true), state.message);
+        assert_eq!(inline_message(&state, false), state.message);
         state.state = "Indexing".into();
         state.message = Some("Catchup: checking changes".into());
         assert!(phase_text(&state).is_none());
         assert_eq!(inline_message(&state, true), state.message);
+        assert!(inline_message(&state, false).is_none());
+        state.state = "Error".into();
+        assert_eq!(inline_message(&state, false), state.message);
         state.state = "Ready".into();
         state.message = None;
         assert_eq!(
