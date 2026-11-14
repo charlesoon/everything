@@ -62,6 +62,12 @@ auto-start label and action both use the actual registration and opt-out state.
 
 The UI follows system appearance and embeds the baseline Inter/JetBrains Mono fonts and SVGs. Layout, colors, 30px titlebar, 34px search field, 27px rows and 33px statusbar come from the preserved CSS. No theme button or empty-table message is added.
 
+On Windows the titlebar background and label form a native caption drag area,
+excluding the three window buttons. Table focus is tracked only in the results
+area: tracking it on the whole window prevents the native caption mouse-down
+action. Native caption handling provides movement, double-click maximize and
+dragging a maximized window back to its restored size.
+
 Preferences (columns, content-window bounds, dismissed FDA banner) use
 an atomically replaced per-user `gpui-preferences.json`. Windows preferences are
 in roaming AppData, separate from the service-owned ProgramData index. macOS

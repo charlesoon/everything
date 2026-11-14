@@ -425,6 +425,31 @@ def run(binary, fixture, output):
             assert d.state()['modal'] is None
         case('WIN-15', 'Windows Shift+Delete: permanent file/folder removal without dialog or Recycle Bin; input focus guard', permanent_delete)
 
+        def titlebar_drag():
+            d.resize(1010, 610)
+            d.wait(lambda s: s['width'] == 1010 and s['height'] == 610)
+            for x, dx in [(120, 90), (505, -60)]:
+                assert d.hit_test(x, 15) == 2, 'Title text and background must be native HTCAPTION'
+                before = d.bounds()
+                d.drag(x, 15, dx, 50)
+                after = d.bounds()
+                assert (after['x']-before['x'])*dx > 0 and after['y']-before['y'] >= 30, (before, after)
+                assert (after['width'], after['height']) == (before['width'], before['height']), (before, after)
+            assert d.hit_test(1010-69, 15) == 1, 'Window buttons must stay outside the drag region'
+            assert d.hit_test(120, 50) == 1, 'Search input must stay outside the drag region'
+            time.sleep(u.GetDoubleClickTime()/1000 + 0.1)
+            d.click(505, 15, count=2)
+            d.wait(lambda s: s['width'] > 1010)
+            assert u.IsZoomed(d.hwnd), 'Caption double-click must maximize once'
+            s = d.state()
+            d.drag(s['width']/2, 15, 80, 90)
+            d.wait(lambda s: s['width'] <= 1010)
+            assert not u.IsZoomed(d.hwnd), 'Dragging a maximized caption must restore the window'
+            d.resize(1010, 610)
+            d.wait(lambda s: s['width'] == 1010 and s['height'] == 610)
+            capture('14-titlebar-drag')
+        case('WIN-17', 'Native titlebar background/text drag, caption double-click and drag from maximized window', titlebar_drag)
+
         def window_controls():
             d.key('escape')
             s = d.state()

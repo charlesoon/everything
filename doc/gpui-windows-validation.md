@@ -59,3 +59,26 @@ Windows에서는 테스트 드라이버가 HWND와 `SendInput`을 사용한다. 
 - [창 버튼 화면](../.artifacts/windows-gpui/precommit-ui/13-window-controls.png)
 
 설치·업그레이드·서비스 재등록, 운영 인덱스의 실시간 갱신, 실제 IME 조합과 외부 앱으로 드래그는 이번 fixture 검증 범위에 포함하지 않았다. NSIS 설치 파일은 만들지 않았다.
+
+## 타이틀바 드래그 후속 검증
+
+Windows에서 `start_window_move()`가 기본 no-op인 상태였고, 창 전체의
+`track_focus`가 마우스 기본 동작도 차단하고 있었다. 창 버튼을 제외한
+타이틀바를 `WindowControlArea::Drag`로 등록하고 Windows의 테이블 포커스
+범위를 결과 영역으로 옮겼다. macOS의 기존 포커스·제목 표시줄 처리는 유지한다.
+
+수정 전에는 제목 표시줄이 `HTCLIENT`였고 드래그 전후 창 좌표가 같았다.
+수정 후에는 `HTCAPTION`이며, 150% 배율에서 빈 공간을 끌었을 때
+`(139, 144) → (274, 219)`, 제목 글자를 끌었을 때
+`(274, 219) → (184, 294)`로 실제 HWND 위치가 바뀌었다.
+
+추가한 WIN-17은 두 드래그 영역, 창 크기 유지, 버튼·검색창의 드래그 영역
+제외, 네이티브 더블클릭 최대화와 최대화 상태에서 끌어 복원을 확인한다.
+전체 Windows UI suite **17 통과 / 0 실패**로 재검증했다.
+
+초기 실행에서 일괄 Unicode 입력의 문자 누락과 빠른 포인터 이동 직후의
+클릭 누락을 관측했다. 테스트 드라이버가 문자 패킷 사이에 5ms,
+포인터 이동과 클릭 사이에 75ms를 두도록 조정한 뒤 전체 suite를 통과했다.
+
+- [타이틀바 수정 후 전체 UI 결과](../.artifacts/windows-gpui/titlebar-verified-ui/ui-results.json)
+- [타이틀바 드래그 캡처](../.artifacts/windows-gpui/titlebar-verified-ui/14-titlebar-drag.png)

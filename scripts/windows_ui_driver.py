@@ -132,13 +132,13 @@ class WindowsDriver(Driver):
         if u.GetForegroundWindow() != self.hwnd:
             raise RuntimeError('Cannot focus the test HWND; refusing global input')
 
-    def inputs(self, events):
+    def inputs(self, events, settle=0.035):
         if u.GetForegroundWindow() != self.hwnd:
             self.activate()
         values = (Input * len(events))(*events)
         if u.SendInput(len(events), values, c.sizeof(Input)) != len(events):
             raise c.WinError(c.get_last_error())
-        time.sleep(0.035)
+        time.sleep(settle)
 
     def keyboard(self, vk, up=False, scan=0, flags=0):
         return Input(type=1, ki=KeyboardInput(vk, scan, flags | (2 if up else 0), 0, 0))
@@ -159,14 +159,14 @@ class WindowsDriver(Driver):
                      *(self.keyboard(v, up=True) for v in reversed(modifiers))])
 
     def text(self, text):
-        events = []
         encoded = text.encode('utf-16-le')
         for i in range(0, len(encoded), 2):
             unit = int.from_bytes(encoded[i:i+2], 'little')
-            events.extend([self.keyboard(0, scan=unit, flags=4),
-                           self.keyboard(0, up=True, scan=unit, flags=4)])
-        if events:
-            self.inputs(events)
+            # Let the target consume committed characters between packets,
+            # including frames produced by leading/trailing search responses.
+            self.inputs([self.keyboard(0, scan=unit, flags=4),
+                         self.keyboard(0, up=True, scan=unit, flags=4)], settle=0.005)
+        time.sleep(0.035)
 
     def point(self, x, y):
         scale = u.GetDpiForWindow(self.hwnd) / 96
@@ -175,10 +175,44 @@ class WindowsDriver(Driver):
             raise c.WinError(c.get_last_error())
         return pt
 
+    def bounds(self):
+        rect = w.RECT()
+        if not u.GetWindowRect(self.hwnd, c.byref(rect)):
+            raise c.WinError(c.get_last_error())
+        return dict(x=rect.left, y=rect.top, width=rect.right-rect.left, height=rect.bottom-rect.top)
+
+    def hit_test(self, x, y):
+        self.activate()
+        pt = self.point(x, y)
+        u.SetCursorPos(pt.x, pt.y)
+        time.sleep(0.1)
+        position = ((pt.y & 0xffff) << 16) | (pt.x & 0xffff)
+        return u.SendMessageW(self.hwnd, 0x0084, 0, position)  # WM_NCHITTEST
+
+    def drag(self, x, y, dx, dy):
+        self.activate()
+        start = self.point(x, y)
+        scale = u.GetDpiForWindow(self.hwnd) / 96
+        u.SetCursorPos(start.x, start.y)
+        time.sleep(0.1)
+        self.inputs([Input(type=0, mi=MouseInput(0, 0, 0, 2, 0, 0))])
+        try:
+            # Use screen coordinates fixed at mouse-down; client coordinates
+            # move with the window during the native caption move loop.
+            for step in range(1, 13):
+                u.SetCursorPos(start.x+round(dx*scale*step/12), start.y+round(dy*scale*step/12))
+                self.inputs([Input(type=0, mi=MouseInput(0, 0, 0, 1, 0, 0))])
+        finally:
+            self.inputs([Input(type=0, mi=MouseInput(0, 0, 0, 4, 0, 0))])
+        time.sleep(0.15)
+
     def mouse(self, op, x, y, button='left', modifiers=(), count=1, **_):
         self.activate()
         pt = self.point(x, y)
         u.SetCursorPos(pt.x, pt.y)
+        # GPUI derives native non-client hit tests from the last mouse move.
+        # Give that move time to dispatch before pressing at a different area.
+        time.sleep(0.075)
         down, up = (8, 16) if button == 'right' else (2, 4)
         flags = dict(click=[down, up] * count, down=[down], up=[up], move=[1])[op]
         mods = [dict(ctrl=17, cmd=17, shift=16, alt=18)[m] for m in modifiers]

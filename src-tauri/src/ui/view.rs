@@ -429,16 +429,29 @@ impl EverythingView {
             .justify_center()
             .h(px(30.))
             .flex_shrink_0()
-            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                if event.click_count == 2 {
-                    if cfg!(target_os = "windows") {
-                        toggle_maximized(window);
-                    } else {
+            .when(!cfg!(target_os = "windows"), |title| {
+                title.on_mouse_down(MouseButton::Left, |event, window, _| {
+                    if event.click_count == 2 {
                         window.titlebar_double_click();
+                    } else {
+                        window.start_window_move();
                     }
-                } else {
-                    window.start_window_move();
-                }
+                })
+            })
+            .when(cfg!(target_os = "windows"), |title| {
+                // Windows start_window_move() is a no-op in GPUI 0.2.2.
+                // Native caption hit testing handles move, snap, double-click
+                // and drag-to-restore. Keep all three 46px buttons outside it.
+                title.child(
+                    div()
+                        .id("titlebar-drag")
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(46. * 3.))
+                        .window_control_area(WindowControlArea::Drag),
+                )
             })
             .child(
                 div()
@@ -755,6 +768,10 @@ impl Render for EverythingView {
                     }),
             );
         let results = div()
+            .id("results-area")
+            .when(cfg!(target_os = "windows"), |area| {
+                area.track_focus(&self.table_focus)
+            })
             .relative()
             .flex_1()
             .min_h_0()
@@ -819,7 +836,12 @@ impl Render for EverythingView {
         div()
             .id("everything")
             .key_context("Everything")
-            .track_focus(&self.table_focus)
+            // A focus-tracked element prevents the default mouse-down action.
+            // On Windows only the results track table focus, so caption clicks
+            // can reach DefWindowProc's native move/maximize handling.
+            .when(!cfg!(target_os = "windows"), |root| {
+                root.track_focus(&self.table_focus)
+            })
             .relative()
             .size_full()
             .flex()
