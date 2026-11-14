@@ -13,3 +13,4 @@ src-tauri/target-test-review2/
 target/
 __pycache__/
 /releases/*.dmg
+/releases/*.exe

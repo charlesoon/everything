@@ -66,6 +66,11 @@ ignored by Git; the update manifest remains tracked.
 Builds from a linked Git worktree also update the main checkout's `releases/`
 directory with the same DMG and manifest.
 
+Every successful `scripts/build-windows.ps1` run copies the installer into
+`releases/` and updates `releases/latest-win.yml` with its version, filename,
+Base64 SHA-512, size and UTC release date. Build or packaging failures leave
+the previous manifest unchanged. Generated installers are ignored by Git.
+
 Node is optional. Existing npm entry points are dependency-free aliases:
 `npm run dev`, `npm run build`, `npm run bundle`, `npm run bundle:dmg`,
 `npm run lint` (cargo check), `npm test` (compile tests), `npm run test:run`.
