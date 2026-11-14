@@ -290,5 +290,57 @@
       "dmgBytes": 7809179,
       "buildLog": ".artifacts/zoom-icon-0.6.3-macos-build.log"
     }
+  },
+  "worktreeReleasePublication": {
+    "verifiedAt": "2026-11-14T13:34:37.270543+00:00",
+    "baseCommit": "85dc8db5e049ad7c8807f73d7feda8ad5459b7ba",
+    "command": "scripts/build_dmg.sh",
+    "buildExitCode": 0,
+    "version": "0.6.3",
+    "architecture": "arm64",
+    "bundleIdentifier": "com.everything.app",
+    "uiAutomationFeature": false,
+    "packagingTests": {
+      "passed": 11,
+      "failed": 0
+    },
+    "requiredTestBuild": {
+      "command": "npm test -- --release -j4",
+      "passed": true
+    },
+    "uiSourceMatchesVerifiedNativeSuite": true,
+    "signingIdentity": "Developer ID Application: EUNHYUCK KIM (C2B2W43278)",
+    "codesignDeepStrictVerified": true,
+    "embeddedLaunchAgentVerified": true,
+    "notarization": {
+      "status": "Accepted",
+      "submissionId": "e87284c2-20c7-4009-b33a-989f3623bd8d",
+      "stapleValidated": true
+    },
+    "gatekeeper": {
+      "accepted": true,
+      "source": "Notarized Developer ID"
+    },
+    "dmgChecksumValid": true,
+    "publication": {
+      "mainCheckoutCopyVerified": true,
+      "worktreeCopyVerified": true,
+      "manifestsIdentical": true,
+      "sha512AndSizeVerified": true,
+      "unrelatedMainCheckoutChangesPreserved": true
+    },
+    "dmg": "releases/Everything_0.6.3_aarch64.dmg",
+    "dmgBytes": 7809193,
+    "dmgSha256": "9df3c6dcb49a71a5ab7d5deae0917a1b66e4839eae4a9577313a1b01341a5297",
+    "dmgSha512": "OwOzEn/hFC8CVV9dnII6/vmI5vxQS/dAFcNuksDbZKKXrGaWdppM7+OR/pq6GV7mRLCdLN2qo7lzOGXaagzR2A==",
+    "manifestSha256": "8ff260a3e14d91d0f942e06e17ae1629ea87b79e07aab0848dfd7a6280d179db",
+    "releaseBinarySha256": "29b44eb899fd688f6e886e1fc8810c8639dd69aae36d06078298b3e3c88690d2",
+    "signedAppBinarySha256": "048bd1dd484b72085a3707f4bf5eced2cc3138d702469612bd189311f0a838c2",
+    "sourceSha256": {
+      "scripts/build_dmg.sh": "9c430c754a28b7f33ef0ee5d12eb8df0b18c9b4b038e8c65d08983b08277af42",
+      "scripts/bundle_macos.py": "e9a381c32eb7a6d8b0df74728a6300ae78e93c97eaadb0192aff4f99b620a6d9",
+      "scripts/test_bundle_macos.py": "235002b8c0bb3776d75459d363c8ae78665b1ac7e2059fb965610a513fda59c3"
+    },
+    "buildLog": ".artifacts/dmg-publication-live-build.log"
   }
 }
