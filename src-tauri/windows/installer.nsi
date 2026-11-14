@@ -49,7 +49,7 @@ Section "Everything" SEC_MAIN
   File /oname=Everything.exe "${BINARY}"
   File /oname=icon.ico "${ICON}"
   SetOutPath "$INSTDIR\licenses"
-  File "${__FILEDIR__}\..\assets\fonts\inter-LICENSE.txt"
+  File "${__FILEDIR__}\..\assets\fonts\geist-LICENSE.txt"
   File "${__FILEDIR__}\..\assets\fonts\jetbrains-mono-LICENSE.txt"
   SetOutPath "$INSTDIR"
   !insertmacro NSIS_HOOK_POSTINSTALL
@@ -82,7 +82,8 @@ Section "Uninstall"
   RMDir "$SMPROGRAMS\Everything"
   Delete "$INSTDIR\Everything.exe"
   Delete "$INSTDIR\icon.ico"
-  Delete "$INSTDIR\licenses\inter-LICENSE.txt"
+  Delete "$INSTDIR\licenses\geist-LICENSE.txt"
+  Delete "$INSTDIR\licenses\inter-LICENSE.txt" ; pre-Geist installs
   Delete "$INSTDIR\licenses\jetbrains-mono-LICENSE.txt"
   RMDir "$INSTDIR\licenses"
   Delete "$INSTDIR\Uninstall.exe"

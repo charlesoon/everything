@@ -362,12 +362,242 @@ impl EverythingView {
             .child(label)
     }
 
+    /// Actionable rows of the settings popover, in display (and arrow-key) order.
+    pub(super) fn settings_items(&self) -> Vec<UiAction> {
+        let mut items = Vec::new();
+        if cfg!(target_os = "macos") {
+            items.extend([UiAction::FdaSettings, UiAction::Autostart]);
+        }
+        items.extend([UiAction::Add, UiAction::Ignore, UiAction::Reset]);
+        items
+    }
+
+    /// Gear popover, laid out like Orca's status-bar usage panel.
+    fn settings_popover(&self, cx: &mut Context<Self>) -> AnyElement {
+        let p = Palette::get(cx);
+        let indexing = self.status.state == "Indexing";
+        let autostart = self.onboarding.as_ref();
+        let autostart_on = autostart.is_some_and(|s| !s.opted_out && s.registration == "enabled");
+        let autostart_unsupported = autostart.is_none_or(|s| s.registration == "unsupported");
+        let items = self.settings_items();
+        let tile = |icon: &'static str| {
+            div()
+                .size(px(20.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(p.border)
+                .bg(p.hover)
+                .child(svg().path(icon).size(px(12.)).text_color(p.text))
+        };
+        let chevron = || {
+            svg()
+                .path("everything/chevron.svg") // Lucide ChevronRight, as in Orca
+                .size(px(14.))
+                .flex_shrink_0()
+                .text_color(p.muted)
+        };
+        let meta = |text: SharedString| {
+            div()
+                .ml(px(8.))
+                .mr(px(4.))
+                .text_size(px(11.))
+                .text_color(p.muted)
+                .whitespace_nowrap()
+                .child(text)
+        };
+        let row = |action: UiAction, disabled: bool, cx: &mut Context<Self>| {
+            let index = items
+                .iter()
+                .position(|a| std::mem::discriminant(a) == std::mem::discriminant(&action))
+                .unwrap_or(0);
+            div()
+                .id(("settings-item", index))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(14.))
+                .py(px(9.))
+                .when(disabled, |r| r.opacity(0.45))
+                .when(!disabled, |r| {
+                    r.cursor_pointer()
+                        .when(self.modal_selection == index, |r| r.bg(p.hover))
+                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                            if this.modal_selection != index {
+                                this.modal_selection = index;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.action(action, window, cx)),
+                        )
+                })
+        };
+        let name = |text: &'static str| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .child(text)
+        };
+        let separator = || div().border_t_1().border_color(p.border);
+        let (dot, state) = match self.status.state.as_str() {
+            "Indexing" => (0xfebc2e, "Indexing"),
+            "Error" => (0xff5f57, "Error"),
+            _ => (0x28c840, "Index ready"),
+        };
+        let switch = div()
+            .ml(px(8.))
+            .w(px(28.))
+            .h(px(16.))
+            .p(px(2.))
+            .flex()
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(if autostart_on { p.accent } else { p.border })
+            .when(autostart_on, |s| s.justify_end())
+            .child(div().size(px(12.)).rounded_full().bg(p.menu).shadow_sm());
+        let popover = div()
+            .absolute()
+            .right(px(8.))
+            .bottom(px(40.))
+            .w(px(300.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.menu)
+            .text_color(p.menu_text)
+            .text_size(px(12.))
+            .shadow_lg()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(14.))
+                    .pt(px(12.))
+                    .pb(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(11.))
+                            .text_color(p.muted)
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(dot)))
+                            .child(state),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(14.))
+                    .py(px(9.))
+                    .child(tile("everything/database.svg"))
+                    .child(name("Index"))
+                    .child(meta(
+                        format!("{} items", thousands(self.status.entries_count)).into(),
+                    )),
+            )
+            .when(cfg!(target_os = "macos"), |pop| {
+                pop.child(
+                    row(UiAction::FdaSettings, false, cx)
+                        .child(tile("everything/shield-check.svg"))
+                        .child(name("Full Disk Access"))
+                        .child(meta(
+                            if self.fda_ok {
+                                "Granted"
+                            } else {
+                                "Not granted"
+                            }
+                            .into(),
+                        ))
+                        .child(chevron()),
+                )
+                .child(
+                    row(
+                        UiAction::Autostart,
+                        self.action_busy || autostart_unsupported,
+                        cx,
+                    )
+                    .child(tile("everything/settings.svg"))
+                    .child(name("Launch at login"))
+                    .child(switch),
+                )
+            })
+            .child(separator())
+            .child(
+                row(UiAction::Add, false, cx)
+                    .child(tile("everything/folder-plus.svg"))
+                    .child(name("Indexed folders"))
+                    .child(meta(".pathindexing".into()).font_family(MONO))
+                    .child(chevron()),
+            )
+            .child(
+                row(UiAction::Ignore, false, cx)
+                    .child(tile("everything/folder-minus.svg"))
+                    .child(name("Excluded paths"))
+                    .child(meta(".pathignore".into()).font_family(MONO))
+                    .child(chevron()),
+            )
+            .child(separator())
+            .child(
+                row(UiAction::Reset, indexing, cx)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .text_color(rgb(if cx.theme().is_dark() {
+                                0xf87171
+                            } else {
+                                0xdc2626
+                            }))
+                            .child("Reset index"),
+                    )
+                    .child(meta("Rebuild from scratch".into()))
+                    .child(chevron()),
+            );
+        // Transparent backdrop: a click anywhere outside closes the popover
+        // (and swallows the click, so the gear toggles instead of reopening).
+        div()
+            .id("settings-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.action(UiAction::Cancel, window, cx);
+                }),
+            )
+            .child(popover)
+            .into_any_element()
+    }
+
     fn modal(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(modal) = &self.modal else {
             return div().into_any_element();
         };
         let p = Palette::get(cx);
         let onboarding = matches!(modal, Modal::Onboarding);
+        if matches!(modal, Modal::Settings) {
+            return self.settings_popover(cx);
+        }
         let body = if let Modal::Trash(paths) = modal {
             let title = if paths.len() == 1 {
                 "Move selected item to Trash?".into()
@@ -684,27 +914,19 @@ impl EverythingView {
                     .items_center()
                     .gap(px(8.))
                     .flex_shrink_0()
-                    .child(self.button("add", "Add", UiAction::Add, false, cx))
-                    .child(self.button("ignore", "Ignore", UiAction::Ignore, false, cx))
                     .child(
-                        self.button(
-                            "reset",
-                            "Reset",
-                            UiAction::Reset,
-                            self.status.state == "Indexing",
-                            cx,
-                        )
-                        .text_size(px(10.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .rounded(px(4.))
-                        .px(px(10.))
-                        .gap(px(6.))
-                        .children([svg()
-                            .path("everything/reset.svg")
-                            .size(px(11.))
-                            .text_color(p.accent)
-                            .into_any_element()])
-                        .flex_row_reverse(),
+                        // Ghost icon button: Add/Ignore/Reset live in the settings dialog.
+                        self.button("settings", "", UiAction::Settings, false, cx)
+                            .px(px(5.))
+                            .border_color(transparent_black())
+                            .bg(transparent_black())
+                            .tooltip(|window, cx| Tooltip::new("Settings").build(window, cx))
+                            .child(
+                                svg()
+                                    .path("everything/settings.svg")
+                                    .size(px(14.))
+                                    .text_color(p.muted),
+                            ),
                     ),
             )
     }
@@ -723,14 +945,12 @@ impl Render for EverythingView {
         if self.prefs.columns == [0.; 4] {
             self.prefs.columns = design::default_columns(window_width);
         }
-        if (width - self.table_width).abs() > 1. {
-            // Keep the user's column proportions while toggling the sidebar;
-            // fitting its narrower viewport must not overwrite preferences.
-            self.table_columns = if (self.prefs.columns.iter().sum::<f32>() - width).abs() <= 2. {
-                self.prefs.columns
-            } else {
-                design::fit_columns(self.prefs.columns, width)
-            };
+        if width != self.table_width {
+            // Refit on every width change: a sub-pixel (or <=2px) stale table
+            // left the content wider than the viewport mid-resize, flashing the
+            // horizontal scrollbar. fit_columns keeps the user's proportions and
+            // never writes back to preferences.
+            self.table_columns = design::fit_columns(self.prefs.columns, width);
             self.table_width = width;
         }
         let widths = self.table_columns;
@@ -1039,7 +1259,7 @@ impl Render for EverythingView {
                                             .px(px(10.))
                                             .py_0()
                                             .rounded(px(6.))
-                                            .font_family(MONO)
+                                            .font_family(SANS)
                                             .text_size(px(if cfg!(target_os = "windows") {
                                                 13.
                                             } else {
@@ -1048,17 +1268,18 @@ impl Render for EverythingView {
                                             .line_height(px(18.))
                                             .bg(p.input)
                                             .border_1()
+                                            // Orca's filter field: focus-within:border-ring ring-1 ring-ring.
                                             .border_color(if self.input.focus_handle(cx).is_focused(window) {
-                                                p.muted
+                                                p.ring
                                             } else {
                                                 p.input_border
                                             })
                                             .when(self.input.focus_handle(cx).is_focused(window), |i| {
                                                 i.shadow(vec![BoxShadow {
-                                                    color: p.muted.opacity(0.3),
+                                                    color: p.ring,
                                                     offset: point(px(0.), px(0.)),
                                                     blur_radius: px(0.),
-                                                    spread_radius: px(3.),
+                                                    spread_radius: px(1.),
                                                 }])
                                             }),
                                     ),
@@ -1260,7 +1481,7 @@ impl EverythingView {
                 "selected":self.model.paths(),"primary":self.model.primary,"sortBy":self.sort_by,"sortDir":self.sort_dir,
                 "renamePath":self.rename_path,"renameValue":self.rename_input.read(cx).value(),
                 "renamePending":self.rename_click_task.is_some(),"renameDelayMs":Self::rename_delay().as_millis() as u64,
-                "modal":self.modal.as_ref().map(|m|match m{Modal::Trash(_)=>"trash",Modal::Onboarding=>"onboarding"}),
+                "modal":self.modal.as_ref().map(|m|match m{Modal::Trash(_)=>"trash",Modal::Onboarding=>"onboarding",Modal::Settings=>"settings"}),
                 "modalSelection":self.modal_selection,"contextMenu":self.context_menu.is_some(),"menuSelection":self.menu_selection,
                 "fdaOk":self.fda_ok,"fdaDismissed":self.prefs.fda_dismissed,"fdaSettingsOpened":self.status_display.fda_settings_opened,"pathignoreBanner":self.status_display.pathignore_changed,"pathindexingBanner":self.status_display.pathindexing_changed,"tableFocused":self.table_focus.is_focused(window),
                 "horizontalOffset":f32::from(self.horizontal_scroll.offset().x),"visibleRange":[self.visible_rows.start,self.visible_rows.end],
@@ -1356,4 +1577,16 @@ fn highlight(name: &str, query: &str) -> Vec<std::ops::Range<usize>> {
         ranges.push(start..i);
     }
     ranges
+}
+
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }

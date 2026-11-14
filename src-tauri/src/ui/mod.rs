@@ -102,6 +102,7 @@ pub(super) fn run() {
 enum Modal {
     Trash(Vec<String>),
     Onboarding,
+    Settings,
 }
 
 struct EverythingView {
@@ -528,7 +529,7 @@ impl EverythingView {
         theme.selection = p.accent.opacity(0.3);
         theme.border = p.border;
         theme.input = p.input_border;
-        theme.ring = p.muted;
+        theme.ring = p.ring;
         theme.popover = p.menu;
         theme.popover_foreground = p.menu_text;
         theme.radius = px(6.);
@@ -594,7 +595,6 @@ impl EverythingView {
         }
     }
 }
-
 
 fn telemetry(value: serde_json::Value) {
     if let Some(path) = std::env::var_os("EVERYTHING_UI_METRICS") {

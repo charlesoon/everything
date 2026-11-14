@@ -16,6 +16,7 @@ pub(super) enum UiAction {
     Add,
     Ignore,
     Reset,
+    Settings,
     FdaSettings,
     LoginSettings,
     Register,
@@ -57,6 +58,19 @@ impl EverythingView {
                 self.save_preferences(cx);
                 cx.notify();
                 return;
+            }
+            UiAction::Settings => {
+                self.modal = Some(Modal::Settings);
+                self.modal_selection = 0;
+                self.table_focus.focus(window);
+                cx.notify();
+                return;
+            }
+            UiAction::Add | UiAction::Ignore | UiAction::Reset | UiAction::FdaSettings
+                if matches!(self.modal, Some(Modal::Settings)) =>
+            {
+                self.modal = None;
+                cx.notify();
             }
             UiAction::Cancel => {
                 if !matches!(self.modal, Some(Modal::Onboarding)) {
@@ -201,14 +215,12 @@ impl EverythingView {
                             .map_err(|e| e.to_string())??;
                         Ok(Outcome::Message(format!("Copied {count} item(s)")))
                     }
-                    UiAction::DeletePermanently => {
-                        crate::runtime::spawn_blocking(move || {
-                            crate::file_actions::delete_permanently(&paths)
-                        })
-                        .await
-                        .map(Outcome::Trash)
-                        .map_err(|error| error.to_string())
-                    }
+                    UiAction::DeletePermanently => crate::runtime::spawn_blocking(move || {
+                        crate::file_actions::delete_permanently(&paths)
+                    })
+                    .await
+                    .map(Outcome::Trash)
+                    .map_err(|error| error.to_string()),
                     UiAction::Add => {
                         crate::runtime::spawn_blocking(move || crate::open_pathindexing(&backend))
                             .await
@@ -279,7 +291,10 @@ impl EverythingView {
                         this.refresh_file_tree(cx);
                         let message = if result.failures.is_empty() {
                             if matches!(action, UiAction::DeletePermanently) {
-                                format!("Deleted {} item(s) permanently.", result.removed_paths.len())
+                                format!(
+                                    "Deleted {} item(s) permanently.",
+                                    result.removed_paths.len()
+                                )
                             } else {
                                 format!("Moved {} item(s) to Trash.", result.removed_paths.len())
                             }
@@ -516,12 +531,15 @@ impl EverythingView {
         let input_focused = self.input.focus_handle(cx).is_focused(window);
         let handled = if let Some(modal) = self.modal.clone() {
             let onboarding = matches!(modal, Modal::Onboarding);
+            let settings = matches!(modal, Modal::Settings);
             let count = if onboarding {
                 if self.fda_ok {
                     4
                 } else {
                     3
                 }
+            } else if settings {
+                self.settings_items().len()
             } else {
                 2
             };
@@ -541,6 +559,8 @@ impl EverythingView {
                             UiAction::OnboardSkip,
                             UiAction::OnboardGranted,
                         ][self.modal_selection]
+                    } else if settings {
+                        self.settings_items()[self.modal_selection]
                     } else if self.modal_selection == 0 {
                         UiAction::Cancel
                     } else {

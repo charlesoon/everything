@@ -57,7 +57,7 @@ def main():
     shutil.copy2(ROOT / 'src-tauri/icons/icon.icns', contents / 'Resources/icon.icns')
     licenses = contents / 'Resources/licenses'
     licenses.mkdir()
-    for name in ['inter-LICENSE.txt', 'jetbrains-mono-LICENSE.txt']:
+    for name in ['geist-LICENSE.txt', 'jetbrains-mono-LICENSE.txt']:
         shutil.copy2(ROOT / 'src-tauri/assets/fonts' / name, licenses / name)
     agents = contents / 'Library/LaunchAgents'
     agents.mkdir(parents=True)

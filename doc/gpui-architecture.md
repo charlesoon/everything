@@ -60,7 +60,7 @@ and tracks indexing progress, elapsed/completion time and catchup display rules.
 The status dot pulses only while indexing or background work is active. The
 auto-start label and action both use the actual registration and opt-out state.
 
-The UI follows system appearance and embeds the baseline Inter/JetBrains Mono fonts and SVGs. Layout, colors, 30px titlebar, 34px search field, 27px rows and 33px statusbar come from the preserved CSS. No theme button or empty-table message is added.
+The UI follows system appearance and embeds Geist (Orca's UI font) and JetBrains Mono and SVGs. Layout, colors, 30px titlebar, 34px search field, 27px rows and 33px statusbar come from the preserved CSS. No theme button or empty-table message is added.
 
 On Windows the titlebar background and label form a native caption drag area,
 excluding the three window buttons. Table focus is tracked only in the results

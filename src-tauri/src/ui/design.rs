@@ -2,7 +2,7 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
 
-pub(super) const SANS: &str = "Inter";
+pub(super) const SANS: &str = "Geist";
 pub(super) const MONO: &str = "JetBrains Mono";
 pub(super) const ROW_HEIGHT: f32 = 27.; // CSS height:26px + 1px bottom border.
 pub(super) const COLUMN_MIN: [f32; 4] = [180., 240., 62., 150.];
@@ -15,6 +15,7 @@ pub(super) struct Palette {
     pub input: Hsla,
     pub border: Hsla,
     pub input_border: Hsla,
+    pub ring: Hsla,
     pub accent: Hsla,
     pub row_border: Hsla,
     pub hover: Hsla,
@@ -36,9 +37,10 @@ impl Palette {
                 bg: rgb(0x09090b).into(),     // background
                 text: rgb(0xd4d4d8).into(),   // zinc-300, not #fafafa: less glare
                 muted: rgb(0xa1a1aa).into(),  // muted-foreground
-                input: rgb(0x0f0f12).into(),  // input/30
+                input: rgb(0x1a1a1c).into(), // input/50 over bg, opaque: GPUI ring shadows fill under the box
                 border: rgb(0x27272a).into(), // border
                 input_border: rgb(0x27272a).into(),
+                ring: rgb(0x71717a).into(),
                 accent: rgb(0xe4e4e7).into(), // primary
                 row_border: rgba(0xffffff08).into(),
                 hover: rgb(0x18181b).into(),    // accent/50
@@ -56,9 +58,10 @@ impl Palette {
                 bg: rgb(0xfafafa).into(),
                 text: rgb(0x27272a).into(),
                 muted: rgb(0x71717a).into(),
-                input: rgb(0xffffff).into(),
+                input: rgb(0xefeff0).into(),
                 border: rgb(0xe4e4e7).into(),
                 input_border: rgb(0xe4e4e7).into(),
+                ring: rgb(0xa1a1aa).into(),
                 accent: rgb(0x27272a).into(),
                 row_border: rgb(0xf0f0f2).into(),
                 hover: rgb(0xf4f4f5).into(),
@@ -98,4 +101,17 @@ pub(super) fn fit_columns(columns: [f32; 4], width: f32) -> [f32; 4] {
         path = flexible - name - size;
     }
     [name, path.max(240.), size, columns[3]]
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fitted_columns_never_overflow_the_viewport() {
+        let prefs = super::default_columns(1200.);
+        for tenth in 6400..14000 {
+            let width = tenth as f32 / 10.;
+            let total: f32 = super::fit_columns(prefs, width).iter().sum();
+            assert!(total <= width + 0.01, "{width}: {total}");
+        }
+    }
 }
