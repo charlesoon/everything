@@ -925,26 +925,33 @@ impl EverythingView {
                             },
                         ))
                     })
-                    .when_some(self.status.message.clone(), |d, message| {
-                        let color = if status::is_catchup(&self.status) {
-                            p.muted
-                        } else if self.status.state == "Error" {
-                            rgb(if cx.theme().is_dark() {
-                                0xff9d9d
+                    .when_some(
+                        // Background catchup progress yields to the selection;
+                        // errors and warnings always show.
+                        self.status.message.clone().filter(|_| {
+                            selected.is_empty() || !status::is_catchup(&self.status)
+                        }),
+                        |d, message| {
+                            let color = if status::is_catchup(&self.status) {
+                                p.muted
+                            } else if self.status.state == "Error" {
+                                rgb(if cx.theme().is_dark() {
+                                    0xff9d9d
+                                } else {
+                                    0xd93025
+                                })
+                                .into()
                             } else {
-                                0xd93025
-                            })
-                            .into()
-                        } else {
-                            rgb(if cx.theme().is_dark() {
-                                0xe0c670
-                            } else {
-                                0xb45309
-                            })
-                            .into()
-                        };
-                        d.child(div().text_color(color).child(message))
-                    }),
+                                rgb(if cx.theme().is_dark() {
+                                    0xe0c670
+                                } else {
+                                    0xb45309
+                                })
+                                .into()
+                            };
+                            d.child(div().text_color(color).child(message))
+                        },
+                    )
             )
             .child(
                 div()
@@ -1186,6 +1193,11 @@ impl Render for EverythingView {
                     this.focus_search(true, window, cx)
                 }),
             )
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                if this.modal.is_none() {
+                    this.action(UiAction::Settings, window, cx);
+                }
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.resize_file_tree(event, window, cx) {
                     return;

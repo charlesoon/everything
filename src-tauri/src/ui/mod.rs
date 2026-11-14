@@ -31,7 +31,7 @@ use crate::{
 };
 use actions::UiAction;
 
-actions!(everything, [Quit, FocusSearch]);
+actions!(everything, [Quit, FocusSearch, OpenSettings]);
 
 pub(super) fn run() {
     let started = Instant::now();
@@ -52,10 +52,12 @@ pub(super) fn run() {
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("ctrl-q", Quit, None),
+                KeyBinding::new("cmd-,", OpenSettings, None),
             ]);
             cx.set_menus(vec![Menu {
                 name: "Everything".into(),
                 items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
                     MenuItem::action("Search", FocusSearch),
                     MenuItem::separator(),
                     MenuItem::action("Quit Everything", Quit),
