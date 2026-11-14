@@ -619,21 +619,6 @@ impl EverythingView {
                     .items_center()
                     .gap(px(8.))
                     .flex_shrink_0()
-                    .when(cfg!(target_os = "macos"), |d| {
-                        d.when_some(self.onboarding.as_ref(), |d, s| {
-                            d.child(self.button(
-                                "autostart",
-                                if !s.opted_out && s.registration == "enabled" {
-                                    "자동 실행: 켜짐"
-                                } else {
-                                    "자동 실행: 꺼짐"
-                                },
-                                UiAction::Autostart,
-                                self.action_busy || s.registration == "unsupported",
-                                cx,
-                            ))
-                        })
-                    })
                     .child(self.button("add", "Add", UiAction::Add, false, cx))
                     .child(self.button("ignore", "Ignore", UiAction::Ignore, false, cx))
                     .child(
