@@ -1,8 +1,35 @@
 use super::*;
 use design::{Palette, COLUMN_MIN, MONO, ROW_HEIGHT, SANS};
-use gpui_component::scroll::Scrollbar;
+use gpui_component::{
+    scroll::{Scrollbar, ScrollbarShow},
+    tooltip::Tooltip,
+};
 
 impl EverythingView {
+    pub(super) fn copyable_path(
+        &self,
+        id: &'static str,
+        path: String,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let p = Palette::get(cx);
+        let label = display_path(&path, &self.backend.home_dir);
+        let tooltip = format!("{path}\nClick to copy path");
+        div()
+            .id(id)
+            .min_w_0()
+            .overflow_hidden()
+            .cursor_pointer()
+            .hover(|path| path.text_color(p.accent))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                this.notify_message("Copied path", cx);
+            }))
+            .child(div().truncate().child(label))
+    }
+
     fn button(
         &self,
         id: &'static str,
@@ -120,6 +147,7 @@ impl EverythingView {
                     {
                         this.model.select(index, toggle, event.modifiers.shift);
                     }
+                    this.reveal_result_in_tree();
                     this.table_focus.focus(window);
                     this.drag_start = Some((event.position, index));
                     cx.notify();
@@ -152,6 +180,7 @@ impl EverythingView {
                     if !this.model.selected.contains(&index) {
                         this.model.select(index, false, false);
                     }
+                    this.reveal_result_in_tree();
                     this.table_focus.focus(window);
                     this.open_context_menu(event.position, window, cx);
                     cx.stop_propagation();
@@ -421,13 +450,14 @@ impl EverythingView {
 
     fn titlebar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let p = Palette::get(cx);
+        let tree_width = self.file_tree_width(window);
         div()
             .id("titlebar")
             .relative()
             .flex()
             .items_center()
-            .justify_center()
             .h(px(30.))
+            .w_full()
             .flex_shrink_0()
             .when(!cfg!(target_os = "windows"), |title| {
                 title.on_mouse_down(MouseButton::Left, |event, window, _| {
@@ -456,22 +486,60 @@ impl EverythingView {
             .child(
                 div()
                     .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
                     .items_center()
-                    .gap(px(8.))
-                    .child(
-                        svg()
-                            .path("everything/search.svg")
-                            .size(px(12.))
-                            .text_color(p.accent),
+                    .justify_center()
+                    .when(
+                        cfg!(target_os = "macos") && self.prefs.file_tree_visible,
+                        |title| {
+                            // Keep the centered title clear of the traffic lights
+                            // even when the results pane is at its minimum width.
+                            title.pl(px(20.))
+                        },
+                    )
+                    .when(
+                        cfg!(target_os = "windows") && !self.prefs.file_tree_visible,
+                        |title| title.pr(px(175.)),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .line_height(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child("Everything"),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                svg()
+                                    .path("everything/search.svg")
+                                    .size(px(12.))
+                                    .text_color(p.accent),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .line_height(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Everything"),
+                            ),
                     ),
             )
+            .when(self.prefs.file_tree_visible, |title| {
+                title.child(
+                    div()
+                        .id("file-tree-titlebar")
+                        .relative()
+                        .w(px(tree_width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .border_l_1()
+                        .border_color(p.border)
+                        .child(self.file_tree_toggle(cx))
+                        .child(self.file_tree_resize_handle(tree_width, cx)),
+                )
+            })
+            .when(!self.prefs.file_tree_visible, |title| {
+                title.child(self.file_tree_toggle(cx))
+            })
             .when(cfg!(target_os = "windows"), |title| {
                 title.child(
                     div()
@@ -529,9 +597,7 @@ impl EverythingView {
         } else {
             dot.into_any_element()
         };
-        let selection = if selected.len() == 1 {
-            display_path(&selected[0], &self.backend.home_dir)
-        } else {
+        let selection_summary = (selected.len() > 1).then(|| {
             let total = self
                 .model
                 .selected
@@ -540,7 +606,7 @@ impl EverythingView {
                 .filter_map(|e| e.size)
                 .sum::<i64>();
             format!("{} selected, Size: {}", selected.len(), format_bytes(total))
-        };
+        });
         div()
             .flex()
             .items_center()
@@ -562,8 +628,11 @@ impl EverythingView {
                     .gap(px(16.))
                     .min_w_0()
                     .overflow_hidden()
-                    .when(!selected.is_empty(), |d| {
-                        d.child(div().truncate().child(selection))
+                    .when(selected.len() == 1, |d| {
+                        d.child(self.copyable_path("status-file-path", selected[0].clone(), cx))
+                    })
+                    .when_some(selection_summary, |d, summary| {
+                        d.child(div().truncate().child(summary))
                     })
                     .when(selected.is_empty(), |d| {
                         d.child(
@@ -651,30 +720,35 @@ impl Render for EverythingView {
         if self.table_width == 0. {
             mac_menu::position_buttons(window);
         }
-        let width = f32::from(window.viewport_size().width);
+        self.sync_file_tree(cx);
+        let tree_width = self.file_tree_width(window);
+        let window_width = f32::from(window.viewport_size().width);
+        let width = window_width - tree_width;
+        if self.prefs.columns == [0.; 4] {
+            self.prefs.columns = design::default_columns(window_width);
+        }
         if (width - self.table_width).abs() > 1. {
-            self.prefs.columns = if self.table_width == 0. && self.prefs.columns == [0.; 4] {
-                design::default_columns(width)
-            } else if self.table_width == 0.
-                && (self.prefs.columns.iter().sum::<f32>() - width).abs() <= 2.
-            {
+            // Keep the user's column proportions while toggling the sidebar;
+            // fitting its narrower viewport must not overwrite preferences.
+            self.table_columns = if (self.prefs.columns.iter().sum::<f32>() - width).abs() <= 2. {
                 self.prefs.columns
             } else {
                 design::fit_columns(self.prefs.columns, width)
             };
             self.table_width = width;
         }
-        let widths = self.prefs.columns;
+        let widths = self.table_columns;
         let total_width = widths.iter().sum::<f32>();
         let p = Palette::get(cx);
         let row_count = self.model.rows.len();
+        let header_height = if cfg!(target_os = "windows") {
+            25.
+        } else {
+            33.
+        };
         let header = div()
             .flex()
-            .h(px(if cfg!(target_os = "windows") {
-                25.
-            } else {
-                33.
-            }))
+            .h(px(header_height))
             .w(px(total_width))
             .flex_shrink_0()
             .border_b_1()
@@ -742,7 +816,7 @@ impl Render for EverythingView {
                                                     this.resizing = Some((
                                                         index,
                                                         event.position,
-                                                        this.prefs.columns,
+                                                        this.table_columns,
                                                     ));
                                                     cx.stop_propagation();
                                                 },
@@ -759,6 +833,7 @@ impl Render for EverythingView {
             })
             .relative()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .w_full()
             .overflow_hidden()
@@ -814,9 +889,16 @@ impl Render for EverythingView {
                     )),
             )
             .when(row_count > 0, |area| {
-                area.child(Scrollbar::vertical(&self.list_scroll))
+                area.child(div().absolute().inset_0().top(px(header_height)).child(
+                    Scrollbar::vertical(&self.list_scroll).scrollbar_show(ScrollbarShow::Always),
+                ))
             })
-            .child(Scrollbar::horizontal(&self.horizontal_scroll));
+            .child(
+                div().absolute().inset_0().child(
+                    Scrollbar::horizontal(&self.horizontal_scroll)
+                        .scrollbar_show(ScrollbarShow::Always),
+                ),
+            );
         self.write_test_state(window, cx);
         div()
             .id("everything")
@@ -852,14 +934,17 @@ impl Render for EverythingView {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if this.resize_file_tree(event, window, cx) {
+                    return;
+                }
                 if let Some((index, start, widths)) = this.resizing {
                     let delta = f32::from(event.position.x - start.x).round();
                     if index == 0 {
-                        this.prefs.columns[0] = (widths[0] + delta)
+                        this.table_columns[0] = (widths[0] + delta)
                             .clamp(COLUMN_MIN[0], widths[0] + widths[1] - COLUMN_MIN[1]);
-                        this.prefs.columns[1] = widths[0] + widths[1] - this.prefs.columns[0];
+                        this.table_columns[1] = widths[0] + widths[1] - this.table_columns[0];
                     } else {
-                        this.prefs.columns[index] = (widths[index] + delta).max(COLUMN_MIN[index]);
+                        this.table_columns[index] = (widths[index] + delta).max(COLUMN_MIN[index]);
                     }
                     cx.notify();
                 } else if event.dragging() {
@@ -881,7 +966,9 @@ impl Render for EverythingView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.finish_file_tree_resize(cx);
                     if this.resizing.take().is_some() {
+                        this.prefs.columns = this.table_columns;
                         this.save_preferences(cx);
                     }
                     this.drag_start = None;
@@ -890,7 +977,9 @@ impl Render for EverythingView {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.finish_file_tree_resize(cx);
                     if this.resizing.take().is_some() {
+                        this.prefs.columns = this.table_columns;
                         this.save_preferences(cx);
                     }
                     this.drag_start = None;
@@ -924,52 +1013,70 @@ impl Render for EverythingView {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .h(px(44.))
-                    .flex_shrink_0()
-                    .px(px(if cfg!(target_os = "windows") { 8. } else { 16. }))
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
                     .child(
-                        Input::new(&self.input)
-                            .appearance(false)
-                            .min_h(px(if cfg!(target_os = "windows") {
-                                30.
-                            } else {
-                                34.
-                            }))
-                            .max_h(px(if cfg!(target_os = "windows") {
-                                30.
-                            } else {
-                                34.
-                            }))
-                            .w_full()
-                            .px(px(10.))
-                            .py_0()
-                            .rounded(px(8.))
-                            .font_family(MONO)
-                            .text_size(px(if cfg!(target_os = "windows") {
-                                13.
-                            } else {
-                                12.
-                            }))
-                            .line_height(px(18.))
-                            .bg(p.input)
-                            .border_1()
-                            .border_color(if self.input.focus_handle(cx).is_focused(window) {
-                                p.accent
-                            } else {
-                                p.input_border
-                            })
-                            .when(self.input.focus_handle(cx).is_focused(window), |i| {
-                                i.shadow(vec![BoxShadow {
-                                    color: rgba(0x7da9ff40).into(),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(0.),
-                                    spread_radius: px(2.),
-                                }])
-                            }),
-                    ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .h(px(44.))
+                                    .flex_shrink_0()
+                                    .px(px(if cfg!(target_os = "windows") { 8. } else { 16. }))
+                                    .child(
+                                        Input::new(&self.input)
+                                            .appearance(false)
+                                            .min_h(px(if cfg!(target_os = "windows") {
+                                                30.
+                                            } else {
+                                                34.
+                                            }))
+                                            .max_h(px(if cfg!(target_os = "windows") {
+                                                30.
+                                            } else {
+                                                34.
+                                            }))
+                                            .w_full()
+                                            .px(px(10.))
+                                            .py_0()
+                                            .rounded(px(8.))
+                                            .font_family(MONO)
+                                            .text_size(px(if cfg!(target_os = "windows") {
+                                                13.
+                                            } else {
+                                                12.
+                                            }))
+                                            .line_height(px(18.))
+                                            .bg(p.input)
+                                            .border_1()
+                                            .border_color(if self.input.focus_handle(cx).is_focused(window) {
+                                                p.accent
+                                            } else {
+                                                p.input_border
+                                            })
+                                            .when(self.input.focus_handle(cx).is_focused(window), |i| {
+                                                i.shadow(vec![BoxShadow {
+                                                    color: rgba(0x7da9ff40).into(),
+                                                    offset: point(px(0.), px(0.)),
+                                                    blur_radius: px(0.),
+                                                    spread_radius: px(2.),
+                                                }])
+                                            }),
+                                    ),
+                            )
+                            .child(results),
+                    )
+                    .when(self.prefs.file_tree_visible, |body| {
+                        body.child(self.file_tree_panel(tree_width, cx))
+                    }),
             )
-            .child(results)
             .child(self.statusbar(cx))
             .when_some(
                 self.toast.as_ref().map(|(text, _)| text.clone()),
@@ -1182,7 +1289,8 @@ impl EverythingView {
                 "modalSelection":self.modal_selection,"contextMenu":self.context_menu.is_some(),"menuSelection":self.menu_selection,
                 "fdaOk":self.fda_ok,"fdaDismissed":self.prefs.fda_dismissed,"fdaSettingsOpened":self.status_display.fda_settings_opened,"pathignoreBanner":self.status_display.pathignore_changed,"pathindexingBanner":self.status_display.pathindexing_changed,"tableFocused":self.table_focus.is_focused(window),
                 "horizontalOffset":f32::from(self.horizontal_scroll.offset().x),"visibleRange":[self.visible_rows.start,self.visible_rows.end],
-                "toast":self.toast.as_ref().map(|(s,_)|s),"theme":if cx.theme().is_dark(){"dark"}else{"light"},"columns":self.prefs.columns,"error":self.model.error,"actionBusy":self.action_busy,"completedAction":self.completed_action.map(|action|format!("{action:?}")),
+                "fileTree":self.file_tree_test_state(window),
+                "toast":self.toast.as_ref().map(|(s,_)|s),"theme":if cx.theme().is_dark(){"dark"}else{"light"},"columns":self.table_columns,"error":self.model.error,"actionBusy":self.action_busy,"completedAction":self.completed_action.map(|action|format!("{action:?}")),
                 "width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height),
             });
             let _ = std::fs::write(path, state.to_string());
@@ -1190,7 +1298,7 @@ impl EverythingView {
     }
 }
 
-fn display_path(path: &str, home: &std::path::Path) -> String {
+pub(super) fn display_path(path: &str, home: &std::path::Path) -> String {
     let home = home.to_string_lossy();
     if path == home.as_ref() {
         "~".into()

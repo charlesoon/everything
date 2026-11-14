@@ -1,0 +1,239 @@
+{
+  "rust": {
+    "passed": 142,
+    "failed": 0,
+    "ignored": 11,
+    "fileTreeModelTests": 6,
+    "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4 -- --test-threads=1"
+  },
+  "npmTest": {
+    "exitCode": 0,
+    "command": "npm test -- --release --features ui-automation -j4"
+  },
+  "screenshots": {
+    "04-tree-dark.png": "24662ebe08a2d2340a96d22764ca9e7ecf369abf443f00098f89568d0ceba534",
+    "05-tree-light.png": "f299daf7b51a683ba5e238048d4fc1853fcf021688d470ac16635f4b81d9fcfb",
+    "06-small-window.png": "2a3d48dd2e3cad9bf0bab73df395b656ef2effb215517b2cb84e597e9e11170d",
+    "09-deep-tree.png": "f1f8bb863cb55b9a4f5593e8c8117b12e9c4116378cb0882fd08b8ef95f13d18",
+    "11-refresh-position.png": "e937fd47a4008875f0ed766367e175bb1122aa3141e1ef59ae33a7c6f1e2fb4d",
+    "12-idle-scrollbars-dark.png": "a60c60e9a527c4e7f6edc06e7aa0ab51d4e9759efe661dc4d26ac4f999c6e137",
+    "14-idle-scrollbars-light.png": "55406be8cd7958aa27d938a7020fb5f596c0114f7680440c997e983ed60e5b97",
+    "15-copy-path.png": "5d3a3108af1b39aaaf7c1c56f6eee3c3a26c2a349b354a1df341edb9f95e0cf6"
+  },
+  "productionRelease": {
+    "exitCode": 0,
+    "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build --release --locked --manifest-path src-tauri/Cargo.toml -j4",
+    "binarySha256": "6d4c6fef6a2f703e2d758b237e80c939181678b332c772fb801439a5b1e6cd79"
+  },
+  "sourceSha256": {
+    "src-tauri/src/ui/file_tree.rs": "d8d9ea04a5f5e2869b2df7a7e6a33540772e2c2c97aaf5ec63f5f6d5d4fcf464",
+    "src-tauri/src/ui/file_tree/model.rs": "178bfc4002d7256fdf5e2540a59fd95dd38090d4701edeb4a60c1d26e9ad64b7",
+    "src-tauri/src/ui/actions.rs": "f5530f901a5829eaae11038f70322b5655197098df6a0472b5bc39d3ee138474",
+    "src-tauri/src/ui/assets.rs": "4c7a93c06cce6f2823c8ac0a1314d9172e08a5a4eb2f2e444dd619a55511d6ab",
+    "src-tauri/src/ui/mod.rs": "def2614921855eafc19658d37cfcbf0cc61b9860f31b20656a20b9226f44f6d3",
+    "src-tauri/src/ui/view.rs": "5d56ff390fad5ce01c16d590331bc0b3833fa8fa25186a85c931f753a461aab7",
+    "src-tauri/src/ui_prefs.rs": "2c03f2c6316a389d3711b64b458167160a50c78344424219722a85a1a926ca4e",
+    "src-tauri/src/ui_automation.rs": "bf485b4918d03b72b6bc71b5dbc9b5c0ccab1b944311d82ad8bad051689c7e39",
+    "scripts/run_file_tree_ui_tests.py": "a6baa04aa4ddf94440e7f780f15dc888bc642a2095fd2677f9dd3825de237212"
+  },
+  "searchRowLayout": {
+    "fileTreeUiPassed": 8,
+    "existingUiPassed": 14,
+    "fileTreeListTop": 89,
+    "dividerDragTestY": 50,
+    "sourceSha256": {
+      "src-tauri/src/ui/view.rs": "49712be11060cf7f3e2be0168321342142b0a8bb998c5fe1afc15b077ef843e1",
+      "scripts/run_file_tree_ui_tests.py": "b98bb58f0622bd5566f10dabb2d1e43d1557bf98f5430eed0d5a4698a53c5fe9"
+    },
+    "productionRelease": {
+      "exitCode": 0,
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build --release --locked --manifest-path src-tauri/Cargo.toml -j4",
+      "binarySha256": "e5ebf8202224946bc72b7355a00e5abfbcb8259ffc398fc1e71f2260500b40f6"
+    }
+  },
+  "titlebarLayout": {
+    "fileTreeUiPassed": 8,
+    "existingUiPassed": 14,
+    "failed": 0,
+    "fileTreeListTop": 89,
+    "dividerTop": 0,
+    "dividerDragTestY": 15,
+    "windowMovesDuringTitlebarResize": false,
+    "sourceSha256": {
+      "src-tauri/src/ui/view.rs": "0a0c2d0ed455734c8944960b709b8d9f30ba2c5d5d6414738430ffd1ba9ccd64",
+      "src-tauri/src/ui/file_tree.rs": "27fbed1c9b0e2015f5245368b53c78d90f14fe38e0ca65d6a9f4b6beb73b835d",
+      "scripts/run_file_tree_ui_tests.py": "a0ca2a587e8b70ed63e2d636d3e5c8036d45c7c1c79602f3e97cf9f9bc2cc535"
+    },
+    "productionRelease": {
+      "exitCode": 0,
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build --release --locked --manifest-path src-tauri/Cargo.toml -j4",
+      "binarySha256": "78e26c5151432c6669ed7efc60994b0b3d8306dba6e6ff85ae88d039a133e808"
+    }
+  },
+  "scrollingFix": {
+    "version": "0.6.1",
+    "fileTreeUiPassed": 10,
+    "existingUiPassed": 14,
+    "modelTestsPassed": 7,
+    "failed": 0,
+    "modelTestCommand": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4 ui::file_tree::model::tests",
+    "reproducedBeforeFix": {
+      "scrollBeforeRefresh": -5367,
+      "scrollAfterRefresh": 0
+    },
+    "checks": [
+      "viewport preserved during refresh and reactivation",
+      "viewport preserved when a file is inserted above it",
+      "manual browsing preserved on refresh",
+      "both vertical thumbs and the results horizontal thumb draggable after idle",
+      "dark and light screenshots inspected"
+    ],
+    "regressionFirstRun": {
+      "passed": 13,
+      "failed": 1,
+      "case": "UI-02",
+      "reason": "*.md query exceeded the 12-second UI wait; entire rerun passed 14/14"
+    },
+    "wildcardFollowup": {
+      "query": "*.md",
+      "expectedTotal": 62502,
+      "elapsedMs": [
+        263.9,
+        250.9,
+        242.6,
+        249.0,
+        243.4,
+        252.3,
+        249.9,
+        243.1,
+        252.1,
+        247.5
+      ],
+      "passed": 10
+    },
+    "sourceSha256": {
+      "src-tauri/src/ui/view.rs": "7d695f5ee76bf194d96c75450590df6ef077733b556aa6314c809f9fcdad079f",
+      "src-tauri/src/ui/file_tree.rs": "6cdac9fc31b7f9fe844c4f28e7da064ac97dbc74ab8b65b665717766f29289c5",
+      "src-tauri/src/ui/file_tree/model.rs": "74181e7a45d9e1c576c7aed50dcb8ed4166692adcd2c861b755bd619696374d7",
+      "scripts/run_file_tree_ui_tests.py": "8c9220749f01e1c0349e776c9eb0b344dab310de862a9cfab33a7b8af434fe6b"
+    },
+    "productionRelease": {
+      "createdAt": "2026-11-14T09:42:38.007158+00:00",
+      "version": "0.6.1",
+      "architecture": "Mach-O 64-bit executable arm64",
+      "app": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app",
+      "dmg": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/dmg/Everything_0.6.1_aarch64.dmg",
+      "signature": "Executable=/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app/Contents/MacOS/everything\nIdentifier=com.everything.app\nFormat=app bundle with Mach-O thin (arm64)\nCodeDirectory v=20500 size=30995 flags=0x10002(adhoc,runtime) hashes=958+7 location=embedded\nSignature=adhoc\nInfo.plist entries=17\nTeamIdentifier=not set\nRuntime Version=27.0.0\nSealed Resources version=2 rules=13 files=4\nInternal requirements count=0 size=12",
+      "checks": {
+        "releaseBuildAndBundleSigning": true,
+        "versionMetadataAndCli": true,
+        "embeddedLaunchAgentAndLicenses": true,
+        "dmgIntegrity": true
+      },
+      "binarySha256": "ebe0ebb9ec0010657c31ef06aed453166234dfb9f3f4e66aa45bacce7d672dca",
+      "appBinarySha256": "ba6836fc3c903a5b70a7fc09771df306c50496c5ed5182dd31f8ecb6e80bdd47",
+      "dmgSha256": "2e9ca761a5c28478c72ebbac64dc8a5248b3ab76781a12ed280a4d1a4299d79d",
+      "dmgBytes": 7694464
+    }
+  },
+  "pathCopy": {
+    "createdAt": "2026-11-14T10:12:50.927811+00:00",
+    "version": "0.6.1",
+    "fileTreeUiPassed": 11,
+    "existingUiPassed": 14,
+    "failed": 0,
+    "checks": [
+      "status path click writes the selected file absolute path to the actual AppKit clipboard",
+      "tree header path click writes the current root absolute path to the actual AppKit clipboard",
+      "Unicode and spaces, home abbreviation, and truncated header in a 400x300 window retain the full copied path",
+      "path clicks preserve query, file selection, tree root and viewport",
+      "latest path-copy screenshot inspected"
+    ],
+    "fileTreeUiFirstRun": {
+      "passed": 10,
+      "failed": 1,
+      "case": "TREE-06",
+      "reason": "child.txt query exceeded the UI wait before the path-copy case; unchanged full rerun passed 11/11",
+      "pathCopyCasePassedBothRuns": true
+    },
+    "sourceSha256": {
+      "src-tauri/src/ui/view.rs": "daa2b60ba226648806cb0f3553c51e0a489daac48ee5fd357da7127305a2fd8c",
+      "src-tauri/src/ui/file_tree.rs": "288fe7a487a8faf2ec16366b15b00589ea75ee4a3443888e0db977420286e049",
+      "scripts/run_file_tree_ui_tests.py": "dd853610f47b698e344c63a6b9cff8c93bc76cc3626cb2c032d411619f9c1568",
+      "doc/gpui-test-cases.md": "bf18e7d0bd381d7a8c9795da98b7d24dda85491068e59ce459b6755b181ee441"
+    },
+    "productionRelease": {
+      "createdAt": "2026-11-14T10:12:34.006973+00:00",
+      "version": "0.6.1",
+      "architecture": "Mach-O 64-bit executable arm64",
+      "app": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app",
+      "dmg": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/dmg/Everything_0.6.1_aarch64.dmg",
+      "signature": "Executable=/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app/Contents/MacOS/everything\nIdentifier=com.everything.app\nFormat=app bundle with Mach-O thin (arm64)\nCodeDirectory v=20500 size=30995 flags=0x10002(adhoc,runtime) hashes=958+7 location=embedded\nSignature=adhoc\nInfo.plist entries=17\nTeamIdentifier=not set\nRuntime Version=27.0.0\nSealed Resources version=2 rules=13 files=4\nInternal requirements count=0 size=12",
+      "checks": {
+        "releaseBuildAndBundleSigning": true,
+        "versionMetadataAndCli": true,
+        "embeddedLaunchAgentAndLicenses": true,
+        "dmgIntegrity": true
+      },
+      "binarySha256": "f0e09dd7849dab34be512d41673f66674a6fc406ff9b0a73310b43792169c1c5",
+      "appBinarySha256": "aaf1d9da20e7e6de25b647ee4f89c42503a0c369485d8eced420b85a15968e50",
+      "dmgSha256": "44b657cc3f3ffcfdab602bb82e98292db419e9f421630c54342f0866f497ea47",
+      "dmgBytes": 7696912,
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer CARGO_BUILD_JOBS=4 scripts/build_dmg.sh",
+      "exitCode": 0
+    }
+  },
+  "commitValidation": {
+    "createdAt": "2026-11-14T10:57:24.037263+00:00",
+    "upstreamRevision": "8938ba869d020ef47afc62996d98b96ee5d351a9",
+    "npmTest": {
+      "exitCode": 0,
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer npm test -- --release --features ui-automation -j4"
+    },
+    "rust": {
+      "passed": 145,
+      "failed": 0,
+      "ignored": 11,
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4 -- --test-threads=1"
+    },
+    "fileTreeUiPassed": 11,
+    "existingUiPassed": 14,
+    "failed": 0,
+    "uiCommands": [
+      "python3 scripts/run_file_tree_ui_tests.py --fixture /tmp/everything-file-tree-validation --output .artifacts/commit-validation-file-tree-ui",
+      "python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-validation --output .artifacts/commit-validation-regression"
+    ],
+    "sourceSha256": {
+      "src-tauri/src/ui/view.rs": "3c0a4de1b6a72a712b3d5089bfd17ad3f27a4c1348a24fce49e01c6165a337d4",
+      "src-tauri/src/ui/file_tree.rs": "288fe7a487a8faf2ec16366b15b00589ea75ee4a3443888e0db977420286e049",
+      "src-tauri/src/ui/file_tree/model.rs": "74181e7a45d9e1c576c7aed50dcb8ed4166692adcd2c861b755bd619696374d7",
+      "src-tauri/src/ui/actions.rs": "574f02c977439f7aa6226f4c0bbd29fd6100f1350df1b47ca1d7e7f73e174938",
+      "src-tauri/src/ui/assets.rs": "4c7a93c06cce6f2823c8ac0a1314d9172e08a5a4eb2f2e444dd619a55511d6ab",
+      "src-tauri/src/ui/mod.rs": "def2614921855eafc19658d37cfcbf0cc61b9860f31b20656a20b9226f44f6d3",
+      "src-tauri/src/ui_prefs.rs": "2c03f2c6316a389d3711b64b458167160a50c78344424219722a85a1a926ca4e",
+      "src-tauri/src/ui_automation.rs": "bf485b4918d03b72b6bc71b5dbc9b5c0ccab1b944311d82ad8bad051689c7e39",
+      "scripts/run_file_tree_ui_tests.py": "dd853610f47b698e344c63a6b9cff8c93bc76cc3626cb2c032d411619f9c1568",
+      "doc/gpui-test-cases.md": "b839da6793eba35dc66627475a84a5d0e45d61b0380032edb9ba3d19c6ccb926"
+    },
+    "productionRelease": {
+      "createdAt": "2026-11-14T10:57:24.005708+00:00",
+      "version": "0.6.1",
+      "architecture": "Mach-O 64-bit executable arm64",
+      "app": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app",
+      "dmg": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/dmg/Everything_0.6.1_aarch64.dmg",
+      "signature": "Executable=/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/bundle/macos/Everything.app/Contents/MacOS/everything\nIdentifier=com.everything.app\nFormat=app bundle with Mach-O thin (arm64)\nCodeDirectory v=20500 size=31027 flags=0x10002(adhoc,runtime) hashes=959+7 location=embedded\nSignature=adhoc\nInfo.plist entries=17\nTeamIdentifier=not set\nRuntime Version=27.0.0\nSealed Resources version=2 rules=13 files=4\nInternal requirements count=0 size=12",
+      "checks": {
+        "releaseBuildAndBundleSigning": true,
+        "versionMetadataAndCli": true,
+        "embeddedLaunchAgentAndLicenses": true,
+        "dmgIntegrity": true
+      },
+      "binarySha256": "78e8031d406ea339d19e8ec6fb06145a640fa2113d8e20c7dd6a798a6279021c",
+      "appBinarySha256": "d7106b6b27c8b151bbd0f375f98429779688f85ff49ef06ff7047cb036864943",
+      "dmgSha256": "c09dfb40ac6d5d61f8b2a36807f8a5986a6bb504d366d8aa4be1f1e6f3a7ed14",
+      "dmgBytes": 7704631,
+      "command": "MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer CARGO_BUILD_JOBS=4 scripts/build_dmg.sh",
+      "exitCode": 0
+    }
+  }
+}

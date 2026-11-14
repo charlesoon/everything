@@ -41,6 +41,8 @@ pub(crate) struct Preferences {
     pub columns: [f32; 4],
     pub window: Option<[f32; 4]>,
     pub fda_dismissed: bool,
+    pub file_tree_visible: bool,
+    pub file_tree_width: f32,
 }
 
 impl Default for Preferences {
@@ -50,6 +52,8 @@ impl Default for Preferences {
             columns: [0.; 4],
             window: None,
             fda_dismissed: false,
+            file_tree_visible: false,
+            file_tree_width: 280.,
         }
     }
 }
@@ -72,6 +76,10 @@ impl Preferences {
             bounds.iter().all(|n| n.is_finite()) && bounds[2] >= 400. && bounds[3] >= 300.
         });
         prefs.theme = "system".into();
+        if !prefs.file_tree_width.is_finite() {
+            prefs.file_tree_width = Self::default().file_tree_width;
+        }
+        prefs.file_tree_width = prefs.file_tree_width.clamp(180., 640.);
         prefs
     }
 

@@ -276,6 +276,7 @@ impl EverythingView {
                     Ok(Outcome::Message(message)) => this.notify_message(message, cx),
                     Ok(Outcome::Trash(result)) => {
                         this.model.remove_paths(&result.removed_paths);
+                        this.refresh_file_tree(cx);
                         let message = if result.failures.is_empty() {
                             if matches!(action, UiAction::DeletePermanently) {
                                 format!("Deleted {} item(s) permanently.", result.removed_paths.len())
@@ -416,6 +417,7 @@ impl EverythingView {
                             this.table_focus.focus(window);
                         }
                         this.toast = None;
+                        this.refresh_file_tree(cx);
                     }
                     Err(error) => {
                         this.notify_message(format!("Failed to rename: {error}"), cx);
@@ -587,6 +589,8 @@ impl EverythingView {
                 }
                 _ => false,
             }
+        } else if self.file_tree_focused(window) {
+            self.file_tree_key_down(key, window, cx)
         } else {
             match key {
                 "down" | "up" | "pagedown" | "pageup" => {

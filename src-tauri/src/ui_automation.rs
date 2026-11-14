@@ -148,6 +148,8 @@ unsafe fn execute(request: Value) -> Result<Value, String> {
                 "right" => (124, "\u{f703}"),
                 "pagedown" => (121, "\u{f72d}"),
                 "pageup" => (116, "\u{f72c}"),
+                "home" => (115, "\u{f729}"),
+                "end" => (119, "\u{f72b}"),
                 "f2" => (120, "\u{f705}"),
                 "space" => (49, " "),
                 "tab" => (48, "\t"),

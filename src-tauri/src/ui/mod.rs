@@ -4,6 +4,7 @@
 mod actions;
 mod assets;
 mod design;
+mod file_tree;
 #[cfg(target_os = "macos")]
 mod mac_menu;
 mod status;
@@ -115,6 +116,7 @@ struct EverythingView {
     sort_dir: String,
     list_scroll: UniformListScrollHandle,
     horizontal_scroll: ScrollHandle,
+    file_tree: file_tree::State,
     status: IndexStatusDto,
     status_display: status::StatusDisplay,
     status_task: Option<Task<()>>,
@@ -140,6 +142,7 @@ struct EverythingView {
     last_search_fired: Option<Instant>,
     displayed_query: String,
     table_width: f32,
+    table_columns: [f32; 4],
     icons: HashMap<String, Arc<Image>>,
     icon_pending: HashSet<String>,
     resizing: Option<(usize, Point<Pixels>, [f32; 4])>,
@@ -175,6 +178,7 @@ impl EverythingView {
             sort_dir: "asc".into(),
             list_scroll: UniformListScrollHandle::new(),
             horizontal_scroll: ScrollHandle::new(),
+            file_tree: file_tree::State::new(cx),
             status_display: status::StatusDisplay::new(&status),
             status_task: None,
             status,
@@ -200,6 +204,7 @@ impl EverythingView {
             last_search_fired: None,
             displayed_query: String::new(),
             table_width: 0.,
+            table_columns: [0.; 4],
             icons: HashMap::new(),
             icon_pending: HashSet::new(),
             resizing: None,
@@ -276,6 +281,7 @@ impl EverythingView {
                 crate::ui_gate::set_visible(&this.sink, window.is_window_active());
                 if window.is_window_active() {
                     this.update_status(crate::get_index_status(&this.backend), cx);
+                    this.refresh_file_tree(cx);
                     cx.notify();
                 }
             }));
@@ -301,6 +307,7 @@ impl EverythingView {
                                 .is_some_and(|event| event["state"] == "Ready")
                         {
                             this.schedule_search(true, false, window, cx);
+                            this.refresh_file_tree(cx);
                         }
                         cx.notify();
                     })
