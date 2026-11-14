@@ -56,7 +56,13 @@ environment variables. Keep the file and certificate bundles untracked.
 existing notarytool keychain profile instead of the local Apple credentials.
 `APPLE_SIGNING_IDENTITY=-` explicitly requests an ad-hoc build without automatic
 notarization, as used in CI. Without local settings or overrides, packaging also
-falls back to ad-hoc signing. Packaging leaves the working source unchanged.
+falls back to ad-hoc signing.
+
+Every successful DMG build copies the final image into `releases/` and updates
+`releases/latest-mac.yml` with its version, filename, SHA-512, size and release
+date. This happens after signing and any notarization/stapling; a failed build
+or notarization leaves the previous release files in place. Generated DMGs are
+ignored by Git; the update manifest remains tracked.
 
 Node is optional. Existing npm entry points are dependency-free aliases:
 `npm run dev`, `npm run build`, `npm run bundle`, `npm run bundle:dmg`,

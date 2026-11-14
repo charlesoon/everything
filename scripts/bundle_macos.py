@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Build/sign a native .app and optionally a DMG, without changing the source tree.
+"""Build/sign a native .app and publish DMGs with update metadata in releases/.
 
 Signing and notarization use the ignored certificates/import.json in this or
 the main checkout. APPLE_SIGNING_IDENTITY and NOTARY_PROFILE override those
 settings; APPLE_SIGNING_IDENTITY=- explicitly selects an ad-hoc build.
 """
 import argparse
+import base64
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -76,6 +79,36 @@ def notarize(dmg, env, apple):
         raise SystemExit('Notarization was not accepted; no ticket was stapled.')
     run('xcrun', 'stapler', 'staple', dmg, env=env)
     run('xcrun', 'stapler', 'validate', dmg, env=env)
+
+
+def publish_dmg(dmg, version):
+    releases = ROOT / 'releases'
+    releases.mkdir(parents=True, exist_ok=True)
+    destination = releases / dmg.name
+    manifest = releases / 'latest-mac.yml'
+    with tempfile.TemporaryDirectory(prefix='.mac-release-', dir=releases) as temporary:
+        staged_dmg = Path(temporary) / dmg.name
+        shutil.copy2(dmg, staged_dmg)
+        digest = hashlib.sha512()
+        with staged_dmg.open('rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        sha512 = base64.b64encode(digest.digest()).decode('ascii')
+        release_date = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        staged_manifest = Path(temporary) / manifest.name
+        staged_manifest.write_text(
+            f'version: {version}\n'
+            f'files:\n'
+            f'  - url: {dmg.name}\n'
+            f'    sha512: {sha512}\n'
+            f'    size: {staged_dmg.stat().st_size}\n'
+            f'path: {dmg.name}\n'
+            f'sha512: {sha512}\n'
+            f"releaseDate: '{release_date}'\n",
+            encoding='utf-8')
+        staged_dmg.replace(destination)
+        staged_manifest.replace(manifest)
+    return destination, manifest
 
 
 def main():
@@ -168,7 +201,9 @@ def main():
     credentials = all(apple.get(key) for key in ['apple_id', 'apple_password', 'team_id'])
     if env.get('NOTARY_PROFILE') or (identity != '-' and credentials):
         notarize(dmg, env, apple)
-    print(dmg, flush=True)
+    release_dmg, manifest = publish_dmg(dmg, version)
+    print(f'Updated {manifest}', flush=True)
+    print(release_dmg, flush=True)
 
 
 if __name__ == '__main__':

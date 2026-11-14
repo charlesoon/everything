@@ -1,11 +1,16 @@
-"""Signing configuration and notarization checks using isolated credentials."""
+"""Signing, notarization and release publication checks using isolated fixtures."""
 
+import base64
 import contextlib
+from datetime import datetime
+import hashlib
 import io
 import json
 from pathlib import Path
+import plistlib
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -91,6 +96,104 @@ class SigningTests(unittest.TestCase):
         for key in ['apple_id', 'apple_password']:
             self.assertNotIn(APPLE[key], output.getvalue() + str(error.exception))
         staple.assert_not_called()
+
+
+class ReleaseTests(unittest.TestCase):
+    def package(self, root, payload, *, fail_notarization=False, app_only=False, target=None):
+        target_directory = root / 'target'
+        release = target_directory / target / 'release' if target else target_directory / 'release'
+        files = {
+            release / 'everything': b'Native executable fixture',
+            root / 'src-tauri/icons/icon.icns': b'Icon fixture',
+            root / 'src-tauri/assets/fonts/geist-LICENSE.txt': b'Font license fixture',
+            root / 'src-tauri/assets/fonts/jetbrains-mono-LICENSE.txt': b'Font license fixture',
+            root / 'src-tauri/Info.plist': plistlib.dumps({}),
+            root / 'src-tauri/launchd/com.everything.app.daemon.plist': plistlib.dumps({
+                'BundleProgram': 'Contents/MacOS/everything',
+            }),
+        }
+        for path, content in files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        metadata = json.dumps({
+            'packages': [{'name': 'everything', 'version': '1.2.3'}],
+            'target_directory': str(target_directory),
+        })
+
+        def output(args, **kwargs):
+            return APPLE['developer_id'] if args[0] == 'security' else metadata
+
+        def command(*args, **kwargs):
+            if args[0] == 'hdiutil':
+                Path(args[-1]).write_bytes(payload)
+
+        def notarize(dmg, env, apple):
+            if fail_notarization:
+                raise SystemExit('Notarization rejected in fixture')
+            dmg.write_bytes(dmg.read_bytes() + b'\nStapled ticket fixture')
+
+        arguments = ['bundle_macos.py', '--skip-build']
+        if not app_only:
+            arguments.append('--dmg')
+        if target:
+            arguments += ['--target', target]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(bundle_macos, 'ROOT', root))
+            stack.enter_context(patch.object(bundle_macos.sys, 'argv', arguments))
+            stack.enter_context(patch.object(bundle_macos.os, 'uname', return_value=SimpleNamespace(
+                sysname='Darwin', machine='arm64')))
+            stack.enter_context(patch.object(bundle_macos, 'signing_settings',
+                                            return_value=(APPLE['developer_id'], APPLE)))
+            stack.enter_context(patch.object(bundle_macos.subprocess, 'check_output', side_effect=output))
+            stack.enter_context(patch.object(bundle_macos, 'run', side_effect=command))
+            stack.enter_context(patch.object(bundle_macos, 'notarize', side_effect=notarize))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            bundle_macos.main()
+
+    def test_rebuilding_refreshes_release_from_final_stapled_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = 'Everything_1.2.3_aarch64.dmg'
+            for payload in [b'First DMG fixture', b'Rebuilt DMG fixture' * 70000]:
+                self.package(root, payload)
+                expected = payload + b'\nStapled ticket fixture'
+                self.assertEqual((root / 'releases' / name).read_bytes(), expected)
+                self.assertEqual((root / 'target/release/bundle/dmg' / name).read_bytes(), expected)
+                manifest = (root / 'releases/latest-mac.yml').read_text()
+                digest = base64.b64encode(hashlib.sha512(expected).digest()).decode('ascii')
+                self.assertIn('version: 1.2.3\n', manifest)
+                self.assertIn(f'url: {name}\n', manifest)
+                self.assertIn(f'path: {name}\n', manifest)
+                self.assertEqual(manifest.count(f'sha512: {digest}\n'), 2)
+                self.assertIn(f'size: {len(expected)}\n', manifest)
+                date = manifest.split("releaseDate: '", 1)[1].strip().strip("'")
+                self.assertEqual(datetime.fromisoformat(date.replace('Z', '+00:00')).utcoffset().total_seconds(), 0)
+                self.assertEqual(set(p.name for p in (root / 'releases').iterdir()),
+                                 {name, 'latest-mac.yml'})
+
+    def test_failed_notarization_keeps_previous_release_and_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.package(root, b'Previous DMG fixture')
+            releases = root / 'releases'
+            before = {p.name: p.read_bytes() for p in releases.iterdir()}
+            with self.assertRaises(SystemExit):
+                self.package(root, b'Rejected replacement fixture', fail_notarization=True)
+            self.assertEqual({p.name: p.read_bytes() for p in releases.iterdir()}, before)
+
+    def test_app_only_build_does_not_publish_a_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.package(root, b'Unused DMG fixture', app_only=True)
+            self.assertFalse((root / 'releases').exists())
+
+    def test_release_filename_follows_explicit_target_architecture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.package(root, b'Intel DMG fixture', target='x86_64-apple-darwin')
+            name = 'Everything_1.2.3_x86_64.dmg'
+            self.assertTrue((root / 'releases' / name).is_file())
+            self.assertIn(f'path: {name}\n', (root / 'releases/latest-mac.yml').read_text())
 
 
 if __name__ == '__main__':
