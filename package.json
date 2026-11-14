@@ -1,7 +1,7 @@
 {
   "name": "everything",
   "private": true,
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "description": "Native GPUI file search for macOS and Windows",
   "scripts": {

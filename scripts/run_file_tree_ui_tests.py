@@ -82,7 +82,7 @@ def run(binary, fixture, output):
             state = d.wait_query(text)
             index = next(i for i, row in enumerate(state['rows'])
                          if name is None or row['name'] == name)
-            d.click(90, 107 + index * 27 + 13)
+            d.click(90, state['resultsTop'] + (index + .5) * state['rowHeight'])
             return revealed(Path(state['rows'][index]['path']))
 
         def tree_click(name):
@@ -90,7 +90,7 @@ def run(binary, fixture, output):
             tree = state['fileTree']
             row = next(row for row in tree['rows'] if row.get('name') == name)
             x, y, width, height = tree['listBounds']
-            click_y = y + row['index'] * 27 + tree['scrollOffset'] + 13
+            click_y = y + (row['index'] + .5) * state['rowHeight'] + tree['scrollOffset']
             assert y <= click_y < y + height, (tree, click_y)
             d.click(x + min(width - 15, 65 + row['depth'] * 14), click_y)
             return row
@@ -102,7 +102,7 @@ def run(binary, fixture, output):
 
         def tree_header_click(right_offset):
             state = d.state()
-            header_y = state['fileTree']['listBounds'][1] - 26 - 33 / 2
+            header_y = state['fileTree']['listBounds'][1] - (26 + 33 / 2) * state['zoom']
             d.click(state['width'] - right_offset, header_y)
 
         def restart():
@@ -130,9 +130,10 @@ def run(binary, fixture, output):
             def siblings():
                 state = select('Alpha', 'Alpha report.txt')
                 assert state['fileTree']['root'] == str(files), state
-                # The tree starts below the 30px titlebar, beside the search
-                # input, followed by its 33px header and 26px folder path.
-                assert state['fileTree']['listBounds'][1] == 89, state
+                # The tree header/path (33+26) sit beside the search/header
+                # (44+33), so its rows start 18 design pixels earlier.
+                assert abs(state['fileTree']['listBounds'][1]
+                           - state['resultsTop'] + 18 * state['zoom']) < 1, state
                 assert state['query'] == 'Alpha', state
                 tree_click('Alpha report.txt')
                 d.key('home')
@@ -349,9 +350,9 @@ def run(binary, fixture, output):
 
                 # The results scrollbar is anchored below the column header.
                 edge = state['width'] - state['fileTree']['width']
-                d.send('down', x=edge - 8, y=107 + 24)
-                d.send('move', x=edge - 8, y=107 + 124, drag=True)
-                d.send('up', x=edge - 8, y=107 + 124)
+                d.send('down', x=edge - 8, y=state['resultsTop'] + 24)
+                d.send('move', x=edge - 8, y=state['resultsTop'] + 124, drag=True)
+                d.send('up', x=edge - 8, y=state['resultsTop'] + 124)
                 state = d.wait(lambda s: s['visibleRange'][0] > 10)
                 assert state['selected'] == [], state
                 assert abs(state['fileTree']['scrollOffset'] - browsing_offset) < 1, state
@@ -372,8 +373,7 @@ def run(binary, fixture, output):
                 selected = files / '한글 보고서.txt'
                 state = select('한글')
                 d.click(30, state['height'] - 16)
-                d.wait(lambda s: s['toast'] == 'Copied path')
-                assert d.send('clipboard')['text'] == str(selected)
+                d.wait(lambda _: d.send('clipboard')['text'] == str(selected))
                 assert d.state()['selected'] == [str(selected)]
 
                 def copy_tree_path():

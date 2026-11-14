@@ -357,7 +357,10 @@ def run(binary, fixture, output):
                     d.wait(lambda s:s['theme']==theme)
                     capture(f'10-theme-{theme}')
                 s=d.state()
-                d.click(s['width']-48,s['height']-14)
+                d.click(s['width']-29,s['height']-16)
+                d.wait(lambda s:s['modal']=='settings')
+                d.key('up')  # Wrap from Full Disk Access to Reset index.
+                d.key('enter')
                 d.wait(lambda s:'disabled in isolated' in (s['toast'] or ''))
                 assert d.state()['modal'] is None
                 d.send('resize',width=400,height=300)
@@ -412,11 +415,11 @@ def run(binary, fixture, output):
                 d.key('enter')
                 s=d.wait(lambda s:s['modal'] is None)
                 assert s['fdaOk'] is False,s
-                d.click(s['width']-100,45)
+                d.click(s['width']-100,56)
                 d.wait(lambda s:s['fdaSettingsOpened'])
                 capture('13-fda-banner')
                 # The banner has its own close button; user defaults are never written.
-                d.click(s['width']-30,45)
+                d.click(s['width']-30,56)
                 d.wait(lambda s:s['fdaDismissed'])
             case('UI-13','First-run modal keyboard trap, Later choice and dismissible FDA banner',onboarding)
         finally:

@@ -57,6 +57,10 @@ impl Zoom {
 }
 
 impl EverythingView {
+    pub(super) fn zoom_button_visible(&self) -> bool {
+        self.prefs.zoom != 1. || self.zoom_popover.visible
+    }
+
     pub(super) fn row_height(&self) -> f32 {
         design::ROW_HEIGHT * self.prefs.zoom
     }
@@ -165,7 +169,7 @@ impl EverythingView {
     }
 
     pub(super) fn zoom_button_bounds(&self, window: &Window) -> Bounds<Pixels> {
-        let width = if self.prefs.zoom == 1. { 26. } else { 66. };
+        let width = 26.;
         let right = if cfg!(target_os = "windows") {
             179.
         } else {
@@ -197,7 +201,6 @@ impl EverythingView {
     pub(super) fn zoom_button(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let p = design::Palette::get(cx);
         let bounds = self.zoom_button_bounds(window);
-        let changed = self.prefs.zoom != 1.;
         let percent = (self.prefs.zoom * 100.).round() as u16;
         div()
             .id("toggle-zoom")
@@ -206,16 +209,11 @@ impl EverythingView {
             .top(bounds.origin.y)
             .w(bounds.size.width)
             .h(bounds.size.height)
-            .px(px(6.))
             .flex()
-            .gap(px(4.))
             .items_center()
             .justify_center()
             .rounded(px(4.))
-            .font_family(design::MONO)
-            .text_size(px(11.))
-            .line_height(px(14.))
-            .text_color(if changed { p.text } else { p.muted })
+            .text_color(p.text)
             .when(self.zoom_popover.visible, |button| button.bg(p.selected))
             .hover(|button| button.bg(p.hover))
             .cursor_pointer()
@@ -242,9 +240,8 @@ impl EverythingView {
                     })
                     .size(px(16.))
                     .flex_shrink_0()
-                    .text_color(if changed { p.text } else { p.muted }),
+                    .text_color(p.text),
             )
-            .when(changed, |button| button.child(format!("{percent}%")))
     }
 
     pub(super) fn zoom_popover(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -315,6 +312,7 @@ impl EverythingView {
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 this.zoom_popover.hovered = *hovered;
                 this.schedule_zoom_popover_hide(cx);
+                cx.notify();
             }))
             .child(
                 div()

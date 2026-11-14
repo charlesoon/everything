@@ -1,0 +1,44 @@
+{
+  "binary": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+  "fixture": "/private/tmp/everything-file-tree-validation",
+  "results": [
+    {
+      "id": "ZOOM-01",
+      "title": "Command/Control, =/Shift+plus, minus and reset work in the search input without inserting shortcut characters or resizing the window",
+      "status": "pass",
+      "elapsedMs": 1919.467541
+    },
+    {
+      "id": "ZOOM-02",
+      "title": "150% layout keeps selection and navigation, and scaled result/path hit targets select and copy the correct file",
+      "status": "pass",
+      "elapsedMs": 789.7793750000002
+    },
+    {
+      "id": "ZOOM-03",
+      "title": "Zoom works during inline rename without committing, cancelling or editing the filename",
+      "status": "pass",
+      "elapsedMs": 961.2907499999999
+    },
+    {
+      "id": "ZOOM-04",
+      "title": "Tree-focused zoom preserves the viewed rows and selection; titlebar resizing uses the scaled sidebar width",
+      "status": "pass",
+      "elapsedMs": 615.6063749999996
+    },
+    {
+      "id": "ZOOM-05",
+      "title": "Repeated shortcuts stop at 50% and 200%; the 400x300 window stays usable and reset restores the layout",
+      "status": "pass",
+      "elapsedMs": 630.1070829999995
+    },
+    {
+      "id": "ZOOM-06",
+      "title": "Zoom and sidebar/column proportions survive restart and theme changes; shortcuts also work with the settings popover open",
+      "status": "pass",
+      "elapsedMs": 7335.762000000001
+    }
+  ],
+  "passed": 6,
+  "failed": 0
+}

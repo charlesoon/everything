@@ -94,6 +94,68 @@ python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-fixture
 
 macOS 최종 통합본에서 `npm test -- --release --features ui-automation -j4`가 성공했고, 전체 Rust 테스트는 **145 통과 / 0 실패 / 11 제외**였다. 파일 트리 UI 11건과 기존 UI 14건도 모두 통과했다. 최신 소스·패키지 검증 기록은 검증 요약의 `commitValidation`에 있다.
 
+## 화면 배율
+
+`Cmd/Ctrl`과 `+` 또는 `=`로 확대, `-`로 축소, `0`으로 100% 복원한다. 50~200% 범위에서 글꼴·아이콘·행·검색창·파일 트리·설정 화면을 함께 조절하며 재실행 후에도 유지한다. 타이틀바와 네이티브 창 버튼은 원래 크기를 유지한다. 컬럼과 트리 너비는 100% 기준 단위로 저장해 배율 변경과 재실행 시 비율을 보존한다.
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cargo build --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4
+python3 scripts/run_ui_zoom_tests.py --fixture /tmp/everything-file-tree-validation \
+  --output .artifacts/ui-zoom-native-final
+python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-validation \
+  --output .artifacts/ui-zoom-regression-final
+python3 scripts/run_file_tree_ui_tests.py --fixture /tmp/everything-file-tree-validation \
+  --output .artifacts/ui-zoom-file-tree-confirmed
+```
+
+| TC | 조작과 확인 |
+| --- | --- |
+| ZOOM-01 | 검색 입력 중 Command/Control, `=`, Shift+`+`, 축소·초기화, 일반 문자 입력 및 창 크기 유지 |
+| ZOOM-02 | 150%에서 검색·선택·탐색 유지, 확대된 행 클릭과 상태바·트리 경로의 실제 클립보드 복사 |
+| ZOOM-03 | 파일명 편집 중 확대·초기화 시 편집 상태와 파일명 유지 |
+| ZOOM-04 | 트리 포커스·선택·스크롤 위치 보존, 125%에서 타이틀바 구분선과 컬럼 너비 조절 |
+| ZOOM-05 | 반복 입력으로 50%·200% 한계 확인, 400×300 창과 설정 스크롤, 100% 복원 |
+| ZOOM-06 | 재실행 후 배율·컬럼·트리 너비 복원, 테마 변경 및 설정 화면에서 단축키 |
+
+확대 UI **6 통과**, 기존 UI **14 통과**, 파일 트리·스크롤·경로 복사 **11 통과**로 총 **31 통과 / 0 실패**였다. 전체 Rust 테스트는 **152 통과 / 0 실패 / 11 제외**였다. 초기 실행에서 입력 내용이 달라진 검색과 예전 복사 팝업을 기다리던 검사가 실패한 이력 및 최종 재실행 결과는 검증 요약에 함께 기록했다.
+
+실행 결과와 소스·캡처·패키지 해시는 [배율 검증 요약](gpui-evidence/ui-zoom/validation.json)에 기록한다. [150% 화면](gpui-evidence/ui-zoom/02-zoom-150.png), [125% 밝은 테마와 재실행](gpui-evidence/ui-zoom/06-zoom-125-restart-light.png), [200% 작은 창의 설정](gpui-evidence/ui-zoom/04b-zoom-200-small-settings.png)을 확인했다. 공간이 부족한 설정 항목명은 말줄임 처리하고 값은 별도 공간을 유지한다.
+
+검사는 마커가 있는 격리 fixture와 별도 설정 파일을 사용한다. Windows 네이티브 창의 배율 동작은 이번에 실행하지 않았으며, Control 입력은 공통 단축키 단위 테스트와 macOS의 실제 키 입력으로 검사한다.
+
+### 배율 조절 팝오버
+
+타이틀바의 파일 트리 버튼 바로 왼쪽에 Lucide ZoomIn/ZoomOut 아이콘만 표시한다. 현재 배율 숫자는 팝오버에만 표시한다. 100%로 복원해도 팝오버가 열려 있으면 아이콘을 유지하고, 팝오버가 닫힐 때 함께 숨긴다. 버튼을 누르면 현재 배율·축소·확대·Reset이 있는 팝오버가 열린다. 아이콘과 팝오버는 배율과 무관하게 고정 크기이며 어두운·밝은 테마의 기존 색상 토큰을 사용한다.
+
+단축키로 열린 팝오버는 마지막 변경 3초 후 닫힌다. 포인터가 팝오버 안에 있으면 유지하고, 벗어나면 다시 3초를 센다. 아이콘으로 직접 열면 외부 클릭·Escape·창 비활성화 시 닫는다. 검색창·파일명 편집의 포커스를 보존하며, 직접 연 팝오버에서는 Tab/Shift+Tab과 좌우 방향키로 버튼을 고르고 Enter/Space로 실행할 수 있다. Escape는 팝오버를 먼저 닫고 다음 입력에서 기존 편집·설정 화면에 적용된다.
+
+```sh
+python3 scripts/run_ui_zoom_tests.py --fixture /tmp/everything-file-tree-validation \
+  --output .artifacts/zoom-icon-refinement-native
+python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-validation \
+  --output .artifacts/zoom-popover-regression
+```
+
+| TC | 조작과 확인 |
+| --- | --- |
+| ZOOM-07 | 아이콘 열기·닫기, 실제 마우스 축소·확대·초기화, 100%에서 아이콘을 유지하다 팝오버와 함께 닫기, 검색어·선택·창 위치 유지, 외부 클릭 전달 |
+| ZOOM-08 | 반복 단축키 시 타이머 갱신, 100% 복원 후 3초가 지나면 팝오버와 아이콘 함께 숨김, hover 중 유지와 벗어난 뒤 닫힘 |
+| ZOOM-09 | Tab/Shift+Tab·좌우 방향키·Enter/Space·Escape, 검색 문자열 보존 |
+| ZOOM-10 | 밝은·어두운 테마, 400×300 창의 50~200% 배율, 고정 크기와 경계 버튼 비활성화, 인접 트리 토글 |
+
+ZOOM-03과 ZOOM-06은 파일명 편집·설정 화면과 팝오버를 함께 열어 버튼 조작 및 Escape 우선순위도 확인한다. 최초 팝오버 구현에서는 배율 UI **10 통과**, 기존 UI 회귀 **14 통과**로 총 **24 통과 / 0 실패**였고, 전체 Rust 테스트는 **153 통과 / 0 실패 / 11 제외**였다. 이 실행 기록은 [검증 요약](gpui-evidence/ui-zoom/validation.json)의 `zoomPopover`에 있다.
+
+`0.6.3`에서는 타이틀바의 숫자를 제거하고, 100% 복원 후 팝오버가 닫힐 때 아이콘도 함께 숨기도록 수정했다. 배율 UI **10 통과 / 0 실패**로 Reset 버튼, Command/Control 단축키, 자동 닫힘·외부 클릭·아이콘 클릭 및 편집·설정 화면을 검증했다. 결과와 소스·패키지 해시는 같은 검증 요약의 `zoomIconRefinement`에 기록했다. UI 검사 후 버전 선언과 lockfile만 0.6.3으로 올려 배포 패키지를 빌드했다.
+
+`scripts/build_dmg.sh`로 만든 macOS arm64 `Everything_0.6.3_aarch64.dmg`는 Developer ID 서명, Apple 공증 승인·티켓 첨부, Gatekeeper 검사 및 DMG 무결성 검사를 통과했다. 앱 버전·번들 ID와 내장 LaunchAgent의 실행 경로도 확인했다. 최종 패키지 해시와 공증 제출 ID는 `zoomIconRefinement.productionRelease`에 기록했다.
+
+- [숫자 없는 아이콘과 어두운 테마의 팝오버](gpui-evidence/ui-zoom/icon-only-dark.png)
+- [밝은 테마의 팝오버](gpui-evidence/ui-zoom/icon-only-light.png)
+- [100% 복원 후 팝오버가 열려 있는 동안 아이콘 유지](gpui-evidence/ui-zoom/icon-reset-100-open.png)
+- [100%에서 팝오버가 닫힐 때 아이콘도 숨김](gpui-evidence/ui-zoom/icon-reset-100-closed.png)
+- [400×300 창의 200% 배율과 고정 크기 조절기](gpui-evidence/ui-zoom/icon-only-small-200-dark.png)
+
 ## Tauri 화면 비교
 
 동일 fixture, 900×560 logical pixels, 동일 이벤트 순서로 원본과 GPUI를 각각 캡처했다. Inter 400/500/600, JetBrains Mono 400, 원본 SVG와 네이티브 파일 아이콘을 사용한다. 제목 30px, 검색창 34px, 헤더 33px, 행 27px, 상태바 33px 및 컬럼 최소 너비를 원본 CSS에서 가져왔다. 테마는 시스템을 따른다.
@@ -134,6 +196,10 @@ python3 scripts/bundle_macos.py --dmg
 번들 ID/버전/실행 파일과 내장 LaunchAgent 경로, 글꼴 라이선스, ad-hoc runtime 서명의 `codesign --verify --deep --strict`, WebKit 직접 링크 부재, CLI help/version을 확인했다. DMG checksum과 읽기 전용 마운트에서 실행 파일 SHA-256 및 Applications 링크도 확인했다. 패키지 안의 production 실행 파일을 fixture로 실행해 첫 프레임·500행/총 500,018개·오류 없음을 확인했고, 자동화 socket은 생성되지 않았다. [패키지 검증 기록](gpui-evidence/package-results.json)에 해시와 결과가 있다. 앱 설치나 운영 데몬 등록은 수행하지 않았다.
 
 파일 트리·스크롤 수정은 `0.6.1`의 production `.app`과 arm64 DMG에도 반영했다. 버전, 번들 ID, 내장 LaunchAgent·라이선스, 서명, DMG 무결성을 확인했으며 최신 패키지 해시는 [파일 트리 검증 요약](gpui-evidence/file-tree/validation.json)의 `scrollingFix.productionRelease`에 기록했다.
+
+화면 배율을 포함한 `0.6.2`는 `scripts/build_dmg.sh`로 기본 기능의 production release를 다시 빌드했다. 로컬 설정에서 Developer ID 인증서를 자동으로 선택해 서명했으며, Apple 공증 `Accepted`, DMG 티켓 부착·검증, Gatekeeper `Notarized Developer ID`, `codesign --verify --deep --strict`와 DMG 무결성 검사를 통과했다. 번들 ID·버전·arm64 실행 파일과 내장 LaunchAgent도 확인했다. [배율 검증 요약](gpui-evidence/ui-zoom/validation.json)의 `productionRelease`에 최종 패키지 해시를 기록했다.
+
+Lucide 배율 팝오버와 100%에서 버튼 숨김을 반영한 최신 `0.6.2` 패키지도 같은 스크립트로 빌드·서명·공증했으며 Gatekeeper와 DMG 무결성 검사를 통과했다. 이 패키지의 해시와 공증 ID는 같은 검증 요약의 `zoomPopover.productionRelease`에 기록했다.
 
 ## Windows 빌드 확인의 한계
 

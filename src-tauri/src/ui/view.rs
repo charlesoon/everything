@@ -798,7 +798,9 @@ impl EverythingView {
             .when(!self.prefs.file_tree_visible, |title| {
                 title.child(self.file_tree_toggle(cx))
             })
-            .child(self.zoom_button(window, cx))
+            .when(self.zoom_button_visible(), |title| {
+                title.child(self.zoom_button(window, cx))
+            })
             .when(cfg!(target_os = "windows"), |title| {
                 title.child(
                     div()
@@ -1520,6 +1522,7 @@ impl EverythingView {
             let zoom_popover = self.zoom_popover_bounds(window);
             let zoom_state = serde_json::json!({
                 "visible":self.zoom_popover.visible,"pinned":self.zoom_popover.pinned,
+                "buttonVisible":self.zoom_button_visible(),
                 "hovered":self.zoom_popover.hovered,"keyboardSelection":self.zoom_popover.keyboard_selection,
                 "buttonBounds":[f32::from(zoom_button.origin.x),f32::from(zoom_button.origin.y),f32::from(zoom_button.size.width),f32::from(zoom_button.size.height)],
                 "bounds":[f32::from(zoom_popover.origin.x),f32::from(zoom_popover.origin.y),f32::from(zoom_popover.size.width),f32::from(zoom_popover.size.height)],

@@ -1,0 +1,68 @@
+{
+  "binary": "/Users/al03229952/.codex/worktrees/8ea2/everything/src-tauri/target/release/everything",
+  "fixture": "/private/tmp/everything-file-tree-validation",
+  "results": [
+    {
+      "id": "ZOOM-01",
+      "title": "Command/Control, =/Shift+plus, minus and reset work in the search input without inserting shortcut characters or resizing the window",
+      "status": "pass",
+      "elapsedMs": 2019.7670829999997
+    },
+    {
+      "id": "ZOOM-02",
+      "title": "150% layout keeps selection and navigation, and scaled result/path hit targets select and copy the correct file",
+      "status": "pass",
+      "elapsedMs": 808.1738750000001
+    },
+    {
+      "id": "ZOOM-03",
+      "title": "Zoom works during inline rename without committing, cancelling or editing the filename",
+      "status": "pass",
+      "elapsedMs": 1000.0007080000004
+    },
+    {
+      "id": "ZOOM-04",
+      "title": "Tree-focused zoom preserves the viewed rows and selection; titlebar resizing uses the scaled sidebar width",
+      "status": "pass",
+      "elapsedMs": 688.3009580000002
+    },
+    {
+      "id": "ZOOM-05",
+      "title": "Repeated shortcuts stop at 50% and 200%; the 400x300 window stays usable and reset restores the layout",
+      "status": "pass",
+      "elapsedMs": 716.9469170000004
+    },
+    {
+      "id": "ZOOM-06",
+      "title": "Zoom and sidebar/column proportions survive restart and theme changes; shortcuts also work with the settings popover open",
+      "status": "pass",
+      "elapsedMs": 4401.275333000001
+    },
+    {
+      "id": "ZOOM-07",
+      "title": "Titlebar toggle and real mouse minus/plus/reset controls preserve input, selection and window bounds; outside clicks continue to the search input",
+      "status": "pass",
+      "elapsedMs": 935.3057909999993
+    },
+    {
+      "id": "ZOOM-08",
+      "title": "Shortcut popovers reset the three-second timer on repeated zoom, remain open while hovered and close after leaving",
+      "status": "pass",
+      "elapsedMs": 11269.116333999998
+    },
+    {
+      "id": "ZOOM-09",
+      "title": "Manual popovers support Tab/Shift+Tab, arrow navigation, Enter/Space and Escape without editing the search text",
+      "status": "pass",
+      "elapsedMs": 268.24766700000066
+    },
+    {
+      "id": "ZOOM-10",
+      "title": "Light/dark popovers keep a fixed size at 50–200% in a 400x300 window; boundary buttons disable and the adjacent file-tree toggle still works",
+      "status": "pass",
+      "elapsedMs": 4290.290542000001
+    }
+  ],
+  "passed": 10,
+  "failed": 0
+}

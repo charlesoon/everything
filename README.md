@@ -70,6 +70,9 @@ tests use temporary fixtures.
 | --- | --- |
 | Cmd+Shift+Space | Activate/focus search (macOS) |
 | Cmd/Ctrl+F | Focus and select search text |
+| Cmd/Ctrl++ (or Cmd/Ctrl+=) | Zoom in |
+| Cmd/Ctrl+- | Zoom out |
+| Cmd/Ctrl+0 | Reset zoom to 100% |
 | Up/Down, PageUp/PageDown | Navigate; Shift extends selection |
 | Cmd/Ctrl+A | Select loaded results when the table has focus |
 | Enter | Open on both platforms |
@@ -89,6 +92,15 @@ tests use temporary fixtures.
 
 Search inputs keep their normal text selection and clipboard shortcuts.
 Confirmation dialogs default to Cancel; Tab/arrow keys select an action.
+UI zoom ranges from 50% to 200% and is restored when the app restarts.
+The Lucide zoom icon in the titlebar, immediately left of the file-tree toggle,
+opens a themed popover with the current percentage, minus, plus and Reset.
+The titlebar shows only the icon. At 100%, the icon stays visible while the
+popover is open and disappears together with it when the popover closes.
+Zoom shortcuts show the same popover for three seconds; hovering pauses dismissal.
+Click outside or press Escape to close it. The titlebar controls and popover keep
+their original size at every zoom level. A manually opened popover also supports
+Tab/Shift+Tab or Left/Right to select a control, then Enter/Space to activate it.
 
 ## Source and verification
 
