@@ -165,8 +165,7 @@ impl EverythingView {
             .items_center()
             .justify_center()
             .rounded(px(4.))
-            .text_color(if visible { p.accent } else { p.muted })
-            .when(visible, |button| button.bg(p.selected))
+            .text_color(p.muted)
             .hover(|button| button.bg(p.hover))
             .cursor_pointer()
             .tooltip(move |window, cx| {
@@ -433,17 +432,13 @@ impl EverythingView {
             .child(
                 svg()
                     .path(if is_dir {
-                        "everything/folder.svg"
+                        super::file_icons::folder(expanded)
                     } else {
-                        "everything/file.svg"
+                        super::file_icons::file(&entry.name)
                     })
-                    .size(px(16.))
+                    .size(px(14.))
                     .flex_shrink_0()
-                    .text_color(if is_dir {
-                        rgb(0xd9b34f).into()
-                    } else {
-                        p.muted
-                    }),
+                    .text_color(p.muted),
             )
             .child(
                 div()

@@ -4,6 +4,7 @@
 mod actions;
 mod assets;
 mod design;
+mod file_icons;
 mod file_tree;
 #[cfg(target_os = "macos")]
 mod mac_menu;
@@ -11,9 +12,8 @@ mod status;
 mod view;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -143,8 +143,6 @@ struct EverythingView {
     displayed_query: String,
     table_width: f32,
     table_columns: [f32; 4],
-    icons: HashMap<String, Arc<Image>>,
-    icon_pending: HashSet<String>,
     resizing: Option<(usize, Point<Pixels>, [f32; 4])>,
     drag_start: Option<(Point<Pixels>, usize)>,
     visible_rows: std::ops::Range<usize>,
@@ -205,8 +203,6 @@ impl EverythingView {
             displayed_query: String::new(),
             table_width: 0.,
             table_columns: [0.; 4],
-            icons: HashMap::new(),
-            icon_pending: HashSet::new(),
             resizing: None,
             drag_start: None,
             visible_rows: 0..0,
@@ -477,7 +473,6 @@ impl EverythingView {
                             if let Some(paths)=pending {this.model.removed=paths.into_iter().collect();}
                             this.last_search_ms=elapsed;
                             if offset == 0 { this.displayed_query = query.clone(); }
-                            this.queue_icons(window,cx);
                             if offset==0 {
                                 let rows=this.model.rows.len();
                                 let first=this.model.rows.first().map(|r|r.name.clone());
@@ -532,6 +527,12 @@ impl EverythingView {
         theme.primary = p.accent;
         theme.selection = p.accent.opacity(0.3);
         theme.border = p.border;
+        theme.input = p.input_border;
+        theme.ring = p.muted;
+        theme.popover = p.menu;
+        theme.popover_foreground = p.menu_text;
+        theme.radius = px(6.);
+        theme.radius_lg = px(8.);
     }
 
     fn notify_message(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
@@ -548,64 +549,6 @@ impl EverythingView {
         })
         .detach();
         cx.notify();
-    }
-
-    fn queue_icons(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let range = if self.visible_rows.is_empty() {
-            0..self.model.rows.len().min(40)
-        } else {
-            self.visible_rows.start.min(self.model.rows.len())
-                ..self.visible_rows.end.min(self.model.rows.len())
-        };
-        let jobs = self.model.rows[range]
-            .iter()
-            .take(150)
-            .map(|e| {
-                (
-                    icon_key(e),
-                    crate::IconRequest {
-                        path: Some(e.path.clone()),
-                        ext: if view::is_package(e) {
-                            "app".into()
-                        } else if e.is_dir {
-                            "folder".into()
-                        } else {
-                            e.ext.clone().unwrap_or_default()
-                        },
-                    },
-                )
-            })
-            .filter(|(key, _)| !self.icons.contains_key(key) && !self.icon_pending.contains(key))
-            .collect::<HashMap<_, _>>();
-        if jobs.is_empty() {
-            return;
-        }
-        let (keys, requests): (Vec<_>, Vec<_>) = jobs.into_iter().unzip();
-        self.icon_pending.extend(keys.iter().cloned());
-        let backend = self.backend.clone();
-        cx.spawn_in(window, async move |view, cx| {
-            let result = crate::get_file_icons(requests, &backend).await;
-            let _ = view.update(cx, |this, cx| {
-                if let Ok(pngs) = result {
-                    for (key, png) in keys.iter().zip(pngs) {
-                        if !png.is_empty() {
-                            this.icons.insert(
-                                key.clone(),
-                                Arc::new(Image::from_bytes(ImageFormat::Png, png)),
-                            );
-                        }
-                    }
-                }
-                for key in keys {
-                    this.icon_pending.remove(&key);
-                }
-                if this.icons.len() > 512 {
-                    this.icons.clear();
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn register_hotkey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -652,21 +595,6 @@ impl EverythingView {
     }
 }
 
-fn icon_key(entry: &EntryDto) -> String {
-    if view::is_package(entry)
-        || (cfg!(target_os = "windows")
-            && entry
-                .ext
-                .as_deref()
-                .is_some_and(crate::is_per_file_icon_ext))
-    {
-        entry.path.clone()
-    } else if entry.is_dir {
-        "__folder__".into()
-    } else {
-        entry.ext.clone().unwrap_or_default().to_lowercase()
-    }
-}
 
 fn telemetry(value: serde_json::Value) {
     if let Some(path) = std::env::var_os("EVERYTHING_UI_METRICS") {

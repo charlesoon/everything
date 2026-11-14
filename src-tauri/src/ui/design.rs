@@ -1,4 +1,4 @@
-//! Visual tokens copied from the preserved Tauri App.svelte, not a GPUI theme.
+//! Visual tokens (shadcn/ui zinc palette), not a GPUI theme.
 use gpui::*;
 use gpui_component::ActiveTheme;
 
@@ -29,45 +29,47 @@ pub(super) struct Palette {
 }
 impl Palette {
     pub fn get(cx: &App) -> Self {
+        // shadcn/ui "zinc" tokens: neutral surfaces, 1px zinc borders, and
+        // foreground (not blue) as the accent, like shadcn's `primary`.
         if cx.theme().is_dark() {
             Self {
-                bg: rgb(0x1e1e21).into(),
-                text: rgb(0xb8bdc5).into(),
-                muted: rgb(0x94a3b8).into(),
-                input: rgb(0x161618).into(),
-                border: rgb(0x2a2a2d).into(),
-                input_border: rgba(0xffffff0f).into(),
-                accent: rgb(0x4da8ff).into(),
-                row_border: rgba(0xffffff05).into(),
-                hover: rgb(0x282828).into(),
-                selected: rgba(0x4da8ff1a).into(),
-                button: rgba(0xffffff0d).into(),
-                button_text: rgb(0x94a3b8).into(),
-                menu: rgb(0x252528).into(),
-                menu_text: rgb(0xe2e8f0).into(),
-                menu_hover: rgba(0xffffff0a).into(),
-                toast: rgba(0x0a0a10ed).into(),
-                toast_text: rgb(0xf2f2f6).into(),
+                bg: rgb(0x09090b).into(),     // background
+                text: rgb(0xd4d4d8).into(),   // zinc-300, not #fafafa: less glare
+                muted: rgb(0xa1a1aa).into(),  // muted-foreground
+                input: rgb(0x0f0f12).into(),  // input/30
+                border: rgb(0x27272a).into(), // border
+                input_border: rgb(0x27272a).into(),
+                accent: rgb(0xe4e4e7).into(), // primary
+                row_border: rgba(0xffffff08).into(),
+                hover: rgb(0x18181b).into(),    // accent/50
+                selected: rgb(0x27272a).into(), // accent
+                button: rgb(0x0f0f12).into(),
+                button_text: rgb(0xd4d4d8).into(),
+                menu: rgb(0x18181b).into(), // popover
+                menu_text: rgb(0xd4d4d8).into(),
+                menu_hover: rgb(0x27272a).into(),
+                toast: rgb(0x18181b).into(),
+                toast_text: rgb(0xd4d4d8).into(),
             }
         } else {
             Self {
-                bg: rgb(0xf5f5f7).into(),
-                text: rgb(0x1c1c1e).into(),
-                muted: rgb(0x6e6e7a).into(),
+                bg: rgb(0xfafafa).into(),
+                text: rgb(0x27272a).into(),
+                muted: rgb(0x71717a).into(),
                 input: rgb(0xffffff).into(),
-                border: rgb(0xd1d1d6).into(),
-                input_border: rgba(0x0000001a).into(),
-                accent: rgb(0x3a8bf5).into(),
-                row_border: rgba(0x0000000a).into(),
-                hover: rgba(0x0000000a).into(),
-                selected: rgba(0x3a8bf51a).into(),
+                border: rgb(0xe4e4e7).into(),
+                input_border: rgb(0xe4e4e7).into(),
+                accent: rgb(0x27272a).into(),
+                row_border: rgb(0xf0f0f2).into(),
+                hover: rgb(0xf4f4f5).into(),
+                selected: rgb(0xe4e4e7).into(),
                 button: rgb(0xffffff).into(),
-                button_text: rgb(0x3c3c43).into(),
+                button_text: rgb(0x27272a).into(),
                 menu: rgb(0xffffff).into(),
-                menu_text: rgb(0x1c1c1e).into(),
-                menu_hover: rgba(0x0000000d).into(),
-                toast: rgba(0xfffffff2).into(),
-                toast_text: rgb(0x1c1c1e).into(),
+                menu_text: rgb(0x27272a).into(),
+                menu_hover: rgb(0xf4f4f5).into(),
+                toast: rgb(0xffffff).into(),
+                toast_text: rgb(0x27272a).into(),
             }
         }
     }

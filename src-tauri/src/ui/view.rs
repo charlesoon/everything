@@ -90,19 +90,15 @@ impl EverythingView {
             + 12.)
             .max(120.)
             .min(widths[0] + widths[1] - 38.);
-        let icon = if let Some(icon) = self.icons.get(&icon_key(entry)).cloned() {
-            img(icon).size(px(16.)).flex_shrink_0().into_any_element()
-        } else {
-            svg()
-                .path(if entry.is_dir {
-                    "everything/folder.svg"
-                } else {
-                    "everything/file.svg"
-                })
-                .size(px(16.))
-                .flex_shrink_0()
-                .into_any_element()
-        };
+        let icon = svg()
+            .path(if entry.is_dir {
+                super::file_icons::folder(false)
+            } else {
+                super::file_icons::file(&entry.name)
+            })
+            .size(px(14.))
+            .flex_shrink_0()
+            .text_color(p.muted);
         div()
             .id(("result", index))
             .relative()
@@ -294,7 +290,7 @@ impl EverythingView {
             .left(position.x)
             .top(position.y)
             .w(px(222.))
-            .rounded(px(10.))
+            .rounded(px(8.))
             .border_1()
             .border_color(p.border)
             .bg(p.menu)
@@ -351,7 +347,7 @@ impl EverythingView {
             .line_height(px(14.))
             .when(self.modal_selection == index, |b| {
                 b.shadow(vec![BoxShadow {
-                    color: p.accent.opacity(0.5),
+                    color: p.muted.opacity(0.4),
                     offset: point(px(0.), px(0.)),
                     blur_radius: px(0.),
                     spread_radius: px(3.),
@@ -381,7 +377,7 @@ impl EverythingView {
             div()
                 .p(px(24.))
                 .max_w(px(410.))
-                .rounded(px(12.))
+                .rounded(px(8.))
                 .bg(p.menu)
                 .border_1()
                 .border_color(p.border)
@@ -420,8 +416,8 @@ impl EverythingView {
             let intro = "백그라운드 인덱서가 로그인할 때 자동으로 실행되어 파일 인덱스를 항상 최신으로 유지합니다. 보호된 폴더(데스크탑·문서·다운로드 등)까지 검색하려면 전체 디스크 접근 권한이 필요합니다.";
             let emphasis = intro.find("전체 디스크 접근").unwrap();
             div().id("onboarding-body").w(px(482.)).max_w_full().max_h_full().overflow_y_scroll()
-                .px(px(20.)).pt(px(18.)).pb(px(16.)).rounded(px(12.)).border_1().border_color(if cx.theme().is_dark(){rgb(0x3a3f46).into()}else{p.border})
-                .bg(if cx.theme().is_dark(){rgb(0x26292e).into()}else{p.bg}).text_size(px(12.5)).line_height(relative(1.65)).shadow_xl()
+                .px(px(20.)).pt(px(18.)).pb(px(16.)).rounded(px(8.)).border_1().border_color(p.border)
+                .bg(p.menu).text_size(px(12.5)).line_height(relative(1.65)).shadow_xl()
                 .child(div().mb(px(8.)).text_size(px(15.)).font_weight(FontWeight::BOLD).child("Everything 시작하기"))
                 .child(div().mb(px(10.)).child(StyledText::new(intro).with_highlights([(emphasis..emphasis + "전체 디스크 접근".len(), HighlightStyle {font_weight: Some(FontWeight::BOLD), ..Default::default()})])))
                 .child(div().flex().items_center().gap(px(8.)).px(px(10.)).py(px(8.)).mb(px(10.)).rounded(px(8.)).bg(rgba(if cx.theme().is_dark(){0xe8a02038}else{0xe8a0202e}))
@@ -431,7 +427,7 @@ impl EverythingView {
                         .child(self.dialog_button("onboarding-restart","앱 재시작",UiAction::Restart,1,false,cx).text_size(px(11.5)).font_weight(FontWeight::MEDIUM).px(px(10.)).py(px(3.)).rounded(px(5.)).border_0().bg(rgb(0xe8a020)).text_color(white()))))
                 .child(div().mb(px(10.)).text_size(px(11.5)).opacity(0.75).child("시스템 설정 > 개인정보 보호 및 보안 > 전체 디스크 접근에서 Everything을 켜 주세요. 목록에 없으면 + 버튼으로 응용 프로그램에서 추가할 수 있습니다. 허용하면 이 창이 자동으로 감지합니다 — 잠시 후에도 감지되지 않으면 (시스템이 재실행을 요구하는 경우) '앱 재시작'을 눌러 주세요."))
                 .child(div().flex().justify_end().gap(px(8.)).mt(px(4.))
-                    .child(self.dialog_button("onboarding-start","시작하기",UiAction::OnboardGranted,3,self.action_busy||!self.fda_ok,cx).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).px(px(14.)).py(px(5.)).border_color(transparent_black()).bg(rgb(0x2f6ede)).text_color(white()))
+                    .child(self.dialog_button("onboarding-start","시작하기",UiAction::OnboardGranted,3,self.action_busy||!self.fda_ok,cx).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).px(px(14.)).py(px(5.)).border_color(transparent_black()).bg(p.accent).text_color(p.bg))
                     .child(self.dialog_button("onboarding-skip","나중에 (제한된 인덱스로 시작)",UiAction::OnboardSkip,2,self.action_busy,cx).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).px(px(14.)).py(px(5.)).bg(transparent_black()).text_color(p.text)))
                 .into_any_element()
         };
@@ -855,11 +851,7 @@ impl Render for EverythingView {
                                     row_count,
                                     cx.processor(
                                         move |this, range: std::ops::Range<usize>, window, cx| {
-                                            let changed = this.visible_rows != range;
                                             this.visible_rows = range.clone();
-                                            if changed {
-                                                this.queue_icons(window, cx);
-                                            }
                                             if this.model.loaded_count > 0
                                                 && range.end + 30 >= this.model.rows.len()
                                             {
@@ -1046,7 +1038,7 @@ impl Render for EverythingView {
                                             .w_full()
                                             .px(px(10.))
                                             .py_0()
-                                            .rounded(px(8.))
+                                            .rounded(px(6.))
                                             .font_family(MONO)
                                             .text_size(px(if cfg!(target_os = "windows") {
                                                 13.
@@ -1057,16 +1049,16 @@ impl Render for EverythingView {
                                             .bg(p.input)
                                             .border_1()
                                             .border_color(if self.input.focus_handle(cx).is_focused(window) {
-                                                p.accent
+                                                p.muted
                                             } else {
                                                 p.input_border
                                             })
                                             .when(self.input.focus_handle(cx).is_focused(window), |i| {
                                                 i.shadow(vec![BoxShadow {
-                                                    color: rgba(0x7da9ff40).into(),
+                                                    color: p.muted.opacity(0.3),
                                                     offset: point(px(0.), px(0.)),
                                                     blur_radius: px(0.),
-                                                    spread_radius: px(2.),
+                                                    spread_radius: px(3.),
                                                 }])
                                             }),
                                     ),
@@ -1088,7 +1080,9 @@ impl Render for EverythingView {
                             .bottom(px(18.))
                             .px(px(12.))
                             .py(px(9.))
-                            .rounded(px(10.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(p.border)
                             .shadow_lg()
                             .bg(p.toast)
                             .text_color(p.toast_text)
@@ -1157,14 +1151,13 @@ impl EverythingView {
             .py(px(7.))
             .flex_shrink_0()
             .min_w_0()
-            .bg(if cx.theme().is_dark() {
-                rgb(0x7a4800)
-            } else {
-                rgb(0xe8a020)
-            })
+            // shadcn Alert: neutral surface with a hairline, not a solid amber bar.
+            .bg(Palette::get(cx).hover)
+            .border_b_1()
+            .border_color(Palette::get(cx).border)
             .text_size(px(11.5))
             .line_height(relative(1.4))
-            .text_color(white())
+            .text_color(Palette::get(cx).text)
             .child(div().flex_1().min_w_0().child(text))
     }
 
@@ -1177,34 +1170,16 @@ impl EverythingView {
         disabled: bool,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
+        // shadcn outline button; dismiss is the ghost variant.
+        let p = Palette::get(cx);
         self.button(id, text, action, disabled, cx)
-            .h(px(20.))
             .px(px(10.))
-            .border_0()
-            .text_size(px(11.5))
             .font_weight(FontWeight::MEDIUM)
-            .bg(if dismiss {
-                transparent_black()
-            } else {
-                white()
-            })
-            .text_color(if dismiss {
-                rgba(0xffffffd9)
-            } else {
-                rgba(0xa05000ff)
-            })
-            .hover(move |button| {
+            .when(dismiss, |button| {
                 button
-                    .bg(if dismiss {
-                        transparent_black()
-                    } else {
-                        white()
-                    })
-                    .text_color(if dismiss {
-                        white()
-                    } else {
-                        rgba(0xa05000ff).into()
-                    })
+                    .border_color(transparent_black())
+                    .bg(transparent_black())
+                    .text_color(p.muted)
             })
     }
 

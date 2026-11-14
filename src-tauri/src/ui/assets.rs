@@ -41,12 +41,10 @@ impl AssetSource for Assets {
             "everything/reset.svg" => {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>"##
             }
-            "everything/file.svg" => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="3" y="1" width="10" height="14" rx="1.5" fill="#b4bec9"/><rect x="5" y="5" width="6" height="1.2" fill="#8d98a5"/><rect x="5" y="8" width="6" height="1.2" fill="#8d98a5"/></svg>"##
-            }
-            "everything/folder.svg" => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect x="1" y="4" width="14" height="10" rx="2" fill="#d9b34f"/><rect x="1" y="2" width="6" height="4" rx="1" fill="#e6ca7a"/></svg>"##
-            }
+            path if path.starts_with(super::file_icons::PREFIX) => match super::file_icons::svg(path) {
+                Some(svg) => svg,
+                None => return Ok(None),
+            },
             _ => return gpui_component_assets::Assets.load(path),
         };
         Ok(Some(Cow::Borrowed(source.as_bytes())))
