@@ -81,7 +81,7 @@ pub(super) fn position_buttons(window: &Window) {
                 continue;
             }
             let mut frame: NSRect = msg_send![button, frame];
-            frame.origin.x = 12. + 20. * index as f64;
+            frame.origin.x = 16. + 23. * index as f64; // Orca-style left margin and pitch
             let _: () = msg_send![button, setFrame:frame];
         }
     }

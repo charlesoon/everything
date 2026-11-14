@@ -6,6 +6,13 @@ pub(super) const SANS: &str = "Geist";
 pub(super) const MONO: &str = "JetBrains Mono";
 pub(super) const ROW_HEIGHT: f32 = 27.; // CSS height:26px + 1px bottom border.
 pub(super) const COLUMN_MIN: [f32; 4] = [180., 240., 62., 150.];
+pub(super) const BASE_REM_SIZE: f32 = 12.;
+pub(super) const TITLEBAR_HEIGHT: f32 = 38.;
+
+/// Design pixels at 100%, resolved through the window's UI zoom.
+pub(super) fn scaled_px(value: f32) -> Rems {
+    rems(value / BASE_REM_SIZE)
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Palette {
@@ -34,23 +41,23 @@ impl Palette {
         // foreground (not blue) as the accent, like shadcn's `primary`.
         if cx.theme().is_dark() {
             Self {
-                bg: rgb(0x09090b).into(),     // background
+                bg: rgb(0x171717).into(),     // background (Orca dark)
                 text: rgb(0xd4d4d8).into(),   // zinc-300, not #fafafa: less glare
                 muted: rgb(0xa1a1aa).into(),  // muted-foreground
-                input: rgb(0x1a1a1c).into(), // input/50 over bg, opaque: GPUI ring shadows fill under the box
+                input: rgb(0x202020).into(), // input/50 over bg, opaque: GPUI ring shadows fill under the box
                 border: rgb(0x27272a).into(), // border
                 input_border: rgb(0x27272a).into(),
                 ring: rgb(0x71717a).into(),
                 accent: rgb(0xe4e4e7).into(), // primary
                 row_border: rgba(0xffffff08).into(),
-                hover: rgb(0x18181b).into(),    // accent/50
+                hover: rgb(0x1f1f1f).into(),    // accent/50
                 selected: rgb(0x27272a).into(), // accent
-                button: rgb(0x0f0f12).into(),
+                button: rgb(0x1c1c1c).into(),
                 button_text: rgb(0xd4d4d8).into(),
-                menu: rgb(0x18181b).into(), // popover
+                menu: rgb(0x1f1f1f).into(), // popover
                 menu_text: rgb(0xd4d4d8).into(),
                 menu_hover: rgb(0x27272a).into(),
-                toast: rgb(0x18181b).into(),
+                toast: rgb(0x1f1f1f).into(),
                 toast_text: rgb(0xd4d4d8).into(),
             }
         } else {

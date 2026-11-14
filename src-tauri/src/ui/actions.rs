@@ -522,6 +522,18 @@ impl EverythingView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(action) = zoom::Zoom::shortcut(&event.keystroke.key, event.keystroke.modifiers)
+        {
+            self.change_zoom(action, window, cx);
+            cx.stop_propagation();
+            window.prevent_default();
+            return;
+        }
+        if self.zoom_popover_key_down(event, window, cx) {
+            cx.stop_propagation();
+            window.prevent_default();
+            return;
+        }
         if self.cancel_pending_rename() {
             cx.notify();
         }
@@ -617,7 +629,7 @@ impl EverythingView {
                     if !self.model.rows.is_empty() {
                         let viewport = self.list_scroll.0.borrow().base_handle.bounds().size.height;
                         let page =
-                            (f32::from(viewport) / design::ROW_HEIGHT).floor().max(1.) as isize;
+                            (f32::from(viewport) / self.row_height()).floor().max(1.) as isize;
                         let delta = match key {
                             "up" => -1,
                             "pageup" => -page,

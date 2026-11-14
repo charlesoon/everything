@@ -6,7 +6,21 @@ impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         let source = match path {
             "everything/search.svg" => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 215 205"><path d="M85 0c46.9 0 85 38.1 85 85 0 20.1-7.2 38.5-19.2 52.7l40.7 40.8c5.8 5.8 5.8 15.2 0 21-5.8 5.8-15.2 5.8-21 0l-40.7-40.7c-13.6 9.7-30.4 15.2-44.8 15.2-46.9 0-85-42.1-85-89 0-46.9 38.1-85 85-85z m0 32c-29.3 0-53 23.7-53 53 0 29.3 23.7 53 53 53 29.3 0 53-23.7 53-53 0-29.3-23.7-53-53-53z" fill-rule="evenodd"/></svg>"##
+                // Lucide "search"
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.34-4.34"/></svg>"##
+            }
+            // Lucide (ISC): fixed-size titlebar zoom controls.
+            "everything/zoom-in.svg" => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/><path d="M11 8v6"/></svg>"##
+            }
+            "everything/zoom-out.svg" => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/></svg>"##
+            }
+            "everything/plus.svg" => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>"##
+            }
+            "everything/minus.svg" => {
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg>"##
             }
             "everything/sort-asc.svg" => {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="black" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5 L5 4 L7.5 6.5"/></svg>"##
@@ -27,7 +41,7 @@ impl AssetSource for Assets {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" fill="none" stroke="black"/></svg>"##
             }
             "everything/panel-right.svg" => {
-                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="M12.5 3.5v13M6.5 7.5L9 10l-2.5 2.5"/></svg>"##
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" stroke="black" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="13" height="13" rx="1.5"/><path d="M12 3.5v13"/></svg>"##
             }
             "everything/chevron-right.svg" => {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12" fill="none" stroke="black" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3L7.5 6l-3 3"/></svg>"##

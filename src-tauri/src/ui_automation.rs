@@ -160,6 +160,10 @@ unsafe fn execute(request: Value) -> Result<Value, String> {
                 "v" => (9, "v"),
                 "q" => (12, "q"),
                 "z" => (6, "z"),
+                "plus" => (24, "+"),
+                "equals" => (24, "="),
+                "minus" => (27, "-"),
+                "0" => (29, "0"),
                 _ => return Err(format!("Unsupported key: {key}")),
             };
             send_key(app, window, code, characters, flags(&parts));

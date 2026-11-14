@@ -4,6 +4,17 @@ use std::{fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const MIN_ZOOM: f32 = 0.5;
+pub(crate) const MAX_ZOOM: f32 = 2.;
+
+pub(crate) fn normalize_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() {
+        zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+    } else {
+        1.
+    }
+}
+
 pub(crate) fn app_data_dir() -> PathBuf {
     let dir = std::env::var_os("EVERYTHING_DATA_DIR")
         .map(PathBuf::from)
@@ -43,6 +54,7 @@ pub(crate) struct Preferences {
     pub fda_dismissed: bool,
     pub file_tree_visible: bool,
     pub file_tree_width: f32,
+    pub zoom: f32,
 }
 
 impl Default for Preferences {
@@ -54,6 +66,7 @@ impl Default for Preferences {
             fda_dismissed: false,
             file_tree_visible: false,
             file_tree_width: 280.,
+            zoom: 1.,
         }
     }
 }
@@ -80,6 +93,7 @@ impl Preferences {
             prefs.file_tree_width = Self::default().file_tree_width;
         }
         prefs.file_tree_width = prefs.file_tree_width.clamp(180., 640.);
+        prefs.zoom = normalize_zoom(prefs.zoom);
         prefs
     }
 
@@ -93,5 +107,27 @@ impl Preferences {
                 let _ = fs::rename(temp, dir.join("gpui-preferences.json"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_preferences_keep_default_zoom() {
+        let prefs: Preferences = serde_json::from_str(r#"{"fileTreeVisible":true}"#).unwrap();
+        assert!(prefs.file_tree_visible);
+        assert_eq!(prefs.zoom, 1.);
+    }
+
+    #[test]
+    fn invalid_zoom_is_safe_and_bounded() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(normalize_zoom(value), 1.);
+        }
+        assert_eq!(normalize_zoom(-10.), MIN_ZOOM);
+        assert_eq!(normalize_zoom(10.), MAX_ZOOM);
+        assert_eq!(normalize_zoom(1.25), 1.25);
     }
 }

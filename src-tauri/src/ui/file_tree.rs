@@ -1,6 +1,7 @@
 mod model;
 
 use super::*;
+use design::scaled_px;
 use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
     tooltip::Tooltip,
@@ -28,28 +29,33 @@ impl State {
         }
     }
 
-    fn scroll_anchor(&self) -> Option<(PathBuf, Pixels)> {
+    pub(super) fn rescale_scroll(&mut self, ratio: f32) {
+        let scroll = self.scroll.0.borrow();
+        let offset = scroll.base_handle.offset();
+        scroll
+            .base_handle
+            .set_offset(point(offset.x * ratio, offset.y * ratio));
+        self.resizing = None;
+    }
+
+    fn scroll_anchor(&self, row_height: f32) -> Option<(PathBuf, Pixels)> {
         if self.model.reveal_pending {
             return None;
         }
         let offset = self.scroll.0.borrow().base_handle.offset().y;
-        let first = (-f32::from(offset) / design::ROW_HEIGHT).floor().max(0.) as usize;
+        let first = (-f32::from(offset) / row_height).floor().max(0.) as usize;
         self.model
             .rows
             .iter()
             .enumerate()
             .skip(first)
             .find_map(|(index, row)| {
-                row.entry().map(|entry| {
-                    (
-                        entry.path.clone(),
-                        offset + px(index as f32 * design::ROW_HEIGHT),
-                    )
-                })
+                row.entry()
+                    .map(|entry| (entry.path.clone(), offset + px(index as f32 * row_height)))
             })
     }
 
-    fn restore_scroll_anchor(&self, anchor: Option<(PathBuf, Pixels)>) {
+    fn restore_scroll_anchor(&self, anchor: Option<(PathBuf, Pixels)>, row_height: f32) {
         let Some((path, top)) = anchor else {
             return;
         };
@@ -62,7 +68,7 @@ impl State {
             let scroll = self.scroll.0.borrow();
             scroll.base_handle.set_offset(point(
                 scroll.base_handle.offset().x,
-                top - px(index as f32 * design::ROW_HEIGHT),
+                top - px(index as f32 * row_height),
             ));
         }
     }
@@ -75,10 +81,11 @@ impl EverythingView {
 
     pub(super) fn file_tree_width(&self, window: &Window) -> f32 {
         if self.prefs.file_tree_visible {
-            self.prefs.file_tree_width.clamp(
-                180.,
-                (f32::from(window.viewport_size().width) - 220.).clamp(180., 640.),
-            )
+            let width = f32::from(window.viewport_size().width);
+            let zoom = self.prefs.zoom;
+            let available = (width - 220. * zoom).max(width * 0.4);
+            (self.prefs.file_tree_width * zoom)
+                .clamp((180. * zoom).min(available), (640. * zoom).min(available))
         } else {
             0.
         }
@@ -128,9 +135,10 @@ impl EverythingView {
                     .map_err(|error| error.to_string())
                     .and_then(|result| result);
                 let _ = view.update(cx, |this, cx| {
-                    let anchor = this.file_tree.scroll_anchor();
+                    let row_height = this.row_height();
+                    let anchor = this.file_tree.scroll_anchor(row_height);
                     if this.file_tree.model.apply(request, result) {
-                        this.file_tree.restore_scroll_anchor(anchor);
+                        this.file_tree.restore_scroll_anchor(anchor, row_height);
                         cx.notify();
                     }
                 });
@@ -156,10 +164,10 @@ impl EverythingView {
             .right(px(if cfg!(target_os = "windows") {
                 147.
             } else {
-                10.
+                16. // same right inset as the status-bar settings button
             }))
-            .top(px(4.))
-            .w(px(28.))
+            .top(px(8.)) // (38px titlebar - 22px button) / 2
+            .w(px(26.))
             .h(px(22.))
             .flex()
             .items_center()
@@ -182,7 +190,7 @@ impl EverythingView {
                 svg()
                     .path("everything/panel-right.svg")
                     .size(px(16.))
-                    .text_color(if visible { p.accent } else { p.muted }),
+                    .text_color(p.muted),
             )
     }
 
@@ -226,20 +234,20 @@ impl EverythingView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(4.))
-                    .h(px(if cfg!(target_os = "windows") {
+                    .gap(scaled_px(4.))
+                    .h(scaled_px(if cfg!(target_os = "windows") {
                         25.
                     } else {
                         33.
                     }))
-                    .px(px(10.))
+                    .px(scaled_px(10.))
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(p.border)
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(11.))
+                            .text_size(scaled_px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(p.muted)
                             .child("Files"),
@@ -271,13 +279,13 @@ impl EverythingView {
             .when_some(root, |panel, root| {
                 panel.child(
                     self.copyable_path("file-tree-path", root.to_string_lossy().into_owned(), cx)
-                        .h(px(26.))
-                        .px(px(12.))
+                        .h(scaled_px(26.))
+                        .px(scaled_px(12.))
                         .flex()
                         .items_center()
                         .flex_shrink_0()
                         .font_family(design::MONO)
-                        .text_size(px(10.))
+                        .text_size(scaled_px(10.))
                         .text_color(p.muted),
                 )
             })
@@ -321,12 +329,12 @@ impl EverythingView {
                         area.flex()
                             .items_center()
                             .justify_center()
-                            .px(px(20.))
+                            .px(scaled_px(20.))
                             .child(
                                 div()
                                     .text_center()
-                                    .text_size(px(12.))
-                                    .line_height(px(19.))
+                                    .text_size(scaled_px(12.))
+                                    .line_height(scaled_px(19.))
                                     .text_color(p.muted)
                                     .child("Select a search result to view its folder."),
                             )
@@ -336,12 +344,12 @@ impl EverythingView {
                 panel.child(
                     div()
                         .id("file-tree-selection-error")
-                        .px(px(12.))
-                        .py(px(8.))
+                        .px(scaled_px(12.))
+                        .py(scaled_px(8.))
                         .flex_shrink_0()
                         .border_t_1()
                         .border_color(p.border)
-                        .text_size(px(11.))
+                        .text_size(scaled_px(11.))
                         .text_color(p.muted)
                         .tooltip({
                             let error = error.clone();
@@ -357,19 +365,19 @@ impl EverythingView {
         let row = &self.file_tree.model.rows[index];
         let p = design::Palette::get(cx);
         // Leave room for the name even after following a deeply nested result.
-        let indent = (row.depth as f32 * 14.).min((width - 146.).max(0.));
+        let indent = (row.depth as f32 * 14.).min((width / self.prefs.zoom - 146.).max(0.));
         let container = div()
             .id(("file-tree-row", index))
             .relative()
             .flex()
             .items_center()
-            .gap(px(5.))
-            .h(px(design::ROW_HEIGHT))
+            .gap(scaled_px(5.))
+            .h(scaled_px(design::ROW_HEIGHT))
             .w_full()
-            .pl(px(8. + indent))
-            .pr(px(20.))
-            .text_size(px(12.))
-            .line_height(px(15.))
+            .pl(scaled_px(8. + indent))
+            .pr(scaled_px(20.))
+            .text_size(scaled_px(12.))
+            .line_height(scaled_px(15.))
             .text_color(p.text)
             .overflow_hidden();
         let entry = match &row.kind {
@@ -383,7 +391,7 @@ impl EverythingView {
                 };
                 return container
                     .text_color(p.muted)
-                    .pl(px(28. + indent))
+                    .pl(scaled_px(28. + indent))
                     .tooltip({
                         let message = message.clone();
                         move |window, cx| Tooltip::new(message.clone()).build(window, cx)
@@ -417,18 +425,23 @@ impl EverythingView {
                 }
                 cx.notify();
             }))
-            .child(div().size(px(12.)).flex_shrink_0().when(is_dir, |slot| {
-                slot.child(
-                    svg()
-                        .path(if expanded {
-                            "everything/chevron-down.svg"
-                        } else {
-                            "everything/chevron-right.svg"
-                        })
-                        .size(px(12.))
-                        .text_color(p.muted),
-                )
-            }))
+            .child(
+                div()
+                    .size(scaled_px(12.))
+                    .flex_shrink_0()
+                    .when(is_dir, |slot| {
+                        slot.child(
+                            svg()
+                                .path(if expanded {
+                                    "everything/chevron-down.svg"
+                                } else {
+                                    "everything/chevron-right.svg"
+                                })
+                                .size(scaled_px(12.))
+                                .text_color(p.muted),
+                        )
+                    }),
+            )
             .child(
                 svg()
                     .path(if is_dir {
@@ -436,7 +449,7 @@ impl EverythingView {
                     } else {
                         super::file_icons::file(&entry.name)
                     })
-                    .size(px(14.))
+                    .size(scaled_px(14.))
                     .flex_shrink_0()
                     .text_color(p.muted),
             )
@@ -459,10 +472,11 @@ impl EverythingView {
         let Some((start, width)) = self.file_tree.resizing else {
             return false;
         };
-        self.prefs.file_tree_width = (width + f32::from(start.x - event.position.x)).clamp(
-            180.,
-            (f32::from(window.viewport_size().width) - 220.).clamp(180., 640.),
-        );
+        let maximum =
+            (f32::from(window.viewport_size().width) / self.prefs.zoom - 220.).clamp(180., 640.);
+        self.prefs.file_tree_width = ((width + f32::from(start.x - event.position.x))
+            / self.prefs.zoom)
+            .clamp(180., maximum);
         cx.notify();
         true
     }
@@ -626,16 +640,16 @@ fn tree_button(
     let p = design::Palette::get(cx);
     div()
         .id(id)
-        .size(px(22.))
+        .size(scaled_px(22.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.))
+        .rounded(scaled_px(4.))
         .text_color(p.muted)
         .when(disabled, |button| button.opacity(0.35))
         .when(!disabled, |button| {
             button.cursor_pointer().hover(|button| button.bg(p.hover))
         })
         .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
-        .child(svg().path(icon).size(px(12.)).text_color(p.muted))
+        .child(svg().path(icon).size(scaled_px(12.)).text_color(p.muted))
 }

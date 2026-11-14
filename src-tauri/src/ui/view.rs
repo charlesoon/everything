@@ -1,5 +1,5 @@
 use super::*;
-use design::{Palette, COLUMN_MIN, MONO, ROW_HEIGHT, SANS};
+use design::{scaled_px, Palette, COLUMN_MIN, MONO, ROW_HEIGHT, SANS};
 use gpui_component::{
     scroll::{Scrollbar, ScrollbarShow},
     tooltip::Tooltip,
@@ -25,9 +25,39 @@ impl EverythingView {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                this.notify_message("Copied path", cx);
+                let time = Instant::now();
+                this.copied = Some((id, time));
+                cx.spawn(async move |view, cx| {
+                    Timer::after(Duration::from_millis(1500)).await;
+                    let _ = view.update(cx, |this, cx| {
+                        if this.copied.is_some_and(|(_, t)| t == time) {
+                            this.copied = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+                cx.notify();
             }))
-            .child(div().truncate().child(label))
+            .flex()
+            .items_center()
+            .child(middle_text::middle_path(label))
+            .when(self.copied.is_some_and(|(copied, _)| copied == id), |d| {
+                d.child(
+                    // Pill badge, like Orca's "파일 경로 복사됨".
+                    div()
+                        .flex_shrink_0()
+                        .ml(scaled_px(8.))
+                        .px(scaled_px(8.))
+                        .py(scaled_px(2.))
+                        .rounded_full()
+                        .bg(p.selected)
+                        .text_color(p.text)
+                        .font_family(SANS)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Copied"),
+                )
+            })
     }
 
     fn button(
@@ -41,17 +71,17 @@ impl EverythingView {
         let p = Palette::get(cx);
         div()
             .id(id)
-            .h(px(22.))
-            .px(px(8.))
+            .h(scaled_px(22.))
+            .px(scaled_px(8.))
             .flex()
             .items_center()
-            .gap(px(3.))
+            .gap(scaled_px(3.))
             .font_family(SANS)
-            .text_size(px(11.))
-            .line_height(px(14.))
+            .text_size(scaled_px(11.))
+            .line_height(scaled_px(14.))
             .border_1()
             .border_color(p.border)
-            .rounded(px(5.))
+            .rounded(scaled_px(5.))
             .bg(p.button)
             .text_color(p.button_text)
             .when(disabled, |b| b.opacity(0.55))
@@ -89,14 +119,14 @@ impl EverythingView {
             * 8.5
             + 12.)
             .max(120.)
-            .min(widths[0] + widths[1] - 38.);
+            .min((widths[0] + widths[1]) / self.prefs.zoom - 38.);
         let icon = svg()
             .path(if entry.is_dir {
                 super::file_icons::folder(false)
             } else {
                 super::file_icons::file(&entry.name)
             })
-            .size(px(14.))
+            .size(scaled_px(14.))
             .flex_shrink_0()
             .text_color(p.muted);
         div()
@@ -104,12 +134,12 @@ impl EverythingView {
             .relative()
             .flex()
             .items_center()
-            .h(px(ROW_HEIGHT))
+            .h(scaled_px(ROW_HEIGHT))
             .w(px(widths.iter().sum()))
             .border_b_1()
             .border_color(p.row_border)
-            .text_size(px(12.))
-            .line_height(px(15.))
+            .text_size(scaled_px(12.))
+            .line_height(scaled_px(15.))
             .text_color(p.text)
             .when(selected, |r| r.bg(p.selected))
             .hover(|r| r.bg(if selected { p.selected } else { p.hover }))
@@ -186,12 +216,12 @@ impl EverythingView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(scaled_px(6.))
                     .w(px(widths[0]))
                     .h_full()
                     .flex_shrink_0()
-                    .pl(px(16.))
-                    .pr(px(8.))
+                    .pl(scaled_px(16.))
+                    .pr(scaled_px(8.))
                     .overflow_hidden()
                     .child(icon)
                     .child(div().flex_1().min_w_0().child(name)),
@@ -200,13 +230,14 @@ impl EverythingView {
                 div()
                     .w(px(widths[1]))
                     .flex_shrink_0()
-                    .pl(px(8.))
-                    .pr(px(4.))
+                    .pl(scaled_px(8.))
+                    .pr(scaled_px(4.))
                     .font_family(MONO)
-                    .text_size(px(11.))
+                    .text_size(scaled_px(11.))
                     .text_color(p.muted)
-                    .truncate()
-                    .child(display_path(&entry.dir, &self.backend.home_dir)),
+                    .overflow_hidden()
+                    .flex() // lets the path shrink below its full width
+                    .child(middle_text::middle_path(display_path(&entry.dir, &self.backend.home_dir))),
             )
             .child(
                 div()
@@ -214,7 +245,7 @@ impl EverythingView {
                     .flex_shrink_0()
                     .text_right()
                     .font_family(MONO)
-                    .text_size(px(11.))
+                    .text_size(scaled_px(11.))
                     .text_color(p.muted)
                     .truncate()
                     .child(format_size(entry)),
@@ -223,10 +254,10 @@ impl EverythingView {
                 div()
                     .w(px(widths[3]))
                     .flex_shrink_0()
-                    .pl(px(8.))
-                    .pr(px(16.))
+                    .pl(scaled_px(8.))
+                    .pr(scaled_px(16.))
                     .font_family(MONO)
-                    .text_size(px(11.))
+                    .text_size(scaled_px(11.))
                     .text_color(p.muted)
                     .truncate()
                     .child(format_modified(entry.mtime)),
@@ -235,30 +266,30 @@ impl EverythingView {
                 r.child(
                     div()
                         .absolute()
-                        .left(px(29.))
+                        .left(scaled_px(29.))
                         .top_0()
-                        .w(px(rename_width))
-                        .h(px(26.))
+                        .w(scaled_px(rename_width))
+                        .h(scaled_px(26.))
                         .child(
                             Input::new(&self.rename_input)
                                 .appearance(false)
                                 .w_full()
-                                .min_h(px(26.))
-                                .max_h(px(26.))
-                                .px(px(4.))
+                                .min_h(scaled_px(26.))
+                                .max_h(scaled_px(26.))
+                                .px(scaled_px(4.))
                                 .py_0()
                                 .font_family(SANS)
-                                .text_size(px(12.))
-                                .line_height(px(18.))
+                                .text_size(scaled_px(12.))
+                                .line_height(scaled_px(18.))
                                 .bg(p.input)
-                                .border(px(1.5))
+                                .border(scaled_px(1.5))
                                 .border_color(p.accent)
-                                .rounded(px(4.))
+                                .rounded(scaled_px(4.))
                                 .shadow(vec![BoxShadow {
                                     color: p.accent.opacity(0.13),
                                     offset: point(px(0.), px(0.)),
                                     blur_radius: px(0.),
-                                    spread_radius: px(3.),
+                                    spread_radius: px(3. * self.prefs.zoom),
                                 }]),
                         ),
                 )
@@ -270,7 +301,7 @@ impl EverythingView {
                         .left_0()
                         .top_0()
                         .bottom_0()
-                        .w(px(3.))
+                        .w(scaled_px(3.))
                         .bg(p.accent),
                 )
             })
@@ -289,8 +320,8 @@ impl EverythingView {
             .absolute()
             .left(position.x)
             .top(position.y)
-            .w(px(222.))
-            .rounded(px(8.))
+            .w(scaled_px(222.))
+            .rounded(scaled_px(8.))
             .border_1()
             .border_color(p.border)
             .bg(p.menu)
@@ -305,9 +336,9 @@ impl EverythingView {
                 |(i, (label, action, _))| {
                     div()
                         .id(("context", i))
-                        .px(px(10.))
-                        .py(px(8.))
-                        .text_size(px(12.))
+                        .px(scaled_px(10.))
+                        .py(scaled_px(8.))
+                        .text_size(scaled_px(12.))
                         .cursor_pointer()
                         .when(i == self.menu_selection, |r| r.bg(p.menu_hover))
                         .hover(|r| r.bg(p.menu_hover))
@@ -336,21 +367,21 @@ impl EverythingView {
         let p = Palette::get(cx);
         div()
             .id(id)
-            .px(px(12.))
-            .py(px(6.))
+            .px(scaled_px(12.))
+            .py(scaled_px(6.))
             .border_1()
             .border_color(p.border)
-            .rounded(px(6.))
+            .rounded(scaled_px(6.))
             .bg(p.button)
             .text_color(p.button_text)
-            .text_size(px(11.))
-            .line_height(px(14.))
+            .text_size(scaled_px(11.))
+            .line_height(scaled_px(14.))
             .when(self.modal_selection == index, |b| {
                 b.shadow(vec![BoxShadow {
                     color: p.muted.opacity(0.4),
                     offset: point(px(0.), px(0.)),
                     blur_radius: px(0.),
-                    spread_radius: px(3.),
+                    spread_radius: px(3. * self.prefs.zoom),
                 }])
             })
             .when(disabled, |b| b.opacity(0.45))
@@ -382,29 +413,30 @@ impl EverythingView {
         let items = self.settings_items();
         let tile = |icon: &'static str| {
             div()
-                .size(px(20.))
+                .size(scaled_px(20.))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(6.))
+                .rounded(scaled_px(6.))
                 .border_1()
                 .border_color(p.border)
                 .bg(p.hover)
-                .child(svg().path(icon).size(px(12.)).text_color(p.text))
+                .child(svg().path(icon).size(scaled_px(12.)).text_color(p.text))
         };
         let chevron = || {
             svg()
                 .path("everything/chevron.svg") // Lucide ChevronRight, as in Orca
-                .size(px(14.))
+                .size(scaled_px(14.))
                 .flex_shrink_0()
                 .text_color(p.muted)
         };
         let meta = |text: SharedString| {
             div()
-                .ml(px(8.))
-                .mr(px(4.))
-                .text_size(px(11.))
+                .flex_shrink_0()
+                .ml(scaled_px(8.))
+                .mr(scaled_px(4.))
+                .text_size(scaled_px(11.))
                 .text_color(p.muted)
                 .whitespace_nowrap()
                 .child(text)
@@ -418,9 +450,9 @@ impl EverythingView {
                 .id(("settings-item", index))
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .px(px(14.))
-                .py(px(9.))
+                .gap(scaled_px(10.))
+                .px(scaled_px(14.))
+                .py(scaled_px(9.))
                 .when(disabled, |r| r.opacity(0.45))
                 .when(!disabled, |r| {
                     r.cursor_pointer()
@@ -440,9 +472,9 @@ impl EverythingView {
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(px(13.))
+                .text_size(scaled_px(13.))
                 .font_weight(FontWeight::MEDIUM)
-                .whitespace_nowrap()
+                .truncate()
                 .child(text)
         };
         let separator = || div().border_t_1().border_color(p.border);
@@ -452,41 +484,51 @@ impl EverythingView {
             _ => (0x28c840, "Index ready"),
         };
         let switch = div()
-            .ml(px(8.))
-            .w(px(28.))
-            .h(px(16.))
-            .p(px(2.))
+            .ml(scaled_px(8.))
+            .w(scaled_px(28.))
+            .h(scaled_px(16.))
+            .p(scaled_px(2.))
             .flex()
             .flex_shrink_0()
             .rounded_full()
             .bg(if autostart_on { p.accent } else { p.border })
             .when(autostart_on, |s| s.justify_end())
-            .child(div().size(px(12.)).rounded_full().bg(p.menu).shadow_sm());
+            .child(
+                div()
+                    .size(scaled_px(12.))
+                    .rounded_full()
+                    .bg(p.menu)
+                    .shadow_sm(),
+            );
         let popover = div()
+            .id("settings-popover")
             .absolute()
-            .right(px(8.))
-            .bottom(px(40.))
-            .w(px(300.))
-            .rounded(px(10.))
+            .right(scaled_px(8.))
+            .bottom(scaled_px(40.))
+            .w(scaled_px(300.))
+            .max_w(relative(0.95))
+            .max_h(relative(0.7))
+            .rounded(scaled_px(10.))
             .border_1()
             .border_color(p.border)
             .bg(p.menu)
             .text_color(p.menu_text)
-            .text_size(px(12.))
+            .text_size(scaled_px(12.))
             .shadow_lg()
             .overflow_hidden()
+            .overflow_y_scroll()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px(px(14.))
-                    .pt(px(12.))
-                    .pb(px(8.))
+                    .px(scaled_px(14.))
+                    .pt(scaled_px(12.))
+                    .pb(scaled_px(8.))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(scaled_px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Settings"),
                     )
@@ -494,10 +536,10 @@ impl EverythingView {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.))
-                            .text_size(px(11.))
+                            .gap(scaled_px(6.))
+                            .text_size(scaled_px(11.))
                             .text_color(p.muted)
-                            .child(div().size(px(6.)).rounded_full().bg(rgb(dot)))
+                            .child(div().size(scaled_px(6.)).rounded_full().bg(rgb(dot)))
                             .child(state),
                     ),
             )
@@ -505,9 +547,9 @@ impl EverythingView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .px(px(14.))
-                    .py(px(9.))
+                    .gap(scaled_px(10.))
+                    .px(scaled_px(14.))
+                    .py(scaled_px(9.))
                     .child(tile("everything/database.svg"))
                     .child(name("Index"))
                     .child(meta(
@@ -561,7 +603,7 @@ impl EverythingView {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(13.))
+                            .text_size(scaled_px(13.))
                             .text_color(rgb(if cx.theme().is_dark() {
                                 0xf87171
                             } else {
@@ -605,17 +647,17 @@ impl EverythingView {
                 format!("Move {} items to Trash?", paths.len())
             };
             div()
-                .p(px(24.))
-                .max_w(px(410.))
-                .rounded(px(8.))
+                .p(scaled_px(24.))
+                .max_w(scaled_px(410.))
+                .rounded(scaled_px(8.))
                 .bg(p.menu)
                 .border_1()
                 .border_color(p.border)
                 .shadow_xl()
                 .child(
                     div()
-                        .mb(px(24.))
-                        .text_size(px(14.))
+                        .mb(scaled_px(24.))
+                        .text_size(scaled_px(14.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title),
                 )
@@ -623,7 +665,7 @@ impl EverythingView {
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(8.))
+                        .gap(scaled_px(8.))
                         .child(self.dialog_button(
                             "dialog-cancel",
                             "Cancel",
@@ -645,20 +687,20 @@ impl EverythingView {
         } else {
             let intro = "백그라운드 인덱서가 로그인할 때 자동으로 실행되어 파일 인덱스를 항상 최신으로 유지합니다. 보호된 폴더(데스크탑·문서·다운로드 등)까지 검색하려면 전체 디스크 접근 권한이 필요합니다.";
             let emphasis = intro.find("전체 디스크 접근").unwrap();
-            div().id("onboarding-body").w(px(482.)).max_w_full().max_h_full().overflow_y_scroll()
-                .px(px(20.)).pt(px(18.)).pb(px(16.)).rounded(px(8.)).border_1().border_color(p.border)
-                .bg(p.menu).text_size(px(12.5)).line_height(relative(1.65)).shadow_xl()
-                .child(div().mb(px(8.)).text_size(px(15.)).font_weight(FontWeight::BOLD).child("Everything 시작하기"))
-                .child(div().mb(px(10.)).child(StyledText::new(intro).with_highlights([(emphasis..emphasis + "전체 디스크 접근".len(), HighlightStyle {font_weight: Some(FontWeight::BOLD), ..Default::default()})])))
-                .child(div().flex().items_center().gap(px(8.)).px(px(10.)).py(px(8.)).mb(px(10.)).rounded(px(8.)).bg(rgba(if cx.theme().is_dark(){0xe8a02038}else{0xe8a0202e}))
+            div().id("onboarding-body").w(scaled_px(482.)).max_w_full().max_h_full().overflow_y_scroll()
+                .px(scaled_px(20.)).pt(scaled_px(18.)).pb(scaled_px(16.)).rounded(scaled_px(8.)).border_1().border_color(p.border)
+                .bg(p.menu).text_size(scaled_px(12.5)).line_height(relative(1.65)).shadow_xl()
+                .child(div().mb(scaled_px(8.)).text_size(scaled_px(15.)).font_weight(FontWeight::BOLD).child("Everything 시작하기"))
+                .child(div().mb(scaled_px(10.)).child(StyledText::new(intro).with_highlights([(emphasis..emphasis + "전체 디스크 접근".len(), HighlightStyle {font_weight: Some(FontWeight::BOLD), ..Default::default()})])))
+                .child(div().flex().items_center().gap(scaled_px(8.)).px(scaled_px(10.)).py(scaled_px(8.)).mb(scaled_px(10.)).rounded(scaled_px(8.)).bg(rgba(if cx.theme().is_dark(){0xe8a02038}else{0xe8a0202e}))
                     .child(div().flex_1().font_weight(if self.fda_ok{FontWeight::SEMIBOLD}else{FontWeight::MEDIUM}).when(self.fda_ok,|d|d.text_color(rgb(0x1f9d57))).child(if self.fda_ok{"✓ 전체 디스크 접근 허용됨"}else{"전체 디스크 접근이 아직 허용되지 않았습니다"}))
                     .when(!self.fda_ok,|d|d
-                        .child(self.dialog_button("onboarding-settings","설정 열기",UiAction::FdaSettings,0,false,cx).text_size(px(11.5)).font_weight(FontWeight::MEDIUM).px(px(10.)).py(px(3.)).rounded(px(5.)).border_0().bg(rgb(0xe8a020)).text_color(white()))
-                        .child(self.dialog_button("onboarding-restart","앱 재시작",UiAction::Restart,1,false,cx).text_size(px(11.5)).font_weight(FontWeight::MEDIUM).px(px(10.)).py(px(3.)).rounded(px(5.)).border_0().bg(rgb(0xe8a020)).text_color(white()))))
-                .child(div().mb(px(10.)).text_size(px(11.5)).opacity(0.75).child("시스템 설정 > 개인정보 보호 및 보안 > 전체 디스크 접근에서 Everything을 켜 주세요. 목록에 없으면 + 버튼으로 응용 프로그램에서 추가할 수 있습니다. 허용하면 이 창이 자동으로 감지합니다 — 잠시 후에도 감지되지 않으면 (시스템이 재실행을 요구하는 경우) '앱 재시작'을 눌러 주세요."))
-                .child(div().flex().justify_end().gap(px(8.)).mt(px(4.))
-                    .child(self.dialog_button("onboarding-start","시작하기",UiAction::OnboardGranted,3,self.action_busy||!self.fda_ok,cx).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).px(px(14.)).py(px(5.)).border_color(transparent_black()).bg(p.accent).text_color(p.bg))
-                    .child(self.dialog_button("onboarding-skip","나중에 (제한된 인덱스로 시작)",UiAction::OnboardSkip,2,self.action_busy,cx).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).px(px(14.)).py(px(5.)).bg(transparent_black()).text_color(p.text)))
+                        .child(self.dialog_button("onboarding-settings","설정 열기",UiAction::FdaSettings,0,false,cx).text_size(scaled_px(11.5)).font_weight(FontWeight::MEDIUM).px(scaled_px(10.)).py(scaled_px(3.)).rounded(scaled_px(5.)).border_0().bg(rgb(0xe8a020)).text_color(white()))
+                        .child(self.dialog_button("onboarding-restart","앱 재시작",UiAction::Restart,1,false,cx).text_size(scaled_px(11.5)).font_weight(FontWeight::MEDIUM).px(scaled_px(10.)).py(scaled_px(3.)).rounded(scaled_px(5.)).border_0().bg(rgb(0xe8a020)).text_color(white()))))
+                .child(div().mb(scaled_px(10.)).text_size(scaled_px(11.5)).opacity(0.75).child("시스템 설정 > 개인정보 보호 및 보안 > 전체 디스크 접근에서 Everything을 켜 주세요. 목록에 없으면 + 버튼으로 응용 프로그램에서 추가할 수 있습니다. 허용하면 이 창이 자동으로 감지합니다 — 잠시 후에도 감지되지 않으면 (시스템이 재실행을 요구하는 경우) '앱 재시작'을 눌러 주세요."))
+                .child(div().flex().justify_end().gap(scaled_px(8.)).mt(scaled_px(4.))
+                    .child(self.dialog_button("onboarding-start","시작하기",UiAction::OnboardGranted,3,self.action_busy||!self.fda_ok,cx).text_size(scaled_px(12.)).font_weight(FontWeight::SEMIBOLD).px(scaled_px(14.)).py(scaled_px(5.)).border_color(transparent_black()).bg(p.accent).text_color(p.bg))
+                    .child(self.dialog_button("onboarding-skip","나중에 (제한된 인덱스로 시작)",UiAction::OnboardSkip,2,self.action_busy,cx).text_size(scaled_px(12.)).font_weight(FontWeight::SEMIBOLD).px(scaled_px(14.)).py(scaled_px(5.)).bg(transparent_black()).text_color(p.text)))
                 .into_any_element()
         };
         div()
@@ -667,7 +709,7 @@ impl EverythingView {
             .flex()
             .items_center()
             .justify_center()
-            .p(px(24.))
+            .p(scaled_px(24.))
             .bg(rgba(if onboarding { 0x00000073 } else { 0x00000040 }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(body)
@@ -682,7 +724,7 @@ impl EverythingView {
             .relative()
             .flex()
             .items_center()
-            .h(px(30.))
+            .h(px(design::TITLEBAR_HEIGHT))
             .w_full()
             .flex_shrink_0()
             .when(!cfg!(target_os = "windows"), |title| {
@@ -716,19 +758,9 @@ impl EverythingView {
                     .min_w_0()
                     .h_full()
                     .items_center()
-                    .justify_center()
-                    .when(
-                        cfg!(target_os = "macos") && self.prefs.file_tree_visible,
-                        |title| {
-                            // Keep the centered title clear of the traffic lights
-                            // even when the results pane is at its minimum width.
-                            title.pl(px(20.))
-                        },
-                    )
-                    .when(
-                        cfg!(target_os = "windows") && !self.prefs.file_tree_visible,
-                        |title| title.pr(px(175.)),
-                    )
+                    // Left-aligned; on macOS start past the traffic lights
+                    // (16 + 2 * 23 + 14 = 76pt, see mac_menu::position_buttons).
+                    .pl(px(if cfg!(target_os = "macos") { 88. } else { 12. }))
                     .child(
                         div()
                             .flex()
@@ -737,7 +769,7 @@ impl EverythingView {
                             .child(
                                 svg()
                                     .path("everything/search.svg")
-                                    .size(px(12.))
+                                    .size(px(14.))
                                     .text_color(p.accent),
                             )
                             .child(
@@ -766,6 +798,7 @@ impl EverythingView {
             .when(!self.prefs.file_tree_visible, |title| {
                 title.child(self.file_tree_toggle(cx))
             })
+            .child(self.zoom_button(window, cx))
             .when(cfg!(target_os = "windows"), |title| {
                 title.child(
                     div()
@@ -808,7 +841,7 @@ impl EverythingView {
             "Indexing" => 0xfebc2e,
             _ => 0x28c840,
         };
-        let dot = div().size(px(6.)).rounded_full().bg(rgb(color));
+        let dot = div().size(scaled_px(6.)).rounded_full().bg(rgb(color));
         let dot = if self.status.state == "Indexing"
             || (self.status.state == "Ready" && self.status.background_active)
         {
@@ -837,21 +870,21 @@ impl EverythingView {
             .flex()
             .items_center()
             .justify_between()
-            .h(px(33.))
-            .px(px(16.))
+            .h(scaled_px(33.))
+            .px(scaled_px(16.))
             .flex_shrink_0()
             .border_t_1()
             .border_color(p.border)
             .font_family(MONO)
-            .text_size(px(11.))
-            .line_height(px(14.))
+            .text_size(scaled_px(11.))
+            .line_height(scaled_px(14.))
             .text_color(p.muted)
             .overflow_hidden()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(scaled_px(16.))
                     .min_w_0()
                     .overflow_hidden()
                     .when(selected.len() == 1, |d| {
@@ -865,7 +898,7 @@ impl EverythingView {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(6.))
+                                .gap(scaled_px(6.))
                                 .flex_shrink_0()
                                 .child(dot)
                                 .child(state),
@@ -912,19 +945,19 @@ impl EverythingView {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(scaled_px(8.))
                     .flex_shrink_0()
                     .child(
                         // Ghost icon button: Add/Ignore/Reset live in the settings dialog.
                         self.button("settings", "", UiAction::Settings, false, cx)
-                            .px(px(5.))
+                            .px(scaled_px(5.))
                             .border_color(transparent_black())
                             .bg(transparent_black())
                             .tooltip(|window, cx| Tooltip::new("Settings").build(window, cx))
                             .child(
                                 svg()
                                     .path("everything/settings.svg")
-                                    .size(px(14.))
+                                    .size(scaled_px(14.))
                                     .text_color(p.muted),
                             ),
                     ),
@@ -934,6 +967,8 @@ impl EverythingView {
 
 impl Render for EverythingView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let zoom = self.prefs.zoom;
+        window.set_rem_size(px(design::BASE_REM_SIZE * zoom));
         #[cfg(target_os = "macos")]
         if self.table_width == 0. {
             mac_menu::position_buttons(window);
@@ -943,25 +978,26 @@ impl Render for EverythingView {
         let window_width = f32::from(window.viewport_size().width);
         let width = window_width - tree_width;
         if self.prefs.columns == [0.; 4] {
-            self.prefs.columns = design::default_columns(window_width);
+            self.prefs.columns = design::default_columns(window_width / zoom);
         }
         if width != self.table_width {
             // Refit on every width change: a sub-pixel (or <=2px) stale table
             // left the content wider than the viewport mid-resize, flashing the
             // horizontal scrollbar. fit_columns keeps the user's proportions and
             // never writes back to preferences.
-            self.table_columns = design::fit_columns(self.prefs.columns, width);
+            self.table_columns =
+                design::fit_columns(self.prefs.columns, width / zoom).map(|value| value * zoom);
             self.table_width = width;
         }
         let widths = self.table_columns;
         let total_width = widths.iter().sum::<f32>();
         let p = Palette::get(cx);
         let row_count = self.model.rows.len();
-        let header_height = if cfg!(target_os = "windows") {
+        let header_height = (if cfg!(target_os = "windows") {
             25.
         } else {
             33.
-        };
+        }) * zoom;
         let header = div()
             .flex()
             .h(px(header_height))
@@ -988,13 +1024,13 @@ impl Render for EverythingView {
                                     .size_full()
                                     .flex()
                                     .items_center()
-                                    .gap(px(4.))
-                                    .px(px(8.))
-                                    .when(index == 0, |d| d.pl(px(16.)))
+                                    .gap(scaled_px(4.))
+                                    .px(scaled_px(8.))
+                                    .when(index == 0, |d| d.pl(scaled_px(16.)))
                                     .when(index == 2, |d| d.justify_end())
                                     .font_family(SANS)
-                                    .text_size(px(11.))
-                                    .line_height(px(11.))
+                                    .text_size(scaled_px(11.))
+                                    .line_height(scaled_px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(p.muted)
                                     .cursor_pointer()
@@ -1010,7 +1046,7 @@ impl Render for EverythingView {
                                                 } else {
                                                     "everything/sort-desc.svg"
                                                 })
-                                                .size(px(10.))
+                                                .size(scaled_px(10.))
                                                 .text_color(p.accent),
                                         )
                                     }),
@@ -1020,10 +1056,10 @@ impl Render for EverythingView {
                                     div()
                                         .id(("resize", index))
                                         .absolute()
-                                        .right(px(-4.))
+                                        .right(scaled_px(-4.))
                                         .top_0()
                                         .h_full()
-                                        .w(px(8.))
+                                        .w(scaled_px(8.))
                                         .cursor_col_resize()
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -1153,10 +1189,12 @@ impl Render for EverythingView {
                     let delta = f32::from(event.position.x - start.x).round();
                     if index == 0 {
                         this.table_columns[0] = (widths[0] + delta)
-                            .clamp(COLUMN_MIN[0], widths[0] + widths[1] - COLUMN_MIN[1]);
+                            .clamp(COLUMN_MIN[0] * this.prefs.zoom,
+                                widths[0] + widths[1] - COLUMN_MIN[1] * this.prefs.zoom);
                         this.table_columns[1] = widths[0] + widths[1] - this.table_columns[0];
                     } else {
-                        this.table_columns[index] = (widths[index] + delta).max(COLUMN_MIN[index]);
+                        this.table_columns[index] = (widths[index] + delta)
+                            .max(COLUMN_MIN[index] * this.prefs.zoom);
                     }
                     cx.notify();
                 } else if event.dragging() {
@@ -1180,7 +1218,7 @@ impl Render for EverythingView {
                 cx.listener(|this, _, _, cx| {
                     this.finish_file_tree_resize(cx);
                     if this.resizing.take().is_some() {
-                        this.prefs.columns = this.table_columns;
+                        this.prefs.columns = this.table_columns.map(|width| width / this.prefs.zoom);
                         this.save_preferences(cx);
                     }
                     this.drag_start = None;
@@ -1191,7 +1229,7 @@ impl Render for EverythingView {
                 cx.listener(|this, _, _, cx| {
                     this.finish_file_tree_resize(cx);
                     if this.resizing.take().is_some() {
-                        this.prefs.columns = this.table_columns;
+                        this.prefs.columns = this.table_columns.map(|width| width / this.prefs.zoom);
                         this.save_preferences(cx);
                     }
                     this.drag_start = None;
@@ -1206,18 +1244,18 @@ impl Render for EverythingView {
                     "전체 디스크 접근을 허용하면 자동으로 반영됩니다 (인덱서가 1분 내 감지)."
                 } else {
                     "전체 디스크 접근을 허용하면 보호된 폴더까지 검색할 수 있습니다."
-                }, cx).child(div().flex().gap(px(6.)).flex_shrink_0()
+                }, cx).child(div().flex().gap(scaled_px(6.)).flex_shrink_0()
                     .child(self.notice_button("fda-settings", "설정 열기", UiAction::FdaSettings, false, false, cx))
                     .child(self.notice_button("fda-dismiss", "닫기", UiAction::DismissFda, true, false, cx)))),
             )
             .when(self.status_display.pathignore_changed, |app| app.child(
                 self.notice_banner("설정 파일(.pathignore)이 변경되었습니다. 재시작 후 적용됩니다.", cx)
-                    .child(div().flex().gap(px(6.)).flex_shrink_0()
+                    .child(div().flex().gap(scaled_px(6.)).flex_shrink_0()
                         .child(self.notice_button("pathignore-restart", "재시작", UiAction::Restart, false, false, cx))
                         .child(self.notice_button("pathignore-dismiss", "닫기", UiAction::DismissIgnore, true, false, cx)))))
             .when(self.status_display.pathindexing_changed, |app| app.child(
                 self.notice_banner("인덱싱 경로(.pathindexing)가 변경되어 반영되었습니다.", cx)
-                    .child(div().flex().gap(px(6.)).flex_shrink_0()
+                    .child(div().flex().gap(scaled_px(6.)).flex_shrink_0()
                         .child(self.notice_button("pathindexing-dismiss", "닫기", UiAction::DismissIndexing, true, false, cx)))))
             .when_some(self.health.clone(), |app, health| {
                 app.child(self.health_banner(&health, cx))
@@ -1239,33 +1277,33 @@ impl Render for EverythingView {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .h(px(44.))
+                                    .h(scaled_px(44.))
                                     .flex_shrink_0()
-                                    .px(px(if cfg!(target_os = "windows") { 8. } else { 16. }))
+                                    .px(scaled_px(if cfg!(target_os = "windows") { 8. } else { 16. }))
                                     .child(
                                         Input::new(&self.input)
                                             .appearance(false)
-                                            .min_h(px(if cfg!(target_os = "windows") {
+                                            .min_h(scaled_px(if cfg!(target_os = "windows") {
                                                 30.
                                             } else {
                                                 34.
                                             }))
-                                            .max_h(px(if cfg!(target_os = "windows") {
+                                            .max_h(scaled_px(if cfg!(target_os = "windows") {
                                                 30.
                                             } else {
                                                 34.
                                             }))
                                             .w_full()
-                                            .px(px(10.))
+                                            .px(scaled_px(10.))
                                             .py_0()
-                                            .rounded(px(6.))
+                                            .rounded(scaled_px(6.))
                                             .font_family(SANS)
-                                            .text_size(px(if cfg!(target_os = "windows") {
+                                            .text_size(scaled_px(if cfg!(target_os = "windows") {
                                                 13.
                                             } else {
                                                 12.
                                             }))
-                                            .line_height(px(18.))
+                                            .line_height(scaled_px(18.))
                                             .bg(p.input)
                                             .border_1()
                                             // Orca's filter field: focus-within:border-ring ring-1 ring-ring.
@@ -1279,7 +1317,7 @@ impl Render for EverythingView {
                                                     color: p.ring,
                                                     offset: point(px(0.), px(0.)),
                                                     blur_radius: px(0.),
-                                                    spread_radius: px(1.),
+                                                    spread_radius: px(1. * self.prefs.zoom),
                                                 }])
                                             }),
                                     ),
@@ -1297,23 +1335,26 @@ impl Render for EverythingView {
                     app.child(
                         div()
                             .absolute()
-                            .right(px(14.))
-                            .bottom(px(18.))
-                            .px(px(12.))
-                            .py(px(9.))
-                            .rounded(px(8.))
+                            .right(scaled_px(14.))
+                            .bottom(scaled_px(18.))
+                            .px(scaled_px(12.))
+                            .py(scaled_px(9.))
+                            .rounded(scaled_px(8.))
                             .border_1()
                             .border_color(p.border)
                             .shadow_lg()
                             .bg(p.toast)
                             .text_color(p.toast_text)
-                            .text_size(px(12.))
+                            .text_size(scaled_px(12.))
                             .child(text),
                     )
                 },
             )
             .child(self.context_menu(cx))
             .child(self.modal(cx))
+            .when(self.zoom_popover.visible, |app| {
+                app.child(self.zoom_popover(window, cx))
+            })
     }
 }
 
@@ -1367,16 +1408,16 @@ impl EverythingView {
         div()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .px(px(12.))
-            .py(px(7.))
+            .gap(scaled_px(8.))
+            .px(scaled_px(12.))
+            .py(scaled_px(7.))
             .flex_shrink_0()
             .min_w_0()
             // shadcn Alert: neutral surface with a hairline, not a solid amber bar.
             .bg(Palette::get(cx).hover)
             .border_b_1()
             .border_color(Palette::get(cx).border)
-            .text_size(px(11.5))
+            .text_size(scaled_px(11.5))
             .line_height(relative(1.4))
             .text_color(Palette::get(cx).text)
             .child(div().flex_1().min_w_0().child(text))
@@ -1394,7 +1435,7 @@ impl EverythingView {
         // shadcn outline button; dismiss is the ghost variant.
         let p = Palette::get(cx);
         self.button(id, text, action, disabled, cx)
-            .px(px(10.))
+            .px(scaled_px(10.))
             .font_weight(FontWeight::MEDIUM)
             .when(dismiss, |button| {
                 button
@@ -1424,7 +1465,7 @@ impl EverythingView {
         self.notice_banner(text, cx).child(
             div()
                 .flex()
-                .gap(px(6.))
+                .gap(scaled_px(6.))
                 .flex_shrink_0()
                 .when(health == "not_registered", |d| {
                     d.child(self.notice_button(
@@ -1475,6 +1516,14 @@ impl EverythingView {
 
     pub(super) fn write_test_state(&self, window: &Window, cx: &App) {
         if let Some(path) = std::env::var_os("EVERYTHING_UI_STATE") {
+            let zoom_button = self.zoom_button_bounds(window);
+            let zoom_popover = self.zoom_popover_bounds(window);
+            let zoom_state = serde_json::json!({
+                "visible":self.zoom_popover.visible,"pinned":self.zoom_popover.pinned,
+                "hovered":self.zoom_popover.hovered,"keyboardSelection":self.zoom_popover.keyboard_selection,
+                "buttonBounds":[f32::from(zoom_button.origin.x),f32::from(zoom_button.origin.y),f32::from(zoom_button.size.width),f32::from(zoom_button.size.height)],
+                "bounds":[f32::from(zoom_popover.origin.x),f32::from(zoom_popover.origin.y),f32::from(zoom_popover.size.width),f32::from(zoom_popover.size.height)],
+            });
             let state = serde_json::json!({
                 "query":self.model.query,"rows":self.model.rows.iter().take(35).map(|e|serde_json::json!({"name":e.name,"path":e.path,"dir":e.dir,"size":e.size,"isDir":e.is_dir})).collect::<Vec<_>>(),
                 "loaded":self.model.rows.len(),"total":self.model.total,"totalKnown":self.model.total_known,"busy":self.model.busy,"paging":self.model.paging,
@@ -1488,6 +1537,9 @@ impl EverythingView {
                 "fileTree":self.file_tree_test_state(window),
                 "toast":self.toast.as_ref().map(|(s,_)|s),"theme":if cx.theme().is_dark(){"dark"}else{"light"},"columns":self.table_columns,"error":self.model.error,"actionBusy":self.action_busy,"completedAction":self.completed_action.map(|action|format!("{action:?}")),
                 "width":f32::from(window.viewport_size().width),"height":f32::from(window.viewport_size().height),
+                "zoom":self.prefs.zoom,"rowHeight":self.row_height(),
+                "resultsTop":f32::from(self.list_scroll.0.borrow().base_handle.bounds().origin.y),
+                "zoomPopover":zoom_state,
             });
             let _ = std::fs::write(path, state.to_string());
         }

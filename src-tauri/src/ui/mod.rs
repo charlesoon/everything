@@ -8,8 +8,10 @@ mod file_icons;
 mod file_tree;
 #[cfg(target_os = "macos")]
 mod mac_menu;
+mod middle_text;
 mod status;
 mod view;
+mod zoom;
 
 use std::{
     collections::HashMap,
@@ -71,7 +73,7 @@ pub(super) fn run() {
                     titlebar: Some(TitlebarOptions {
                         title: Some("Everything".into()),
                         appears_transparent: true,
-                        traffic_light_position: Some(point(px(12.), px(8.))),
+                        traffic_light_position: Some(point(px(16.), px(12.))),
                     }),
                     app_id: Some("com.everything.app".into()),
                     window_min_size: Some(size(px(400.), px(300.))),
@@ -118,6 +120,7 @@ struct EverythingView {
     list_scroll: UniformListScrollHandle,
     horizontal_scroll: ScrollHandle,
     file_tree: file_tree::State,
+    zoom_popover: zoom::Popover,
     status: IndexStatusDto,
     status_display: status::StatusDisplay,
     status_task: Option<Task<()>>,
@@ -136,6 +139,8 @@ struct EverythingView {
     action_busy: bool,
     completed_action: Option<UiAction>,
     toast: Option<(String, Instant)>,
+    /// Inline "Copied" badge next to a copyable path: (element id, when).
+    copied: Option<(&'static str, Instant)>,
     search_task: Option<Task<()>>,
     preference_task: Option<Task<()>>,
     input_started: Instant,
@@ -178,6 +183,7 @@ impl EverythingView {
             list_scroll: UniformListScrollHandle::new(),
             horizontal_scroll: ScrollHandle::new(),
             file_tree: file_tree::State::new(cx),
+            zoom_popover: zoom::Popover::default(),
             status_display: status::StatusDisplay::new(&status),
             status_task: None,
             status,
@@ -194,6 +200,7 @@ impl EverythingView {
             action_busy: false,
             completed_action: None,
             toast: None,
+            copied: None,
             fda_polling: false,
             fixture_onboarding_decided: false,
             search_task: None,
@@ -274,6 +281,7 @@ impl EverythingView {
             .push(cx.observe_window_activation(window, |this, window, cx| {
                 if !window.is_window_active() {
                     this.cancel_pending_rename();
+                    this.close_zoom_popover(cx);
                 }
                 crate::ui_gate::set_visible(&this.sink, window.is_window_active());
                 if window.is_window_active() {
@@ -520,7 +528,7 @@ impl EverythingView {
         let p = design::Palette::get(cx);
         let theme = Theme::global_mut(cx);
         theme.font_family = design::SANS.into();
-        theme.font_size = px(12.);
+        theme.font_size = px(design::BASE_REM_SIZE * self.prefs.zoom);
         theme.background = p.bg;
         theme.foreground = p.text;
         theme.muted_foreground = p.muted.opacity(0.85);
@@ -532,8 +540,8 @@ impl EverythingView {
         theme.ring = p.ring;
         theme.popover = p.menu;
         theme.popover_foreground = p.menu_text;
-        theme.radius = px(6.);
-        theme.radius_lg = px(8.);
+        theme.radius = px(6. * self.prefs.zoom);
+        theme.radius_lg = px(8. * self.prefs.zoom);
     }
 
     fn notify_message(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
