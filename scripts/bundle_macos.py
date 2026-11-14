@@ -160,6 +160,11 @@ def main():
     (contents / 'Resources').mkdir()
     shutil.copy2(binary, contents / 'MacOS/everything')
     shutil.copy2(ROOT / 'src-tauri/icons/icon.icns', contents / 'Resources/icon.icns')
+    # Liquid Glass icon (macOS 26+). Regenerate both from everything.icon with:
+    #   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun actool everything.icon --compile <out> \
+    #     --app-icon everything --platform macosx --minimum-deployment-target 12.0 --output-partial-info-plist <out>/p.plist
+    #   then copy <out>/Assets.car and <out>/everything.icns (as icon.icns) into src-tauri/icons/.
+    shutil.copy2(ROOT / 'src-tauri/icons/Assets.car', contents / 'Resources/Assets.car')
     licenses = contents / 'Resources/licenses'
     licenses.mkdir()
     for name in ['geist-LICENSE.txt', 'jetbrains-mono-LICENSE.txt']:

@@ -1,165 +1,179 @@
 {
-  "fill-specializations" : [
+  "fill-specializations": [
     {
-      "value" : "system-light"
+      "value": {
+        "solid": "srgb:0.98039,0.98039,0.98039,1.00000"
+      }
     },
     {
-      "appearance" : "dark",
-      "value" : "system-dark"
+      "appearance": "dark",
+      "value": {
+        "solid": "srgb:0.09020,0.09020,0.09020,1.00000"
+      }
     }
   ],
-  "groups" : [
+  "groups": [
     {
-      "blend-mode-specializations" : [
+      "blend-mode-specializations": [
         {
-          "value" : "normal"
+          "value": "normal"
         },
         {
-          "appearance" : "dark",
-          "value" : "normal"
+          "appearance": "dark",
+          "value": "normal"
         }
       ],
-      "blur-material-specializations" : [
+      "blur-material-specializations": [
         {
-          "value" : 0.15
+          "value": 0.15
         },
         {
-          "appearance" : "dark",
-          "value" : 0.15
+          "appearance": "dark",
+          "value": 0.15
         }
       ],
-      "hidden" : false,
-      "layers" : [
+      "hidden": false,
+      "layers": [
         {
-          "blend-mode" : "normal",
-          "fill" : "automatic",
-          "glass" : false,
-          "hidden" : false,
-          "image-name" : "everything-icon-search.svg",
-          "name" : "everything-icon-search",
-          "opacity" : 1,
-          "position" : {
-            "scale" : 1.3,
-            "translation-in-points" : [
-              8,
-              -6
+          "blend-mode": "normal",
+          "hidden": false,
+          "image-name": "search.svg",
+          "name": "search",
+          "opacity": 1,
+          "position": {
+            "scale": 1,
+            "translation-in-points": [
+              0,
+              0
             ]
-          }
+          },
+          "fill-specializations": [
+            {
+              "value": {
+                "solid": "srgb:0.44314,0.44314,0.47843,1.00000"
+              }
+            },
+            {
+              "appearance": "dark",
+              "value": {
+                "solid": "srgb:0.63137,0.63137,0.66667,1.00000"
+              }
+            }
+          ],
+          "glass": true
         }
       ],
-      "lighting" : "individual",
-      "name" : "Magnifier",
-      "shadow-specializations" : [
+      "lighting": "individual",
+      "name": "Magnifier",
+      "shadow-specializations": [
         {
-          "appearance" : "light",
-          "value" : {
-            "kind" : "layer-color",
-            "opacity" : 0.28
+          "appearance": "light",
+          "value": {
+            "kind": "layer-color",
+            "opacity": 0.28
           }
         },
         {
-          "appearance" : "dark",
-          "value" : {
-            "kind" : "neutral",
-            "opacity" : 0.5
+          "appearance": "dark",
+          "value": {
+            "kind": "neutral",
+            "opacity": 0.5
           }
         }
       ],
-      "specular-specializations" : [
+      "specular-specializations": [
         {
-          "value" : true
+          "value": true
         },
         {
-          "appearance" : "dark",
-          "value" : true
+          "appearance": "dark",
+          "value": true
         }
       ],
-      "translucency-specializations" : [
+      "translucency-specializations": [
         {
-          "value" : {
-            "enabled" : false,
-            "value" : 0
+          "value": {
+            "enabled": false,
+            "value": 0
           }
         },
         {
-          "appearance" : "dark",
-          "value" : {
-            "enabled" : false,
-            "value" : 0
+          "appearance": "dark",
+          "value": {
+            "enabled": false,
+            "value": 0
           }
         }
       ]
     },
     {
-      "blend-mode-specializations" : [
+      "blend-mode-specializations": [
         {
-          "value" : "normal"
+          "value": "normal"
         },
         {
-          "appearance" : "dark",
-          "value" : "normal"
+          "appearance": "dark",
+          "value": "normal"
         }
       ],
-      "blur-material-specializations" : [
+      "blur-material-specializations": [
         {
-          "value" : 0.5
+          "value": 0.5
         },
         {
-          "appearance" : "dark",
-          "value" : 0.5
+          "appearance": "dark",
+          "value": 0.5
         }
       ],
-      "hidden" : false,
-      "layers" : [
-
-      ],
-      "lighting" : "individual",
-      "name" : "Background",
-      "shadow-specializations" : [
+      "hidden": false,
+      "layers": [],
+      "lighting": "individual",
+      "name": "Background",
+      "shadow-specializations": [
         {
-          "value" : {
-            "kind" : "none",
-            "opacity" : 0
+          "value": {
+            "kind": "none",
+            "opacity": 0
           }
         },
         {
-          "appearance" : "dark",
-          "value" : {
-            "kind" : "none",
-            "opacity" : 0
+          "appearance": "dark",
+          "value": {
+            "kind": "none",
+            "opacity": 0
           }
         }
       ],
-      "specular-specializations" : [
+      "specular-specializations": [
         {
-          "value" : true
+          "value": true
         },
         {
-          "appearance" : "dark",
-          "value" : true
+          "appearance": "dark",
+          "value": true
         }
       ],
-      "translucency-specializations" : [
+      "translucency-specializations": [
         {
-          "value" : {
-            "enabled" : true,
-            "value" : 0.25
+          "value": {
+            "enabled": true,
+            "value": 0.25
           }
         },
         {
-          "appearance" : "dark",
-          "value" : {
-            "enabled" : true,
-            "value" : 0.2
+          "appearance": "dark",
+          "value": {
+            "enabled": true,
+            "value": 0.2
           }
         }
       ]
     }
   ],
-  "supported-platforms" : {
-    "circles" : [
+  "supported-platforms": {
+    "circles": [
       "watchOS"
     ],
-    "squares" : "shared"
+    "squares": "shared"
   }
 }

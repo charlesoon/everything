@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Lucide "search" (ISC), the titlebar glyph, at app-icon weight (2.5 on the 24px grid),
+       outlined to fills: the Liquid Glass renderer ignores SVG strokes. -->
+  <g transform="translate(242 242) scale(22.5)" fill="#71717a">
+    <path fill-rule="evenodd" d="M1.75 11a9.25 9.25 0 1 0 18.5 0a9.25 9.25 0 1 0-18.5 0ZM4.25 11a6.75 6.75 0 1 0 13.5 0a6.75 6.75 0 1 0-13.5 0Z"/>
+    <path d="M15.776 17.544L20.116 21.884A1.25 1.25 0 0 0 21.884 20.116L17.544 15.776A1.25 1.25 0 0 0 15.776 17.544Z"/>
+  </g>
+</svg>
