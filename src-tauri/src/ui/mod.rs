@@ -154,6 +154,8 @@ struct EverythingView {
     preference_task: Option<Task<()>>,
     input_started: Instant,
     search_started: Instant,
+    /// The in-flight search is an index-change refresh, not a user request.
+    index_refresh: bool,
     startup_started: Instant,
     first_results_logged: bool,
     last_search_ms: f64,
@@ -222,6 +224,7 @@ impl EverythingView {
             preference_task: None,
             input_started: started,
             search_started: started,
+            index_refresh: false,
             startup_started: started,
             first_results_logged: false,
             last_search_ms: 0.,
@@ -329,7 +332,7 @@ impl EverythingView {
                                 .get("index_state")
                                 .is_some_and(|event| event["state"] == "Ready")
                         {
-                            this.schedule_search(true, false, window, cx);
+                            this.refresh_for_index_change(window, cx);
                             this.refresh_file_tree(cx);
                         }
                         cx.notify();
@@ -381,6 +384,11 @@ impl EverythingView {
     }
 
     fn search_activity(&self) -> Option<String> {
+        // Watcher-driven refreshes over already-shown rows run every few
+        // seconds on a busy volume; flashing "Searching" for them is noise.
+        if self.index_refresh && !self.model.rows.is_empty() {
+            return None;
+        }
         if self.model.busy || self.model.paging {
             Some(format!(
                 "{} · {}s",
@@ -471,6 +479,11 @@ impl EverythingView {
         cx.notify();
     }
 
+    fn refresh_for_index_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.schedule_search(true, false, window, cx);
+        self.index_refresh = true;
+    }
+
     fn search_page(
         &mut self,
         offset: usize,
@@ -488,6 +501,7 @@ impl EverythingView {
             self.model.busy = true;
         }
         self.search_started = Instant::now();
+        self.index_refresh = false;
         self.refresh_activity_timer(cx);
         let state = self.backend.clone();
         let sink = self.sink.clone();
