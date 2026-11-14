@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build/sign a native .app and optionally a DMG, without changing the source tree.
 
-APPLE_SIGNING_IDENTITY defaults to ad-hoc (-). NOTARY_PROFILE, when set, names
-an existing notarytool keychain profile and opts into notarization of the DMG.
+Signing and notarization use the ignored certificates/import.json in this or
+the main checkout. APPLE_SIGNING_IDENTITY and NOTARY_PROFILE override those
+settings; APPLE_SIGNING_IDENTITY=- explicitly selects an ad-hoc build.
 """
 import argparse
 import json
@@ -11,6 +12,7 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,62 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def run(*args, **kwargs):
     subprocess.run([str(arg) for arg in args], check=True, **kwargs)
+
+
+def signing_settings(env):
+    if env.get('APPLE_SIGNING_IDENTITY') == '-':
+        return '-', {}
+    config = ROOT / 'certificates/import.json'
+    if not config.is_file():
+        try:
+            common = subprocess.check_output(
+                ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                cwd=ROOT, stderr=subprocess.DEVNULL, text=True).strip()
+            config = Path(common).parent / 'certificates/import.json'
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    apple = {}
+    if config.is_file():
+        try:
+            apple = json.loads(config.read_text())['apple']
+        except (OSError, ValueError, KeyError, TypeError):
+            raise SystemExit(f'Cannot read Apple signing settings from {config}') from None
+        fields = ['developer_id', 'apple_id', 'apple_password', 'team_id']
+        if not isinstance(apple, dict) or any(not isinstance(apple.get(key, ''), str) for key in fields):
+            raise SystemExit(f'Apple signing settings must contain string values: {config}')
+        print(f'Using signing settings: {config}', flush=True)
+    identity = env.get('APPLE_SIGNING_IDENTITY') or apple.get('developer_id') or '-'
+    return identity, apple
+
+
+def notarize(dmg, env, apple):
+    args = ['xcrun', 'notarytool', 'submit', str(dmg), '--wait', '--output-format', 'json']
+    if env.get('NOTARY_PROFILE'):
+        args += ['--keychain-profile', env['NOTARY_PROFILE']]
+    else:
+        args += ['--apple-id', apple['apple_id'], '--password', apple['apple_password'],
+                 '--team-id', apple['team_id']]
+    print('Submitting DMG for notarization...', flush=True)
+    # Do not use check=True: CalledProcessError would print credential arguments.
+    result = subprocess.run(args, env=env, capture_output=True, text=True)
+    if result.returncode:
+        output = result.stdout + result.stderr
+        for key in ['apple_id', 'apple_password']:
+            if apple.get(key):
+                output = output.replace(apple[key], '<redacted>')
+        print(output, file=sys.stderr)
+        raise SystemExit('Notarization submission failed.')
+    try:
+        report = json.loads(result.stdout)
+        status = report['status']
+        submission = report['id']
+    except (ValueError, KeyError, TypeError):
+        raise SystemExit('Notary service returned an invalid result.') from None
+    print(f'Notarization: {status} ({submission})', flush=True)
+    if status != 'Accepted':
+        raise SystemExit('Notarization was not accepted; no ticket was stapled.')
+    run('xcrun', 'stapler', 'staple', dmg, env=env)
+    run('xcrun', 'stapler', 'validate', dmg, env=env)
 
 
 def main():
@@ -32,6 +90,13 @@ def main():
     env.setdefault('MACOSX_DEPLOYMENT_TARGET', '13.0')
     if Path('/Applications/Xcode.app/Contents/Developer').is_dir():
         env.setdefault('DEVELOPER_DIR', '/Applications/Xcode.app/Contents/Developer')
+    identity, apple = signing_settings(env)
+    if identity != '-':
+        identities = subprocess.check_output(
+            ['security', 'find-identity', '-v', '-p', 'codesigning'], text=True, env=env)
+        if identity not in identities:
+            raise SystemExit(f'Signing identity is not installed in the keychain: {identity}')
+    print(f'Signing identity: {identity}', flush=True)
     cargo = ['cargo', 'build', '--manifest-path', ROOT / 'src-tauri/Cargo.toml', '--release', '--locked']
     if args.target:
         cargo += ['--target', args.target]
@@ -83,12 +148,11 @@ def main():
     agent = plistlib.loads((agents / agent_name).read_bytes())
     if not (app / agent['BundleProgram']).is_file():
         raise SystemExit('LaunchAgent BundleProgram does not resolve inside the app')
-    identity = env.get('APPLE_SIGNING_IDENTITY', '-')
     sign = ['codesign', '--force', '--sign', identity, '--options', 'runtime', '--entitlements', ROOT / 'src-tauri/Entitlements.plist']
     if identity != '-':
         sign += ['--timestamp']
-    run(*sign, app)
-    run('codesign', '--verify', '--deep', '--strict', app)
+    run(*sign, app, env=env)
+    run('codesign', '--verify', '--deep', '--strict', app, env=env)
     print(app, flush=True)
     if not args.dmg:
         return
@@ -101,10 +165,9 @@ def main():
         run('ditto', app, stage / 'Everything.app')
         (stage / 'Applications').symlink_to('/Applications')
         run('hdiutil', 'create', '-volname', 'Everything', '-srcfolder', stage, '-ov', '-format', 'UDZO', dmg)
-    if env.get('NOTARY_PROFILE'):
-        run('xcrun', 'notarytool', 'submit', dmg, '--keychain-profile', env['NOTARY_PROFILE'], '--wait')
-        run('xcrun', 'stapler', 'staple', dmg)
-        run('xcrun', 'stapler', 'validate', dmg)
+    credentials = all(apple.get(key) for key in ['apple_id', 'apple_password', 'team_id'])
+    if env.get('NOTARY_PROFILE') or (identity != '-' and credentials):
+        notarize(dmg, env, apple)
     print(dmg, flush=True)
 
 

@@ -32,7 +32,7 @@ cargo run --manifest-path src-tauri/Cargo.toml
 # Release executable
 cargo build --release --locked --manifest-path src-tauri/Cargo.toml
 
-# macOS .app / .dmg (ad-hoc signing by default)
+# macOS .app / .dmg (uses local signing settings when available)
 python3 scripts/bundle_macos.py
 scripts/build_dmg.sh
 
@@ -45,9 +45,18 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 
 On macOS, scope `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` to
 Cargo commands when the default developer directory is Command Line Tools.
-The packaging script does this automatically. For Developer ID releases, set
-`APPLE_SIGNING_IDENTITY`; optional `NOTARY_PROFILE` names an existing notarytool
-keychain profile. Packaging leaves the working source unchanged.
+The packaging script does this automatically. It also reads the ignored
+`certificates/import.json` from the checkout, or the main checkout when using a
+Git worktree. Its `apple.developer_id` selects the installed signing identity;
+`apple.apple_id`, `apple.apple_password` and `apple.team_id` enable automatic
+notarization and stapling. With this local file, `scripts/build_dmg.sh` needs no
+environment variables. Keep the file and certificate bundles untracked.
+
+`APPLE_SIGNING_IDENTITY` overrides the identity, and `NOTARY_PROFILE` selects an
+existing notarytool keychain profile instead of the local Apple credentials.
+`APPLE_SIGNING_IDENTITY=-` explicitly requests an ad-hoc build without automatic
+notarization, as used in CI. Without local settings or overrides, packaging also
+falls back to ad-hoc signing. Packaging leaves the working source unchanged.
 
 Node is optional. Existing npm entry points are dependency-free aliases:
 `npm run dev`, `npm run build`, `npm run bundle`, `npm run bundle:dmg`,
