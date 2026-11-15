@@ -384,9 +384,14 @@ impl EverythingView {
     }
 
     fn search_activity(&self) -> Option<String> {
-        // Watcher-driven refreshes over already-shown rows run every few
-        // seconds on a busy volume; flashing "Searching" for them is noise.
-        if self.index_refresh && !self.model.rows.is_empty() {
+        // Watcher-driven refreshes run every few seconds on a busy volume and
+        // keep the current results meanwhile, so they never earn the indicator.
+        // With rows on screen, a user search does only once it is slow enough
+        // to notice; sub-second ones would just flash on every keystroke.
+        if self.index_refresh
+            || (!self.model.rows.is_empty()
+                && self.search_started.elapsed() < SEARCH_ACTIVITY_DELAY)
+        {
             return None;
         }
         if self.model.busy || self.model.paging {
@@ -713,3 +718,5 @@ fn telemetry(value: serde_json::Value) {
         }
     }
 }
+
+const SEARCH_ACTIVITY_DELAY: Duration = Duration::from_secs(1);
