@@ -169,7 +169,10 @@ impl EverythingView {
             .right(px(if cfg!(target_os = "windows") {
                 147.
             } else {
-                16. // same right inset as the status-bar settings button
+                // Drawn edge 16px from the window edge, like the traffic
+                // lights on the left: 9 + (26 - 16) / 2 + panel-right.svg's
+                // own ~2.3px inset (its rect stops at 17.1 of 20).
+                9.
             }))
             .top(px(8.)) // (38px titlebar - 22px button) / 2
             .w(px(26.))
@@ -245,7 +248,9 @@ impl EverythingView {
                     } else {
                         33.
                     }))
-                    .px(scaled_px(10.))
+                    // "Files" and the refresh icon sit 16px in: 11 + (22 - 12) / 2.
+                    .pl(scaled_px(16.))
+                    .pr(scaled_px(11.))
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(p.border)
@@ -285,7 +290,7 @@ impl EverythingView {
                 panel.child(
                     self.copyable_path("file-tree-path", root.to_string_lossy().into_owned(), cx)
                         .h(scaled_px(26.))
-                        .px(scaled_px(12.))
+                        .px(scaled_px(16.))
                         .flex()
                         .items_center()
                         .flex_shrink_0()
@@ -371,7 +376,7 @@ impl EverythingView {
         let row = &self.file_tree.model.rows[index];
         let p = design::Palette::get(cx);
         // Leave room for the name even after following a deeply nested result.
-        let indent = (row.depth as f32 * 14.).min((width / self.prefs.zoom - 146.).max(0.));
+        let indent = (row.depth as f32 * 14.).min((width / self.prefs.zoom - 154.).max(0.));
         let container = div()
             .id(("file-tree-row", index))
             .relative()
@@ -380,7 +385,7 @@ impl EverythingView {
             .gap(scaled_px(5.))
             .h(scaled_px(design::ROW_HEIGHT))
             .w_full()
-            .pl(scaled_px(8. + indent))
+            .pl(scaled_px(16. + indent))
             .pr(scaled_px(20.))
             .text_size(scaled_px(12.))
             .line_height(scaled_px(15.))
@@ -397,7 +402,7 @@ impl EverythingView {
                 };
                 return container
                     .text_color(p.muted)
-                    .pl(scaled_px(28. + indent))
+                    .pl(scaled_px(36. + indent))
                     .tooltip({
                         let message = message.clone();
                         move |window, cx| Tooltip::new(message.clone()).build(window, cx)

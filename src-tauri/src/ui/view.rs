@@ -896,7 +896,10 @@ impl EverythingView {
             .items_center()
             .justify_between()
             .h(scaled_px(33.))
-            .px(scaled_px(16.))
+            // Settings glyph edge 16px from the right: 8.5 + 1 border + 5
+            // padding + settings.svg's own ~1.5px inset (21.5 of 24 at 14px).
+            .pl(scaled_px(16.))
+            .pr(scaled_px(8.5))
             .flex_shrink_0()
             .border_t_1()
             .border_color(p.border)
