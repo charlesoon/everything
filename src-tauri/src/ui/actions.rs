@@ -829,14 +829,23 @@ impl EverythingView {
                     let scale = window.scale_factor();
                     let x = (f32::from(b.origin.x + position.x) * scale) as i32;
                     let y = (f32::from(b.origin.y + position.y) * scale) as i32;
-                    if let Err(error) = crate::win::context_menu::show(
-                        handle.hwnd.get(),
-                        &self.action_paths(),
-                        x,
-                        y,
-                    ) {
-                        self.notify_message(error, cx);
-                    }
+                    let hwnd = handle.hwnd.get();
+                    let paths = self.action_paths();
+                    // TrackPopupMenu runs a nested modal loop that keeps
+                    // dispatching GPUI tasks. Inside this update the app stays
+                    // borrowed, so those tasks would fail or panic; show the
+                    // menu from a task, outside any update.
+                    cx.spawn_in(window, async move |view, cx| {
+                        let choice = crate::win::context_menu::show(hwnd, &paths, x, y);
+                        let _ = view.update_in(cx, |this, window, cx| match choice {
+                            Ok(crate::win::context_menu::MenuChoice::Delete) => {
+                                this.action(UiAction::TrashImmediately, window, cx)
+                            }
+                            Ok(crate::win::context_menu::MenuChoice::Handled) => {}
+                            Err(error) => this.notify_message(error, cx),
+                        });
+                    })
+                    .detach();
                     return;
                 }
             }

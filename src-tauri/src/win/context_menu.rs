@@ -2,12 +2,13 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
-use windows::core::PCWSTR;
+use windows::core::{PCWSTR, PSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IContextMenu, IShellFolder, SHBindToParent, SHParseDisplayName, CMINVOKECOMMANDINFO,
+    GCS_VERBW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, InsertMenuItemW, TrackPopupMenu, HMENU, MENUITEMINFOW,
@@ -52,9 +53,23 @@ fn insert_separator(hmenu: HMENU, pos: u32) {
 
 /// Shows a native Windows Explorer context menu for the given paths.
 /// `hwnd_raw` is the raw HWND as isize (to be Send-safe across threads).
-pub fn show(hwnd_raw: isize, paths: &[String], screen_x: i32, screen_y: i32) -> Result<(), String> {
+/// A menu pick the app performs itself instead of the shell.
+pub enum MenuChoice {
+    Handled,
+    /// The shell's Delete verb. The shell deletes on its own thread after the
+    /// menu returns and the index catches up seconds later; the app's own trash
+    /// action hides the rows at once.
+    Delete,
+}
+
+pub fn show(
+    hwnd_raw: isize,
+    paths: &[String],
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<MenuChoice, String> {
     if paths.is_empty() {
-        return Ok(());
+        return Ok(MenuChoice::Handled);
     }
 
     let _com = ComGuard::init()?;
@@ -81,6 +96,7 @@ pub fn show(hwnd_raw: isize, paths: &[String], screen_x: i32, screen_y: i32) -> 
     };
 
     let cmd_id = selected.0 as u32;
+    let mut choice = MenuChoice::Handled;
     if cmd_id == ID_OPEN {
         open_paths(paths);
     } else if cmd_id == ID_REVEAL {
@@ -89,12 +105,17 @@ pub fn show(hwnd_raw: isize, paths: &[String], screen_x: i32, screen_y: i32) -> 
         copy_paths_to_clipboard(paths);
     } else if cmd_id >= ID_CMD_FIRST {
         if let Ok(ref ctx) = shell_ctx {
-            invoke_shell_command(ctx, cmd_id - ID_CMD_FIRST);
+            let cmd_offset = cmd_id - ID_CMD_FIRST;
+            if shell_verb(ctx, cmd_offset).is_some_and(|verb| verb.eq_ignore_ascii_case("delete")) {
+                choice = MenuChoice::Delete;
+            } else {
+                invoke_shell_command(ctx, cmd_offset);
+            }
         }
     }
 
     unsafe { let _ = DestroyMenu(hmenu); }
-    Ok(())
+    Ok(choice)
 }
 
 /// RAII guard that frees PIDL memory on drop.
@@ -196,6 +217,24 @@ fn build_shell_context_menu(
         _parent_folder: pf,
         _pidls: abs_pidls,
     })
+}
+
+/// Canonical verb ("delete", "properties", …) of a shell menu command.
+fn shell_verb(info: &ShellContextInfo, cmd_offset: u32) -> Option<String> {
+    let mut buf = [0u16; 64];
+    unsafe {
+        info.context_menu
+            .GetCommandString(
+                cmd_offset as usize,
+                GCS_VERBW,
+                None,
+                PSTR(buf.as_mut_ptr().cast()),
+                buf.len() as u32,
+            )
+            .ok()?;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
 }
 
 fn invoke_shell_command(info: &ShellContextInfo, cmd_offset: u32) {
