@@ -249,8 +249,10 @@ impl EverythingView {
                         33.
                     }))
                     // "Files" and the refresh icon sit 16px in: 11 + (22 - 12) / 2.
+                    // On Windows the icon is centred under the 46px close
+                    // button's glyph instead: 23 - 22 / 2.
                     .pl(scaled_px(16.))
-                    .pr(scaled_px(11.))
+                    .pr(scaled_px(if cfg!(target_os = "windows") { 12. } else { 11. }))
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(p.border)

@@ -781,7 +781,9 @@ impl EverythingView {
                     .items_center()
                     // Left-aligned; on macOS start past the traffic lights
                     // (16 + 2 * 23 + 14 = 76pt, see mac_menu::position_buttons).
-                    .pl(px(if cfg!(target_os = "macos") { 88. } else { 12. }))
+                    // Elsewhere the drawn glyph sits 16px in, like every other
+                    // edge: search.svg's circle stroke starts at 2 of 24.
+                    .pl(px(if cfg!(target_os = "macos") { 88. } else { 16. - 14. * 2. / 24. }))
                     .child(
                         div()
                             .flex()
@@ -898,8 +900,10 @@ impl EverythingView {
             .h(scaled_px(33.))
             // Settings glyph edge 16px from the right: 8.5 + 1 border + 5
             // padding + settings.svg's own ~1.5px inset (21.5 of 24 at 14px).
+            // Windows shifts it 1px with the file tree's refresh icon, which
+            // centres under the close button there.
             .pl(scaled_px(16.))
-            .pr(scaled_px(8.5))
+            .pr(scaled_px(if cfg!(target_os = "windows") { 9.5 } else { 8.5 }))
             .flex_shrink_0()
             .border_t_1()
             .border_color(p.border)
@@ -1334,7 +1338,7 @@ impl Render for EverythingView {
                                     .items_center()
                                     .h(scaled_px(44.))
                                     .flex_shrink_0()
-                                    .px(scaled_px(if cfg!(target_os = "windows") { 8. } else { 16. }))
+                                    .px(scaled_px(16.))
                                     .child(
                                         Input::new(&self.input)
                                             .appearance(false)
