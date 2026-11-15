@@ -5,7 +5,7 @@ use gpui_component::ActiveTheme;
 pub(super) const SANS: &str = "Geist";
 pub(super) const MONO: &str = "JetBrains Mono";
 pub(super) const ROW_HEIGHT: f32 = 27.; // CSS height:26px + 1px bottom border.
-pub(super) const COLUMN_MIN: [f32; 4] = [180., 240., 62., 150.];
+pub(super) const COLUMN_MIN: [f32; 4] = [180., 240., 62., MODIFIED_WIDTH];
 pub(super) const BASE_REM_SIZE: f32 = 12.;
 pub(super) const TITLEBAR_HEIGHT: f32 = 38.;
 
@@ -85,18 +85,23 @@ impl Palette {
     }
 }
 
+/// Modified column: 8 + "2026-07-11 19:47" in 11px mono (~106) + 16, so the
+/// date ends 16px from the edge like Name starts 16px in. Not user-resizable,
+/// so saved preferences are overridden too.
+const MODIFIED_WIDTH: f32 = 130.;
+
 pub(super) fn default_columns(width: f32) -> [f32; 4] {
-    let rest = width - 150.;
+    let rest = width - MODIFIED_WIDTH;
     [
         (rest * 0.32 / 0.85).round().max(180.),
         (rest * 0.48 / 0.85).round().max(240.),
         (rest * 0.05 / 0.85).round().max(62.),
-        150.,
+        MODIFIED_WIDTH,
     ]
 }
 
 pub(super) fn fit_columns(columns: [f32; 4], width: f32) -> [f32; 4] {
-    let flexible = (width - columns[3]).max(482.);
+    let flexible = (width - MODIFIED_WIDTH).max(482.);
     let scale = flexible / (columns[0] + columns[1] + columns[2]).max(1.);
     let mut name = (columns[0] * scale).round().max(180.);
     let mut size = (columns[2] * scale).round().max(62.);
@@ -107,7 +112,7 @@ pub(super) fn fit_columns(columns: [f32; 4], width: f32) -> [f32; 4] {
         size -= (240. - path - reduction).max(0.).min(size - 62.);
         path = flexible - name - size;
     }
-    [name, path.max(240.), size, columns[3]]
+    [name, path.max(240.), size, MODIFIED_WIDTH]
 }
 
 #[cfg(test)]
