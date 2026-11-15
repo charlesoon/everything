@@ -884,16 +884,56 @@ impl EverythingView {
         if paths.is_empty() {
             return;
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if let Err(error) = drag::start_drag(
-            window,
-            drag::DragItem::Files(paths),
-            drag::Image::Raw(include_bytes!("../../icons/32x32.png").to_vec()),
-            |_, _| {},
-            drag::Options::default(),
-        ) {
+        #[cfg(target_os = "macos")]
+        if let Err(error) = start_file_drag(window, paths) {
             self.notify_message(error.to_string(), cx);
         }
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::HasWindowHandle;
+            let Ok(handle) = HasWindowHandle::window_handle(window) else {
+                return;
+            };
+            let window_handle = OwnedWindowHandle(handle.as_raw());
+            // DoDragDrop runs a nested modal loop that keeps dispatching GPUI
+            // input, paint and tasks (including GPUI's own drop target). Inside
+            // this update the app stays borrowed, so that re-entry panics;
+            // start the drag from a task, outside any update.
+            cx.spawn_in(window, async move |view, cx| {
+                if let Err(error) = start_file_drag(&window_handle, paths) {
+                    let _ = view.update(cx, |this, cx| this.notify_message(error.to_string(), cx));
+                }
+            })
+            .detach();
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn start_file_drag(
+    window: &impl raw_window_handle::HasWindowHandle,
+    paths: Vec<PathBuf>,
+) -> drag::Result<()> {
+    drag::start_drag(
+        window,
+        drag::DragItem::Files(paths),
+        drag::Image::Raw(include_bytes!("../../icons/32x32.png").to_vec()),
+        |_, _| {},
+        drag::Options::default(),
+    )
+}
+
+/// A window handle that can outlive the `&Window` borrow of an update.
+#[cfg(target_os = "windows")]
+struct OwnedWindowHandle(raw_window_handle::RawWindowHandle);
+
+#[cfg(target_os = "windows")]
+impl raw_window_handle::HasWindowHandle for OwnedWindowHandle {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        // The task runs on the UI thread while the window is open.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.0) })
     }
 }
 

@@ -2,6 +2,7 @@ pub mod clipboard;
 pub mod com_guard;
 pub mod context_menu;
 pub mod dir_rescan;
+pub mod drop_target;
 pub mod icon;
 pub mod legacy_cleanup;
 pub mod mft_indexer;

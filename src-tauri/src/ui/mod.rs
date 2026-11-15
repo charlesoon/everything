@@ -83,6 +83,15 @@ pub(super) fn run() {
                     ..Default::default()
                 },
                 move |window, cx| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                        if let Ok(handle) = HasWindowHandle::window_handle(window) {
+                            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                                crate::win::drop_target::revoke(handle.hwnd.get());
+                            }
+                        }
+                    }
                     let view = cx.new(|cx| {
                         EverythingView::new(state, sink, receiver, prefs, started, window, cx)
                     });
