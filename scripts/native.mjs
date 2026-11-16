@@ -18,7 +18,7 @@ function run(command, args) {
   if (result.status !== 0) process.exit(result.status || 1);
 }
 const [mode = 'dev', ...args] = process.argv.slice(2);
-const manifest = ['--manifest-path', 'src-tauri/Cargo.toml'];
+const manifest = ['--manifest-path', 'app/Cargo.toml'];
 switch (mode) {
   case 'dev': run('cargo', ['run', '--locked', ...manifest, '--', ...args]); break;
   case 'build': run('cargo', ['build', '--release', '--locked', ...manifest, ...args]); break;

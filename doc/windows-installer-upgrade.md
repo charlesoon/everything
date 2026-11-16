@@ -43,7 +43,7 @@ the built-in Temp exclusions; explicit `.pathignore` rules still apply.
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer.ps1
 & "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer.ps1
-cargo test --release --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+cargo test --release --locked --manifest-path app/Cargo.toml -- --test-threads=1
 ./scripts/build-windows.ps1
 ```
 

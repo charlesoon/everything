@@ -56,7 +56,7 @@
 
 | 검사 | 결과 |
 | --- | --- |
-| `cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -- --test-threads=1` | 143 통과, 수동 스트레스 벤치마크 8개 제외 |
+| `cargo test --release --locked --features ui-automation --manifest-path app/Cargo.toml -- --test-threads=1` | 143 통과, 수동 스트레스 벤치마크 8개 제외 |
 | `npm test -- --release --features ui-automation` | 통과 |
 | `scripts/run_windows_ui_feature_tests.py` | 14 통과 |
 | `scripts/run_gpui_windows_tests.py` | 17 통과 |
@@ -67,7 +67,7 @@
 설정 복구, 종료 후 DB/WAL/SHM의 바이트 단위 백업을 확인한다. 별도로 소유한
 x64 테스트 프로세스를 실제 종료해 PID·실행 경로 검증도 확인했다.
 
-설치파일: [Everything_0.6.3_x64-setup.exe](../src-tauri/target/release/bundle/nsis/Everything_0.6.3_x64-setup.exe)
+설치파일: [Everything_0.6.3_x64-setup.exe](../app/target/release/bundle/nsis/Everything_0.6.3_x64-setup.exe)
 
 - 크기: 5,633,812 bytes
 - SHA-256: `94fbb0e60ec50fc867e2b9218def20aa5e5e1672fa53d3f54b26e7407e0fa228`
@@ -82,10 +82,10 @@ x64 테스트 프로세스를 실제 종료해 PID·실행 경로 검증도 확�
 Windows 대화형 데스크톱과 Python Pillow가 필요하다. fixture는 새 경로에 만든다.
 
 ```powershell
-cargo test --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -- --test-threads=1
-cargo build --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml
+cargo test --release --locked --features ui-automation --manifest-path app/Cargo.toml -- --test-threads=1
+cargo build --release --locked --features ui-automation --manifest-path app/Cargo.toml
 python -X utf8 scripts/ui_fixture.py .artifacts/windows-macos-repro/fixture --entries 500000
-Copy-Item src-tauri/target/release/everything.exe .artifacts/windows-macos-repro/everything-ui-automation.exe -Force
+Copy-Item app/target/release/everything.exe .artifacts/windows-macos-repro/everything-ui-automation.exe -Force
 python -X utf8 scripts/run_windows_ui_feature_tests.py --binary .artifacts/windows-macos-repro/everything-ui-automation.exe --fixture .artifacts/windows-macos-repro/fixture --output .artifacts/windows-macos-repro/features
 python -X utf8 scripts/run_gpui_windows_tests.py --binary .artifacts/windows-macos-repro/everything-ui-automation.exe --fixture .artifacts/windows-macos-repro/fixture --output .artifacts/windows-macos-repro/regression
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-windows-installer.ps1

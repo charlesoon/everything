@@ -104,12 +104,12 @@ class ReleaseTests(unittest.TestCase):
         release = target_directory / target / 'release' if target else target_directory / 'release'
         files = {
             release / 'everything': b'Native executable fixture',
-            root / 'src-tauri/icons/icon.icns': b'Icon fixture',
-            root / 'src-tauri/icons/Assets.car': b'Asset catalog fixture',
-            root / 'src-tauri/assets/fonts/geist-LICENSE.txt': b'Font license fixture',
-            root / 'src-tauri/assets/fonts/jetbrains-mono-LICENSE.txt': b'Font license fixture',
-            root / 'src-tauri/Info.plist': plistlib.dumps({}),
-            root / 'src-tauri/launchd/com.everything.app.daemon.plist': plistlib.dumps({
+            root / 'app/icons/icon.icns': b'Icon fixture',
+            root / 'app/icons/Assets.car': b'Asset catalog fixture',
+            root / 'app/assets/fonts/geist-LICENSE.txt': b'Font license fixture',
+            root / 'app/assets/fonts/jetbrains-mono-LICENSE.txt': b'Font license fixture',
+            root / 'app/Info.plist': plistlib.dumps({}),
+            root / 'app/launchd/com.everything.app.daemon.plist': plistlib.dumps({
                 'BundleProgram': 'Contents/MacOS/everything',
             }),
         }

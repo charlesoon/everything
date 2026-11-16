@@ -18,13 +18,13 @@ jobs:
           toolchain: '1.97.1'
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: app
       - name: Install Metal compiler
         run: xcodebuild -downloadComponent MetalToolchain
       - name: Check and test native application
         run: |
-          cargo check --locked --manifest-path src-tauri/Cargo.toml
-          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          cargo check --locked --manifest-path app/Cargo.toml
+          cargo test --locked --manifest-path app/Cargo.toml
       - name: Build native app and DMG
         env:
           APPLE_SIGNING_IDENTITY: '-'
@@ -32,7 +32,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: app/target/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
   windows:
@@ -44,19 +44,19 @@ jobs:
           toolchain: '1.97.1'
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: app
       - name: Install NSIS
         run: choco install nsis --no-progress -y
       - name: Check and test native application
         run: |
-          cargo check --locked --manifest-path src-tauri/Cargo.toml
-          cargo test --locked --manifest-path src-tauri/Cargo.toml
+          cargo check --locked --manifest-path app/Cargo.toml
+          cargo test --locked --manifest-path app/Cargo.toml
       - name: Build native installer
         run: ./scripts/build-windows.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          path: app/target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
 
   publish:

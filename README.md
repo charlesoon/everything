@@ -9,12 +9,15 @@ queries. The macOS daemon and Windows service own indexing; the GUI reads it.
 - Name, glob, extension and path searches; Korean and spaces in file names
 - Virtual result table, sorting, adjustable columns and multiple selection
 - Open, Reveal, Copy Path/Files, Trash confirmation, inline Rename and Quick Look
-- System light/dark appearance, preserving the Tauri UI and saved window/column preferences
+- File tree browsing with the same file actions, and click-to-copy paths
+- Drag files from the results into other apps
+- Native context menus (Windows Explorer menu; its Delete uses the app's trash action)
+- System light/dark appearance, UI zoom, a settings popover and saved window/column preferences
 - Full Disk Access onboarding, background indexer health and auto-start controls
 - The same executable supports `--mcp`, `--daemon` and Windows service commands
 
 The UI renders directly through GPUI. No browser runtime or JavaScript assets
-are bundled. `src-tauri/` retains its historical directory name for stable paths.
+are bundled.
 
 ## Build and run
 
@@ -27,10 +30,10 @@ build tools and a DirectX 11 compatible GPU. NSIS 3 is needed for installers.
 
 ```sh
 # Native development window
-cargo run --manifest-path src-tauri/Cargo.toml
+cargo run --manifest-path app/Cargo.toml
 
 # Release executable
-cargo build --release --locked --manifest-path src-tauri/Cargo.toml
+cargo build --release --locked --manifest-path app/Cargo.toml
 
 # macOS .app / .dmg (uses local signing settings when available)
 python3 scripts/bundle_macos.py
@@ -40,7 +43,7 @@ scripts/build_dmg.sh
 ./scripts/build-windows.ps1
 
 # Compile and run Rust regression tests
-cargo test --locked --manifest-path src-tauri/Cargo.toml
+cargo test --locked --manifest-path app/Cargo.toml
 ```
 
 On macOS, scope `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` to
@@ -117,7 +120,7 @@ Tab/Shift+Tab or Left/Right to select a control, then Enter/Space to activate it
 
 ## Source and verification
 
-- `src-tauri/src/ui/`: GPUI lifecycle, rendering, actions and status notices
+- `app/src/ui/`: GPUI lifecycle, rendering, actions and status notices
 - `ui_model.rs`, `ui_prefs.rs`, `runtime.rs`: selection/search state, preferences, worker/event bridge
 - `main.rs`, `query.rs`, `mac/`, `win/`: shared engine, file actions and indexers
 - `scripts/ui_fixture.py`, `ui_driver.py`: isolated real-window test tools
@@ -125,7 +128,6 @@ Tab/Shift+Tab or Left/Right to select a control, then Enter/Space to activate it
 - [Native architecture](doc/gpui-architecture.md)
 - [Test cases and results](doc/gpui-test-cases.md)
 - [Windows native verification](doc/gpui-windows-validation.md)
-- [Performance comparison](doc/gpui-performance.md)
 
 Product specs remain in `doc/spec.md` and `doc/spec_KR.md`. Migration decisions,
 validation scope and known platform limits are recorded in the linked reports.

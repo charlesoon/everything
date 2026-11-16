@@ -137,13 +137,13 @@ def main():
         if identity not in identities:
             raise SystemExit(f'Signing identity is not installed in the keychain: {identity}')
     print(f'Signing identity: {identity}', flush=True)
-    cargo = ['cargo', 'build', '--manifest-path', ROOT / 'src-tauri/Cargo.toml', '--release', '--locked']
+    cargo = ['cargo', 'build', '--manifest-path', ROOT / 'app/Cargo.toml', '--release', '--locked']
     if args.target:
         cargo += ['--target', args.target]
     if not args.skip_build:
         run(*cargo, cwd=ROOT, env=env)
     metadata = json.loads(subprocess.check_output(
-        ['cargo', 'metadata', '--no-deps', '--format-version', '1', '--manifest-path', str(ROOT / 'src-tauri/Cargo.toml')],
+        ['cargo', 'metadata', '--no-deps', '--format-version', '1', '--manifest-path', str(ROOT / 'app/Cargo.toml')],
         cwd=ROOT, env=env, text=True))
     package = next(p for p in metadata['packages'] if p['name'] == 'everything')
     version = package['version']
@@ -159,21 +159,21 @@ def main():
     (contents / 'MacOS').mkdir(parents=True)
     (contents / 'Resources').mkdir()
     shutil.copy2(binary, contents / 'MacOS/everything')
-    shutil.copy2(ROOT / 'src-tauri/icons/icon.icns', contents / 'Resources/icon.icns')
+    shutil.copy2(ROOT / 'app/icons/icon.icns', contents / 'Resources/icon.icns')
     # Liquid Glass icon (macOS 26+). Regenerate both from everything.icon with:
     #   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun actool everything.icon --compile <out> \
     #     --app-icon everything --platform macosx --minimum-deployment-target 12.0 --output-partial-info-plist <out>/p.plist
-    #   then copy <out>/Assets.car and <out>/everything.icns (as icon.icns) into src-tauri/icons/.
-    shutil.copy2(ROOT / 'src-tauri/icons/Assets.car', contents / 'Resources/Assets.car')
+    #   then copy <out>/Assets.car and <out>/everything.icns (as icon.icns) into app/icons/.
+    shutil.copy2(ROOT / 'app/icons/Assets.car', contents / 'Resources/Assets.car')
     licenses = contents / 'Resources/licenses'
     licenses.mkdir()
     for name in ['geist-LICENSE.txt', 'jetbrains-mono-LICENSE.txt']:
-        shutil.copy2(ROOT / 'src-tauri/assets/fonts' / name, licenses / name)
+        shutil.copy2(ROOT / 'app/assets/fonts' / name, licenses / name)
     agents = contents / 'Library/LaunchAgents'
     agents.mkdir(parents=True)
     agent_name = 'com.everything.app.daemon.plist'
-    shutil.copy2(ROOT / 'src-tauri/launchd' / agent_name, agents / agent_name)
-    info = plistlib.loads((ROOT / 'src-tauri/Info.plist').read_bytes())
+    shutil.copy2(ROOT / 'app/launchd' / agent_name, agents / agent_name)
+    info = plistlib.loads((ROOT / 'app/Info.plist').read_bytes())
     info.update({
         'CFBundleExecutable': 'everything',
         'CFBundleIdentifier': 'com.everything.app',
@@ -193,7 +193,7 @@ def main():
     agent = plistlib.loads((agents / agent_name).read_bytes())
     if not (app / agent['BundleProgram']).is_file():
         raise SystemExit('LaunchAgent BundleProgram does not resolve inside the app')
-    sign = ['codesign', '--force', '--sign', identity, '--options', 'runtime', '--entitlements', ROOT / 'src-tauri/Entitlements.plist']
+    sign = ['codesign', '--force', '--sign', identity, '--options', 'runtime', '--entitlements', ROOT / 'app/Entitlements.plist']
     if identity != '-':
         sign += ['--timestamp']
     run(*sign, app, env=env)

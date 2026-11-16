@@ -103,7 +103,7 @@ logging=true
 - [일반 실행 기록](../.artifacts/windows-logging-startup/normal-launch.json)
 - [로컬 설치파일 빌드 로그](../.artifacts/windows-logging-startup/windows-build-refined.log)
 
-최종 설치파일은 [Everything_0.6.4_x64-setup.exe](../src-tauri/target/release/bundle/nsis/Everything_0.6.4_x64-setup.exe)다.
+최종 설치파일은 [Everything_0.6.4_x64-setup.exe](../app/target/release/bundle/nsis/Everything_0.6.4_x64-setup.exe)다.
 
 다음 스크립트는 테스트용 DB에서 앱을 직접 실행한다.
 

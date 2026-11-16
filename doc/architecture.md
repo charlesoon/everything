@@ -21,7 +21,7 @@ Everything — a GPUI desktop app that indexes the filesystem into SQLite for su
 ## Module Structure
 
 ```
-src-tauri/src/
+app/src/
 ├── ui/mod.rs, view.rs, actions.rs  # Native GPUI lifecycle, views, file actions
 ├── ui_model.rs, ui_prefs.rs      # Generations, selection, pagination, preferences
 ├── runtime.rs, ui_gate.rs        # Worker executor, coalesced status event bridge
@@ -32,7 +32,7 @@ src-tauri/src/
 ├── mac/                         # FSEvents, daemon bridge, login item, FDA, icons
 └── win/                         # MFT/USN/RDCW, service, Shell menu and icons
 scripts/bundle_macos.py           # Native .app/.dmg packaging
-src-tauri/windows/installer.nsi   # Native NSIS installer and service hooks
+app/windows/installer.nsi   # Native NSIS installer and service hooks
 ```
 
 ### Module Dependencies
@@ -530,8 +530,8 @@ index. See [GPUI architecture](gpui-architecture.md).
 
 See [GPUI architecture](gpui-architecture.md) for the current source layout,
 input/IME handling, generation guards, virtual list, dialogs, preferences,
-status bridge and native packaging. See [test cases](gpui-test-cases.md) and
-[performance](gpui-performance.md) for measured behavior.
+status bridge and native packaging. See [test cases](gpui-test-cases.md) for
+measured behavior.
 
 ## Platform Comparison
 

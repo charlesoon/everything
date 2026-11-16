@@ -8,10 +8,10 @@
 # are saved and restored around the run.
 #
 # Usage:  scripts/verify_macos_daemon.sh [path-to-everything-binary]
-# Default binary: src-tauri/target/debug/everything (build with `cargo build`).
+# Default binary: app/target/debug/everything (build with `cargo build`).
 set -u
 
-BIN="${1:-src-tauri/target/debug/everything}"
+BIN="${1:-app/target/debug/everything}"
 [ -x "$BIN" ] || { echo "binary not found: $BIN (cargo build first)"; exit 2; }
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 

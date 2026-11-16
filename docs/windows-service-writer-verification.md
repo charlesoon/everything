@@ -1,6 +1,6 @@
 # Windows admin service writer — verification runbook
 
-Implements `design-windows-service-writer.html` (Phases 0–3). This runbook covers
+Implements the Windows admin service writer design (Phases 0–3). This runbook covers
 what can't be verified headlessly: the macOS build, and the elevated
 service/installer/pipe/ACL paths (§7 scenarios ①–㉙). Headless status at time of
 writing: `cargo check` 0 warnings; `cargo test` 95 pass (7 new: S1–S7 + pipe),
@@ -10,8 +10,8 @@ writing: `cargo check` 0 warnings; `cargo test` 95 pass (7 new: S1–S7 + pipe),
 
 ```bash
 # Windows backend (this dev box): 0 warnings expected
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test  --manifest-path src-tauri/Cargo.toml    # 4 pre-existing Unix-path failures only
+cargo check --manifest-path app/Cargo.toml
+cargo test  --manifest-path app/Cargo.toml    # 4 pre-existing Unix-path failures only
 
 # Frontend
 npm run build
@@ -19,7 +19,7 @@ npm run build
 # macOS cross-platform check (run on a Mac / CI — the Windows box can't verify it).
 # Confirms the cfg-gated shared edits (build_app_state_with_config, DB_READONLY
 # gate in db_connection, MCP read-only open, gated spawn_detached/handshake fns).
-cargo check --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path app/Cargo.toml
 ```
 
 ## 1. Phase 0 — MFT/USN fixes (elevated GUI, no service needed)
@@ -34,8 +34,8 @@ Run today's admin GUI build (before the service exists) to validate S1–S7:
 ## 2. Phase 1 — the service (elevated)
 
 ```powershell
-cargo build --release --manifest-path src-tauri/Cargo.toml
-$exe = "$PWD\src-tauri\target\release\everything.exe"
+cargo build --release --manifest-path app/Cargo.toml
+$exe = "$PWD\app\target\release\everything.exe"
 # Data root + ACL (installer normally does this — see §3):
 New-Item -ItemType Directory -Force "C:\ProgramData\com.everything.app\data","C:\ProgramData\com.everything.app\config" | Out-Null
 icacls "C:\ProgramData\com.everything.app\data" /inheritance:r /grant:r "NT AUTHORITY\SYSTEM:(OI)(CI)F" "BUILTIN\Administrators:(OI)(CI)F" "BUILTIN\Users:(OI)(CI)RX"

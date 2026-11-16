@@ -48,5 +48,3 @@
 
 - GPUI 구현과 실행/패키징 명령.
 - `doc/gpui-test-cases.md`: TC 및 실행 결과.
-- `doc/gpui-performance.md`: 측정 방법·원시 데이터 위치·전후 결과.
-- `doc/gpui-evidence/`: UI 스크린샷과 요약 JSON (DB·로그·빌드 산출물 제외).

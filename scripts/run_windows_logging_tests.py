@@ -195,7 +195,7 @@ def run(binary, fixture, output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary', type=Path, default=ROOT / 'src-tauri/target/release/everything.exe')
+    parser.add_argument('--binary', type=Path, default=ROOT / 'app/target/release/everything.exe')
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/windows-logging-startup/ui')
     args = parser.parse_args()

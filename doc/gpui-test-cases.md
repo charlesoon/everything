@@ -9,12 +9,12 @@
 ```sh
 python3 scripts/ui_fixture.py /tmp/everything-ui-fixture --entries 500000
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cargo build --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml
+  cargo build --release --locked --features ui-automation --manifest-path app/Cargo.toml
 python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-ui-fixture \
-  --output doc/gpui-evidence/ui
+  --output /tmp/everything-ui-results
 ```
 
-실행 결과: **14 통과 / 0 실패**. 기계 판독 결과와 실행 시각은 [ui-results.json](gpui-evidence/ui/ui-results.json)에 있다.
+실행 결과: **14 통과 / 0 실패**. 기계 판독 결과와 실행 시각은 ui-results.json에 있다.
 
 | TC | 조작과 확인 | 결과 |
 | --- | --- | --- |
@@ -48,14 +48,14 @@ UI-11은 요청 완료를 검증한다. 외부 편집기나 Quick Look 내용의
 ```sh
 python3 scripts/ui_fixture.py /tmp/everything-file-tree-fixture --entries 500000
 MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cargo build --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml
+  cargo build --release --locked --features ui-automation --manifest-path app/Cargo.toml
 python3 scripts/run_file_tree_ui_tests.py --fixture /tmp/everything-file-tree-fixture \
   --output .artifacts/file-tree-ui
 python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-fixture \
   --output .artifacts/file-tree-regression
 ```
 
-실제 GPUI/AppKit 입력을 통한 파일 트리·스크롤·경로 복사 **11 통과 / 0 실패**, 기존 UI 회귀 **14 통과 / 0 실패**. [새 기능 결과](gpui-evidence/file-tree/file-tree-results.json)와 [회귀 결과](gpui-evidence/file-tree/regression-results.json)에 실행 기록이 있다.
+실제 GPUI/AppKit 입력을 통한 파일 트리·스크롤·경로 복사 **11 통과 / 0 실패**, 기존 UI 회귀 **14 통과 / 0 실패**. 새 기능 결과와 회귀 결과에 실행 기록이 있다.
 
 | TC | 조작과 확인 | 결과 |
 | --- | --- | --- |
@@ -71,18 +71,10 @@ python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-fixture
 | TREE-10 | 3초 이상 대기 후 양쪽 세로·결과 가로 스크롤바 드래그, 독립 스크롤, 수동 탐색 중 새로고침 위치 유지, light/dark | 통과 |
 | TREE-11 | 상태바·트리 경로 클릭 후 실제 클립보드의 전체 절대 경로 대조, 한글·공백·~ 표시·작은 창의 경로 잘림, 선택·검색어·트리 위치 유지 | 통과 |
 
-- [어두운 테마](gpui-evidence/file-tree/04-tree-dark.png)
-- [밝은 테마](gpui-evidence/file-tree/05-tree-light.png)
-- [400×300 창](gpui-evidence/file-tree/06-small-window.png)
-- [24단계 깊은 폴더](gpui-evidence/file-tree/09-deep-tree.png)
-- [새로고침 후 선택 위치](gpui-evidence/file-tree/11-refresh-position.png)
-- [대기 중 스크롤바: 어두운 테마](gpui-evidence/file-tree/12-idle-scrollbars-dark.png)
-- [대기 중 스크롤바: 밝은 테마](gpui-evidence/file-tree/14-idle-scrollbars-light.png)
-- [경로 클릭 복사](gpui-evidence/file-tree/15-copy-path.png)
 
 최초 파일 트리 구현 시 `npm test -- --release --features ui-automation -j4`와 전체 Rust 테스트가 **142 통과 / 0 실패**했으며 트리 모델 테스트 6개가 포함됐다. 스크롤 수정 후에는 트리 모델 테스트 **7 통과 / 0 실패**를 확인했다. 오래된 비동기 응답 배제, 상위 경로 펼침, 범위 전환, 접힌 폴더 읽기 억제, 디스크 목록과 누락된 선택 경로, 새로고침 중 기존 목록·선택 유지 및 재갱신 전 응답 무효화를 검사한다. 기본 기능의 production release 빌드도 통과했다.
 
-[검증 요약](gpui-evidence/file-tree/validation.json)에 명령, 소스·캡처 해시와 production 실행 파일 해시를 기록했다. 테스트는 마커가 있는 격리 fixture와 별도 설정 파일을 사용했다. Windows 실행 검증은 포함하지 않는다.
+검증 요약에 명령, 소스·캡처 해시와 production 실행 파일 해시를 기록했다. 테스트는 마커가 있는 격리 fixture와 별도 설정 파일을 사용했다. Windows 실행 검증은 포함하지 않는다.
 
 타이틀바까지 구분선을 확장한 후 UI 22건을 재실행해 모두 통과했다. 트리 목록의 시작 위치는 89px이며, 타이틀바 높이인 y=15에서 구분선을 드래그해 패널 너비만 바뀌고 창 위치·크기는 유지되는지 검증했다. 어두운·밝은 테마, 너비 조절 후 화면과 400×300 창의 캡처에서 구분선의 연속성과 제목·창 버튼 배치도 확인했다. 위 캡처와 UI 결과는 이 배치를 반영한다.
 
@@ -100,7 +92,7 @@ macOS 최종 통합본에서 `npm test -- --release --features ui-automation -j4
 
 ```sh
 MACOSX_DEPLOYMENT_TARGET=13.0 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cargo build --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml -j4
+  cargo build --release --locked --features ui-automation --manifest-path app/Cargo.toml -j4
 python3 scripts/run_ui_zoom_tests.py --fixture /tmp/everything-file-tree-validation \
   --output .artifacts/ui-zoom-native-final
 python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-validation \
@@ -120,7 +112,7 @@ python3 scripts/run_file_tree_ui_tests.py --fixture /tmp/everything-file-tree-va
 
 확대 UI **6 통과**, 기존 UI **14 통과**, 파일 트리·스크롤·경로 복사 **11 통과**로 총 **31 통과 / 0 실패**였다. 전체 Rust 테스트는 **152 통과 / 0 실패 / 11 제외**였다. 초기 실행에서 입력 내용이 달라진 검색과 예전 복사 팝업을 기다리던 검사가 실패한 이력 및 최종 재실행 결과는 검증 요약에 함께 기록했다.
 
-실행 결과와 소스·캡처·패키지 해시는 [배율 검증 요약](gpui-evidence/ui-zoom/validation.json)에 기록한다. [150% 화면](gpui-evidence/ui-zoom/02-zoom-150.png), [125% 밝은 테마와 재실행](gpui-evidence/ui-zoom/06-zoom-125-restart-light.png), [200% 작은 창의 설정](gpui-evidence/ui-zoom/04b-zoom-200-small-settings.png)을 확인했다. 공간이 부족한 설정 항목명은 말줄임 처리하고 값은 별도 공간을 유지한다.
+실행 결과와 소스·캡처·패키지 해시는 배율 검증 요약에 기록한다. 150% 화면, 125% 밝은 테마와 재실행, 200% 작은 창의 설정을 확인했다. 공간이 부족한 설정 항목명은 말줄임 처리하고 값은 별도 공간을 유지한다.
 
 검사는 마커가 있는 격리 fixture와 별도 설정 파일을 사용한다. Windows 네이티브 창의 배율 동작은 이번에 실행하지 않았으며, Control 입력은 공통 단축키 단위 테스트와 macOS의 실제 키 입력으로 검사한다.
 
@@ -144,46 +136,31 @@ python3 scripts/run_gpui_ui_tests.py --fixture /tmp/everything-file-tree-validat
 | ZOOM-09 | Tab/Shift+Tab·좌우 방향키·Enter/Space·Escape, 검색 문자열 보존 |
 | ZOOM-10 | 밝은·어두운 테마, 400×300 창의 50~200% 배율, 고정 크기와 경계 버튼 비활성화, 인접 트리 토글 |
 
-ZOOM-03과 ZOOM-06은 파일명 편집·설정 화면과 팝오버를 함께 열어 버튼 조작 및 Escape 우선순위도 확인한다. 최초 팝오버 구현에서는 배율 UI **10 통과**, 기존 UI 회귀 **14 통과**로 총 **24 통과 / 0 실패**였고, 전체 Rust 테스트는 **153 통과 / 0 실패 / 11 제외**였다. 이 실행 기록은 [검증 요약](gpui-evidence/ui-zoom/validation.json)의 `zoomPopover`에 있다.
+ZOOM-03과 ZOOM-06은 파일명 편집·설정 화면과 팝오버를 함께 열어 버튼 조작 및 Escape 우선순위도 확인한다. 최초 팝오버 구현에서는 배율 UI **10 통과**, 기존 UI 회귀 **14 통과**로 총 **24 통과 / 0 실패**였고, 전체 Rust 테스트는 **153 통과 / 0 실패 / 11 제외**였다. 이 실행 기록은 검증 요약의 `zoomPopover`에 있다.
 
 `0.6.3`에서는 타이틀바의 숫자를 제거하고, 100% 복원 후 팝오버가 닫힐 때 아이콘도 함께 숨기도록 수정했다. 배율 UI **10 통과 / 0 실패**로 Reset 버튼, Command/Control 단축키, 자동 닫힘·외부 클릭·아이콘 클릭 및 편집·설정 화면을 검증했다. 결과와 소스·패키지 해시는 같은 검증 요약의 `zoomIconRefinement`에 기록했다. UI 검사 후 버전 선언과 lockfile만 0.6.3으로 올려 배포 패키지를 빌드했다.
 
 `scripts/build_dmg.sh`로 만든 macOS arm64 `Everything_0.6.3_aarch64.dmg`는 Developer ID 서명, Apple 공증 승인·티켓 첨부, Gatekeeper 검사 및 DMG 무결성 검사를 통과했다. 앱 버전·번들 ID와 내장 LaunchAgent의 실행 경로도 확인했다. 최종 패키지 해시와 공증 제출 ID는 `zoomIconRefinement.productionRelease`에 기록했다.
 
-- [숫자 없는 아이콘과 어두운 테마의 팝오버](gpui-evidence/ui-zoom/icon-only-dark.png)
-- [밝은 테마의 팝오버](gpui-evidence/ui-zoom/icon-only-light.png)
-- [100% 복원 후 팝오버가 열려 있는 동안 아이콘 유지](gpui-evidence/ui-zoom/icon-reset-100-open.png)
-- [100%에서 팝오버가 닫힐 때 아이콘도 숨김](gpui-evidence/ui-zoom/icon-reset-100-closed.png)
-- [400×300 창의 200% 배율과 고정 크기 조절기](gpui-evidence/ui-zoom/icon-only-small-200-dark.png)
+## macOS 컨텍스트 메뉴
 
-## Tauri 화면 비교
-
-동일 fixture, 900×560 logical pixels, 동일 이벤트 순서로 원본과 GPUI를 각각 캡처했다. Inter 400/500/600, JetBrains Mono 400, 원본 SVG와 네이티브 파일 아이콘을 사용한다. 제목 30px, 검색창 34px, 헤더 33px, 행 27px, 상태바 33px 및 컬럼 최소 너비를 원본 CSS에서 가져왔다. 테마는 시스템을 따른다.
-
-- [어두운 테마: 왼쪽 Tauri / 오른쪽 GPUI](gpui-evidence/visual/comparison-dark.png)
-- [밝은 테마: 왼쪽 Tauri / 오른쪽 GPUI](gpui-evidence/visual/comparison-light.png)
-- [전체 캡처 목록](gpui-evidence/visual/captures.json): 두 테마 × 초기/검색/선택/이름 변경/휴지통/결과 없음 = 각 렌더러 12장.
-- [채널별 평균 절대 픽셀 차이](gpui-evidence/visual/pixel-comparison.json): 0–255 척도의 참고 지표. 유사도 백분율이나 완전한 픽셀 일치를 뜻하지 않는다. 렌더러의 글자 안티앨리어싱, caret/선택 표시와 OS 포커스 링에 미세한 차이가 남는다.
-
-macOS 메뉴는 Tauri가 사용하던 동일 버전 muda/AppKit으로 그린다. Open, 선택 시 Show Package Contents, Quick Look, Open With..., 구분선, Reveal in Finder, 구분선, Copy, Copy Path, 구분선, Move to Trash, 단일 선택 시 Rename 순서를 유지한다. 메뉴는 별도 네이티브 창이므로 본창 캡처에는 포함되지 않는다. 실제 메뉴 키보드 선택은 UI-07에서 검증했다.
+macOS 메뉴는 muda/AppKit으로 그린다. Open, 선택 시 Show Package Contents, Quick Look, Open With..., 구분선, Reveal in Finder, 구분선, Copy, Copy Path, 구분선, Move to Trash, 단일 선택 시 Rename 순서를 유지한다. 메뉴는 별도 네이티브 창이므로 본창 캡처에는 포함되지 않는다. 실제 메뉴 키보드 선택은 UI-07에서 검증했다.
 
 ## Rust 및 검색 회귀
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   cargo test --release --locked --features ui-automation \
-  --manifest-path src-tauri/Cargo.toml -j4 -- --test-threads=1
+  --manifest-path app/Cargo.toml -j4 -- --test-threads=1
 ```
 
 **136 통과 / 0 실패**. HOME 스캔/운영 DB benchmark 2개, Swift 툴체인을 실행하는 아이콘 통합 테스트 1개, 네이티브 휴지통 통합 테스트 1개와 기존 수동 benchmark 7개는 기본 실행에서 제외한다. 파서·검색·DB·MCP·선택/페이지/삭제 상태와 설정 변경 알림·인덱싱 진행 상태 테스트가 포함된다.
 
-초기 GPUI 전환 검증 중 기존 CPU QoS 타이밍 테스트가 한 번 실패했다(300ms wall time 동안 background CPU 0.080s 관측, 기대값 ≥0.15s). 해당 테스트 개별 실행과 전체 재실행은 코드나 기대값 변경 없이 통과했다. [초기 실행 요약](gpui-evidence/rust-results.json)에 이 이력도 기록했다.
+초기 GPUI 전환 검증 중 기존 CPU QoS 타이밍 테스트가 한 번 실패했다(300ms wall time 동안 background CPU 0.080s 관측, 기대값 ≥0.15s). 해당 테스트 개별 실행과 전체 재실행은 코드나 기대값 변경 없이 통과했다. 초기 실행 요약에 이 이력도 기록했다.
 
-후속 병합에서는 `npm test -- --release --features ui-automation -j4`와 전체 Rust 테스트를 다시 실행했다. 추가된 네이티브 휴지통 테스트도 명시적으로 실행해 **1 통과**를 확인했다. 고유한 이름의 임시 파일 여러 개와 하위 파일이 있는 폴더를 휴지통으로 옮긴 뒤 복원·정리한다. 첫 UI 실행에서는 UI-01의 시작 직후 문자 입력이 한 번 실패했고, 포커스 구현 변경 없이 독립 실행 6회에서 재현되지 않았다. 이후 전체 UI suite를 재실행했다. [병합 검증 기록](gpui-evidence/merge-results.json)에 결과와 이력을 기록했다.
+후속 병합에서는 `npm test -- --release --features ui-automation -j4`와 전체 Rust 테스트를 다시 실행했다. 추가된 네이티브 휴지통 테스트도 명시적으로 실행해 **1 통과**를 확인했다. 고유한 이름의 임시 파일 여러 개와 하위 파일이 있는 폴더를 휴지통으로 옮긴 뒤 복원·정리한다. 첫 UI 실행에서는 UI-01의 시작 직후 문자 입력이 한 번 실패했고, 포커스 구현 변경 없이 독립 실행 6회에서 재현되지 않았다. 이후 전체 UI suite를 재실행했다. 병합 검증 기록에 결과와 이력을 기록했다.
 
 Cmd+Delete 즉시 휴지통 이동 변경 후에도 `npm test`, 전체 Rust 테스트 **136 통과**와 UI suite **14 통과**를 확인했다. UI-09는 두 Command 단축키의 단일·다중 항목 이동, 확인창 부재와 삭제 결과 억제를 검사한다. 검색창과 이름 편집에서는 Command 단축키가 텍스트만 삭제하는지도 확인했다.
-
-Tauri/GPUI의 실제 production search engine에 동일한 36개 케이스를 넣고 반환 경로 전체, 결과 수와 mode를 비교했다. **36개 모두 일치**한다. 케이스당 warmup 3회 후 10회 측정했다. [측정 보고서](gpui-performance.md)와 [원시 검색 결과](gpui-evidence/performance/gpui-engine.json)를 참고한다.
 
 ## macOS 배포 패키지
 
@@ -193,11 +170,11 @@ macOS 파일 작업·이름 변경 병합과 Cmd+Delete 즉시 휴지통 이동�
 python3 scripts/bundle_macos.py --dmg
 ```
 
-번들 ID/버전/실행 파일과 내장 LaunchAgent 경로, 글꼴 라이선스, ad-hoc runtime 서명의 `codesign --verify --deep --strict`, WebKit 직접 링크 부재, CLI help/version을 확인했다. DMG checksum과 읽기 전용 마운트에서 실행 파일 SHA-256 및 Applications 링크도 확인했다. 패키지 안의 production 실행 파일을 fixture로 실행해 첫 프레임·500행/총 500,018개·오류 없음을 확인했고, 자동화 socket은 생성되지 않았다. [패키지 검증 기록](gpui-evidence/package-results.json)에 해시와 결과가 있다. 앱 설치나 운영 데몬 등록은 수행하지 않았다.
+번들 ID/버전/실행 파일과 내장 LaunchAgent 경로, 글꼴 라이선스, ad-hoc runtime 서명의 `codesign --verify --deep --strict`, WebKit 직접 링크 부재, CLI help/version을 확인했다. DMG checksum과 읽기 전용 마운트에서 실행 파일 SHA-256 및 Applications 링크도 확인했다. 패키지 안의 production 실행 파일을 fixture로 실행해 첫 프레임·500행/총 500,018개·오류 없음을 확인했고, 자동화 socket은 생성되지 않았다. 패키지 검증 기록에 해시와 결과가 있다. 앱 설치나 운영 데몬 등록은 수행하지 않았다.
 
-파일 트리·스크롤 수정은 `0.6.1`의 production `.app`과 arm64 DMG에도 반영했다. 버전, 번들 ID, 내장 LaunchAgent·라이선스, 서명, DMG 무결성을 확인했으며 최신 패키지 해시는 [파일 트리 검증 요약](gpui-evidence/file-tree/validation.json)의 `scrollingFix.productionRelease`에 기록했다.
+파일 트리·스크롤 수정은 `0.6.1`의 production `.app`과 arm64 DMG에도 반영했다. 버전, 번들 ID, 내장 LaunchAgent·라이선스, 서명, DMG 무결성을 확인했으며 최신 패키지 해시는 파일 트리 검증 요약의 `scrollingFix.productionRelease`에 기록했다.
 
-화면 배율을 포함한 `0.6.2`는 `scripts/build_dmg.sh`로 기본 기능의 production release를 다시 빌드했다. 로컬 설정에서 Developer ID 인증서를 자동으로 선택해 서명했으며, Apple 공증 `Accepted`, DMG 티켓 부착·검증, Gatekeeper `Notarized Developer ID`, `codesign --verify --deep --strict`와 DMG 무결성 검사를 통과했다. 번들 ID·버전·arm64 실행 파일과 내장 LaunchAgent도 확인했다. [배율 검증 요약](gpui-evidence/ui-zoom/validation.json)의 `productionRelease`에 최종 패키지 해시를 기록했다.
+화면 배율을 포함한 `0.6.2`는 `scripts/build_dmg.sh`로 기본 기능의 production release를 다시 빌드했다. 로컬 설정에서 Developer ID 인증서를 자동으로 선택해 서명했으며, Apple 공증 `Accepted`, DMG 티켓 부착·검증, Gatekeeper `Notarized Developer ID`, `codesign --verify --deep --strict`와 DMG 무결성 검사를 통과했다. 번들 ID·버전·arm64 실행 파일과 내장 LaunchAgent도 확인했다. 배율 검증 요약의 `productionRelease`에 최종 패키지 해시를 기록했다.
 
 Lucide 배율 팝오버와 100%에서 버튼 숨김을 반영한 최신 `0.6.2` 패키지도 같은 스크립트로 빌드·서명·공증했으며 Gatekeeper와 DMG 무결성 검사를 통과했다. 이 패키지의 해시와 공증 ID는 같은 검증 요약의 `zoomPopover.productionRelease`에 기록했다.
 
@@ -211,10 +188,10 @@ Lucide 배율 팝오버와 100%에서 버튼 숨김을 반영한 최신 `0.6.2` 
 
 ```sh
 cargo check --release --locked --target x86_64-pc-windows-msvc \
-  --manifest-path src-tauri/Cargo.toml -j4
+  --manifest-path app/Cargo.toml -j4
 ```
 
-`ring 0.17.14`의 C 의존성 컴파일에서 Windows용 `assert.h`를 찾지 못해 exit 101로 중단됐다. 이 호스트에는 Windows C toolchain/SDK가 없으므로 앱의 Windows Rust 타입 검사까지 완료하지 못했다. [실행 요약](gpui-evidence/windows-check.json)에 원인을 기록했다. 제공한 `windows-latest` workflow의 native check/test 및 NSIS build는 이번 로컬 작업에서 실행하지 않았으며, Windows 빌드·설치·실행 성공으로 주장하지 않는다.
+`ring 0.17.14`의 C 의존성 컴파일에서 Windows용 `assert.h`를 찾지 못해 exit 101로 중단됐다. 이 호스트에는 Windows C toolchain/SDK가 없으므로 앱의 Windows Rust 타입 검사까지 완료하지 못했다. 실행 요약에 원인을 기록했다. 제공한 `windows-latest` workflow의 native check/test 및 NSIS build는 이번 로컬 작업에서 실행하지 않았으며, Windows 빌드·설치·실행 성공으로 주장하지 않는다.
 
 ## 검증 범위
 

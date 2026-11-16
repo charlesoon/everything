@@ -360,7 +360,7 @@ def run(binary, fixture, output):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--binary',type=Path,default=ROOT/'src-tauri/target/release/everything.exe')
+    p.add_argument('--binary',type=Path,default=ROOT/'app/target/release/everything.exe')
     p.add_argument('--fixture',type=Path,required=True)
     p.add_argument('--output',type=Path,default=ROOT/'.artifacts/windows-ui-features')
     a=p.parse_args(); report=run(a.binary.resolve(),a.fixture,a.output)

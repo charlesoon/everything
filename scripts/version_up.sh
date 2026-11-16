@@ -7,8 +7,8 @@
 # Updates (structural, anchored replacements — no blind global search/replace):
 #   - package.json                (top-level "version")
 #   - package-lock.json           ("everything" package: root + packages."")
-#   - src-tauri/Cargo.toml        ([package] version)
-#   - src-tauri/Cargo.lock        ([[package]] name = "everything")
+#   - app/Cargo.toml        ([package] version)
+#   - app/Cargo.lock        ([[package]] name = "everything")
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -32,8 +32,8 @@ cd "$REPO_ROOT"
 
 PKG_JSON="package.json"
 PKG_LOCK="package-lock.json"
-CARGO_TOML="src-tauri/Cargo.toml"
-CARGO_LOCK="src-tauri/Cargo.lock"
+CARGO_TOML="app/Cargo.toml"
+CARGO_LOCK="app/Cargo.lock"
 
 # Regex-escaped version for the verification step (dots are literal).
 NEW_RE="${NEW_VERSION//./\\.}"

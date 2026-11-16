@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement every item of `design-nonadmin-indexing-perf.html` — 2× faster non-admin indexing (D1–D4), UI-block removal via CPU management (C1–C3), and memory-peak mitigation (M1–M3).
+**Goal:** Implement every item of the non-admin indexing perf design — 2× faster non-admin indexing (D1–D4), UI-block removal via CPU management (C1–C3), and memory-peak mitigation (M1–M3).
 
 **Architecture:** Rewrite `win/nonadmin_indexer.rs`'s scan core around the proven `main.rs` fresh-parallel-scan pattern: `jwalk::WalkDirGeneric` builds `CompactEntry` on shared-pool worker threads (`process_read_dir`), scanner threads stream bounded-channel batches to a single collector that feeds both `all_entries` (MemIndex) and a single DB-writer thread. One shared rayon pool capped at `max(2, n_cpus − 2)` with `THREAD_PRIORITY_BELOW_NORMAL` workers. `CompactEntry.dir` becomes `Arc<str>` (interned per read_dir callback).
 
@@ -29,9 +29,9 @@
 ### Task 1: M3 — `CompactEntry.dir: String` → `Arc<str>` (pure refactor, zero behavior change)
 
 **Files:**
-- Modify: `src-tauri/src/mem_search.rs` (struct + `to_entry_dto`; add `Debug` derive needed later by jwalk `DirEntryState`)
-- Modify: `src-tauri/src/win/mft_indexer.rs` (construction sites :232, :306; uses :463, :564, :577-579)
-- Modify: `src-tauri/src/win/nonadmin_indexer.rs` (construction sites :586, :663; IndexRow conversion :707)
+- Modify: `app/src/mem_search.rs` (struct + `to_entry_dto`; add `Debug` derive needed later by jwalk `DirEntryState`)
+- Modify: `app/src/win/mft_indexer.rs` (construction sites :232, :306; uses :463, :564, :577-579)
+- Modify: `app/src/win/nonadmin_indexer.rs` (construction sites :586, :663; IndexRow conversion :707)
 
 **Interfaces:**
 - Produces: `pub struct CompactEntry { pub name: String, pub dir: Arc<str>, ... }` with `#[derive(Debug, Clone)]`. `path()` and `dir_map`/`path_depth` consumers work through `Deref<Target=str>`.
@@ -39,13 +39,13 @@
 - [ ] **Step 1.1: mem_search.rs** — add `use std::sync::Arc;`, change field to `pub dir: Arc<str>`, derive `Debug`, and in `to_entry_dto` use `dir: self.dir.to_string()`.
 - [ ] **Step 1.2: mft_indexer.rs** — dirs: `dir: Arc::from(dir)`; files: build a per-scan `HashMap<u64, Arc<str>>` from `path_cache` once (`Arc::from(path.as_str())` per unique parent FRN) so sibling files share one allocation, then `dir: Arc::clone(parent_arc)`. Fix uses: `e.dir.as_str()` → `&*e.dir`, `dir_stat_cache.get(&entry.dir)` → `.get(&*entry.dir)`, `entry.dir.clone()` (IndexRow) → `entry.dir.to_string()`.
 - [ ] **Step 1.3: nonadmin_indexer.rs** — `compact_entry_from_path`: `dir: Arc::from(dir_str)`; scan loop + `background_db_insert` conversions adjusted (`entry.dir.to_string()` for IndexRow).
-- [ ] **Step 1.4: Verify** — `cargo test --manifest-path src-tauri/Cargo.toml` passes; `cargo check` no warnings.
+- [ ] **Step 1.4: Verify** — `cargo test --manifest-path app/Cargo.toml` passes; `cargo check` no warnings.
 
 ### Task 2: D2+C1+C2 — shared low-priority scan pool
 
 **Files:**
-- Modify: `src-tauri/Cargo.toml` (add `"Win32_System_Threading"` to windows features)
-- Modify: `src-tauri/src/win/nonadmin_indexer.rs`
+- Modify: `app/Cargo.toml` (add `"Win32_System_Threading"` to windows features)
+- Modify: `app/src/win/nonadmin_indexer.rs`
 
 **Interfaces:**
 - Produces: `fn build_nonadmin_scan_pool() -> Arc<jwalk::rayon::ThreadPool>` (size `max(2, n_cpus − 2)`, workers BELOW_NORMAL) and `fn lower_thread_priority()` (also applied to scanner threads).
@@ -83,7 +83,7 @@ fn build_nonadmin_scan_pool() -> Arc<jwalk::rayon::ThreadPool> {
 ### Task 3: D1+D3+M1+M2 — parallel entry creation, streaming collection
 
 **Files:**
-- Modify: `src-tauri/src/win/nonadmin_indexer.rs` (replace `ScanResult`/`scan_dir_jwalk`/`SharedProgress`)
+- Modify: `app/src/win/nonadmin_indexer.rs` (replace `ScanResult`/`scan_dir_jwalk`/`SharedProgress`)
 
 **Interfaces:**
 - Produces:
@@ -108,7 +108,7 @@ Key semantics:
 ### Task 4: D4 — DB upsert pipelined with scan
 
 **Files:**
-- Modify: `src-tauri/src/win/nonadmin_indexer.rs`
+- Modify: `app/src/win/nonadmin_indexer.rs`
 
 **Interfaces:**
 - Produces:
@@ -127,7 +127,7 @@ Flow changes in `run_nonadmin_index`:
 
 ### Task 5: Verification
 
-- [ ] **Step 5.1:** `cargo test --manifest-path src-tauri/Cargo.toml` — all pass.
+- [ ] **Step 5.1:** `cargo test --manifest-path app/Cargo.toml` — all pass.
 - [ ] **Step 5.2:** `npm run lint` (frontend build + cargo check) — no warnings.
 - [ ] **Step 5.3:** Self-review against design: every badge item D1-D4/C1-C3/M1-M3 mapped to shipped code; no `RayonNewPool` remains; exactly one `SetThreadPriority` helper; single DB writer.
 - [ ] **Step 5.4:** Runtime measurement (user executes, design §6): `[nonadmin +Xs]` Ready / Phase-3 timestamps, peak working set, UI responsiveness during indexing.

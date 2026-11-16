@@ -42,8 +42,8 @@ Enter/Open/Reveal은 앱의 OS 요청 완료를 확인했다. 외부 편집기�
 Windows의 대화형 데스크톱과 Python Pillow가 필요하다. fixture 경로는 새 디렉터리를 사용한다.
 
 ```powershell
-cargo test --release --locked --manifest-path src-tauri/Cargo.toml -- --test-threads=1
-cargo build --release --locked --features ui-automation --manifest-path src-tauri/Cargo.toml
+cargo test --release --locked --manifest-path app/Cargo.toml -- --test-threads=1
+cargo build --release --locked --features ui-automation --manifest-path app/Cargo.toml
 python -X utf8 scripts/ui_fixture.py .artifacts/windows-gpui/new-fixture --entries 500000
 python -X utf8 scripts/run_gpui_windows_tests.py --fixture .artifacts/windows-gpui/new-fixture --output .artifacts/windows-gpui/new-ui
 ```

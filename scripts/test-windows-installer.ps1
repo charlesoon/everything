@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path $PSScriptRoot -Parent
-. (Join-Path $repoRoot 'src-tauri/windows/prepare-upgrade.ps1')
+. (Join-Path $repoRoot 'app/windows/prepare-upgrade.ps1')
 $realStopProcess = ${function:Stop-ValidatedUpgradeProcess}
 $realBackup = ${function:Backup-StoppedIndexerDatabase}
 $fixtureParent = [IO.Path]::GetFullPath((Join-Path $repoRoot '.artifacts/windows-installer-tests'))

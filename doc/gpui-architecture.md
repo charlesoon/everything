@@ -1,7 +1,7 @@
 # GPUI native architecture
 
 The GPUI migration replaces the entire window/UI lifecycle. The Rust crate
-stays at `src-tauri/` to retain build paths; it no longer depends on Tauri,
+stays at `app/` to retain build paths; it no longer depends on Tauri,
 WebKit/WebView2, a JavaScript bridge or bundled web assets.
 
 ```mermaid

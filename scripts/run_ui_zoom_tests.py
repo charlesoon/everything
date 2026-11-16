@@ -387,7 +387,7 @@ def run(binary, fixture, output):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary', type=Path, default=ROOT / 'src-tauri/target/release/everything')
+    parser.add_argument('--binary', type=Path, default=ROOT / 'app/target/release/everything')
     parser.add_argument('--fixture', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=ROOT / '.artifacts/ui-zoom')
     args = parser.parse_args()
