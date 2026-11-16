@@ -1,103 +1,49 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Communication
 
-## Project Overview
+- Answer in the language the user wrote the question in.
 
-Everything — an ultrafast file/folder name search app for macOS and Windows. Indexes the filesystem into SQLite, providing sub-50ms search response. UI messages and spec are in Korean.
+## Project
 
-**Stack:** GPUI 0.2.2 + gpui-component 0.5.1 + Rust + SQLite (LIKE-based search)
+Everything: a file/folder name search app for macOS and Windows. Rust + GPUI 0.2.2 +
+gpui-component 0.5.1 + SQLite (LIKE + FTS5 trigram). UI messages and specs are in Korean.
 
-## Build & Development Commands
+## Commands
 
 ```bash
 cargo run --manifest-path app/Cargo.toml
 cargo build --release --locked --manifest-path app/Cargo.toml
 cargo check --locked --manifest-path app/Cargo.toml
 cargo test --locked --manifest-path app/Cargo.toml
-python3 scripts/bundle_macos.py --dmg
-# Windows: scripts/build-windows.ps1
-# Optional npm aliases: dev, build, lint, test, test:run, bundle, bundle:dmg
+python3 scripts/bundle_macos.py --dmg      # macOS DMG (scripts/build_dmg.sh for Developer ID releases)
+./scripts/build-windows.ps1                # Windows binary + NSIS installer
 ```
 
-## Architecture
+## Invariants
 
-### Backend (Rust) — `app/src/`
-
-- **`main.rs`** (~10,000 lines) — Core backend: app state (`AppState`), SQLite schema init, indexer (jwalk), search (LIKE-based multi-mode), file actions (open/reveal/trash/rename/quick_look), native setup and direct Rust UI APIs. Status updates use `runtime::EventSink`.
-- **`daemon.rs`** — Resident indexer daemon (`everything --daemon`). On macOS it is the **sole index.db writer**, supervised by launchd (login-item LaunchAgent, `KeepAlive.SuccessfulExit=false`: exit 0 = dormant until next login/kickstart, exit 1 = relaunch from disk). Lifecycle (design §4): Starting → WaitingOnboarding (first-install gate — no build, no TCC access until the user decides; existing installs auto-pass as `granted-implicit`) → Building → Ready → Quiescing (shared graceful exit: cancel pass ≤2s → watcher join ≤3s → `wal_checkpoint(TRUNCATE)` best-effort). SIGTERM (logout/shutdown/unregister) quiesces. The 5s supervision tick heals `index_complete`, restarts a dead watcher, probes FDA (60s while missing; rising edge → forced catchup), watches exe identity (replaced → exit 1; missing 3 ticks → dormant — Finder's replace-on-update reads as replace), and in `--lease` mode retires once all renewable lease users (GUI bridge/MCP, 60s renewals, TTL 5min) age out and gui.lock is free. `ensure_daemon_running()` is the single revival gate: registered → `launchctl kickstart`; opt-out/OS-off → lease spawn; unregistered (dev) → detached spawn. Linux keeps the legacy yield-to-GUI polling daemon.
-- **`daemon_ipc.rs`** (macOS) — UDS control socket `<data dir>/daemon.sock` (0600 + `getpeereid` same-uid check, newline-delimited JSON, one request/connection — port of `win/service_pipe.rs`): `status` / `reset_index` (600s cooldown) / `restart` (exit 1) / `disable` (exit 0) / `attach_lease`. The server opens **before** the startup build so control always answers; paths over the 104-byte `sockaddr_un` limit fall back to `$TMPDIR` with a `daemon.sock.path` sidecar.
-- **`query.rs`** — Search query parser: classifies input into `SearchMode` variants (`Empty`, `NameSearch`, `GlobName`, `ExtSearch`, `PathSearch`). Handles glob-to-LIKE conversion and LIKE escaping. Has unit tests.
-- **`rescan.rs`** — Streaming subtree rescan (`rescan_subtree` + `SubtreeDiff`): diffs a directory tree against the DB with a hash-compacted snapshot (~24 B/row), upserts only new/changed rows in batches, deletes vanished rows. Used by the MustScanSubDirs handler, directory rename, and (via `SubtreeDiff`) catchup workers. Has unit tests.
-- **`mem_search.rs`** — In-memory compact entry search (`MemIndex`): built during MFT/WalkDir scan for instant results while DB upsert runs in background. Uses binary search, ext/dir maps, and time-budgeted contains matching.
-- **`gitignore_filter.rs`** — Lazy .gitignore discovery and matching (depth 3, `ignore` crate)
-- **`mcp_server.rs`** — MCP stdio server (`everything --mcp`): serves a `search` tool for AI agents straight from index.db (read-only, `query_only` pragma), reusing `run_db_search` — works with the GUI app closed. Can register the binary into Claude Code (`~/.claude.json`) and Codex (`~/.codex/config.toml`) via the explicit `everything --register-mcp` flag only — app startup never writes to those configs; registration is idempotent and preserves existing config content.
-- **`mac/`** — macOS-specific: FSEvents watcher (direct fsevent-sys binding; `PathEvent` carries the ItemRenamed/ItemIsDir flags for S5), Spotlight search fallback (mdfind), `launch_agent.rs` (SMAppService login-item registration + plist-bytes marker self-heal + `launchctl kickstart`; the agent plist ships in the bundle at `Contents/Library/LaunchAgents/com.everything.app.daemon.plist`), `prefs.rs` (`defaults` domain `com.everything.app`: `onboardingDecision`/`daemonOptOut`/`onboardingFirstSeen` — user intent survives data-dir deletion), `bridge.rs` (read-only GUI ↔ daemon status bridge), `cpu_monitor.rs` (field CPU/power self-accounting for fan complaints: `proc_pid_rusage` per-QoS-class CPU time + `task_info` `task_energy` joules; a watchdog thread in GUI+daemon logs an episode to the diag log when the process sustains ≥5W / ≥2 P-band cores — onset with per-class split, backed-off heartbeats, end summary — and every index pass / fresh finalize appends its `| cpu …` accounting to the existing diag lines. Note: per-class billing follows *effective* QoS incl. turnstile boosts — never `join()` a thread you're measuring mid-burn), `probe_full_disk_access` (1-byte TCC.db read)
-- **`win/`** — Windows-specific: MFT indexer (NTFS metadata scan), non-admin WalkDir fallback (`nonadmin_indexer.rs`), USN journal watcher, ReadDirectoryChangesW fallback, native Explorer context menu, offline catchup (Windows Search / mtime scan)
-
-### Native UI — `app/src/ui/`
-
-- `mod.rs`: GPUI window, InputState (IME), asynchronous search/paging, event receiver, theme and hotkey.
-- `view.rs`: virtual uniform_list (27px rows), adjustable columns, menu/dialogs and status/settings controls.
-- `actions.rs`: file actions, keyboard handling, inline rename, onboarding/FDA polling.
-- `ui_model.rs`: generations, loaded offset, path-based selection and pending-trash suppression. Unit tested without a renderer.
-- `ui_prefs.rs`: per-user `gpui-preferences.json`, atomic replacement, separate from daemon config/index ownership.
-- `runtime.rs`: Tokio blocking worker pool and bounded/latest-per-event status bridge.
-
-No Svelte/Vite/Tauri runtime or IPC is used. See `doc/gpui-architecture.md` and
-the TC/performance reports for the current migration contracts.
-
-### Data Flow
-
-0. **macOS process split (daemon-writer, design `design-macos-daemon-writer.html`)**: the login-item daemon owns *every* write below — schema init, fresh/catchup passes, FSEvents watcher, `.pathindexing` reconcile, FTS/VACUUM maintenance, `purge_ignored_entries`. The GUI starts `set_db_readonly()` + `is_writer=false` (it still holds `gui.lock` for second-instance detection, the lease-liveness check, and pre-flip field daemons) and runs `mac/bridge.rs`: 1s UDS status poll re-emitting the existing `index_*` events (change-deduped; a non-fresh Building maps to a `"Catchup: …"` message = `isCatchup`), `PRAGMA data_version` watch on a dedicated connection (on change: invalidate negative/fd caches, drop the search pool — daemon resets swap the entries table — re-derive `fts_ready`, emit `index_updated`), `service_health` outage classification with one `ensure_daemon_running` per outage, and `attach_lease` renewals while auto-start is off. GUI rename/trash are filesystem-only; the daemon's watcher reflects them (directory renames via the S5 subtree rescan). Search rides the Spotlight fallback until the daemon's DB is readable. Bench mode (`EVERYTHING_BENCH`) keeps the in-process writer path.
-1. App start → scan filesystem → batch upsert into `entries` table (SQLite WAL mode)
-   - macOS fresh index: parallel jwalk scan of `$HOME` (workers → bounded `sync_channel(8)` → single writer, sorted `INSERT OR IGNORE` batches — backpressure caps queued-batch memory); secondary indexes + FTS rebuild + ANALYZE are deferred to the background finalizing thread (`finalize_fresh_index` with `temp_store=FILE`, `fts_dirty` meta flag heals crashes)
-   - macOS restart catchup: single parallel pass; each worker snapshots its root's rows into a hash-compacted `SubtreeDiff` over its own read connection, upserts only new/changed rows, and deletes vanished rows via snapshot leftovers (no per-row run_id stamping)
-   - The finalizing thread ends with storage/memory maintenance: threshold-gated `VACUUM` (free pages ≥ 25% and ≥ 100MB), `wal_checkpoint(TRUNCATE)`, `shrink_memory`, and `malloc_zone_pressure_relief` (returns freed heap to the OS)
-   - macOS scan cost control (`mac/sched.rs`): scan threads inherit the native app main thread's `USER_INTERACTIVE` QoS unless told otherwise, which pins them to P-cores at full clock. Every scan thread calls `apply_scan_scheduling(role)`, and the role — not the pass's urgency — picks the class, because **`QOS_CLASS_UTILITY` is not a throttle**: measured on a 6P+12E Mac over a 1.39M-entry `$HOME`, `UTILITY` draws 5.5 avg cores vs `USER_INTERACTIVE`'s 5.6 (the scheduler runs it on P-cores at full clock), while `QOS_CLASS_BACKGROUND` is the only class that confines work to the E-cluster (3.8 avg cores, ~2x wall). So `ScanRole::Walk` (rayon pool via `start_handler` + walk workers — the whole thread multiplier, and syscall-bound work E-cores handle well) is **always** `BACKGROUND`, while `ScanRole::FreshWriter` (the *single* SQLite writer/finalizer thread of a fresh pass, which is what the pass's wall time is actually made of) keeps `UTILITY` and one P-core; `ScanRole::IdleWriter` (catchup writer, subtree rescans) is `BACKGROUND`. Thermal pressure / Low Power Mode pushes even `FreshWriter` down. **Never pair any of this with `setiopolicy_np(IOPOL_SCOPE_THREAD, …)`** — it silently unsets the QoS class and permanently opts the thread out (see the module docs). `build_scan_pool` sizes the pool at `n_cpus/2` (2–6) plus a quarter as many walk workers, shrunk further under pressure — that sizing bounds oversubscription and per-worker memory, not CPU draw (the class does that). `ScanThrottle` duty-cycles the walk if the machine heats up mid-pass. `EVERYTHING_INDEX_FULL_SPEED=1` (implied by `EVERYTHING_BENCH`) restores the old oversubscribed, un-downgraded behavior. The scan-start log line reports `writer_qos=` and `walk_qos=` so a regression to the P-cores is visible in a field log.
-   - Windows: NTFS MFT scan of `C:\` → builds MemIndex for instant search → background DB upsert
-2. User types → GPUI schedules a direct asynchronous `search` call → Rust checks MemIndex first, then queries SQLite (LIKE + FTS5 trigram multi-mode) → returns `SearchResultDto { entries, modeLabel, totalCount, totalKnown }`
-3. File watcher detects changes → upsert/delete affected paths over a persistent write connection (`watcher_conn`)
-   - macOS: FSEvents (direct fsevent-sys, supports event ID replay), owned by the daemon. One stream watches `$HOME` plus canonicalized `.pathindexing` extra roots (`/tmp` → `/private/tmp`; event paths are remapped back to the stored prefix — the home root is canonicalized/remapped too for symlinked homes). The stream is rebuilt with event-id continuity when `.pathindexing` changes. `MustScanSubDirs` (kernel event-queue overflow) queues a streaming `rescan_subtree` on a single-flight background thread — change-detected, batch-bounded memory, per-path 5-min cooldown. **S5**: external directory renames deliver no per-child events, so the watcher queues the same subtree rescan with a short 7s cooldown class for (a) dirs flagged ItemRenamed+ItemIsDir that still exist, and (b) freshly inserted dirs with children on disk but no DB descendants (probe-capped per batch; overlapping triggers keep the strictest cooldown)
-   - Windows: USN Change Journal → ReadDirectoryChangesW fallback
-
-### Key Design Decisions
-
-- **Search modes:** Query containing `/` or `\` → path search; containing `*` or `?` → glob-to-LIKE; simple `*.ext` → extension lookup; otherwise → 3-phase name search (exact → prefix → contains). The contains phase and non-name sorts use the FTS5 trigram index (queries ≥ 3 chars, gated by `fts_ready`); globs with a leading wildcard use an FTS literal-run prefilter + LIKE verify.
-- **MCP server:** the app binary doubles as an MCP server (`--mcp` flag, JSON-RPC over stdio, newline-delimited). The DB-search core is shared via `run_db_search` (no AppState), so the MCP process searches the same index without the app running. Registration into Claude Code/Codex configs is opt-in via `everything --register-mcp`; app launch never writes to those configs.
-- **macOS daemon-writer:** the GUI never writes index.db. First-run onboarding (GPUI modal) records `onboardingDecision` via `defaults` (survives data-dir deletion — G14); the daemon's gate waits on it (no build, no TCC access before consent), with a 7-day + `mcp.activity` escape hatch for MCP-only installs (Q7). The auto-start toggle implements §5.2: OFF records the opt-out first (the daemon start gate checks the record OR the SMAppService user-off state), then IPC `disable`, then unregister; while off, GUI/MCP keep a `--lease` daemon alive with 60s `attach_lease` renewals. Registration self-heal re-registers only when the embedded plist bytes differ from `agent_plist.marker` (re-registering churns the daemon and can re-fire the BTM notification — G7). Developer ID releases use `scripts/build_dmg.sh` with `APPLE_SIGNING_IDENTITY` and `NOTARY_PROFILE`: SMAppService needs a signed, non-translocated bundle, and ad-hoc signing would invalidate FDA on every update. Verification: `scripts/verify_macos_daemon.sh` + `docs/macos-daemon-writer-verification.md`.
-- **Search connections:** pooled warm read connections (`search_conn_pool`, max 3, 1GB mmap, cached prepared statements) reused across keystrokes; total counts use FTS-only `COUNT` (no join) where possible. The pool is only cleared on `reset_index`, not by watcher updates.
-- **Sort:** Backend SQL `ORDER BY` (name/mtime/size × asc/desc), not relevance. Relevance sorting applied only on first page (offset=0) for name sort (decorate–sort–undecorate; ranks computed once per row).
-- **Scan failures (`ScanFailures`):** the index pass splits filesystem observation failures into `denied` (EACCES/EPERM — on macOS, TCC) and `io` (everything else non-`NotFound`), and **does not count** mid-walk `NotFound` at all (a directory deleted between its parent's `readdir` and the walk reaching it is normal). Denied paths are collapsed to prefixes 2 components below the scan root (so several hundred `~/Library/Containers/<app>/Data` denials become one `~/Library/Containers`) and persisted to the `denied_prefixes` meta key, capped at 64. The FDA rising edge then rescans exactly those prefixes via `rescan_subtree` instead of running a second full 1M-entry catchup pass; it falls back to a full pass only when nothing was recorded. The status-bar line is built by `scan_failure_message` and names Full Disk Access when the probe says it is missing — the old rendering was a bare count in two places ("321 permission errors" plus "321 permission/access error(s) occurred.") with no cause and no action.
-- **Recent ops cache:** 2-second TTL prevents watcher from re-processing app-initiated rename/trash operations
-- **Virtual scroll:** GPUI uniform_list with 27px rows; gpui-component scrollbars
-- **Indexing root:** macOS: `$HOME`, Windows: `C:\`. Skips `.git`, `node_modules`, `DerivedData`, `.build` suffixes, platform-specific noisy directories
-- **Context menu:** macOS: original muda/AppKit menu. Windows: native Explorer context menu via Shell API, actions returned via `context_menu_action` event
-- **Enter key:** Both platforms open the selection. Cmd/Ctrl+Enter reveals in Finder/Explorer. F2 starts rename on both platforms.
-- **MemIndex (Windows):** In-memory index built during MFT/WalkDir scan provides instant search before DB is populated. Freed after background DB upsert completes.
-- **Windows fallback chain:** MFT scan → USN watcher → non-admin WalkDir → RDCW watcher
-
-### Direct Rust UI APIs
-
-`get_index_status`, `get_platform`, `reset_index`, `search`, `open`, `open_with`, `reveal_in_finder`, `show_package_contents` (macOS), `copy_paths`, `copy_files` (macOS), `move_to_trash`, `rename`, `show_context_menu`, `quick_look` (macOS), `check_full_disk_access` (macOS), `open_privacy_settings` (macOS), `open_login_items_settings` (macOS), `get_onboarding_state` (macOS), `record_onboarding_decision` (macOS), `register_daemon` (macOS), `set_daemon_autostart` (macOS), `open_pathignore`, `open_pathindexing`, `restart_app`, `register_service_elevated` (Windows), `mark_frontend_ready`
-
-CLI flags (handled before GPUI boots): `--mcp`, `--daemon` (`--lease` variant for opt-out users), `--register-mcp`, `--register-daemon` / `--unregister-daemon` (macOS login item; register starts the daemon immediately), `--uninstall` (macOS: unregister + clean runtime files, keeps the DB), `--version`, `--help`. Windows adds `--service` / `--register-service`.
-
-### Backend Events (→ Frontend)
-
-`index_progress`, `index_state` (includes `isCatchup` — produced by the macOS bridge for non-fresh daemon builds), `index_updated`, `context_menu_action` (Windows), `service_health` (Windows service / macOS daemon outage states: `not_installed`, `stopped`, `starting`, `unresponsive`, `version_mismatch`, plus macOS `not_registered`, `approval_required`, `disabled`), `pathignore_changed`, `pathindexing_changed`
-
-## Design Spec
-
-Full product spec is at `doc/spec.md` (English) and `doc/spec_KR.md` (Korean). Detailed architecture at `doc/architecture.md` (English) and `doc/architecture_KR.md` (Korean). The legacy targets are search p95 < 30ms backend and < 50ms with UI render; retained 200ms UI scheduling and some full sorts exceed them. The GUI requests 500 results (100 for single-char queries, max 1000); the backend API default remains 300.
+- The GUI never writes `index.db`. The macOS login-item daemon (`daemon.rs`) and the
+  Windows service are the only writers; the GUI reads the index and talks to them over
+  IPC (`daemon_ipc.rs`, `win/service_pipe.rs`).
+- The daemon must not build the index or touch TCC-protected paths before the user's
+  onboarding decision is recorded.
+- App startup never writes Claude Code/Codex configs. MCP registration happens only via
+  `everything --register-mcp`.
+- macOS scan threads: only `QOS_CLASS_BACKGROUND` keeps work on E-cores (`UTILITY` is not
+  a throttle). Never combine QoS with `setiopolicy_np(IOPOL_SCOPE_THREAD, …)`; it unsets
+  the QoS class. See `app/src/mac/sched.rs`.
+- Keep filesystem I/O, DB work and shell commands off the GPUI foreground executor.
+- Bumping `PRAGMA user_version` (currently 7) clears all entries and re-indexes.
 
 ## Conventions
 
-- Rust error handling: `AppResult<T> = Result<T, String>` — errors are displayed by the native UI
-- Serde: all DTOs use `#[serde(rename_all = "camelCase")]`
-- DB version tracked via `PRAGMA user_version` (currently 7); version bump clears all entries and re-indexes
-- Batch size for DB writes: 10,000 rows (macOS), 50,000 rows (Windows MFT)
-- Native state is owned by EverythingView/SearchModel; background responses re-enter through GPUI entity updates.
-- Platform-specific code uses `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "windows")]` conditional compilation
-- DB init is split: `init_db()` creates tables (fast, blocks search), `ensure_db_indexes()` creates indexes (deferred, non-blocking)
-- Ignore rules: `BUILTIN_SKIP_NAMES` (dir names), `BUILTIN_SKIP_SUFFIXES` (`.build`), `BUILTIN_SKIP_PATHS` (multi-segment paths), `DEFERRED_DIR_NAMES` (Windows system dirs), `.pathignore`, `.gitignore` (LazyGitignoreFilter)
+- Errors: `AppResult<T> = Result<T, String>`, shown by the native UI.
+- DTOs use `#[serde(rename_all = "camelCase")]`.
+- Platform code uses `#[cfg(target_os = "macos")]` / `#[cfg(target_os = "windows")]`.
+
+## Docs
+
+- Spec: `doc/spec.md`, `doc/spec_KR.md`
+- Architecture: `doc/architecture.md`, `doc/gpui-architecture.md`
+- UI test cases: `doc/gpui-test-cases.md`
+- macOS daemon verification: `docs/macos-daemon-writer-verification.md`
