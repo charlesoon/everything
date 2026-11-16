@@ -333,9 +333,9 @@ mod tests {
     #[test]
     fn efficiency_core_count_is_plausible() {
         // A wrong sysctl name returns None and silently reverts the walk to the
-        // old half-the-machine sizing, so assert the read actually lands. Every
-        // Apple Silicon Mac has an efficiency cluster smaller than the whole
-        // machine; Intel has none, which is a legitimate None.
+        // old half-the-machine sizing, so assert the read actually lands whenever
+        // the machine reports a second cluster. Intel Macs and virtual machines
+        // (such as CI runners) expose a single cluster, a legitimate None.
         let total = std::thread::available_parallelism().unwrap().get();
         match efficiency_cores() {
             Some(e) => {
@@ -343,10 +343,27 @@ mod tests {
                 eprintln!("efficiency cores: {e} of {total} logical");
             }
             None => assert!(
-                cfg!(target_arch = "x86_64"),
-                "Apple Silicon must report hw.perflevel1.logicalcpu"
+                perf_levels() < 2,
+                "{} perf levels reported but hw.perflevel1.logicalcpu was unreadable",
+                perf_levels()
             ),
         }
+    }
+
+    /// `hw.nperflevels`, or 1 where the sysctl does not exist (Intel).
+    fn perf_levels() -> u32 {
+        let mut value: u32 = 0;
+        let mut size = std::mem::size_of::<u32>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                b"hw.nperflevels\0".as_ptr() as *const c_char,
+                &mut value as *mut u32 as *mut c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 { value } else { 1 }
     }
 
     #[test]
