@@ -163,6 +163,8 @@ pub fn start_windows_readonly(app: EventSink, state: AppState) {
                                 c.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
                             {
                                 if last_dv.is_some() && last_dv != Some(dv) {
+                                    // The service wrote — drop stale caches.
+                                    crate::invalidate_search_caches(&state);
                                     crate::emit_index_updated(
                                         &app,
                                         s.indexed,
