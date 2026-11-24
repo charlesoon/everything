@@ -1,8 +1,8 @@
-version: 0.6.6
+version: 0.6.8
 files:
-  - url: Everything_0.6.6_x64-setup.exe
-    sha512: 4xH46W8XhIV4ac+5mqpxmz+HOrK28eWA7C1g059UtycvJSxM0JQ/3JGfkoiRHM11BmPPxeII55YcYQX6a1VVcg==
-    size: 5688349
-path: Everything_0.6.6_x64-setup.exe
-sha512: 4xH46W8XhIV4ac+5mqpxmz+HOrK28eWA7C1g059UtycvJSxM0JQ/3JGfkoiRHM11BmPPxeII55YcYQX6a1VVcg==
-releaseDate: '2026-11-14T16:45:36.108Z'
+  - url: Everything_0.6.8_x64-setup.exe
+    sha512: R0nPqFKomNu26l2oSVjfiDLTG7/MKvUnW1OABnhGwq0ftAY9mDkyvILdE3dEVaFd2vBSknXqmLwNHdExvAqB+A==
+    size: 5680354
+path: Everything_0.6.8_x64-setup.exe
+sha512: R0nPqFKomNu26l2oSVjfiDLTG7/MKvUnW1OABnhGwq0ftAY9mDkyvILdE3dEVaFd2vBSknXqmLwNHdExvAqB+A==
+releaseDate: '2026-11-24T12:06:44.654Z'
