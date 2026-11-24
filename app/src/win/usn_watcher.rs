@@ -44,6 +44,10 @@ const USN_REASON_RENAME_NEW_NAME: u32 = 0x00002000;
 /// Directory attribute bit in a USN record's FileAttributes field (S6).
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
+/// Low 48 bits of a file reference: the MFT record index without the 16-bit
+/// sequence number. All FRN caches (MFT and watcher) are keyed by this.
+const FRN_RECORD_INDEX_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
 /// Bounded transient-read retries before the watcher exits so its supervisor
 /// can restart it (S2). Journal-stale errors are handled separately.
 const MAX_TRANSIENT_RETRIES: u32 = 5;
@@ -60,8 +64,12 @@ struct ReadUsnJournalDataV0 {
 }
 
 struct UsnChangeRecord {
+    /// Record index (low 48 bits) — the key shared with the MFT-built caches.
     frn: u64,
     parent_frn: u64,
+    /// Full 64-bit parent reference (sequence number included), as
+    /// `OpenFileById` requires.
+    parent_file_id: u64,
     reason: u32,
     attributes: u32,
     name: String,
@@ -204,8 +212,6 @@ fn poll_loop(
     state.watcher_active.store(true, AtomicOrdering::Release);
 
     let scan_root = state.scan_root.clone();
-    let scan_str = scan_root.to_string_lossy().to_string().replace('/', "\\");
-    let scan_prefix = format!("{}\\", scan_str);
 
     let mut last_usn = initial_usn;
     let mut pending_changes: Vec<FileChange> = Vec::new();
@@ -225,7 +231,8 @@ fn poll_loop(
     // Cleared periodically to handle moved/renamed directories.
     let mut dir_cache: HashMap<u64, PathBuf> = HashMap::new();
     let mut last_cache_clear = Instant::now();
-    // Negative cache: FRNs confirmed outside scan_root or unresolvable.
+    // Negative cache: FRNs whose resolved path is outside scan_root. Failed
+    // lookups are not cached so a later event retries them.
     // Pre-populated from MFT scan with known outside-scan directory FRNs.
     // Never cleared — these are system dirs that won't move into scan_root.
     let mut skip_frns = outside_scan_frns;
@@ -307,13 +314,24 @@ fn poll_loop(
         for record in &records {
             diag_total_records += 1;
 
+            // A renamed or deleted directory frees its cached path; NTFS may
+            // reuse the record index for a new directory at another path.
+            if (record.reason
+                & (USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME | USN_REASON_FILE_DELETE))
+                != 0
+            {
+                frn_cache.remove(&record.frn);
+                dir_cache.remove(&record.frn);
+                skip_frns.remove(&record.frn);
+            }
+
             // Resolve parent path: FRN cache (MFT) → skip_frns → dir_cache → syscall
             let parent_path: Option<PathBuf> = if let Some(path) = frn_cache.get(&record.parent_frn)
             {
                 diag_frn_cache_hits += 1;
                 Some(PathBuf::from(path))
             } else if skip_frns.contains(&record.parent_frn) {
-                // Known outside scan_root or unresolvable — skip without syscall
+                // Known outside scan_root — skip without syscall
                 diag_skip_hits += 1;
                 None
             } else if let Some(cached) = dir_cache.get(&record.parent_frn) {
@@ -321,19 +339,17 @@ fn poll_loop(
                 Some(cached.clone())
             } else {
                 diag_syscalls += 1;
-                let resolved = frn_to_path(vol.raw(), record.parent_frn).filter(|p| {
-                    let s = p.to_string_lossy();
-                    *s == *scan_str || s.starts_with(&scan_prefix)
-                });
-                match &resolved {
-                    Some(p) => {
+                match classify_parent(frn_to_path(vol.raw(), record.parent_file_id), &scan_root) {
+                    ParentResolution::InScope(p) => {
                         dir_cache.insert(record.parent_frn, p.clone());
+                        Some(p)
                     }
-                    None => {
+                    ParentResolution::OutOfScope => {
                         skip_frns.insert(record.parent_frn);
+                        None
                     }
+                    ParentResolution::Unresolved => None,
                 }
-                resolved
             };
             let full_path = match parent_path {
                 Some(ref _p) => {
@@ -373,13 +389,6 @@ fn poll_loop(
             }
 
             let reason = record.reason;
-
-            // Invalidate caches when a directory may have been renamed
-            if (reason & (USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME)) != 0 {
-                frn_cache.remove(&record.frn);
-                dir_cache.remove(&record.frn);
-                skip_frns.remove(&record.frn);
-            }
 
             if (reason & USN_REASON_RENAME_OLD_NAME) != 0 {
                 // First half of rename pair
@@ -429,6 +438,11 @@ fn poll_loop(
             }
 
             if (reason & USN_REASON_FILE_CREATE) != 0 {
+                // The new directory's path is known now; its children's
+                // records resolve from the cache without a syscall.
+                if (record.attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                    dir_cache.insert(record.frn, full_path.clone());
+                }
                 pending_changes.push(FileChange::Create(full_path));
                 continue;
             }
@@ -781,8 +795,9 @@ fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
         return None;
     }
 
-    let frn = u64::from_le_bytes(data[8..16].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
-    let parent_frn = u64::from_le_bytes(data[16..24].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
+    let frn = u64::from_le_bytes(data[8..16].try_into().ok()?) & FRN_RECORD_INDEX_MASK;
+    let parent_file_id = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    let parent_frn = parent_file_id & FRN_RECORD_INDEX_MASK;
     let reason = u32::from_le_bytes(data[40..44].try_into().ok()?);
     // FileAttributes (offset 52) — used to detect directory renames (S6).
     let attributes = u32::from_le_bytes(data[52..56].try_into().ok()?);
@@ -808,15 +823,34 @@ fn parse_usn_change_record(data: &[u8]) -> Option<UsnChangeRecord> {
     Some(UsnChangeRecord {
         frn,
         parent_frn,
+        parent_file_id,
         reason,
         attributes,
         name,
     })
 }
 
-/// Resolve a File Reference Number to a filesystem path using
-/// GetFinalPathNameByHandleW (via OpenFileById).
-fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
+/// Outcome of resolving a parent directory by syscall.
+#[derive(Debug, PartialEq)]
+enum ParentResolution {
+    InScope(PathBuf),
+    /// Resolved, but outside the scan root — safe to cache as skippable.
+    OutOfScope,
+    /// Lookup failed — never cached, so a later event retries.
+    Unresolved,
+}
+
+fn classify_parent(resolved: Option<PathBuf>, scan_root: &Path) -> ParentResolution {
+    match resolved {
+        Some(path) if path.starts_with(scan_root) => ParentResolution::InScope(path),
+        Some(_) => ParentResolution::OutOfScope,
+        None => ParentResolution::Unresolved,
+    }
+}
+
+/// Resolve a full 64-bit file reference (sequence number included) to a
+/// filesystem path using GetFinalPathNameByHandleW (via OpenFileById).
+fn frn_to_path(volume_handle: HANDLE, file_id: u64) -> Option<PathBuf> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Storage::FileSystem::{
         GetFinalPathNameByHandleW, OpenFileById, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_DESCRIPTOR,
@@ -827,7 +861,7 @@ fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
     let file_id = FILE_ID_DESCRIPTOR {
         dwSize: mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
         Type: FILE_ID_TYPE(0), // FileIdType
-        Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: frn as i64 },
+        Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: file_id as i64 },
     };
 
     let handle = unsafe {
@@ -842,14 +876,20 @@ fn frn_to_path(volume_handle: HANDLE, frn: u64) -> Option<PathBuf> {
         .ok()?
     };
 
+    // A too-small buffer makes the call return the required size (including
+    // the terminating NUL); grow once and retry so long paths still resolve.
     let mut buf = vec![0u16; 512];
-    let len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) };
+    let mut len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) };
+    if len as usize > buf.len() {
+        buf.resize(len as usize, 0);
+        len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, FILE_NAME_NORMALIZED) };
+    }
 
     unsafe {
         let _ = CloseHandle(handle);
     }
 
-    if len == 0 || len as usize > buf.len() {
+    if len == 0 || len as usize >= buf.len() {
         return None;
     }
 
@@ -918,6 +958,108 @@ pub(crate) fn resolve_resume_position(
 mod tests {
     use super::*;
     use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    #[test]
+    fn classifies_parent_against_drive_root_scan() {
+        let root = Path::new("C:\\");
+        let inside = PathBuf::from("C:\\Users\\u\\new-dir");
+        assert_eq!(
+            classify_parent(Some(inside.clone()), root),
+            ParentResolution::InScope(inside)
+        );
+        assert_eq!(
+            classify_parent(Some(PathBuf::from("C:\\")), root),
+            ParentResolution::InScope(PathBuf::from("C:\\"))
+        );
+        // Drive-letter case differs between config and GetFinalPathNameByHandleW.
+        assert_eq!(
+            classify_parent(Some(PathBuf::from("c:\\Users")), root),
+            ParentResolution::InScope(PathBuf::from("c:\\Users"))
+        );
+        assert_eq!(
+            classify_parent(Some(PathBuf::from("D:\\data")), root),
+            ParentResolution::OutOfScope
+        );
+        assert_eq!(classify_parent(None, root), ParentResolution::Unresolved);
+    }
+
+    #[test]
+    fn classifies_parent_against_nested_scan_root() {
+        let root = Path::new("C:\\Users\\u");
+        for inside in ["C:\\Users\\u", "C:\\Users\\u\\", "C:\\Users\\u\\a\\b"] {
+            assert!(matches!(
+                classify_parent(Some(PathBuf::from(inside)), root),
+                ParentResolution::InScope(_)
+            ));
+        }
+        assert_eq!(
+            classify_parent(Some(PathBuf::from("C:\\Users\\u2\\a")), root),
+            ParentResolution::OutOfScope
+        );
+    }
+
+    #[test]
+    fn parse_keeps_full_parent_reference() {
+        let parent_file_id: u64 = 0x0023_0000_001a_f760;
+        let name: Vec<u8> = "index.html"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut data = vec![0u8; 60 + name.len()];
+        data[4..6].copy_from_slice(&2u16.to_le_bytes());
+        data[8..16].copy_from_slice(&0x0005_0000_0000_0042u64.to_le_bytes());
+        data[16..24].copy_from_slice(&parent_file_id.to_le_bytes());
+        data[40..44].copy_from_slice(&USN_REASON_FILE_CREATE.to_le_bytes());
+        data[56..58].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        data[58..60].copy_from_slice(&60u16.to_le_bytes());
+        data[60..].copy_from_slice(&name);
+
+        let record = parse_usn_change_record(&data).unwrap();
+        assert_eq!(record.frn, 0x42);
+        assert_eq!(record.parent_frn, 0x001a_f760);
+        assert_eq!(record.parent_file_id, parent_file_id);
+        assert_eq!(record.name, "index.html");
+    }
+
+    /// Resolves a real NTFS directory by file id. The production watcher passes
+    /// the `\\.\C:` volume handle (needs admin); any handle on the same volume
+    /// is a valid `OpenFileById` hint, so a handle to the directory is used.
+    #[test]
+    fn resolves_real_directory_only_by_full_file_id() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        };
+
+        let dir = crate::temp_case_dir("usn_frn_to_path");
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(&dir)
+            .unwrap();
+        let handle = HANDLE(handle_file.as_raw_handle());
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle, &mut info) }.unwrap();
+        let file_id = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+
+        let resolved = frn_to_path(handle, file_id).expect("full file id resolves");
+        assert_eq!(
+            resolved.to_string_lossy().to_lowercase(),
+            std::fs::canonicalize(&dir)
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches("\\\\?\\")
+                .to_lowercase()
+        );
+        if file_id >> 48 != 0 {
+            assert_eq!(frn_to_path(handle, file_id & FRN_RECORD_INDEX_MASK), None);
+        }
+
+        drop(handle_file);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn classifies_journal_stale_vs_transient() {
